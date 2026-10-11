@@ -16,9 +16,14 @@
 //! See `docs/02-lld.md` for the normative description of every type here.
 
 #![forbid(unsafe_code)]
+// `Condition` is a recursive enum, and its serde derives make the compiler evaluate a
+// deeply nested generic requirement. The default limit is too low for that combination.
+#![recursion_limit = "512"]
 
 pub mod assessment;
 pub mod clock;
+pub mod condition;
+pub mod definitions;
 pub mod directive;
 pub mod error;
 pub mod event;
@@ -38,6 +43,10 @@ pub use assessment::{
     Side, Verdict,
 };
 pub use clock::{Clock, FixedClock, SystemClock};
+pub use condition::{Comparator, Condition, ConditionError};
+pub use definitions::{
+    DeclarativeResponsibility, DefinitionError, DefinitionSet, ResponsibilityDefinition,
+};
 pub use directive::{
     Directive, Invariant, Proposal, Stakes, SteerKind, Suppression, SuppressionReason,
 };

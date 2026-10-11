@@ -101,11 +101,25 @@ evidence providers are not.** What landed:
   sandbox flag and no tool-permission flag, so it is refused before run state exists
   rather than launching something unpinned.
 
-Still outstanding in this milestone: the six bundled TOML definitions with their
-schema and user-dir override, the global/conditional router, and command evidence
-providers with `run_when` scheduling. The built-in responsibilities already propose
-with the documented ids, rule ids, thresholds, and priorities, so that work is a
-relocation into TOML rather than a redesign.
+Also landed from this milestone: **declarative definitions**
+(`aftman-core::definitions`) with the six bundled `.toml` files compiled in via
+`include_str!`, a validating schema (`deny_unknown_fields`, so a typo fails loudly),
+and a config-directory overlay that replaces a bundled definition of the same name.
+The `when` grammar from `docs/05` §2.1 is implemented in `aftman-core::condition`,
+including the rule that mixing `and` with `or` at one level without parentheses is a
+parse error.
+
+One scope decision, stated rather than assumed: **TOML owns checks, Rust owns rule
+logic.** A definition declares ids, instructions, thresholds, evidence selection, and
+(for operator-authored responsibilities) `[[rules]]` over check results. It cannot
+express `verifier_completed`, the remaining steer budget, or the attempt count, because
+those are runtime facts rather than check results — so the bundled responsibilities keep
+their logic in code and a condition may only read checks their own definition declares.
+Pretending otherwise would produce rules that silently mean something weaker than they
+read.
+
+Still outstanding in this milestone: the global/conditional router, and command evidence
+providers with `run_when` scheduling.
 
 Two layering corrections came out of this milestone and are worth keeping: backend
 launch options must **not** live in `RunConfig` (that would make `aftman-core` depend

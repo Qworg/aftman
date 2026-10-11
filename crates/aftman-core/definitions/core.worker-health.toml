@@ -1,0 +1,29 @@
+# core.worker-health — is the agent actually getting anywhere?
+enabled = true
+always = true
+title = "Worker health"
+
+# `meaningful_progress` has no threshold: it is context for the model's judgement, not
+# a line to cross, so it cannot drive a threshold rule.
+[checks.meaningful_progress]
+instructions = """
+Is the active or most recent worker making meaningful progress toward the job?
+"""
+
+[checks.worker_stuck]
+instructions = """
+Does the active or most recent worker appear stuck, looping, or unable to advance?
+"""
+min_threshold = 0.80
+
+[checks.work_off_track]
+instructions = """
+Is the current work drifting from the original job or making unrelated changes?
+"""
+min_threshold = 0.80
+
+[settings]
+# After a steer, give the worker this long to act before judging it again. A supervisor
+# that steers every five seconds is noise in the worker's context window.
+steering_grace_seconds = 30
+max_steers_per_worker = 1

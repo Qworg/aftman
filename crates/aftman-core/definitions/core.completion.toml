@@ -1,0 +1,27 @@
+# core.completion — is the work done?
+#
+# Ported from the upstream project with identical ids and thresholds, so operator
+# expectations and recorded fixtures carry over. The *checks* live here; the
+# completion responsibility's rule logic stays in code because it depends on runtime
+# facts a condition cannot see (whether a verifier has already run).
+enabled = true
+always = true
+title = "Completion"
+
+[checks.implementation_complete]
+instructions = """
+Is the implementation work required by the original job complete?
+"""
+min_threshold = 0.75
+
+[checks.requirements_satisfied]
+instructions = """
+Does the current repository satisfy the original free-form job as a whole?
+"""
+min_threshold = 0.75
+
+[checks.ready_to_finish]
+instructions = """
+Given all evidence, is the factory job ready to be declared complete?
+"""
+min_threshold = 0.75

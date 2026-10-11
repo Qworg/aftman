@@ -72,10 +72,11 @@ fn a_recorded_response_parses_with_its_extra_primitive_ignored()
         answers[&CheckKey::from("core.completion__ready_to_finish")].as_noul(),
         Some(0.21)
     );
-    assert_eq!(
-        answers[&CheckKey::from("core.worker-health__worker_stuck")].as_noul(),
-        None,
-        "stuckness was not requested here, so it is not in the result"
+    // The recording answers `worker_stuck`, but this request did not ask for it, so it
+    // must not appear: a result is keyed by what was asked, not by what came back.
+    assert!(
+        !answers.contains_key(&CheckKey::from("core.worker-health__worker_stuck")),
+        "an answer nobody asked for must not enter the result"
     );
 
     // The choice round-trips with its distribution.
@@ -118,15 +119,13 @@ fn a_recorded_response_parses_with_its_extra_primitive_ignored()
 fn asking_for_a_key_the_recording_omits_is_fatal() -> Result<(), Box<dyn std::error::Error>> {
     let response: SystemOneResponse = serde_json::from_str(RECORDED)?;
     let mut questions = asked();
-    questions.insert(
-        CheckKey::from("core.worker-health__worker_stuck"),
-        Question::noul("stuck?"),
-    );
+    // Genuinely absent from the recording: the conditional documentation
+    // responsibility was not routed in for this evaluation.
+    let absent = CheckKey::from("quality.documentation__documentation_sufficient");
+    questions.insert(absent.clone(), Question::noul("documentation sufficient?"));
     let error = parse_answers(&response, &questions).expect_err("absent answer");
     match error {
-        ModelError::MissingAnswer(key) => {
-            assert_eq!(key, "core.worker-health__worker_stuck");
-        }
+        ModelError::MissingAnswer(key) => assert_eq!(key, absent.to_string()),
         other => panic!("expected MissingAnswer, got {other:?}"),
     }
     Ok(())

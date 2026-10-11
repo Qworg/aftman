@@ -10,12 +10,22 @@ description = "Coding-agent backends for aftman"
 aftman-core.workspace = true
 
 async-trait.workspace = true
+serde.workspace = true
+# Safe wrappers for signalling a process group. `libc::kill` would need `unsafe`,
+# which is forbidden workspace-wide.
+nix.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+# `process_group(0)` and signals are Unix-only in this milestone; the tests assume the
+# same platform the implementation targets.
+tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
 
 [lints]
 workspace = true

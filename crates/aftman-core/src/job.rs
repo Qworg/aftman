@@ -201,6 +201,12 @@ impl WorkerExit {
 #[serde(deny_unknown_fields)]
 pub struct RunConfig {
     pub worker: WorkerKind,
+    /// The model to request from the provider, if any.
+    ///
+    /// Deliberately *not* a place for launch flags: `aftman-core` must not know what
+    /// `--permission-prompts` is, and holding them here would invert the dependency
+    /// between the domain and the worker backends. The CLI keeps them and hands them to
+    /// the worker factory.
     pub worker_model: Option<String>,
     pub verify: VerifyPolicy,
     /// Total workers allowed across the run, including verifiers and retries.

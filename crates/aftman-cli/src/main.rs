@@ -101,6 +101,28 @@ struct RunArgs {
     #[arg(long, default_value = "simulated")]
     worker: String,
 
+    /// argv template for `--worker generic`. Placeholders: {mission_file}, {repo}, {model}.
+    #[arg(long)]
+    cmd: Option<String>,
+
+    /// Permission posture: sandboxed (default), auto-approve, or interactive.
+    #[arg(long, default_value = "sandboxed")]
+    permissions: String,
+
+    /// Reasoning effort, where the backend accepts one.
+    #[arg(long)]
+    effort: Option<String>,
+
+    /// Prefer a live-input mode where the backend has one (currently only pi).
+    #[arg(long)]
+    steer: bool,
+
+    /// Assert that isolation is provided by a container, VM, or throwaway checkout.
+    ///
+    /// This is what makes `sandboxed` honest for a backend that has no sandbox flag.
+    #[arg(long)]
+    external_sandbox: bool,
+
     /// Model to request from the provider.
     #[arg(long)]
     model: Option<String>,
@@ -175,19 +197,58 @@ fn resolve_store(data_dir: Option<PathBuf>) -> Result<Arc<FileRunStore>> {
     Ok(Arc::new(FileRunStore::new(root)))
 }
 
-/// Parse a worker name, refusing the ones that do not exist yet.
+/// Parse a worker name.
 ///
 /// A real backend that silently fell back to a simulation would make a run look
-/// supervised when it was not, so this fails loudly instead.
+/// supervised when it was not, so an unknown name fails loudly.
 fn resolve_worker(name: &str) -> Result<WorkerKind> {
     match name {
         "simulated" => Ok(WorkerKind::Simulated),
-        "pi" | "agy" | "claude" | "generic" | "herdr:pane" => bail!(
-            "the `{name}` backend arrives in milestone M2/M8; M0 ships only \
-             `--worker simulated`, which needs no agent binary and no credentials"
+        "pi" => Ok(WorkerKind::Pi),
+        "agy" => Ok(WorkerKind::Agy),
+        "claude" => Ok(WorkerKind::Claude),
+        "generic" => Ok(WorkerKind::Generic),
+        "herdr:pane" => bail!(
+            "`herdr:pane` is driven by the herdr surface (milestone M6), not by a \
+             command line. Use --worker pi, agy, claude, or generic for now."
         ),
-        other => bail!("unknown worker `{other}` (try: simulated)"),
+        other => bail!("unknown worker `{other}` (try: simulated, pi, agy, claude, generic)"),
     }
+}
+
+/// Build the backend options from the CLI.
+fn backend_options(
+    args: &RunArgs,
+    human_available: bool,
+) -> Result<aftman_workers::BackendOptions> {
+    let permissions = match args.permissions.as_str() {
+        "sandboxed" => aftman_workers::PermissionMode::Sandboxed,
+        "auto-approve" => {
+            if std::env::var_os("AFTMAN_ACK_UNSANDBOXED").is_none() {
+                bail!(
+                    "--permissions auto-approve suppresses the agent's approval prompts. \
+                     Set AFTMAN_ACK_UNSANDBOXED=1 to acknowledge that, or use the default \
+                     `sandboxed` posture."
+                );
+            }
+            aftman_workers::PermissionMode::AutoApprove
+        }
+        "interactive" => aftman_workers::PermissionMode::Interactive,
+        other => {
+            bail!("unknown permission posture `{other}` (sandboxed, auto-approve, interactive)")
+        }
+    };
+    Ok(aftman_workers::BackendOptions {
+        model: args.model.clone(),
+        effort: args.effort.clone(),
+        executable: None,
+        permissions,
+        external_sandbox: args.external_sandbox,
+        human_available,
+        command_template: args.cmd.clone(),
+        prefer_steering: args.steer,
+        extra_args: Vec::new(),
+    })
 }
 
 #[tokio::main]
@@ -237,12 +298,13 @@ fn config_from(args: &RunArgs) -> Result<RunConfig> {
 async fn build_runtime(
     store: &Arc<FileRunStore>,
     config: RunConfig,
+    options: aftman_workers::BackendOptions,
     ensemble: bool,
     simulate_model: bool,
     quiet: bool,
 ) -> Result<FactoryRuntime> {
     let model = build_model(store, simulate_model, quiet)?;
-    let worker: Arc<dyn Worker> = Arc::new(SimulatedWorker::new());
+    let worker: Arc<dyn Worker> = build_worker(&config, &options, store, quiet)?;
     Ok(FactoryRuntime::new(RuntimeDeps {
         config,
         store: store.clone(),
@@ -255,6 +317,49 @@ async fn build_runtime(
         uncertainty_margin: aftman_daemon::default_margin(),
         steering_grace: std::time::Duration::from_secs(30),
     }))
+}
+
+/// Construct the configured coding-agent backend.
+///
+/// A backend whose posture it cannot express fails here, at startup, rather than
+/// launching something unpinned and discovering it later.
+fn build_worker(
+    config: &RunConfig,
+    options: &aftman_workers::BackendOptions,
+    store: &Arc<FileRunStore>,
+    quiet: bool,
+) -> Result<Arc<dyn Worker>> {
+    if config.worker == WorkerKind::Simulated {
+        return Ok(Arc::new(SimulatedWorker::new()));
+    }
+    // Validate the posture *before* any run state exists. A backend that cannot
+    // express what was asked for must fail here, not after a worker has been announced
+    // and then failed to launch.
+    aftman_workers::backends::validate(config.worker, options)
+        .with_context(|| format!("--worker {}", config.worker.as_str()))?;
+    let mission_dir = store.root().join("missions");
+    std::fs::create_dir_all(&mission_dir).context("creating the mission directory")?;
+    let worker =
+        aftman_workers::SubprocessWorker::backend(config.worker, options.clone(), mission_dir);
+    // Surfacing the resolved argv at startup makes the launch auditable and catches a
+    // bad flag before a worker is spawned.
+    if !quiet {
+        println!(
+            "worker      {} ({}), steering {}\n",
+            config.worker.as_str(),
+            if options.prefer_steering {
+                "live input"
+            } else {
+                "one-shot"
+            },
+            if worker.steering_available() {
+                "available"
+            } else {
+                "unsupported"
+            }
+        );
+    }
+    Ok(Arc::new(worker))
 }
 
 /// Pick the decision model, or explain what is missing.
@@ -322,7 +427,18 @@ async fn run_job(store: &Arc<FileRunStore>, args: RunArgs, quiet: bool) -> Resul
     }
 
     let config = config_from(&args)?;
-    let runtime = build_runtime(store, config, args.ensemble, args.simulate_model, quiet).await?;
+    // `--no-daemon` has no human attached, so `interactive` is refused here and is
+    // offered by the herdr surface in M6.
+    let options = backend_options(&args, false)?;
+    let runtime = build_runtime(
+        store,
+        config,
+        options,
+        args.ensemble,
+        args.simulate_model,
+        quiet,
+    )
+    .await?;
     let job = Job {
         prompt,
         repo,
@@ -353,6 +469,11 @@ async fn demo(store: &Arc<FileRunStore>, args: DemoArgs, quiet: bool) -> Result<
         ensemble: false,
         // The demo is the offline path by definition.
         simulate_model: true,
+        cmd: None,
+        permissions: "sandboxed".to_owned(),
+        effort: None,
+        steer: false,
+        external_sandbox: false,
     };
     run_job(store, args, quiet).await
 }

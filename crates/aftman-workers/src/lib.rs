@@ -5,18 +5,27 @@
 //! a terminate. Nothing about `pi`, `agy`, `claude`, or herdr leaks into the
 //! runtime.
 //!
-//! M0 ships one backend — [`simulated::SimulatedWorker`] — because the M0 goal is an
-//! offline run with no credentials and no real agent binary. The subprocess
-//! backends arrive in M2 and M8; the machinery they share (process groups, bounded
-//! streaming, interrupt-then-kill) is described in `docs/04-workers.md` §11, and
-//! the `Worker` trait is already shaped so that adding one is a new file rather than
-//! a runtime change.
+//! | Backend | Steering | Verified against |
+//! | --- | --- | --- |
+//! | [`backends::pi_oneshot`] / [`backends::pi_rpc`] | RPC mode only | pi 1.1.0 |
+//! | [`backends::agy`] | no | agy 1.3.3 |
+//! | [`backends::claude`] | no | claude 2.1.293 |
+//! | [`backends::generic`] | no | operator-supplied |
+//! | [`simulated::SimulatedWorker`] | yes (synthetic) | — |
+//!
+//! [`subprocess::SubprocessWorker`] runs any of them, and is where the requirements
+//! that are the same for all of them live: an own process group so termination reaches
+//! grandchildren, bounded output, interrupt-before-kill, and a scrubbed environment.
 
 #![forbid(unsafe_code)]
 
+pub mod backends;
 pub mod simulated;
+pub mod subprocess;
 
+pub use backends::{BackendOptions, PermissionMode, SpecError, SteerProtocol};
 pub use simulated::SimulatedWorker;
+pub use subprocess::{CommandSpec, SubprocessWorker};
 
 /// The worker environment, with supervisor credentials removed.
 ///

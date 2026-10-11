@@ -88,6 +88,31 @@ budget module provably refuses to send a request missing the job.
 
 ## M2 — Responsibilities, policy, and a real worker
 
+**Status: the worker backends are complete; the TOML registry, router, and command
+evidence providers are not.** What landed:
+
+- `aftman-workers::subprocess` — one process-group spawn path, bounded streaming,
+  interrupt-then-kill with a grace period, and a scrubbed environment. Termination
+  reaches grandchildren, which is the reason for the process group.
+- `aftman-workers::backends` — `pi` (one-shot and steerable RPC), `agy`, `claude`, and
+  a quoted generic template, as pure functions from options to argv, so command
+  construction is tested against the documented lines without any agent installed.
+- Posture validation at **startup**: `pi` cannot express `sandboxed` because it has no
+  sandbox flag and no tool-permission flag, so it is refused before run state exists
+  rather than launching something unpinned.
+
+Still outstanding in this milestone: the six bundled TOML definitions with their
+schema and user-dir override, the global/conditional router, and command evidence
+providers with `run_when` scheduling. The built-in responsibilities already propose
+with the documented ids, rule ids, thresholds, and priorities, so that work is a
+relocation into TOML rather than a redesign.
+
+Two layering corrections came out of this milestone and are worth keeping: backend
+launch options must **not** live in `RunConfig` (that would make `aftman-core` depend
+on `aftman-workers`), and the mission is run-time data, so a backend builds its argv
+per run rather than at construction — the same worker instance serves the coding
+worker and the verifier.
+
 *Deliverable:* `aftman run --worker pi|agy|claude` supervises a real agent and can steer, stop, or
 finish.
 

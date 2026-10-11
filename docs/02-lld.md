@@ -241,6 +241,11 @@ pub struct Suppression { pub responsibility: ResponsibilityId, pub rule: RuleId,
     pub reason: SuppressionReason }
 pub enum   SuppressionReason { NotPermitted, Invariant(Invariant), HigherPriority,
     WorkerLimit, RetryLimit, VerificationAlreadyRun, BudgetExhausted }
+/// The hard invariants of doc 05 §6.1, named so that a suppression is
+/// self-describing in the event log. Distinct from `CheckSuppression`
+/// (doc 06 §5), which is about measurement quality, not proposal arbitration.
+pub enum   Invariant { OverallTimeout, AttemptsExhausted, WorkerLimit, VerificationAlreadyRun,
+    AssessmentBudget, ModelUnavailable }
 pub struct Condition(String);         // parsed expression; see doc 05 §2
 pub struct Routing { pub always: bool, pub instructions: Option<String>, pub threshold: f32 }
 
@@ -258,9 +263,14 @@ pub struct RunSummary { pub id: RunId, pub status: FactoryStatus, pub created_at
 pub struct RunFilter { pub status: Option<Vec<FactoryStatus>>, pub repo: Option<PathBuf>,
     pub limit: Option<u32>, pub cursor: Option<RunId> }
 pub struct EventStream { /* async iterator over EventEnvelope, resume by EventSeq */ }
-pub struct Escalation { pub id: EscalationId, pub raised_at: OffsetDateTime, pub check: CheckKey,
+pub struct Escalation { pub id: EscalationId, pub kind: EscalationKind,
+    pub raised_at: OffsetDateTime,
+    /// `None` when the escalation is not about one check — budget exhaustion and
+    /// model unavailability have no check key.
+    pub check: Option<CheckKey>,
     pub ask: String, pub jev_p: Option<f32>, pub opinions: Vec<Opinion>,
     pub answered: Option<(OffsetDateTime, HumanDecision, String)> }
+pub enum   EscalationKind { Check, AssessmentBudget, ModelUnavailable, WorkerBlocked }
 
 // ---- model layer ------------------------------------------------------
 pub enum   Purpose { Assessment, Routing }
@@ -284,6 +294,11 @@ pub struct WorkerEventSink { /* sends WorkerSignal; see §7.1 */ }
 A property worth asserting in a test: every type reachable from `PolicyInput` and from `RunState`
 contains only ordered collections, so `serde_json::to_vec` is byte-stable and snapshot comparisons
 are meaningful.
+
+Four types are **defined once, in [06-ensemble.md §5](06-ensemble.md)**, and referenced here rather
+than redefined, because a duplicate definition of the same name in two documents is how the
+`SuppressionReason` collision nearly happened: `Rung`, `Opinion`, `CheckSuppression`,
+`ResolvedCheck`, and `HumanDecision`.
 
 ## 4. Responsibilities
 
@@ -330,9 +345,6 @@ pub enum Directive {
 be split back into its parts unambiguously. The double-underscore separator is also what the
 upstream project uses, so a recorded fixture or a hand-written Jev probe stays valid.
 
-```rust
-```
-
 Responsibilities are loaded from bundled TOML (compiled in via `include_str!`) and merged with a
 user config directory. The TOML schema is defined in
 [05-responsibilities.md](05-responsibilities.md).
@@ -349,7 +361,7 @@ pub struct PolicyInput<'a> {
     pub config: &'a RunConfig,
     pub assessment: &'a Assessment,
     /// Every check, with Jev's unmodified value and whether policy may act on
-    /// it. See docs/06-ensemble.md §5 — policy reads `rule_permitted`, never a
+    /// it. See docs/06-ensemble.md §5 — policy reads `permitted`, never a
     /// fabricated number.
     pub checks: &'a BTreeMap<CheckKey, ResolvedCheck>,
     /// Materialised by the runtime so this function needs no clock. See below.
@@ -375,7 +387,6 @@ is also pure, so replay re-derives the same proposals from the same `PolicyInput
 injected from the `Clock`, and on replay it is reconstructed from the event log's timestamps.
 
 ```rust
-
 pub struct PolicyDecision {
     pub selected: Directive,
     pub considered: Vec<Proposal>,       // every proposal, with its rule id
@@ -389,15 +400,17 @@ Arbitration is two-phase:
    - overall timeout exceeded ⇒ `Stop`;
    - `attempts >= max_attempts` ⇒ no `Retry`;
    - `verifiers_run > 0` ⇒ `Verify` is suppressed;
-   - **`rule_permitted` gates every rule.** A proposal whose check has
-     `rule_permitted == false` is suppressed with `SuppressionReason::NotPermitted`, no matter how far
-     above threshold its value is. This is the single mechanism behind the ensemble's guarantee
-     (doc 06 §2.2): nothing but Jev's own decisive value or an R0 evidence refresh can set
-     `rule_permitted`.
+   - **`permitted` gates every rule, in both directions.** A rule fires only when
+     `permitted(check) && comparator(p, t)`. A proposal whose check has `permitted == false` is
+     suppressed with `SuppressionReason::NotPermitted`, no matter how far its value is from the
+     threshold. `permitted` is `decisive && !contested` and is **not** `p >= t`, so a `<` rule
+     behaves exactly like a `>=` rule (doc 06 §5.2). Nothing but Jev's own decisive value or an R0
+     evidence refresh can set it.
    - `Finish` requires all of: `ready_to_finish` and `requirements_satisfied` and
-     `tests_sufficient` above threshold **and permitted** (`rule_permitted == true`, so the value
-     is decisively outside the uncertainty band), **and**
-     `(verification_completed or needs_verification < threshold)`, **and** no active worker;
+     `tests_sufficient` above threshold **and permitted** (`permitted == true`, so each value is
+     decisively outside the uncertainty band), **and**
+     `(verification_completed or (needs_verification < threshold and permitted))`, **and** no
+     active worker;
    - `max_assessments` exhausted ⇒ `Stop` (or `Escalate` if verification is pending).
 
 2. **Priority** among surviving proposals. The exact numeric table is authoritative and lives in
@@ -490,11 +503,18 @@ input:
 | --- | --- |
 | **Activity channel** (`tokio::mpsc`, unpersisted) | Signalled by each stdout/stderr chunk as `BoundedLog` absorbs it. Cheap, lossy, coalesced. |
 | **Lifecycle channel** | `WorkerStarted`, `WorkerCompleted`, `WorkerSteered`, `WorkerTerminated`. Completion forces an immediate cycle. |
-| **Interval ticker** | `min_assessment_interval` (default 5s). Guarantees forward progress even if a worker is silent. |
+| **Idle ticker** | `idle_poll_interval` (default 30s), deliberately **not** `min_assessment_interval`. Guarantees forward progress for a silent worker without burning the assessment budget. |
 
 Debounce rules:
 
-- activity signals are coalesced within `min_assessment_interval`;
+- activity signals are coalesced within `min_assessment_interval` (default 5s);
+- **an idle tick only runs a cycle if the observation content changed.** The watcher digests
+  `state_for(...)` and the counters; an unchanged digest skips the model call entirely and consumes
+  no assessment budget. Without this, a worker running a long silent test suite would exhaust
+  `max_assessments_per_run = 400` in ~33 minutes at a 5-second cadence and be stopped as if stuck,
+  well inside its 45-minute timeout;
+- `WorkerOutput` is flushed only when new bytes actually arrived, so an idle tick never emits an
+  empty output event;
 - a worker-completion event always forces an immediate cycle, regardless of the interval, after
   command evidence providers have run;
 - a cycle in progress is never interrupted; the next signal starts the next cycle;
@@ -688,6 +708,15 @@ events_history = 30
 workers_history = 10
 untracked_files = 3
 untracked_bytes = 4096
+
+[runtime]
+# The debounce interval and the idle poll interval are separate on purpose: a
+# single 5s ticker would let a silent worker exhaust the assessment budget well
+# inside its own timeout. See §7.1.
+min_assessment_interval_ms = 5000
+idle_poll_interval_ms = 30000
+# Skip the model call when the observation digest is unchanged.
+skip_unchanged_assessments = true
 
 [workers]
 default = "pi"

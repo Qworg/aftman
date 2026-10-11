@@ -217,8 +217,10 @@ condition  := disjunction
 
 `and` binds tighter than `or`, evaluation is left-to-right, and **mixing `and` and `or` at the same
 level without parentheses is a parse error** rather than a precedence subtlety. A reference to an
-unknown check key is a load-time error. Condition evaluation reads `rule_permitted`, not the raw
-probability, so an ensemble-suppressed check cannot drive a rule (doc 06 §5).
+unknown check key is a load-time error. A condition term evaluates
+`permitted(check) && comparator(p, t)`. `permitted` is direction-agnostic (`decisive &&
+!contested`), so `<` and `>=` behave identically, and an ensemble-suppressed check cannot drive a
+rule in either direction (doc 06 §5.2).
 
 Validation rules (all fatal at load, never at assessment time):
 
@@ -333,7 +335,7 @@ Applied before any priority comparison. They cannot be overridden by a score:
 | Invariant | Effect |
 | --- | --- |
 | Overall timeout exceeded | `Stop` |
-| **`rule_permitted == false` for a check** | Every rule that reads that check is suppressed (`SuppressionReason::NotPermitted`), regardless of how far above threshold its value is. This is how the ensemble's guarantee is enforced (doc 06 §2.2). |
+| **`permitted == false` for a check** | Every rule that reads that check is suppressed (`SuppressionReason::NotPermitted`), in both comparison directions, regardless of how far the value is from the threshold. This is how the ensemble's guarantee is enforced (doc 06 §2.2). |
 | `attempts >= max_attempts` | `Retry` suppressed |
 | `workers >= max_workers` | `StartWorker` / `Verify` / `Retry` suppressed → `Escalate` |
 | `verification_started` | `Verify` suppressed |
@@ -345,17 +347,21 @@ Applied before any priority comparison. They cannot be overridden by a score:
 `Finish` is proposed only when **all** of these hold:
 
 ```text
-ready_to_finish        >= 0.75  and  rule_permitted
-requirements_satisfied >= 0.75  and  rule_permitted
-tests_sufficient       >= 0.75  and  rule_permitted
-and ( verification_completed  or  needs_verification < 0.65 )
+ready_to_finish        >= 0.75  and  permitted
+requirements_satisfied >= 0.75  and  permitted
+tests_sufficient       >= 0.75  and  permitted
+and ( verification_completed  or  ( needs_verification < 0.65  and  permitted ) )
 and no worker is active
 ```
 
-`rule_permitted` is `true` only when the value is decisively outside the uncertainty band (or the
+`permitted` is `true` only when the value is decisively outside the uncertainty band (or the
 ensemble is disabled). So with `ensemble.enabled = true`, a `ready_to_finish` of `0.79` against a
 `0.75` threshold is **in band** and cannot finish: the run either refreshes evidence (R0) or
 continues. This is the mechanism, not the prose, behind "only evidence can finish work".
+
+Note that the `needs_verification` disjunct — the one comparison that reads a *less-than* — carries
+`permitted` like every other term. An earlier revision omitted it there, which let a raw, in-band,
+or even actively contested `needs_verification` satisfy a `Finish` conjunct.
 
 Any single failure falls through to `StartWorker`, so an unmet requirement can never be silently
 finished. This is the joint-threshold rule that keeps `ready_to_finish` from being trusted alone.
@@ -373,7 +379,7 @@ priority  directive      rule id                             source
  900      Stop           repository.instructions:drift        agents_md_drift >= 0.80
  900      Steer          (the same three rules, when a steer is permitted)
  800      Retry          core.completion:retry-stopped         no worker, last directive was Stop
- 800      Steer          (declarative rule with failure_action = "steer")
+ 800      Steer          (declarative rule with `propose = "steer"`)
  750      StartWorker    quality.documentation:insufficient   documentation_sufficient < 0.75
  700      Finish         core.completion:thresholds-satisfied §6.2 holds
  600      Verify         core.verification:warranted          needs_verification >= 0.65

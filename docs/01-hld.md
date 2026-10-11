@@ -153,8 +153,9 @@ Details in [07-surfaces.md](07-surfaces.md).
 
 ## 8. Data flow of one cycle
 
-1. A worker event enters the runtime's event queue.
-2. The watcher drains adjacent events and enforces the minimum assessment interval.
+1. A worker signals activity (a stdout/stderr chunk), completes, or the idle ticker fires.
+2. The watcher coalesces signals, enforces the minimum assessment interval, and skips the model
+   call entirely when the observation content is unchanged (see [02-lld.md §7.1](02-lld.md)).
 3. On worker completion, command evidence providers referenced by active checks run first, and
    their bounded results are persisted.
 4. Git state, diffs, untracked excerpts, output tails, repository instructions, prior decisions,

@@ -67,15 +67,18 @@ finish.
 | Command evidence providers, `run_when` scheduling | `aftman-core` |
 | `pi` (`--mode json`; `--mode rpc` for steering), `agy` (`--print="…" --output-format stream-json`), and `claude` (`-p --permission-mode … --permission-prompts none`) backends | `aftman-workers` |
 | Process-group spawn, bounded streaming, interrupt→grace→kill | `aftman-workers` |
+| Watcher trigger architecture (activity channel, lifecycle channel, idle ticker) + unchanged-observation digest skip | `aftman-daemon` |
 | `worker_environment` scrubbing + a test that asserts no `TYPESAFE_*` survives | `aftman-workers` |
 | Ensemble **S0**: types, events, no-op resolver | `aftman-core` |
 
 **Exit criteria:** the `Finish` precondition has a truth-table test; priority ordering is pinned
 pairwise and asserted to be a total order with no ties; a fake worker script that prints
-`3 passed` and exits 0 produces the expected directive; `rule_permitted == false` suppresses a rule
-whose value is far above threshold; the scrub test passes. A real agent run against the live API is
-a gated `AFTMAN_LIVE=1` smoke test and is **not** an exit criterion, because exit criteria must be
-checkable by `cargo test --workspace` with no network and no credentials (`AGENTS.md` hard rule 4).
+`3 passed` and exits 0 produces the expected directive; `permitted == false` suppresses a rule
+whose value is far from the threshold **in both comparison directions**; a silent worker consumes no
+assessment budget across many idle ticks; the scrub test passes. A real agent run against the live
+API is a gated `AFTMAN_LIVE=1` smoke test and is **not** an exit criterion, because exit criteria
+must be checkable by `cargo test --workspace` with no network and no credentials (`AGENTS.md` hard
+rule 4).
 
 ## M3 — Daemon, protocol, CLI, TUI
 
@@ -121,14 +124,14 @@ framing-consistency check catches a framing-sensitive answer.
 
 | Work | Crate |
 | --- | --- |
-| Trigger computation, including the `Decisive` trigger computed by re-running pure policy | `aftman-core` |
+| Trigger computation: `NearThreshold`, `LowConfidence`, `ClaimOnlyEvidence`, `OutcomeRelevant`, `HighStakes`, `Irreversible`, `RepeatContest` — with `OutcomeRelevant` computed by re-running pure policy | `aftman-core` |
 | **S1 — R0**: evidence refresh, re-assessment, `supersedes` linking, refresh cap | `aftman-core` |
 | **S2 — R2**: negated question, framing tolerance, consistency verdict | `aftman-core` |
-| Band promotion/demotion with the `ε = margin/10` bound, recorded as `promoted` | `aftman-core` |
+| `permitted` gating on a direction-agnostic measurement, contest suppression, and the in-band → R0/escalate path | `aftman-core` |
 | The two invariant property tests (no fusion; no opinion-driven finish) | `aftman-core` |
 | Replay from `RecordedOpinionSource` | `aftman-core::testing` |
 
-**Exit criteria:** a non-`Decisive` trigger requests zero opinions; a fake passing test run
+**Exit criteria:** a check in band, or one whose rule would not fire, requests zero opinions; a fake passing test run
 converts a `0.71` into a decisive value; no input can produce an opinion-driven `Finish`; repeated
 refresh is capped and visible.
 

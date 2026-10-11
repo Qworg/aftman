@@ -192,7 +192,7 @@ rather than blocking. See §8.1 for the full posture mapping.
   stop-then-resume-with-guidance only if `--resume-on-retry` is enabled; otherwise stop/retry.
 
 The exact stdout schema of `stream-json` is **not yet fixture-verified**. The parser must be built
-against recorded real output (see §9) before this backend is considered supported, and until then
+against recorded real output (see §12 item 6) before this backend is considered supported, and until then
 `aftman doctor --worker claude --probe` is required to enable it.
 
 ## 6. The verifier is a worker
@@ -379,7 +379,9 @@ interrupt → wait terminate_grace (5s) → kill process group
 5. Cover it offline with a fake executable: argv construction, streaming, launch failure, signal
    termination, and `steer()` while running and while finished.
 6. Record real CLI output into `crates/aftman-workers/tests/fixtures/<name>/` and parse *that*.
-   Hand-written fixtures for a third-party CLI format are how parsers rot.
+   Hand-written fixtures for a third-party CLI format are how parsers rot. (Doc 09 M8 sequences
+   this work; the red line here is that a backend without a recorded fixture stays gated behind
+   `aftman doctor --probe`.)
 7. Add the backend row to the matrix in §1 with the version you verified against.
 
 ## 13. What is deliberately not supported

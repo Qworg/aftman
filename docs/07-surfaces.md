@@ -183,7 +183,7 @@ herdr agent read aftman-<run>-1 --source recent-unwrapped --lines 200
 What this buys:
 
 - **Real steering.** `Steer` becomes `herdr agent prompt <name> "<message>"`, which lands in the
-  live session. The trait reports `SteerOutcome::Delivered`/`Queued` honestly (§10 of doc 04).
+  live session. The trait reports `SteerOutcome::Delivered`/`Queued` honestly (doc 04 §3.2).
 - **Approval prompts become an escalation instead of a hang.** herdr classifies a waiting agent as
   `blocked`. Aftman maps `blocked` → `EscalationRaised` rather than `worker_stuck`, so the human
   answers in the pane and work resumes. This is the one configuration where the `interactive`

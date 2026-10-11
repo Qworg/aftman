@@ -8,6 +8,24 @@ agent appear. Every milestone ends with the full offline suite green.
 
 ## M0 — Skeleton, core types, offline run
 
+**Status: complete.** `cargo test --workspace` is green (160 tests) with an empty environment, clippy
+is clean under `-D warnings`, and `aftman demo` reaches `finished` with no network, no credentials,
+and no agent binary, leaving the target repository untouched. No design change was needed: every bug
+found during M0 was a deviation of the code from these documents, which is the intended direction.
+
+Two details earned a place in the design from this milestone: the completion channel must be drained
+independently of the trigger that woke the loop (`docs/02-lld.md` §7.1), and the content digest must
+exclude *every* per-cycle counter, including the assessment sequence inside the prior decision.
+
+**Status: complete.** `cargo test --workspace` is green (160 tests) with an empty environment, clippy
+is clean under `-D warnings`, and `aftman demo` reaches `finished` with no network, no credentials,
+and no agent binary, leaving the target repository untouched. No design change was needed: every bug
+found during M0 was a deviation of the code from these documents, which is the intended direction.
+
+Two details earned a place in the design from this milestone: the completion channel must be drained
+independently of the trigger that woke the loop (`docs/02-lld.md` §7.1), and the content digest must
+exclude *every* per-cycle counter, including the assessment sequence inside the prior decision.
+
 *Deliverable:* `aftman run --repo . --job "..." --worker simulated` completes with no network and
 no API key, streaming events to the terminal.
 

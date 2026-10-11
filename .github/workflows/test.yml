@@ -1,0 +1,46 @@
+---
+name: test
+
+# Quoted because yamllint parses bare `on` as boolean true.
+"on":
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      # The suite must pass with an empty environment: no credentials, no
+      # network, no real pi/agy/claude binary. See AGENTS.md hard rule 4.
+      - name: Test
+        run: cargo test --workspace
+        env:
+          TYPESAFE_API_KEY: ""
+          AFTMAN_CONFIG: ""
+
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-audit
+      - name: Audit
+        run: cargo audit --deny warnings

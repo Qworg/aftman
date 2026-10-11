@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/qworg/aftman"
+description = "An agent supervisor: a fast decision model above slower coding agents"
+
+[workspace.dependencies]
+aftman-core = { path = "crates/aftman-core" }
+aftman-store = { path = "crates/aftman-store" }
+aftman-workers = { path = "crates/aftman-workers" }
+aftman-daemon = { path = "crates/aftman-daemon" }
+
+anyhow = "1.0"
+async-trait = "0.1"
+blake3 = "1.5"
+clap = { version = "4.5", features = ["derive", "env"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tempfile = "3.12"
+thiserror = "2.0"
+time = { version = "0.3", features = ["serde", "formatting", "macros", "parsing"] }
+tokio = { version = "1.40", features = [
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "time",
+  "fs",
+  "io-util",
+  "process",
+  "signal",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uuid = { version = "1.10", features = ["v7", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_qualifications = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+# `pedantic` is NOT enabled wholesale. It is a large group whose value here is
+# mostly stylistic (`needless_pass_by_value`, `items_after_statements`, …), and
+# turning it on from M0 would mean either a wall of `allow`s or a wall of churn in
+# a codebase that does not exist yet. Individual pedantic lints get enabled when
+# there is a concrete reason; the ones below are judgements worth recording.
+#
+# Deliberately allowed, with reasons:
+must_use_candidate = "allow"     # noisy on pure accessors with no caller yet
+doc_markdown = "allow"           # `aftman`/`Jev`/`f32` in prose is not code
+module_name_repetitions = "allow" # `policy::PolicyInput` reads better than the alternative
+cast_precision_loss = "allow"    # f32<->f64 on probabilities is intentional and bounded
+cast_possible_truncation = "allow" # byte counts fit usize by construction
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

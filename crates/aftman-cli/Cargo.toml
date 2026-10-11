@@ -1,0 +1,29 @@
+[package]
+name = "aftman-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "The aftman command-line interface"
+
+[[bin]]
+name = "aftman"
+path = "src/main.rs"
+
+[dependencies]
+aftman-core.workspace = true
+aftman-daemon.workspace = true
+aftman-store.workspace = true
+aftman-workers.workspace = true
+
+anyhow.workspace = true
+clap.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

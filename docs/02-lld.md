@@ -242,7 +242,7 @@ pub struct Proposal { pub responsibility: ResponsibilityId, pub rule: RuleId,
 pub struct Suppression { pub responsibility: ResponsibilityId, pub rule: RuleId,
     pub reason: SuppressionReason }
 pub enum   SuppressionReason { NotPermitted, Invariant(Invariant), HigherPriority,
-    WorkerLimit, RetryLimit, VerificationAlreadyRun, BudgetExhausted }
+    CapabilityUnavailable }
 /// The hard invariants of doc 05 §6.1, named so that a suppression is
 /// self-describing in the event log. Distinct from `CheckSuppression`
 /// (doc 06 §5), which is about measurement quality, not proposal arbitration.
@@ -552,6 +552,12 @@ input:
 Debounce rules:
 
 - activity signals are coalesced within `min_assessment_interval` (default 5s);
+- **the completion channel is drained without blocking at the top of every iteration,**
+  independently of which trigger fired. Observing a worker's completion only inside the wait
+  branch is a deadlock: if a cycle outlasts the idle interval — which a real model call easily does
+  — `idle_due` is true on every iteration, the wait branch is never reached, the completion is never
+  seen, and the runtime supervises a worker that no longer exists. Implemented in M0; the bug was
+  found by an integration test whose idle interval was shorter than its cycle;
 - **an idle tick only runs a cycle if there is something to decide.** The condition is
   `content_changed || time_driven_check_due`, not `content_changed` alone:
   - `content_changed` compares an **`observation_content_digest`**: BLAKE3 over the canonical

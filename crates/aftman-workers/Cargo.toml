@@ -1,0 +1,21 @@
+[package]
+name = "aftman-workers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Coding-agent backends for aftman"
+
+[dependencies]
+aftman-core.workspace = true
+
+async-trait.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[lints]
+workspace = true

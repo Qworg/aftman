@@ -525,9 +525,13 @@ Properties:
 
 - **`jev_p` is persisted unmodified, alongside `permitted` and the `Band`.** A reader can always
   see both what the model said and whether aftman was willing to use it. Nothing is overwritten.
-- **`state_digest` is BLAKE3 over the canonical serialization of `state_for(...)`.** It proves the
-  judge saw what Jev saw. Only the digest is persisted — repository prose must not land in the run
-  log ([02-lld.md §3.3](02-lld.md)).
+- **`state_digest` is BLAKE3 over the canonical serialization of `state_for(...)`**, volatile fields
+  included, because it must prove that the judge saw exactly what Jev saw. Only the digest is
+  persisted — repository prose must not land in the run log ([02-lld.md §3.3](02-lld.md)).
+  Do not confuse it with the watcher's `observation_content_digest`, which deliberately *removes*
+  volatile fields so that an idle tick can detect that nothing has changed
+  ([02-lld.md §7.1](02-lld.md)). Same idea, opposite tolerance for timestamps: one is provenance,
+  the other is a change detector.
 - **`prompt_hash`** covers the judge's full prompt, so a stored verdict is attributable to an exact
   template revision.
 - **Replay:** `RecordedOpinionSource` reads `OpinionRecorded` events and answers from them. Because

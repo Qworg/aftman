@@ -74,11 +74,13 @@ finish.
 **Exit criteria:** the `Finish` precondition has a truth-table test; priority ordering is pinned
 pairwise and asserted to be a total order with no ties; a fake worker script that prints
 `3 passed` and exits 0 produces the expected directive; `permitted == false` suppresses a rule
-whose value is far from the threshold **in both comparison directions**; a silent worker consumes no
-assessment budget across many idle ticks; the scrub test passes. A real agent run against the live
-API is a gated `AFTMAN_LIVE=1` smoke test and is **not** an exit criterion, because exit criteria
-must be checkable by `cargo test --workspace` with no network and no credentials (`AGENTS.md` hard
-rule 4).
+whose value is far from the threshold **in both comparison directions**; an unresolved active check
+suppresses `Finish` even when `Finish`'s own direct conjuncts are satisfied; `Stop` leaves the run in
+`Stopped` and a following `Retry` returns it to `Running` (so the stop-then-retry path is reachable);
+a silent worker consumes no assessment budget across many idle ticks; the scrub test passes. A real
+agent run against the live API is a gated `AFTMAN_LIVE=1` smoke test and is **not** an exit
+criterion, because exit criteria must be checkable by `cargo test --workspace` with no network and
+no credentials (`AGENTS.md` hard rule 4).
 
 ## M3 — Daemon, protocol, CLI, TUI
 

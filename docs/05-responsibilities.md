@@ -341,6 +341,7 @@ Applied before any priority comparison. They cannot be overridden by a score:
 | `verification_started` | `Verify` suppressed |
 | Assessment budget exhausted | `Stop`, or `Escalate` when verification is pending |
 | Model error this cycle | only conservative directives are permitted (see §7) |
+| **Any active check unresolved** (`UnresolvedInBand`, `SuppressedByContest`, `Unresolved`) | `Finish` suppressed (`Invariant::UnresolvedUncertainty`). A high-priority inhibitor rule that cannot fire because its own measurement is uncertain must not silently disarm: uncertainty about a blocker blocks, it does not permit. |
 
 ### 6.2 The `Finish` precondition
 
@@ -362,6 +363,12 @@ continues. This is the mechanism, not the prose, behind "only evidence can finis
 Note that the `needs_verification` disjunct — the one comparison that reads a *less-than* — carries
 `permitted` like every other term. An earlier revision omitted it there, which let a raw, in-band,
 or even actively contested `needs_verification` satisfy a `Finish` conjunct.
+
+And the whole disjunction is additionally gated by the last row of §6.1: **if any active check is
+unresolved for any reason, `Finish` is suppressed.** The precondition above names the checks
+`Finish` directly depends on; that invariant covers every *other* active check, including
+`documentation_sufficient`, whose `<` rule inhibits `Finish` by priority and would otherwise be
+disarmed the moment its own measurement fell in the band.
 
 Any single failure falls through to `StartWorker`, so an unmet requirement can never be silently
 finished. This is the joint-threshold rule that keeps `ready_to_finish` from being trusted alone.

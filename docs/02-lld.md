@@ -75,14 +75,16 @@ pub struct RunConfig {                  // resolved for one run; env/config merg
     pub max_attempts: u32,              // default 2
     pub overall_timeout: Duration,      // default 2h
     pub worker_timeout: Duration,       // default 45m
-    pub min_assessment_interval: Duration, // default 5s
+    pub min_assessment_interval: Duration, // debounce, default 5s
+    pub idle_poll_interval: Duration,   // silent-worker ticker, default 30s; see §7.1
+    pub skip_unchanged_assessments: bool,  // default true; see §7.1
     pub max_assessments: u32,           // default 400
     pub steering_enabled: bool,
     pub max_steers_per_worker: u32,     // default 1
 }
 
 pub enum FactoryStatus {
-    Queued, Routing, Running, Assessing, Verifying,
+    Queued, Routing, Running, Assessing, Stopped, Verifying,
     NeedsHuman, Finished, Failed, Cancelled,
 }
 ```
@@ -245,7 +247,7 @@ pub enum   SuppressionReason { NotPermitted, Invariant(Invariant), HigherPriorit
 /// self-describing in the event log. Distinct from `CheckSuppression`
 /// (doc 06 §5), which is about measurement quality, not proposal arbitration.
 pub enum   Invariant { OverallTimeout, AttemptsExhausted, WorkerLimit, VerificationAlreadyRun,
-    AssessmentBudget, ModelUnavailable }
+    AssessmentBudget, ModelUnavailable, UnresolvedUncertainty }
 pub struct Condition(String);         // parsed expression; see doc 05 §2
 pub struct Routing { pub always: bool, pub instructions: Option<String>, pub threshold: f32 }
 
@@ -410,7 +412,22 @@ Arbitration is two-phase:
      `tests_sufficient` above threshold **and permitted** (`permitted == true`, so each value is
      decisively outside the uncertainty band), **and**
      `(verification_completed or (needs_verification < threshold and permitted))`, **and** no
-     active worker;
+     active worker, **and** no active check is unresolved (next bullet);
+   - **Any unresolved uncertainty suppresses `Finish`.** If *any* active check has a resolution of
+     `UnresolvedInBand`, `SuppressedByContest`, or `Unresolved`, `Finish` is suppressed with
+     `SuppressionReason::Invariant(Invariant::UnresolvedUncertainty)`.
+
+     This closes a hole that is easy to miss. Priority arbitration inhibits a low-priority
+     directive with a higher-priority rule — `quality.documentation:insufficient` (750) beats
+     `core.completion:thresholds-satisfied` (700). But if that inhibitor's check is *in band*, the
+     inhibitor is not permitted to fire, so the inhibition silently vanishes and `Finish` proceeds
+     without its own precondition ever having looked at documentation. **Uncertainty about a
+     blocker must block, not permit.**
+
+     Stating it once, over "any active check", rather than as an extra `Finish` conjunct per
+     responsibility, is deliberate: a responsibility added later cannot reopen the hole, because it
+     does not have to remember to register itself as a blocker. With `ensemble.enabled = false`
+     (the default) no check can ever be `UnresolvedInBand`, so this is a no-op at upstream parity.
    - `max_assessments` exhausted ⇒ `Stop` (or `Escalate` if verification is pending).
 
 2. **Priority** among surviving proposals. The exact numeric table is authoritative and lives in
@@ -438,26 +455,41 @@ didn't it stop?" is always answerable from the log.
                 ┌─────────┐
                 │ Routing │──────────────► Failed   (routing model error, bad config)
                 └────┬────┘
-                     │ RESPONSIBILITIES_ACTIVATED
+                     │ JOB_ROUTED
                      ▼
-   ┌────────────►┌─────────┐  worker event   ┌───────────┐
-   │             │ Running │────────────────►│ Assessing │
-   │             └────┬────┘                 └─────┬─────┘
-   │                  │                            │ directive
-   │  Continue/Steer  │                            ├──► Continue/Steer ──► Running
-   └──────────────────┴────────────────────────────┤
-                                                   ├──► Verify ──► Verifying ──► Running
-                                                   ├──► Retry  ──► Running (new attempt)
-                                                   ├──► Stop   ──► Failed | Cancelled
-                                                   ├──► Finish ──► Finished
-                                                   └──► Escalate   ──► NeedsHuman
-                                                                          │ operator replies
-                                                                          ▼
-                                                                        Running
+   ┌────────────►┌─────────┐  activity / ticker  ┌───────────┐
+   │             │ Running │────────────────────►│ Assessing │
+   │             └────┬────┘                     └─────┬─────┘
+   │                  │                                │ directive
+   │  Continue/Steer  │                                ├──► Continue/Steer ──► Running
+   └──────────────────┴────────────────────────────────┤
+                                                       ├──► Verify    ──► Verifying ──► Running
+                                                       ├──► Retry     ──► Running (new attempt)
+                                                       ├──► Stop      ──► Stopped
+                                                       ├──► Finish    ──► Finished
+                                                       └──► Escalate  ──► NeedsHuman
+                                                                              │ operator replies
+                                                                              ▼
+                                                                            Running
+
+   ┌─────────┐  Retry (core.completion:retry-stopped)   ┌─────────┐
+   │ Stopped │─────────────────────────────────────────►│ Running │
+   └────┬────┘                                          └─────────┘
+        ├──► Finish  ──► Finished
+        ├──► Escalate ──► NeedsHuman
+        └──► Cancel  ──► Cancelled
 ```
 
 Terminal states: `Finished`, `Failed`, `Cancelled`. `NeedsHuman` is a wait state with its own
 timeout (default: none; `--escalation-timeout` optional).
+
+**`Stopped` is a state, not a terminal one.** `Stop` terminates the active worker; it does not end
+the run. The factory sits in `Stopped` with no active worker, and on the next cycle
+`core.completion:retry-stopped` may propose `Retry` at priority 800, which returns it to `Running`.
+An earlier revision routed `Stop` straight to `Failed | Cancelled`, which made `Retry` — and the
+whole stop-then-retry recovery path of [05-responsibilities.md §6.3](05-responsibilities.md) —
+unreachable. A run reaches `Failed` only from an exhausted attempt budget or an unrecoverable
+error, and `Cancelled` only from an explicit cancel or daemon shutdown.
 
 ## 7. Events
 
@@ -473,13 +505,25 @@ pub struct EventEnvelope {
 }
 
 pub enum EventKind {
-    RunCreated, WorkerStarted, WorkerOutput, WorkerCompleted, WorkerSteered,
+    RunCreated, JobRouted, WorkerStarted, WorkerOutput, WorkerCompleted, WorkerSteered,
     WorkerTerminated, EvidenceCollected, AssessmentRequested, AssessmentCompleted,
-    DirectiveProposed, DirectiveSelected, EnsembleTriggered, OpinionRequested,
-    OpinionRecorded, EnsembleResolved, StateChanged, EscalationRaised,
-    EscalationAnswered, RunFinished, Error, Notification,
+    AssessmentSkippedUnchanged, DirectiveProposed, DirectiveSelected, EnsembleTriggered,
+    OpinionRequested, OpinionRecorded, EnsembleResolved, StateChanged, EscalationRaised,
+    EscalationAnswered, ModelError, RateLimited, BudgetExceeded, RunFinished, Error,
+    Notification,
 }
 ```
+
+Variant notes, because three of these were previously cited in prose without existing here:
+
+- `JobRouted` — the routing decision, with each conditional responsibility's probability and
+  threshold. Replaces the earlier `RESPONSIBILITIES_ACTIVATED` label
+  ([05-responsibilities.md §5](05-responsibilities.md)).
+- `AssessmentSkippedUnchanged` — a cycle that the content digest found unchanged (`§7.1`). Recorded
+  so "why did supervision not react?" is answerable.
+- `ModelError`, `RateLimited`, `BudgetExceeded` — distinct kinds rather than payloads inside `Error`,
+  because a rate limit and a malformed answer are different operational events and the UI shows
+  them differently. `Error` remains for internal faults only.
 
 Rules:
 
@@ -508,11 +552,19 @@ input:
 Debounce rules:
 
 - activity signals are coalesced within `min_assessment_interval` (default 5s);
-- **an idle tick only runs a cycle if the observation content changed.** The watcher digests
-  `state_for(...)` and the counters; an unchanged digest skips the model call entirely and consumes
-  no assessment budget. Without this, a worker running a long silent test suite would exhaust
-  `max_assessments_per_run = 400` in ~33 minutes at a 5-second cadence and be stopped as if stuck,
-  well inside its 45-minute timeout;
+- **an idle tick only runs a cycle if there is something to decide.** The condition is
+  `content_changed || time_driven_check_due`, not `content_changed` alone:
+  - `content_changed` compares an **`observation_content_digest`**: BLAKE3 over the canonical
+    serialization of the observation with every volatile scalar removed — `elapsed` durations,
+    `*_at` timestamps, and `EventSeq`. This is **not** the ensemble's `state_digest`, which must
+    cover the exact bytes a judge saw and therefore keeps them
+    ([06-ensemble.md §8](06-ensemble.md)). An earlier revision hashed `state_for(...)` directly;
+    because that serializes `elapsed`, the digest changed on every tick, making the skip dead code
+    and letting a silent worker burn the whole assessment budget anyway;
+  - `time_driven_check_due` is true when a time-based boundary will trip within the next tick:
+    `overall_timeout`, `worker_timeout`, the steering grace window, or an escalation timeout.
+    Without this, the skip could suppress the one cycle that would notice a timeout;
+  - a skipped cycle records `AssessmentSkippedUnchanged` and consumes no assessment budget;
 - `WorkerOutput` is flushed only when new bytes actually arrived, so an idle tick never emits an
   empty output event;
 - a worker-completion event always forces an immediate cycle, regardless of the interval, after
@@ -692,7 +744,6 @@ model = "jev-latest"
 base_url = "https://api.typesafe.ai"     # or https://openrouter.ai/api
 timeout_seconds = 10
 max_retries = 2
-min_assessment_interval_ms = 5000
 max_assessments_per_run = 400
 
 [jev.budget]

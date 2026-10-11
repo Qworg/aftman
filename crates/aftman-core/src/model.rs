@@ -22,10 +22,13 @@ use crate::ids::{AssessmentSeq, CheckKey};
 
 /// Why a model call is being made. Recorded in usage accounting so that routing
 /// cost and assessment cost can be told apart.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Purpose {
-    /// The per-cycle assessment.
+    /// The per-cycle assessment. The default, because it is what almost every call is.
+    #[default]
     Assessment,
     /// Deciding which conditional responsibilities participate.
     Routing,
@@ -157,6 +160,42 @@ impl Default for Budget {
     }
 }
 
+/// Why a model call is being made, and what it belongs to.
+///
+/// Carried into every call so that usage accounting can be attributed to a run and a
+/// cycle rather than being an unattributable global counter. `run_id` is absent only
+/// for calls made outside a run, such as `aftman doctor --probe`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AskContext {
+    pub purpose: Purpose,
+    pub run_id: Option<crate::ids::RunId>,
+    pub assessment_seq: Option<AssessmentSeq>,
+}
+
+impl AskContext {
+    #[must_use]
+    pub const fn new(purpose: Purpose) -> Self {
+        Self {
+            purpose,
+            run_id: None,
+            assessment_seq: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn for_run(
+        purpose: Purpose,
+        run_id: crate::ids::RunId,
+        assessment_seq: AssessmentSeq,
+    ) -> Self {
+        Self {
+            purpose,
+            run_id: Some(run_id),
+            assessment_seq: Some(assessment_seq),
+        }
+    }
+}
+
 /// A supervisory model.
 ///
 /// Implementations are the only place provider specifics live. An implementation
@@ -167,7 +206,7 @@ pub trait DecisionModel: Send + Sync {
     /// Ask one group of questions about one `state` document.
     async fn ask(
         &self,
-        purpose: Purpose,
+        context: &AskContext,
         state: &Value,
         questions: &BTreeMap<CheckKey, Question>,
         budget: &Budget,

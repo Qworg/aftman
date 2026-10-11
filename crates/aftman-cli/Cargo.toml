@@ -13,6 +13,7 @@ path = "src/main.rs"
 [dependencies]
 aftman-core.workspace = true
 aftman-daemon.workspace = true
+aftman-jev.workspace = true
 aftman-store.workspace = true
 aftman-workers.workspace = true
 

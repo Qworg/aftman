@@ -353,7 +353,11 @@ impl FactoryRuntime {
                 .deps
                 .model
                 .ask(
-                    Purpose::Assessment,
+                    &aftman_core::model::AskContext::for_run(
+                        Purpose::Assessment,
+                        run_id,
+                        aftman_core::ids::AssessmentSeq(assessments.into()),
+                    ),
                     &state_json,
                     &questions,
                     &aftman_core::model::Budget::default(),

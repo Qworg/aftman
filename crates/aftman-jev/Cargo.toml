@@ -1,0 +1,28 @@
+[package]
+name = "aftman-jev"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "System One decision-model client for aftman"
+
+[dependencies]
+aftman-core.workspace = true
+
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+# `test-util` provides `start_paused`, so a test can assert that a 100 ms
+# `Retry-After` is honoured without waiting 100 ms.
+tokio = { workspace = true, features = ["rt", "macros", "time", "test-util"] }
+
+[lints]
+workspace = true

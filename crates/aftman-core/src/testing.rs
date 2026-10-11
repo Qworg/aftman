@@ -13,7 +13,7 @@ use serde_json::Value;
 use crate::assessment::AnswerValue;
 use crate::error::ModelError;
 use crate::ids::CheckKey;
-use crate::model::{Budget, DecisionModel, ModelAnswers, ModelInfo, Purpose, Question, Usage};
+use crate::model::{AskContext, Budget, DecisionModel, ModelAnswers, ModelInfo, Question, Usage};
 
 /// A model that returns answers from a fixed table.
 ///
@@ -35,7 +35,7 @@ pub struct ScriptedModel {
 /// One recorded call, so a test can assert what was asked.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallRecord {
-    pub purpose: Purpose,
+    pub context: AskContext,
     pub keys: Vec<CheckKey>,
     pub state: Value,
 }
@@ -98,7 +98,7 @@ impl ScriptedModel {
 impl DecisionModel for ScriptedModel {
     async fn ask(
         &self,
-        purpose: Purpose,
+        context: &AskContext,
         state: &Value,
         questions: &BTreeMap<CheckKey, Question>,
         _budget: &Budget,
@@ -109,7 +109,7 @@ impl DecisionModel for ScriptedModel {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             calls.push(CallRecord {
-                purpose,
+                context: *context,
                 keys: questions.keys().cloned().collect(),
                 state: state.clone(),
             });
@@ -207,7 +207,7 @@ fn string_at<'a>(state: &'a Value, path: &[&str]) -> Option<&'a str> {
 impl DecisionModel for SimulatedModel {
     async fn ask(
         &self,
-        _purpose: Purpose,
+        _context: &AskContext,
         state: &Value,
         questions: &BTreeMap<CheckKey, Question>,
         _budget: &Budget,
@@ -322,7 +322,7 @@ mod tests {
     use super::{ScriptedModel, SimulatedModel};
     use crate::error::ModelError;
     use crate::ids::CheckKey;
-    use crate::model::{Budget, DecisionModel, Purpose, Question};
+    use crate::model::{AskContext, Budget, DecisionModel, Purpose, Question};
     use std::collections::BTreeMap;
 
     fn questions() -> BTreeMap<CheckKey, Question> {
@@ -346,7 +346,7 @@ mod tests {
             .with("core.worker-health__worker_stuck", 0.02);
         let answers = model
             .ask(
-                Purpose::Assessment,
+                &AskContext::new(Purpose::Assessment),
                 &serde_json::json!({}),
                 &questions(),
                 &Budget::default(),
@@ -366,7 +366,7 @@ mod tests {
         let model = ScriptedModel::new("test").with("core.completion__ready_to_finish", 0.5);
         let answers = model
             .ask(
-                Purpose::Assessment,
+                &AskContext::new(Purpose::Assessment),
                 &serde_json::json!({}),
                 &questions(),
                 &Budget::default(),
@@ -391,7 +391,7 @@ mod tests {
         let model = ScriptedModel::new("test").failing_with(ModelError::Auth);
         let result = model
             .ask(
-                Purpose::Assessment,
+                &AskContext::new(Purpose::Assessment),
                 &serde_json::json!({}),
                 &questions(),
                 &Budget::default(),
@@ -411,7 +411,7 @@ mod tests {
         assert!(
             model
                 .ask(
-                    Purpose::Assessment,
+                    &AskContext::new(Purpose::Assessment),
                     &serde_json::json!({}),
                     &q,
                     &Budget::default()
@@ -422,7 +422,7 @@ mod tests {
         assert!(
             model
                 .ask(
-                    Purpose::Assessment,
+                    &AskContext::new(Purpose::Assessment),
                     &serde_json::json!({}),
                     &q,
                     &Budget::default()
@@ -433,7 +433,7 @@ mod tests {
         assert!(
             model
                 .ask(
-                    Purpose::Assessment,
+                    &AskContext::new(Purpose::Assessment),
                     &serde_json::json!({}),
                     &q,
                     &Budget::default()
@@ -450,7 +450,7 @@ mod tests {
         let state = serde_json::json!({ "job": { "prompt": "do it" } });
         model
             .ask(
-                Purpose::Assessment,
+                &AskContext::new(Purpose::Assessment),
                 &state,
                 &questions(),
                 &Budget::default(),
@@ -458,7 +458,7 @@ mod tests {
             .await?;
         let calls = model.calls();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].purpose, Purpose::Assessment);
+        assert_eq!(calls[0].context.purpose, Purpose::Assessment);
         assert_eq!(calls[0].keys.len(), 2);
         assert_eq!(calls[0].state["job"]["prompt"], serde_json::json!("do it"));
         Ok(())
@@ -475,7 +475,7 @@ mod tests {
         });
         let answers = model
             .ask(
-                Purpose::Assessment,
+                &AskContext::new(Purpose::Assessment),
                 &state,
                 &questions(),
                 &Budget::default(),
@@ -497,7 +497,7 @@ mod tests {
         });
         let answers = model
             .ask(
-                Purpose::Assessment,
+                &AskContext::new(Purpose::Assessment),
                 &state,
                 &questions(),
                 &Budget::default(),
@@ -520,7 +520,7 @@ mod tests {
         });
         let answers = model
             .ask(
-                Purpose::Assessment,
+                &AskContext::new(Purpose::Assessment),
                 &state,
                 &questions(),
                 &Budget::default(),
@@ -545,7 +545,12 @@ mod tests {
         );
         let state = serde_json::json!({ "agents_md_instructions": null });
         let answers = model
-            .ask(Purpose::Assessment, &state, &q, &Budget::default())
+            .ask(
+                &AskContext::new(Purpose::Assessment),
+                &state,
+                &q,
+                &Budget::default(),
+            )
             .await?;
         assert_eq!(
             answers.answers[&CheckKey::from("repository.instructions__agents_md_drift")].as_noul(),

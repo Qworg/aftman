@@ -46,6 +46,23 @@ a truncated final line in `events.jsonl` is recovered.
 
 ## M1 — Real Jev
 
+**Status: complete.** `crates/aftman-jev` implements the System One contract against
+`docs/03-jev.md`: request and response shapes, retry with `Retry-After` honouring, the
+request budget, and usage accounting. `aftman doctor` reports the resolved provider and
+`--probe` makes one billable liveness call; `aftman usage` aggregates the token log.
+
+Two design decisions worth recording, both forced by hard rule 4 rather than by
+convenience:
+
+- **The HTTP boundary is a trait, not `reqwest`.** A `FixtureTransport` that answers from
+  memory keeps the retry, timeout, and error-mapping tests free of sockets, rather than
+  binding a loopback port and calling that offline. The real `ReqwestTransport` is used
+  by the binary and by the `AFTMAN_LIVE=1` tests.
+- **A configured provider is used by default; the simulated model must be asked for.**
+  A supervised run that quietly fell back to a simulation would be a lie about what
+  happened, so `run` refuses to start without a provider unless `--simulate-model` is
+  passed.
+
 *Deliverable:* `aftman run --repo . --job "..."` makes a real System One call and logs usage.
 
 At this point the observation is **minimal** (job, status, one worker record) and the question set is

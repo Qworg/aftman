@@ -500,7 +500,7 @@ impl CountingModel {
 impl DecisionModel for CountingModel {
     async fn ask(
         &self,
-        purpose: aftman_core::model::Purpose,
+        context: &aftman_core::model::AskContext,
         state: &serde_json::Value,
         questions: &std::collections::BTreeMap<
             aftman_core::ids::CheckKey,
@@ -512,7 +512,7 @@ impl DecisionModel for CountingModel {
             .calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
-        self.inner.ask(purpose, state, questions, budget).await
+        self.inner.ask(context, state, questions, budget).await
     }
 }
 

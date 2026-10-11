@@ -1,0 +1,68 @@
+{
+  "_comment": "A recorded System One assessment response. Hand-written fixtures for a third-party format rot, so this file is the shape the client must keep parsing: a noul, a choice, a score with string-keyed probabilities, an unknown primitive the provider added after this client was written, and an answer nobody asked for.",
+  "model": "jev-2026-01-15",
+  "usage": { "input_tokens": 8123, "output_tokens": 96 },
+  "answers": {
+    "core.completion__implementation_complete": {
+      "type": "noul",
+      "noul": 0.91
+    },
+    "core.completion__requirements_satisfied": {
+      "type": "noul",
+      "noul": 0.79
+    },
+    "core.completion__ready_to_finish": {
+      "type": "noul",
+      "noul": 0.21
+    },
+    "core.verification__tests_sufficient": {
+      "type": "noul",
+      "noul": 0.34
+    },
+    "core.verification__needs_verification": {
+      "type": "noul",
+      "noul": 0.82
+    },
+    "core.worker-health__meaningful_progress": {
+      "type": "noul",
+      "noul": 0.94
+    },
+    "core.worker-health__worker_stuck": {
+      "type": "noul",
+      "noul": 0.02
+    },
+    "core.worker-health__work_off_track": {
+      "type": "noul",
+      "noul": 0.06
+    },
+    "core.human-escalation__needs_human": {
+      "type": "noul",
+      "noul": 0.01
+    },
+    "repository.instructions__agents_md_drift": {
+      "type": "noul",
+      "noul": 0.01
+    },
+    "core.verification__next_step": {
+      "type": "choice",
+      "choice": "verify",
+      "confidence": 0.77,
+      "probabilities": { "continue": 0.12, "verify": 0.77, "stop": 0.11 }
+    },
+    "core.worker-health__progress_level": {
+      "type": "score",
+      "score": 2.4,
+      "confidence": 0.81,
+      "legend": { "0": "None", "1": "Some", "2": "Most", "3": "Essentially all" },
+      "probabilities": { "0": 0.03, "1": 0.11, "2": 0.46, "3": 0.40 }
+    },
+    "future__primitive_not_yet_modelled": {
+      "type": "distribution",
+      "pdf": [0.1, 0.2, 0.7]
+    },
+    "nobody__asked_for_this": {
+      "type": "noul",
+      "noul": 0.5
+    }
+  }
+}

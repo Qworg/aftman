@@ -1,0 +1,26 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# Credentials — never commit
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Aftman local state (run logs contain job text and diffs)
+/.aftman/
+aftman.sock
+aftman.pid
+
+# Agent harness / editor local state
+.pi/
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Test scratch
+/tmp-test/

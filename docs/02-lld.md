@@ -181,6 +181,110 @@ Validation rules (a violation is a `ModelError`, never a silent clamp):
 - unknown answer `type`s are ignored, not fatal (forward compatibility);
 - unknown answer *keys* are ignored; missing *requested* keys are fatal.
 
+**Score answer keys arrive as JSON strings.** The provider sends
+`"probabilities": {"0": 0.03, "1": 0.11, …}` and `"legend": {"0": "None", …}` with *string*
+object keys. `serde_json` will not deserialize those into `BTreeMap<u32, _>`; it fails with
+`invalid type: string "0", expected u32`. The wire type therefore keeps
+`BTreeMap<String, f32>`, and `aftman-jev` converts to `BTreeMap<u32, f32>` in the domain type,
+returning `ModelError::InvalidAnswer` on a non-numeric key. `level` is **derived** (the argmax of
+`probabilities`), never sent by the provider, and is `None` when the keys do not parse.
+
+### 3.5 Remaining domain types
+
+The types above are the ones a reader needs to follow a cycle. These are the rest of the surface an
+implementer must have, given compactly. All are `serde` types, and all collections that can reach
+policy or a snapshot are ordered (`BTreeMap`, `Vec`) so that replay is deterministic — **no
+`HashMap` appears in any type that reaches policy or a state snapshot.**
+
+```rust
+// ---- identity newtypes -------------------------------------------------
+pub struct ResponsibilityId(String);  // "core.completion"
+pub struct CheckId(String);           // "implementation_complete"
+pub struct CheckKey(String);          // "core.completion__implementation_complete"
+pub struct EvidenceId(String);        // "git_diff", "command:tests"
+pub struct RuleId(String);            // "core.worker-health:stuck"
+pub struct EscalationId(Uuid);
+
+// ---- observation carriers ---------------------------------------------
+pub struct WorkerSummary { pub id: WorkerId, pub kind: WorkerKind, pub task: TaskKind,
+    pub status: WorkerStatus, pub mission_excerpt: String, pub elapsed: Duration,
+    pub exit: Option<WorkerExit>, pub steer_count: u32 }
+pub struct WorkerExit { pub code: Option<i32>, pub signal: Option<i32>, pub cause: ExitCause }
+pub enum   ExitCause { Completed, Failed, TimedOut, Terminated, LaunchFailed }
+pub struct GitEvidence { pub status_short: String, pub diff_excerpt: String,
+    pub diff_stat: String, pub changed_files: Vec<String>, pub truncated: bool,
+    pub head_sha: Option<String>, pub branch: Option<String> }
+pub struct UntrackedExcerpt { pub path: String, pub bytes: usize, pub content: String,
+    pub truncated: bool }
+pub struct RepoInstructions { pub file: String, pub excerpt: String, pub truncated: bool }
+pub struct TestResult { pub source: TestSource, pub passed: u32, pub failed: u32,
+    pub errored: u32, pub skipped: u32, pub status: TestStatus, pub raw: String }
+pub enum   TestSource { WorkerOutput, Command(EvidenceId) }
+pub enum   TestStatus { Passed, Failed, Errored, Mixed, Unknown }
+pub struct EventSummary { pub seq: EventSeq, pub at: OffsetDateTime, pub kind: EventKind,
+    pub summary: String }
+pub struct PriorDecision { pub assessment_seq: AssessmentSeq, pub directive: Directive,
+    pub reason: String }
+pub struct Counters { pub workers_run: u32, pub attempts: u32, pub failures: u32,
+    pub verifiers_run: u32, pub verifier_completed: bool, pub steers_sent: u32,
+    pub assessments: u32, pub elapsed: Duration, pub consecutive_model_failures: u32 }
+pub struct EvidenceResult { pub provider: EvidenceId, pub argv: Vec<String>,
+    pub exit_code: Option<i32>, pub duration: Duration, pub output_excerpt: String,
+    pub truncated: bool, pub observed_at: OffsetDateTime }
+
+// ---- responsibilities and policy --------------------------------------
+pub enum   Stakes { Low, High }
+pub enum   SteerKind { Nudge, Refocus, Warn, Ask }
+pub struct Proposal { pub responsibility: ResponsibilityId, pub rule: RuleId,
+    pub directive: Directive, pub priority: u16, pub stakes: Stakes }
+pub struct Suppression { pub responsibility: ResponsibilityId, pub rule: RuleId,
+    pub reason: SuppressionReason }
+pub enum   SuppressionReason { NotPermitted, Invariant(Invariant), HigherPriority,
+    WorkerLimit, RetryLimit, VerificationAlreadyRun, BudgetExhausted }
+pub struct Condition(String);         // parsed expression; see doc 05 §2
+pub struct Routing { pub always: bool, pub instructions: Option<String>, pub threshold: f32 }
+
+// ---- store ------------------------------------------------------------
+pub struct RunHeader { pub id: RunId, pub created_at: OffsetDateTime, pub job: Job,
+    pub config: RunConfig, pub aftman_version: String,
+    pub worker_versions: BTreeMap<String, String>, pub granted_key_names: Vec<String> }
+pub struct RunState { pub header: RunHeader, pub status: FactoryStatus,
+    pub last_seq: EventSeq, pub counters: Counters, pub workers: Vec<WorkerRecord>,
+    pub checks: BTreeMap<CheckKey, ResolvedCheck>, pub last_directive: Option<Directive>,
+    pub escalations: Vec<Escalation> }
+pub struct RunSummary { pub id: RunId, pub status: FactoryStatus, pub created_at: OffsetDateTime,
+    pub elapsed: Duration, pub job_excerpt: String, pub repo: PathBuf,
+    pub worker: WorkerKind, pub last_directive: Option<Directive> }
+pub struct RunFilter { pub status: Option<Vec<FactoryStatus>>, pub repo: Option<PathBuf>,
+    pub limit: Option<u32>, pub cursor: Option<RunId> }
+pub struct EventStream { /* async iterator over EventEnvelope, resume by EventSeq */ }
+pub struct Escalation { pub id: EscalationId, pub raised_at: OffsetDateTime, pub check: CheckKey,
+    pub ask: String, pub jev_p: Option<f32>, pub opinions: Vec<Opinion>,
+    pub answered: Option<(OffsetDateTime, HumanDecision, String)> }
+
+// ---- model layer ------------------------------------------------------
+pub enum   Purpose { Assessment, Routing }
+pub struct Usage { pub input_tokens: Option<u64>, pub output_tokens: Option<u64> }
+pub struct ModelInfo { pub name: String, pub description: String, pub release_date: String }
+pub enum   Question { Noul   { instructions: Json },
+    Choice { instructions: Json, criteria: BTreeMap<String, Json> },
+    Score  { instructions: Json, criteria: Vec<Json> } }
+pub struct Budget { pub pair_bytes: usize, pub request_bytes: usize,
+    pub pair_target_bytes: usize, pub request_target_bytes: usize }
+
+// ---- worker runtime ---------------------------------------------------
+pub struct WorkerEnv(Vec<(String, String)>);   // built only by worker_environment()
+pub struct SteerRecord { pub at: OffsetDateTime, pub message_excerpt: String,
+    pub outcome: SteerOutcome, pub queue_depth: Option<u32> }
+pub enum   WorkerOutcome { Completed, Failed { code: Option<i32> }, TimedOut,
+    Terminated(TerminateReason), StreamError(String) }
+pub struct WorkerEventSink { /* sends WorkerSignal; see §7.1 */ }
+```
+
+A property worth asserting in a test: every type reachable from `PolicyInput` and from `RunState`
+contains only ordered collections, so `serde_json::to_vec` is byte-stable and snapshot comparisons
+are meaningful.
+
 ## 4. Responsibilities
 
 ```rust
@@ -194,28 +298,39 @@ pub struct Responsibility {
 
 pub struct Check {
     pub id: CheckId,                     // "implementation_complete"
-    pub key: CheckKey,                   // wire name; defaults to "<responsibility>.<id>"
+    pub key: CheckKey,                   // wire name; always "<responsibility_id>__<check_id>"
     pub question: Question,              // Noul | Choice | Score, with instructions
     pub evidence: Vec<EvidenceId>,       // empty ⇒ default provider set
     pub threshold: Option<f32>,
 }
 
 pub struct Rule {
-    pub id: RuleId,
+    pub id: RuleId,                      // unique; REQUIRED for every rule, including built-ins
     pub when: Condition,                 // boolean expression over check results
     pub propose: Directive,
     pub stakes: Stakes,                  // Low | High  (High opts into the ensemble path)
 }
 
+/// The single directive vocabulary. Every document and the code use these
+/// names; `docs/05-responsibilities.md` priorities are keyed by them.
 pub enum Directive {
     Continue,
-    Steer { kind: SteerKind },           // Nudge | Refocus | Warn | EscalateAsk
-    Retry  { reason: String },
-    Verify { reason: String },
-    Stop   { reason: String },
-    Finish,
-    EscalateHuman { reason: String, ask: String },
+    StartWorker { reason: String },
+    Steer       { kind: SteerKind, reason: String },   // Nudge | Refocus | Warn | Ask
+    Retry       { reason: String },
+    Verify      { reason: String },                    // spawn an independent verifier
+    Stop        { reason: String },
+    Finish      { reason: String },
+    Escalate    { reason: String, ask: String },       // escalate to a human
 }
+```
+
+**Why the wire key is `__` and not `.`.** Responsibility ids contain dots
+(`core.completion`), so a dot-joined key such as `core.completion.implementation_complete` cannot
+be split back into its parts unambiguously. The double-underscore separator is also what the
+upstream project uses, so a recorded fixture or a hand-written Jev probe stays valid.
+
+```rust
 ```
 
 Responsibilities are loaded from bundled TOML (compiled in via `include_str!`) and merged with a
@@ -233,9 +348,33 @@ pub struct PolicyInput<'a> {
     pub counters: &'a Counters,          // attempts, failures, verifiers run, elapsed
     pub config: &'a RunConfig,
     pub assessment: &'a Assessment,
-    pub ensemble: &'a EnsembleResolution,
-    pub proposals: &'a [Proposal],
+    /// Every check, with Jev's unmodified value and whether policy may act on
+    /// it. See docs/06-ensemble.md §5 — policy reads `rule_permitted`, never a
+    /// fabricated number.
+    pub checks: &'a BTreeMap<CheckKey, ResolvedCheck>,
+    /// Materialised by the runtime so this function needs no clock. See below.
+    pub now: OffsetDateTime,
+    pub active_worker: Option<&'a WorkerRecord>,
 }
+```
+
+**Where the impurity lives.** An earlier revision claimed `arbitrate()` was pure while the
+steer-versus-stop decision (doc 05 §6.5) depended on `within_grace`, which depends on the current
+time and `worker.last_steered_at` — neither of which was in `PolicyInput`. Purity is restored by
+splitting the pipeline in two, with all impurity confined to the first step:
+
+```text
+runtime (impure: clock, I/O, git)
+  └─► PolicyInput          fully materialised, including `now`
+        ├─► responsibilities::propose(&PolicyInput) -> Vec<Proposal>   pure
+        └─► policy::arbitrate(&PolicyInput, &[Proposal]) -> PolicyDecision   pure
+```
+
+`Proposal` therefore remains `&[Proposal]` only because the runtime passes it; proposal *generation*
+is also pure, so replay re-derives the same proposals from the same `PolicyInput`. `now` is
+injected from the `Clock`, and on replay it is reconstructed from the event log's timestamps.
+
+```rust
 
 pub struct PolicyDecision {
     pub selected: Directive,
@@ -250,10 +389,16 @@ Arbitration is two-phase:
    - overall timeout exceeded ⇒ `Stop`;
    - `attempts >= max_attempts` ⇒ no `Retry`;
    - `verifiers_run > 0` ⇒ `Verify` is suppressed;
+   - **`rule_permitted` gates every rule.** A proposal whose check has
+     `rule_permitted == false` is suppressed with `SuppressionReason::NotPermitted`, no matter how far
+     above threshold its value is. This is the single mechanism behind the ensemble's guarantee
+     (doc 06 §2.2): nothing but Jev's own decisive value or an R0 evidence refresh can set
+     `rule_permitted`.
    - `Finish` requires all of: `ready_to_finish` and `requirements_satisfied` and
-     `tests_sufficient` at or above threshold, **and**
+     `tests_sufficient` above threshold **and permitted** (`rule_permitted == true`, so the value
+     is decisively outside the uncertainty band), **and**
      `(verification_completed or needs_verification < threshold)`, **and** no active worker;
-   - `max_assessments` exhausted ⇒ `Stop` (or `EscalateHuman` if verification is pending).
+   - `max_assessments` exhausted ⇒ `Stop` (or `Escalate` if verification is pending).
 
 2. **Priority** among surviving proposals. The exact numeric table is authoritative and lives in
    one place: [05-responsibilities.md §6.3](05-responsibilities.md). It is a *total order*
@@ -292,7 +437,7 @@ didn't it stop?" is always answerable from the log.
                                                    ├──► Retry  ──► Running (new attempt)
                                                    ├──► Stop   ──► Failed | Cancelled
                                                    ├──► Finish ──► Finished
-                                                   └──► EscalateHuman ──► NeedsHuman
+                                                   └──► Escalate   ──► NeedsHuman
                                                                           │ operator replies
                                                                           ▼
                                                                         Running
@@ -331,6 +476,34 @@ Rules:
   rather than to agent verbosity;
 - aftman-generated events never enter the assessment queue;
 - every event carries a `schema_version` inside `payload`.
+
+### 7.1 What wakes the watcher
+
+An earlier revision said a cycle begins when "a worker event enters the queue", while also saying
+`WorkerOutput` is only flushed *at* a cycle. That is circular, and would have meant the supervisor
+slept until the worker exited — defeating the entire premise of supervising work in flight.
+
+The watcher selects over three sources, and persisted events are an *output* of a cycle, not its
+input:
+
+| Source | Purpose |
+| --- | --- |
+| **Activity channel** (`tokio::mpsc`, unpersisted) | Signalled by each stdout/stderr chunk as `BoundedLog` absorbs it. Cheap, lossy, coalesced. |
+| **Lifecycle channel** | `WorkerStarted`, `WorkerCompleted`, `WorkerSteered`, `WorkerTerminated`. Completion forces an immediate cycle. |
+| **Interval ticker** | `min_assessment_interval` (default 5s). Guarantees forward progress even if a worker is silent. |
+
+Debounce rules:
+
+- activity signals are coalesced within `min_assessment_interval`;
+- a worker-completion event always forces an immediate cycle, regardless of the interval, after
+  command evidence providers have run;
+- a cycle in progress is never interrupted; the next signal starts the next cycle;
+- the ticker alone is enough to make progress, so a worker that prints nothing still gets
+  supervised.
+
+The activity channel carries no payload and is never persisted. This is what keeps the log
+proportional to *decisions* (`WorkerOutput` once per cycle) while still reacting to output within
+milliseconds.
 
 `state.json` is a full snapshot, written by atomic rename (`state.json.tmp` → `fsync` →
 `rename`), containing the last `seq` it includes. On startup, state is loaded from `state.json`
@@ -521,18 +694,21 @@ default = "pi"
 terminate_grace_ms = 5000
 
 [ensemble]
-enabled = false             # see docs/06-ensemble.md
+enabled = false             # see docs/06-ensemble.md; false ⇒ exact upstream thresholds
 uncertainty_margin = 0.15
+confidence_floor = 0.60
+framing_tolerance = 0.15
 max_opinions_per_run = 20
+max_evidence_refreshes_per_check = 3
 opinion_timeout_seconds = 120
-sources = ["independent_judge", "rederive_evidence"]
+per_check_cooldown_cycles = 10
+consecutive_contests_before_human = 2
+rungs = ["refresh_evidence", "reframe_same_model", "independent_judge", "human"]
 
-[policy]
-finish_threshold = 0.85
-verify_threshold = 0.60
-stuck_threshold = 0.70
-off_track_threshold = 0.75
-human_threshold = 0.80
+[ensemble.judge]
+backend = "agy"
+model = "..."
+tools = "none"              # enforced; not configurable in v1
 
 [herdr]
 enabled = "auto"            # auto | always | never
@@ -541,7 +717,23 @@ enabled = "auto"            # auto | always | never
 enabled = true
 bind = "127.0.0.1:8787"
 auth = "loopback"           # loopback | token | none
+# Required when auth = "token". Canonicalised, symlink-resolved prefixes that
+# POST /v1/runs may use as `repo`. Without this, a token holder could point a
+# run at any directory the daemon user can read. Defaults to $HOME when
+# auth = "loopback".
+allowed_repo_roots = ["/home/me/Development"]
 ```
+
+**There is no `[policy]` threshold block.** Thresholds are owned by the responsibility definitions
+(doc 05), which are the single source of truth for `min_threshold`, so that changing a check and
+changing its threshold is one edit in one file. An earlier revision listed a second set of
+thresholds here (`finish_threshold = 0.85`, `stuck_threshold = 0.70`, …) that contradicted the
+definitions and would have been either dead config or a silent override. `FactoryConfig` carries no
+semantic thresholds at all.
+
+`TYPESAFE_BASE_URL` must be `https://…` **or** a loopback address (`http://127.0.0.1:…`,
+`http://localhost:…`). A cleartext remote base URL would send the supervisor key over the network in
+the clear, so it is rejected at startup rather than warned about.
 
 Environment variables use the `AFTMAN_` prefix with underscores
 (`AFTMAN_JEV_MODEL`, `AFTMAN_WEB_BIND`, …), except the Jev credentials, which keep their

@@ -28,11 +28,18 @@ a truncated final line in `events.jsonl` is recovered.
 
 ## M1 — Real Jev
 
-*Deliverable:* `aftman run --repo . --job "..."` makes real System One calls and logs usage.
+*Deliverable:* `aftman run --repo . --job "..."` makes a real System One call and logs usage.
+
+At this point the observation is **minimal** (job, status, one worker record) and the question set is
+a single hardcoded check, because responsibilities, routing, and the full observation arrive in M2.
+The purpose of M1 is to prove the wire contract, the retry and budget behaviour, and the credential
+path — not to supervise well yet. An earlier revision promised "real System One calls" from a run
+whose observation and check registry did not exist until the following milestone.
 
 | Work | Crate |
 | --- | --- |
 | `DecisionModel` trait, `Question`/`AnswerValue`, `ModelError` | `aftman-core` |
+| Minimal `ObservationBuilder` (job, status, worker record) + one hardcoded check set | `aftman-core` |
 | `SystemOneClient`: reqwest, retry with `retry-after-ms`/`retry-after`, timeout, error extraction | `aftman-jev` |
 | Wire types mirroring the documented request/response, tolerant of additive change | `aftman-jev` |
 | Request budget: pair/request caps, hysteresis targets, deterministic compaction plan | `aftman-jev` |
@@ -46,7 +53,8 @@ budget module provably refuses to send a request missing the job.
 
 ## M2 — Responsibilities, policy, and a real worker
 
-*Deliverable:* `aftman run --worker pi` supervises a real agent and can steer, stop, or finish.
+*Deliverable:* `aftman run --worker pi|agy|claude` supervises a real agent and can steer, stop, or
+finish.
 
 | Work | Crate |
 | --- | --- |
@@ -57,14 +65,17 @@ budget module provably refuses to send a request missing the job.
 | `FactoryPolicy::arbitrate` — pure, total order, every suppression recorded | `aftman-core` |
 | `ObservationBuilder`: git, untracked excerpts, test-summary parser, sensitive-file skipping | `aftman-core` |
 | Command evidence providers, `run_when` scheduling | `aftman-core` |
-| `pi` backend: `--mode json` one-shot and `--mode rpc` steerable | `aftman-workers` |
+| `pi` (`--mode json`; `--mode rpc` for steering), `agy` (`--print="…" --output-format stream-json`), and `claude` (`-p --permission-mode … --permission-prompts none`) backends | `aftman-workers` |
 | Process-group spawn, bounded streaming, interrupt→grace→kill | `aftman-workers` |
 | `worker_environment` scrubbing + a test that asserts no `TYPESAFE_*` survives | `aftman-workers` |
 | Ensemble **S0**: types, events, no-op resolver | `aftman-core` |
 
 **Exit criteria:** the `Finish` precondition has a truth-table test; priority ordering is pinned
-pairwise and asserted to be a total order; a fake worker script that prints `3 passed` and exits 0
-produces the expected directive; `pi` runs a real job end to end; the scrub test passes.
+pairwise and asserted to be a total order with no ties; a fake worker script that prints
+`3 passed` and exits 0 produces the expected directive; `rule_permitted == false` suppresses a rule
+whose value is far above threshold; the scrub test passes. A real agent run against the live API is
+a gated `AFTMAN_LIVE=1` smoke test and is **not** an exit criterion, because exit criteria must be
+checkable by `cargo test --workspace` with no network and no credentials (`AGENTS.md` hard rule 4).
 
 ## M3 — Daemon, protocol, CLI, TUI
 
@@ -158,22 +169,28 @@ all three surfaces.
 Jev's value; an injected instruction in the state cannot produce an opinion-driven action; a
 `NeedsHuman` run is distinguishable from `Failed` in every surface.
 
-## M8 — `agy` and `claude` backends
+## M8 — Backend hardening and verifier missions
 
-*Deliverable:* all three worker backends supported, with recorded fixtures.
+All three agent backends are implemented in M2, because M6 (`--kind claude`) and M7 (an `agy` judge)
+both depend on them and an earlier sequencing put the backends after their own consumers. M8 is the
+work that turns "the command line launches" into "the output is understood":
+
+*Deliverable:* every backend parses recorded real output, and the verifier mission is constrained.
 
 | Work | Crate |
 | --- | --- |
-| `agy` backend: `--print --output-format stream-json`, `--sandbox`, `--print-timeout` | `aftman-workers` |
-| `claude` backend: `-p --output-format stream-json --verbose`, `--json-schema`, `--resume` | `aftman-workers` |
-| Record real CLI output into `tests/fixtures/`; parse the recording, not a guess | `aftman-workers` |
-| Verifier mission for both, using `--json-schema` → `EvidenceResult` | `aftman-workers` |
+| Record real CLI output for each backend into `tests/fixtures/`; parse the recording, not a guess | `aftman-workers` |
+| `agy` hardening: `--print-timeout`, stream-json event coverage | `aftman-workers` |
+| `claude` hardening: stream-json schema, `--json-schema` verifier output, `--resume` continuity | `aftman-workers` |
+| Verifier mission for all three, using `--json-schema` → `EvidenceResult` | `aftman-workers` |
 | Verifier-mutation detection (diff the tree before/after) | `aftman-core` |
+| Per-backend permission mapping (§8.1) implemented and tested, including the `pi` refusal path | `aftman-workers` |
 | Update the §1 matrix with verified versions; `doctor --probe` gating for unverified backends | docs, `aftman-cli` |
 
-**Exit criteria:** each backend parses its recorded fixture; the `claude` backend stays gated
-behind `doctor --probe` until its stream schema is fixture-verified; a verifier that modifies the
-repo is recorded as inconclusive, not as a pass.
+**Exit criteria:** each backend parses its recorded fixture; a backend whose stream schema is not
+fixture-verified stays gated behind `doctor --probe`; `mode = "sandboxed"` with `--worker pi` fails
+at startup with guidance rather than silently degrading; a verifier that modifies the repo is
+recorded as inconclusive, not as a pass.
 
 ## Deferred, with reasons
 

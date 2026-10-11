@@ -21,14 +21,14 @@ pub trait Worker: Send + Sync {
 
 ## 1. Backends at a glance
 
-| Backend | Selection | Transport | Live steering | Verified against |
-| --- | --- | --- | --- | --- |
-| `pi` | `--worker pi` | `pi --print --mode json` (one-shot) or `pi --mode rpc` (steerable) | **Yes** (RPC) | pi 1.1.0 |
-| `agy` | `--worker agy` | `agy --print --output-format stream-json` | No | agy 1.3.3 |
-| `claude` | `--worker claude` | `claude -p --output-format stream-json` | No (resume only) | claude 2.1.293 |
-| `generic` | `--worker generic --cmd …` | operator-supplied argv template | No | — |
-| `herdr-pane` | `--worker herdr:pane` | drives a herdr pane + recognized agent | **Yes** (`agent prompt`) | herdr 0.8.2 |
-| `simulated` | tests / `aftman demo` | in-process | Yes (synthetic) | — |
+| Backend | Selection | Transport | Live steering | Non-interactive permissions | Verified against |
+| --- | --- | --- | --- | --- | --- |
+| `pi` | `--worker pi` | `pi --print --mode json` (one-shot) or `pi --mode rpc` (steerable) | **Yes** (RPC) | no sandbox flag — see §8.1 | pi 1.1.0 |
+| `agy` | `--worker agy` | `agy --print="…" --output-format stream-json` | No | `--sandbox` | agy 1.3.3 |
+| `claude` | `--worker claude` | `claude -p --output-format stream-json` | No (resume only) | `--permission-mode` / `--permission-prompts` | claude 2.1.293 |
+| `generic` | `--worker generic --cmd …` | operator-supplied argv template | No | operator's responsibility | — |
+| `herdr-pane` | `--worker herdr:pane` | drives a herdr pane + recognized agent | **Yes** (`agent prompt`) | inherits the pane's agent | herdr 0.8.2 |
+| `simulated` | tests / `aftman demo` | in-process | Yes (synthetic) | n/a | — |
 
 `aftman doctor` reports each backend's availability and version. A backend whose binary is missing
 is a startup error with the exact binary name and an install hint, not a mid-run surprise.
@@ -126,13 +126,28 @@ explicit does not make output trustworthy (§7) but it makes an honest worker's 
 ## 4. `agy`
 
 ```bash
-agy --print \
+agy --print="<mission>" \
     --output-format stream-json \
     --model <model> \
     --effort <low|medium|high|xhigh|max> \
-    [--sandbox] [--add-dir <dir>] \
-    -- "<mission>"
+    [--sandbox] [--add-dir <dir>]
 ```
+
+**The prompt must be attached to the flag.** Verified against `agy 1.3.3`: a bare `--print`
+consumes the *next* token as its prompt, so the natural-looking
+`agy --print --model x -- "<mission>"` fails immediately with
+
+```text
+Error: --print took "--model" as its prompt, so the intended prompt was left as an argument
+```
+
+The `--print="<mission>"` form may appear anywhere on the command line; flags may precede or follow
+it. This exact failure was caught in design review, and a test asserts that the constructed argv
+attaches the mission to `--print`.
+
+Because the mission is a single argv element, it is bounded by the platform's per-argument limit
+(128 KiB `MAX_ARG_STRLEN` on Linux). Aftman rejects a mission over 64 KiB rather than letting the
+kernel truncate it or the launch fail opaquely.
 
 - `stream-json` emits one JSON object per event; `json` emits a single final object. Aftman uses
   `stream-json` so the output tail exists while the worker is still running.
@@ -151,10 +166,19 @@ agy --print \
 ```bash
 claude -p \
     --output-format stream-json --verbose \
+    --permission-mode <acceptEdits|auto|bypassPermissions|manual|dontAsk|plan> \
+    --permission-prompts <host|none> \
     --model <model> --effort <level> \
     [--append-system-prompt <text>] [--add-dir <dir>] \
     -- "<mission>"
 ```
+
+`--permission-mode` and `--permission-prompts` are what make `claude` safe to run headless. Without
+them, `-p` mode still routes tool approvals to a prompt that nobody can answer in a daemon, and
+the worker hangs in a state indistinguishable from being stuck. Aftman sets
+`--permission-mode acceptEdits --permission-prompts none` under the default `sandboxed` posture:
+edits are accepted (the work is the point), and anything else that would prompt is **denied**
+rather than blocking. See §8.1 for the full posture mapping.
 
 - `-p/--print` is non-interactive; `--output-format stream-json` emits NDJSON.
 - `--json-schema <schema>` is available **only with `--print`** and is how the verifier mission is
@@ -232,11 +256,42 @@ worker, so this must be decided up front, not discovered at runtime.
 mode = "sandboxed"     # sandboxed | auto-approve | interactive
 ```
 
-| Mode | Behaviour | When to use |
-| --- | --- | --- |
-| `sandboxed` | Pass the backend's sandbox flag (e.g. `agy --sandbox`). No approval prompts. | **Default.** Least privilege that still completes work. |
-| `auto-approve` | Pass the backend's skip-permissions flag. | Trusted repos, containers, throwaway checkouts. Requires `AFTMAN_ACK_UNSANDBOXED=1` and prints a warning on every run. |
-| `interactive` | Do not pass any approval-suppressing flag. | **herdr surface only**, where a human can approve. |
+### 8.1 Per-backend permission mapping
+
+There is no single `--sandbox` flag the three CLIs share. `mode` is a *posture* that each backend
+maps onto its own flags, and where a backend cannot express the posture, aftman says so rather than
+pretending:
+
+| Mode | `pi` | `agy` | `claude` |
+| --- | --- | --- | --- |
+| `sandboxed` (**default**) | *not expressible by a flag* | `--sandbox` | `--permission-mode acceptEdits --permission-prompts none` |
+| `auto-approve` | pi's modes are already non-interactive | `--dangerously-skip-permissions` | `--permission-mode bypassPermissions` |
+| `interactive` | no flag | no flag | no flag |
+
+`pi` has neither a sandbox flag nor a tool-permission flag. Its `--approve` / `--no-approve` govern
+trust of *project-local files* (AGENTS.md, extensions, skills), not tool permissions. So `sandboxed`
+cannot be honoured for `pi` by a CLI flag, and aftman does not silently degrade:
+
+- with `mode = "sandboxed"` and `--worker pi`, startup **fails** with guidance, unless the operator
+  either sets `[workers.pi] sandbox = "container"` to assert that isolation is provided externally
+  (container, VM, or throwaway checkout), or explicitly moves to `mode = "auto-approve"` and sets
+  `AFTMAN_ACK_UNSANDBOXED=1`;
+- this is the honest failure mode. Passing a flag `pi` does not have would crash on launch; passing
+  nothing would leave a headless daemon with an unpinned permission posture and no record of it.
+
+### 8.2 Project-local agent configuration is not trusted by default
+
+A cloned repository can carry executable agent configuration: `pi` extensions and skills, `claude`
+project settings, `agy` projects. Aftman does not load it:
+
+- `pi` runs with `--no-approve`;
+- `agy` and `claude` are not passed `--add-dir` for paths outside the repository, and any
+  project-config trust flag is left off.
+
+`[workers] trust_project_config = true` opts back in, is recorded in `meta.json`, and prints a
+warning. This addresses the same threat as [08-security.md §10](08-security.md) item 2 (a malicious
+repository) one step earlier: instead of noticing drift after the agent has acted, the agent's
+project-local extensions are never loaded.
 
 On the herdr surface, `interactive` is genuinely useful: herdr classifies a waiting agent as
 `blocked`, aftman turns that into an `EscalationRaised`, and the human answers in the pane. On the

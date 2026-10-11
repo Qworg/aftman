@@ -24,14 +24,19 @@ Ported from the upstream project with the same ids, check ids, and thresholds, s
 operator expectations carry over. Definitions are TOML compiled in with `include_str!` and
 overridable from `$XDG_CONFIG_HOME/aftman/responsibilities/`.
 
-| Responsibility | `always` | Checks | Threshold | Proposes |
+| Responsibility | `always` | Checks | Threshold | Rule ids and directives (priority) |
 | --- | --- | --- | --- | --- |
-| `core.completion` | yes | `implementation_complete`, `requirements_satisfied`, `ready_to_finish` | 0.75 | `Finish` (700), `Retry` (800), `StartWorker` (500) |
-| `core.verification` | yes | `tests_sufficient`, `needs_verification` | 0.75 / 0.65 | `StartVerifier` (600) |
-| `core.worker-health` | yes | `meaningful_progress`, `worker_stuck`, `work_off_track` | — / 0.80 / 0.80 | `Steer` or `Stop` (900) |
-| `repository.instructions` | yes | `agents_md_drift` | 0.80 | `Steer` or `Stop` (900) |
-| `core.human-escalation` | yes | `needs_human` | 0.80 | `Escalate` (1000) |
-| `quality.documentation` | **no** | `documentation_sufficient` | 0.75 | `StartWorker` (750) |
+| `core.completion` | yes | `implementation_complete`, `requirements_satisfied`, `ready_to_finish` | 0.75 | `:retry-stopped` → `Retry` (800); `:thresholds-satisfied` → `Finish` (700); `:work-remains` → `StartWorker` (500) |
+| `core.verification` | yes | `tests_sufficient`, `needs_verification` | 0.75 / 0.65 | `:warranted` → `Verify` (600) |
+| `core.worker-health` | yes | `meaningful_progress`, `worker_stuck`, `work_off_track` | — / 0.80 / 0.80 | `:stuck`, `:off-track` → `Steer` or `Stop` (900) |
+| `repository.instructions` | yes | `agents_md_drift` | 0.80 | `:drift` → `Steer` or `Stop` (900) |
+| `core.human-escalation` | yes | `needs_human` | 0.80 | `:needs-human` → `Escalate` (1000) |
+| `quality.documentation` | **no** | `documentation_sufficient` | 0.75 | `:insufficient` → `StartWorker` (750) |
+
+**Every rule has a unique id, including the built-ins.** This is not cosmetic: the tie-break
+ladder in §6.3 ends at the rule id, and two built-in worker-health proposals (`:stuck` and
+`:off-track`) could otherwise be indistinguishable when both fire — the same responsibility, the
+same priority, the same stakes — leaving the winner dependent on slice order and breaking replay.
 
 `quality.documentation` is *conditional*: it participates only if the router decides the incoming
 job requires documentation (routing threshold 0.70). Routing sees the job text, never the
@@ -185,15 +190,35 @@ evidence = ["git_diff"]   # optional; empty ⇒ default provider set
 
 [[rules]]                 # optional; advanced responsibilities
 id = "stop-when-stuck"
-when = "core.worker-health.worker_stuck >= 0.80"
+when = "core.worker-health__worker_stuck >= 0.80"
 propose = "stop"
 stakes = "high"
 
 [[rules]]
 id = "verify-before-finish"
-when = "core.verification.needs_verification >= 0.65 and core.completion.implementation_complete >= 0.75"
+when = "core.verification__needs_verification >= 0.65 and core.completion__implementation_complete >= 0.75"
 propose = "verify"
 ```
+
+### 2.1 `when` grammar
+
+Deliberately tiny, so that evaluation is total and unambiguous:
+
+```text
+condition  := disjunction
+ disjunction := conjunction ("or" conjunction)*
+ conjunction := term ("and" term)*
+ term       := check_key comparator number
+             | "not" "(" condition ")"
+ comparator := ">=" | ">" | "<=" | "<"
+ check_key  := "<responsibility_id>__<check_id>"      (the wire key, §2)
+ number     := decimal literal
+```
+
+`and` binds tighter than `or`, evaluation is left-to-right, and **mixing `and` and `or` at the same
+level without parentheses is a parse error** rather than a precedence subtlety. A reference to an
+unknown check key is a load-time error. Condition evaluation reads `rule_permitted`, not the raw
+probability, so an ensemble-suppressed check cannot drive a rule (doc 06 §5).
 
 Validation rules (all fatal at load, never at assessment time):
 
@@ -308,9 +333,10 @@ Applied before any priority comparison. They cannot be overridden by a score:
 | Invariant | Effect |
 | --- | --- |
 | Overall timeout exceeded | `Stop` |
+| **`rule_permitted == false` for a check** | Every rule that reads that check is suppressed (`SuppressionReason::NotPermitted`), regardless of how far above threshold its value is. This is how the ensemble's guarantee is enforced (doc 06 §2.2). |
 | `attempts >= max_attempts` | `Retry` suppressed |
-| `workers >= max_workers` | `StartWorker` / `StartVerifier` / `Retry` suppressed → `Escalate` |
-| `verification_started` | `StartVerifier` suppressed |
+| `workers >= max_workers` | `StartWorker` / `Verify` / `Retry` suppressed → `Escalate` |
+| `verification_started` | `Verify` suppressed |
 | Assessment budget exhausted | `Stop`, or `Escalate` when verification is pending |
 | Model error this cycle | only conservative directives are permitted (see §7) |
 
@@ -319,12 +345,17 @@ Applied before any priority comparison. They cannot be overridden by a score:
 `Finish` is proposed only when **all** of these hold:
 
 ```text
-ready_to_finish        >= 0.75
-requirements_satisfied >= 0.75
-tests_sufficient       >= 0.75
+ready_to_finish        >= 0.75  and  rule_permitted
+requirements_satisfied >= 0.75  and  rule_permitted
+tests_sufficient       >= 0.75  and  rule_permitted
 and ( verification_completed  or  needs_verification < 0.65 )
 and no worker is active
 ```
+
+`rule_permitted` is `true` only when the value is decisively outside the uncertainty band (or the
+ensemble is disabled). So with `ensemble.enabled = true`, a `ready_to_finish` of `0.79` against a
+`0.75` threshold is **in band** and cannot finish: the run either refreshes evidence (R0) or
+continues. This is the mechanism, not the prose, behind "only evidence can finish work".
 
 Any single failure falls through to `StartWorker`, so an unmet requirement can never be silently
 finished. This is the joint-threshold rule that keeps `ready_to_finish` from being trusted alone.
@@ -334,19 +365,26 @@ finished. This is the joint-threshold rule that keeps `ready_to_finish` from bei
 Proposals carry a priority; the highest wins, with a stable tie-break:
 
 ```text
-1000  EscalateHuman      core.human-escalation
- 950  Escalate           runtime (assessment/iteration budget exhausted)
- 900  Steer | Stop       core.worker-health, repository.instructions, declarative
- 800  Retry | Steer      core.completion retry, declarative steer
- 750  StartWorker        quality.documentation
- 700  Finish             core.completion
- 600  StartVerifier      core.verification
- 500  StartWorker        core.completion
-   0  Continue           runtime default
+priority  directive      rule id                             source
+1000      Escalate       core.human-escalation:needs-human    needs_human >= 0.80
+ 950      Escalate       runtime:budget-exhausted             assessment/iteration cap
+ 900      Stop           core.worker-health:stuck             worker_stuck >= 0.80
+ 900      Stop           core.worker-health:off-track         work_off_track >= 0.80
+ 900      Stop           repository.instructions:drift        agents_md_drift >= 0.80
+ 900      Steer          (the same three rules, when a steer is permitted)
+ 800      Retry          core.completion:retry-stopped         no worker, last directive was Stop
+ 800      Steer          (declarative rule with failure_action = "steer")
+ 750      StartWorker    quality.documentation:insufficient   documentation_sufficient < 0.75
+ 700      Finish         core.completion:thresholds-satisfied §6.2 holds
+ 600      Verify         core.verification:warranted          needs_verification >= 0.65
+ 500      StartWorker    core.completion:work-remains         no worker, thresholds unmet
+   0      Continue       runtime:default
 ```
 
-Tie-break order: priority desc → stakes (High first) → responsibility id → rule id. A total
-order, so arbitration is never ambiguous and is reproducible from the log.
+Tie-break order: priority desc → stakes (High first) → responsibility id → **rule id**. Because
+every rule — built-in included — has a unique id (§1), this is a total order with no ties, which is
+what makes `arbitrate()` reproducible from the event log. `docs/09-plan.md` M2 requires a test that
+asserts it: no two proposals in any built-in scenario compare equal.
 
 ### 6.4 Steering grace
 
@@ -372,6 +410,14 @@ else Stop
 
 A non-steerable backend therefore degrades to stop/retry automatically, with the same thresholds.
 This is why `supports_steering` must be honest (see [04-workers.md §2](04-workers.md)).
+
+**This decision is pure, and that requires the inputs to be in `PolicyInput`.** `within_grace`
+depends on the current time and on `worker.last_steered_at`; `steer_count` lives on the worker
+record. Both `now` and `active_worker` are therefore fields of `PolicyInput`
+([02-lld.md §5](02-lld.md)), materialised by the runtime before either `propose()` or `arbitrate()`
+runs. An earlier revision asserted policy purity while leaving these inputs unreachable, which would
+have forced an implementer to read the clock inside a function advertised as pure and would have
+broken replay of the steering-grace path.
 
 ### 6.6 Recording
 

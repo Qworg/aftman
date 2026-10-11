@@ -40,8 +40,13 @@ not the model, decides what happens next.
 
 ## Status
 
-**Design phase.** No implementation yet. The design is written down before the code, and the docs
-are the contract:
+**Design phase.** No implementation yet.
+
+- **New here?** Read the [visual explainer](explainer/index.html) first — one self-contained HTML
+  page, no build step, no network. Open the file directly, or serve it over a tailnet. It is a
+  narrative rendering of the docs below; where the two disagree, the docs win.
+- **Working on the code?** The design is written down before the code, and the docs are the
+  contract:
 
 | Doc | What it covers |
 | --- | --- |

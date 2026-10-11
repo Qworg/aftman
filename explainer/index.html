@@ -1,0 +1,1050 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aftman — an explainer</title>
+<style>
+  :root {
+    --bg: #ffffff;
+    --bg-soft: #f6f7f9;
+    --bg-card: #ffffff;
+    --fg: #1a1d21;
+    --fg-soft: #5c6470;
+    --fg-faint: #8b939f;
+    --line: #e3e6ea;
+    --line-strong: #c9ced6;
+    --accent: #1f6feb;
+    --accent-soft: #dbe9ff;
+    --good: #1a7f4b;
+    --good-soft: #d8f3e3;
+    --warn: #9a6700;
+    --warn-soft: #fff1cc;
+    --stop: #b3261e;
+    --stop-soft: #ffe2e0;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, Roboto, Helvetica, Arial, sans-serif;
+    --radius: 10px;
+    --maxw: 62rem;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1115;
+      --bg-soft: #16191f;
+      --bg-card: #191d24;
+      --fg: #e6e9ee;
+      --fg-soft: #a7b0bd;
+      --fg-faint: #78828f;
+      --line: #262b33;
+      --line-strong: #3a414b;
+      --accent: #6ea8fe;
+      --accent-soft: #17243a;
+      --good: #5fd39a;
+      --good-soft: #12291f;
+      --warn: #e3b341;
+      --warn-soft: #2b2413;
+      --stop: #ff8078;
+      --stop-soft: #2e1817;
+    }
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; scroll-padding-top: 1.5rem; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: var(--sans);
+    font-size: 17px;
+    line-height: 1.65;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: var(--maxw); margin: 0 auto; padding: 0 1.25rem; }
+
+  /* ---------- header ---------- */
+  header.hero {
+    border-bottom: 1px solid var(--line);
+    background: linear-gradient(180deg, var(--bg-soft), var(--bg));
+    padding: 3.5rem 0 2.5rem;
+  }
+  .kicker {
+    font: 600 0.75rem/1 var(--mono);
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--accent);
+    margin: 0 0 1rem;
+  }
+  h1 { font-size: clamp(2rem, 5vw, 2.9rem); line-height: 1.15; margin: 0 0 1rem; letter-spacing: -0.02em; }
+  h1 code { font-family: var(--mono); color: var(--accent); background: none; padding: 0; }
+  .lede { font-size: 1.2rem; color: var(--fg-soft); max-width: 46rem; margin: 0; }
+  .metaline { margin-top: 1.75rem; font-size: 0.9rem; color: var(--fg-faint); }
+  .metaline a { color: var(--fg-soft); }
+
+  /* ---------- nav ---------- */
+  nav.toc {
+    position: sticky; top: 0; z-index: 20;
+    background: color-mix(in srgb, var(--bg) 88%, transparent);
+    backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--line);
+    font-size: 0.85rem;
+  }
+  nav.toc ul { display: flex; gap: 1.1rem; list-style: none; margin: 0; padding: 0.7rem 0; overflow-x: auto; }
+  nav.toc a { color: var(--fg-soft); text-decoration: none; white-space: nowrap; }
+  nav.toc a:hover { color: var(--accent); }
+
+  /* ---------- sections ---------- */
+  section { padding: 3.25rem 0; border-bottom: 1px solid var(--line); }
+  section:last-of-type { border-bottom: 0; }
+  h2 { font-size: 1.65rem; margin: 0 0 0.4rem; letter-spacing: -0.01em; }
+  h2 .num {
+    display: inline-block; font: 600 0.8rem var(--mono); color: var(--fg-faint);
+    margin-right: 0.6rem; vertical-align: 0.15em;
+  }
+  h3 { font-size: 1.12rem; margin: 2rem 0 0.5rem; }
+  p { margin: 0 0 1rem; }
+  .sub { color: var(--fg-soft); font-size: 1.02rem; max-width: 46rem; }
+  strong { font-weight: 650; }
+  code {
+    font: 0.87em var(--mono);
+    background: var(--bg-soft);
+    border: 1px solid var(--line);
+    border-radius: 5px;
+    padding: 0.1em 0.35em;
+  }
+  a { color: var(--accent); }
+
+  /* ---------- cards ---------- */
+  .cards { display: grid; gap: 1rem; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); margin: 1.75rem 0 0; }
+  .card {
+    background: var(--bg-card); border: 1px solid var(--line);
+    border-radius: var(--radius); padding: 1.1rem 1.2rem;
+  }
+  .card h4 { margin: 0 0 0.4rem; font-size: 1rem; }
+  .card p { margin: 0; font-size: 0.92rem; color: var(--fg-soft); }
+  .card .glyph { font-size: 1.3rem; line-height: 1; margin-bottom: 0.6rem; display: block; }
+
+  /* ---------- figures ---------- */
+  figure { margin: 1.75rem 0; }
+  figure svg { width: 100%; height: auto; display: block; }
+  figcaption { font-size: 0.87rem; color: var(--fg-faint); margin-top: 0.7rem; }
+  .svg-label { font: 600 12px var(--sans); fill: var(--fg); }
+  .svg-sub { font: 11px var(--sans); fill: var(--fg-faint); }
+  .svg-mono { font: 11px var(--mono); fill: var(--fg-soft); }
+  .svg-box { fill: var(--bg-card); stroke: var(--line-strong); stroke-width: 1.25; }
+  .svg-box-accent { fill: var(--accent-soft); stroke: var(--accent); stroke-width: 1.25; }
+  .svg-box-good { fill: var(--good-soft); stroke: var(--good); stroke-width: 1.25; }
+  .svg-box-warn { fill: var(--warn-soft); stroke: var(--warn); stroke-width: 1.25; }
+  .svg-box-stop { fill: var(--stop-soft); stroke: var(--stop); stroke-width: 1.25; }
+  .svg-arrow { stroke: var(--line-strong); stroke-width: 1.5; fill: none; }
+  .svg-arrow-accent { stroke: var(--accent); stroke-width: 1.6; fill: none; }
+  .svg-dashed { stroke-dasharray: 5 4; }
+
+  /* ---------- steps ---------- */
+  ol.steps { counter-reset: s; list-style: none; padding: 0; margin: 1.5rem 0 0; }
+  ol.steps > li {
+    counter-increment: s; position: relative; padding: 0 0 1.35rem 3rem; border-left: 2px solid var(--line);
+    margin-left: 1rem;
+  }
+  ol.steps > li:last-child { border-left-color: transparent; padding-bottom: 0; }
+  ol.steps > li::before {
+    content: counter(s); position: absolute; left: -1.05rem; top: -0.15rem;
+    width: 2.1rem; height: 2.1rem; border-radius: 50%;
+    background: var(--bg); border: 2px solid var(--accent); color: var(--accent);
+    font: 650 0.9rem/1.95rem var(--sans); text-align: center;
+  }
+  ol.steps > li > strong { display: block; margin-bottom: 0.2rem; }
+  ol.steps p { margin: 0; color: var(--fg-soft); font-size: 0.95rem; }
+
+  /* ---------- callouts ---------- */
+  .note {
+    border-left: 3px solid var(--accent); background: var(--bg-soft);
+    padding: 0.9rem 1.1rem; border-radius: 0 var(--radius) var(--radius) 0; margin: 1.5rem 0;
+    font-size: 0.95rem;
+  }
+  .note.warn { border-left-color: var(--warn); }
+  .note p:last-child { margin-bottom: 0; }
+  .note .tag {
+    display: block; font: 600 0.72rem var(--mono); letter-spacing: 0.1em;
+    text-transform: uppercase; color: var(--fg-faint); margin-bottom: 0.35rem;
+  }
+
+  /* ---------- invariants ---------- */
+  .rule {
+    border: 1px solid var(--line); border-left: 4px solid var(--accent);
+    border-radius: var(--radius); padding: 1rem 1.2rem; margin: 1rem 0; background: var(--bg-card);
+  }
+  .rule h4 { margin: 0 0 0.35rem; font-size: 1.02rem; }
+  .rule p { margin: 0 0 0.5rem; font-size: 0.94rem; color: var(--fg-soft); }
+  .rule p:last-child { margin-bottom: 0; }
+  .rule .short { color: var(--fg); font-weight: 600; font-size: 0.98rem; }
+
+  /* ---------- explorer ---------- */
+  .explorer {
+    border: 1px solid var(--line-strong); border-radius: var(--radius);
+    background: var(--bg-card); padding: 1.25rem; margin: 1.75rem 0;
+  }
+  .explorer h3 { margin: 0 0 0.25rem; font-size: 1.05rem; }
+  .explorer .hint { font-size: 0.88rem; color: var(--fg-faint); margin: 0 0 1.25rem; }
+  .ctrl { display: grid; grid-template-columns: 11rem 1fr 4.5rem; gap: 0.75rem 1rem; align-items: center; margin-bottom: 1rem; }
+  .ctrl label { font-size: 0.9rem; color: var(--fg-soft); }
+  .ctrl output { font: 600 0.9rem var(--mono); text-align: right; color: var(--fg); }
+  input[type=range] { width: 100%; accent-color: var(--accent); }
+  .verdict { display: grid; gap: 0.6rem; grid-template-columns: repeat(auto-fit, minmax(13rem, 1fr)); margin-top: 1.25rem; }
+  .vbox { border: 1px solid var(--line); border-radius: 8px; padding: 0.7rem 0.85rem; background: var(--bg-soft); }
+  .vbox .lbl { font: 600 0.7rem var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-faint); display: block; margin-bottom: 0.25rem; }
+  .vbox .val { font-size: 0.95rem; font-weight: 600; }
+  .vbox.good { border-color: var(--good); background: var(--good-soft); }
+  .vbox.good .val { color: var(--good); }
+  .vbox.warn { border-color: var(--warn); background: var(--warn-soft); }
+  .vbox.warn .val { color: var(--warn); }
+  .vbox.stop { border-color: var(--stop); background: var(--stop-soft); }
+  .vbox.stop .val { color: var(--stop); }
+  .vbox .why { font-size: 0.85rem; color: var(--fg-soft); font-weight: 400; }
+  fieldset { border: 0; padding: 0; margin: 0 0 1rem; }
+  fieldset legend { font-size: 0.9rem; color: var(--fg-soft); padding: 0; margin-bottom: 0.4rem; }
+  .radios { display: flex; flex-wrap: wrap; gap: 0.5rem; }
+  .radios label {
+    display: inline-flex; align-items: center; gap: 0.4rem; font-size: 0.88rem;
+    border: 1px solid var(--line); border-radius: 99px; padding: 0.3rem 0.8rem; cursor: pointer;
+    color: var(--fg-soft);
+  }
+  .radios input { accent-color: var(--accent); margin: 0; }
+  .radios label:has(input:checked) { border-color: var(--accent); color: var(--fg); background: var(--accent-soft); }
+
+  /* ---------- table ---------- */
+  .tablewrap { overflow-x: auto; margin: 1.5rem 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+  th, td { text-align: left; padding: 0.6rem 0.8rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font: 600 0.78rem var(--mono); letter-spacing: 0.05em; text-transform: uppercase; color: var(--fg-faint); }
+  td code { font-size: 0.85em; }
+
+  /* ---------- goal/nongoal ---------- */
+  .twocol { display: grid; gap: 1.25rem; grid-template-columns: repeat(auto-fit, minmax(17rem, 1fr)); margin-top: 1.5rem; }
+  .list-block h4 { margin: 0 0 0.6rem; font-size: 0.78rem; font-family: var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-faint); }
+  .list-block ul { margin: 0; padding-left: 1.1rem; }
+  .list-block li { margin-bottom: 0.4rem; font-size: 0.94rem; color: var(--fg-soft); }
+  .list-block li strong { color: var(--fg); }
+
+  footer { padding: 2.5rem 0 3.5rem; color: var(--fg-faint); font-size: 0.88rem; }
+  footer a { color: var(--fg-soft); }
+  footer p { margin: 0 0 0.5rem; }
+  @media (max-width: 34rem) {
+    .ctrl { grid-template-columns: 1fr; gap: 0.25rem; }
+    .ctrl output { text-align: left; }
+  }
+</style>
+</head>
+<body>
+
+<header class="hero">
+  <div class="wrap">
+    <p class="kicker">Design explainer</p>
+    <h1><code>aftman</code> — software that watches the software</h1>
+    <p class="lede">
+      Aftman puts a small, fast judgement model above a slower coding agent. The agent writes the
+      code. Aftman watches it work, decides whether it is actually succeeding, and intervenes when
+      it is not.
+    </p>
+    <p class="metaline">
+      Built from <a href="../docs/README.md">docs/</a> ·
+      Still a design — no implementation yet ·
+      <a href="#limits">What it does not do</a>
+    </p>
+  </div>
+</header>
+
+<nav class="toc">
+  <div class="wrap">
+    <ul>
+      <li><a href="#problem">The problem</a></li>
+      <li><a href="#idea">The idea</a></li>
+      <li><a href="#shape">How it fits together</a></li>
+      <li><a href="#cycle">One round</a></li>
+      <li><a href="#decision">How a number becomes an action</a></li>
+      <li><a href="#rules">Three safety rules</a></li>
+      <li><a href="#walkthrough">A worked example</a></li>
+      <li><a href="#use">How you use it</a></li>
+      <li><a href="#limits">What it is not</a></li>
+    </ul>
+  </div>
+</nav>
+
+<main>
+
+<!-- ============================================================ -->
+<section id="problem">
+  <div class="wrap">
+    <h2><span class="num">01</span>The problem</h2>
+    <p class="sub">
+      Modern coding agents are good at writing code and bad at knowing when to stop. If you hand
+      one a task and walk away, you eventually have to answer the same questions yourself:
+    </p>
+
+    <div class="cards">
+      <div class="card">
+        <span class="glyph">🔁</span>
+        <h4>Is it stuck?</h4>
+        <p>It has re-run the same failing test four times with tiny variations. That looks like
+        work. It is not.</p>
+      </div>
+      <div class="card">
+        <span class="glyph">🎯</span>
+        <h4>Is it still on the job?</h4>
+        <p>You asked for a bug fix. It refactored the logging layer, the test helpers, and the CI
+        config.</p>
+      </div>
+      <div class="card">
+        <span class="glyph">✅</span>
+        <h4>Is it actually done?</h4>
+        <p>It says "all tests pass". It did not run the tests. You find out in review, or in
+        production.</p>
+      </div>
+    </div>
+
+    <div class="note">
+      <span class="tag">The real bottleneck</span>
+      <p>
+        The agent's work is fast and cheap. <strong>Watching it is the slow part</strong>, and today
+        the watcher is you. You supervise by reading a diff after the fact — which is the most
+        expensive possible moment to find a problem.
+      </p>
+    </div>
+
+    <p>
+      Aftman is an attempt to automate the watching without automating the work. It does not choose
+      files or write code. It observes, judges, and intervenes.
+    </p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="idea">
+  <div class="wrap">
+    <h2><span class="num">02</span>The idea</h2>
+    <p class="sub">
+      Split the job in two. A <em>coding</em> agent does the engineering. A separate
+      <em>supervisory</em> loop asks narrow, repetitive questions about what is happening — and
+      answers them cheaply enough to run continuously.
+    </p>
+
+    <div class="cards">
+      <div class="card">
+        <span class="glyph">🧠</span>
+        <h4>A decision model, not a chat model</h4>
+        <p>
+          Aftman asks <strong>Jev</strong> (TypeSafe's System One model) questions like
+          <em>"is this worker stuck?"</em>. It gets back a <strong>probability</strong> — a number
+          between 0 and 1 — not a paragraph. Ten questions go out in one request and come back
+          independently.
+        </p>
+      </div>
+      <div class="card">
+        <span class="glyph">⚖️</span>
+        <h4>Plain code decides</h4>
+        <p>
+          The probabilities go to ordinary, deterministic Rust that compares them to thresholds and
+          picks exactly one action. The model estimates. The code acts.
+        </p>
+      </div>
+      <div class="card">
+        <span class="glyph">👀</span>
+        <h4>Bounded evidence</h4>
+        <p>
+          Nobody dumps a repository into a model. Aftman sends a small, size-capped summary: git
+          status, part of the diff, the tail of the agent's output, parsed test results.
+        </p>
+      </div>
+    </div>
+
+    <div class="note warn">
+      <span class="tag">Why a probability instead of "yes"</span>
+      <p>
+        Because "we are 40% sure the tests are adequate" is a genuinely different situation from
+        "we are 95% sure", and a system that flattens both to "no" throws away the information it
+        needs to decide between <em>keep going</em>, <em>verify it</em>, and <em>ask a human</em>.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="shape">
+  <div class="wrap">
+    <h2><span class="num">03</span>How it fits together</h2>
+    <p class="sub">
+      Two loops run at the same time. Critically, the supervisor does not stop the agent in order to
+      think — the agent keeps working while it is being judged.
+    </p>
+
+    <figure>
+      <svg viewBox="0 0 920 430" role="img" aria-labelledby="svg-shape-title">
+        <title id="svg-shape-title">The coding agent loop and the supervisory loop running side by side</title>
+        <defs>
+          <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--line-strong)"/>
+          </marker>
+          <marker id="aha" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--accent)"/>
+          </marker>
+        </defs>
+
+        <!-- lane labels -->
+        <text class="svg-mono" x="16" y="30">CODING AGENT</text>
+        <line x1="16" y1="40" x2="904" y2="40" stroke="var(--line)"/>
+        <text class="svg-mono" x="16" y="278">AFTMAN · SUPERVISOR</text>
+        <line x1="16" y1="288" x2="904" y2="288" stroke="var(--line)"/>
+
+        <!-- job -->
+        <rect class="svg-box-accent" x="16" y="62" width="118" height="52" rx="8"/>
+        <text class="svg-label" x="75" y="86" text-anchor="middle">Job</text>
+        <text class="svg-sub" x="75" y="103" text-anchor="middle">ticket, bug, spec</text>
+
+        <!-- agent loop -->
+        <rect class="svg-box" x="168" y="52" width="330" height="72" rx="8"/>
+        <text class="svg-label" x="333" y="76" text-anchor="middle">Coding agent</text>
+        <text class="svg-mono" x="333" y="98" text-anchor="middle">reason → tool → observe → edit → test</text>
+        <text class="svg-mono" x="333" y="114" text-anchor="middle" fill="var(--accent)">↻ loops on its own</text>
+
+        <!-- repo -->
+        <rect class="svg-box" x="532" y="62" width="118" height="52" rx="8"/>
+        <text class="svg-label" x="591" y="86" text-anchor="middle">Repository</text>
+        <text class="svg-sub" x="591" y="103" text-anchor="middle">real files, real tests</text>
+
+        <!-- arrows job->agent, agent<->repo -->
+        <line class="svg-arrow" x1="134" y1="88" x2="164" y2="88" marker-end="url(#ah)"/>
+        <line class="svg-arrow" x1="498" y1="88" x2="528" y2="88" marker-end="url(#ah)"/>
+
+        <!-- evidence strip -->
+        <rect class="svg-box" x="168" y="306" width="330" height="76" rx="8"/>
+        <text class="svg-label" x="333" y="330" text-anchor="middle">Bounded evidence</text>
+        <text class="svg-sub" x="333" y="349" text-anchor="middle">git status · part of the diff · output tail</text>
+        <text class="svg-sub" x="333" y="366" text-anchor="middle">test summary · changed files · AGENTS.md</text>
+
+        <!-- agent -> evidence -->
+        <path class="svg-arrow" d="M 560 246 L 560 262 L 333 262 L 333 302" marker-end="url(#ah)"/>
+        <rect x="378" y="248" width="150" height="18" rx="4" fill="var(--bg)"/>
+        <text class="svg-sub" x="453" y="261" text-anchor="middle">factory events + git state</text>
+
+        <!-- evidence -> jev -->
+        <rect class="svg-box-accent" x="532" y="310" width="130" height="68" rx="8"/>
+        <text class="svg-label" x="597" y="336" text-anchor="middle">Jev</text>
+        <text class="svg-sub" x="597" y="353" text-anchor="middle">decision model</text>
+        <text class="svg-mono" x="597" y="369" text-anchor="middle">→ probabilities</text>
+        <line class="svg-arrow-accent" x1="498" y1="344" x2="528" y2="344" marker-end="url(#aha)"/>
+
+        <!-- jev -> policy -->
+        <rect class="svg-box-good" x="706" y="310" width="130" height="68" rx="8"/>
+        <text class="svg-label" x="771" y="336" text-anchor="middle">Policy</text>
+        <text class="svg-sub" x="771" y="353" text-anchor="middle">plain Rust rules</text>
+        <text class="svg-mono" x="771" y="369" text-anchor="middle">→ one action</text>
+        <line class="svg-arrow" x1="662" y1="344" x2="702" y2="344" marker-end="url(#ah)"/>
+
+        <!-- policy -> agent (feedback) -->
+        <path class="svg-arrow-accent" d="M 771 310 L 771 214 L 333 214 L 333 128" marker-end="url(#aha)"/>
+        <rect x="470" y="205" width="230" height="18" rx="4" fill="var(--bg)"/>
+        <text class="svg-mono" x="585" y="218" text-anchor="middle" fill="var(--accent)">continue · steer · stop · retry · verify · finish</text>
+
+        <!-- annotation -->
+        <text class="svg-sub" x="880" y="120" text-anchor="end">The agent never</text>
+        <text class="svg-sub" x="880" y="136" text-anchor="end">sees the supervisor's</text>
+        <text class="svg-sub" x="880" y="152" text-anchor="end">credentials.</text>
+      </svg>
+      <figcaption>
+        The agent loop (top) is untouched — aftman does not pick its tools or files. The supervisory
+        loop (bottom) turns bounded evidence into probabilities, then into exactly one action, which
+        feeds back into the running agent.
+      </figcaption>
+    </figure>
+
+    <p>
+      The two loops share nothing except a one-way event stream. That separation is the whole point:
+      the agent cannot talk the supervisor into anything, because the supervisor is not part of the
+      agent's conversation.
+    </p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="cycle">
+  <div class="wrap">
+    <h2><span class="num">04</span>One round of supervision</h2>
+    <p class="sub">
+      Aftman repeats this loop every few seconds while the agent works. The agent is never paused
+      for it.
+    </p>
+
+    <ol class="steps">
+      <li>
+        <strong>Something happens</strong>
+        <p>The agent prints output, finishes a tool call, exits, or nothing at all happens for
+        30 seconds and a timer fires. All three are valid reasons to think.</p>
+      </li>
+      <li>
+        <strong>Skip if nothing changed</strong>
+        <p>Aftman compares a fingerprint of the situation to last time. Identical? No model call,
+        no cost. This is what stops a long silent test run from burning the supervision budget.</p>
+      </li>
+      <li>
+        <strong>Gather bounded evidence</strong>
+        <p>A size-capped summary is assembled: the job, the status, the agent's recent output, a
+        trimmed diff, untracked new files, parsed test results.</p>
+      </li>
+      <li>
+        <strong>Ask the model</strong>
+        <p>All active questions go out in <em>one</em> request. Each comes back as a probability:
+        <code>implementation_complete 0.91</code>, <code>worker_stuck 0.02</code>.</p>
+      </li>
+      <li>
+        <strong>Turn probabilities into proposals</strong>
+        <p>Each area of responsibility compares its own numbers to its own thresholds and proposes
+        something — "stop the worker", "verify independently", "nothing to do".</p>
+      </li>
+      <li>
+        <strong>Pick exactly one action</strong>
+        <p>Deterministic rules discard anything that violates a hard limit, then take the most
+        conservative surviving proposal. Every proposal and every rejection is recorded.</p>
+      </li>
+      <li>
+        <strong>Act, then write it down</strong>
+        <p>Steer the agent, stop it, spawn an independent verifier, finish, or ask a human. The
+        result is persisted <em>before</em> the next round starts.</p>
+      </li>
+    </ol>
+
+    <div class="note">
+      <span class="tag">Why this is auditable</span>
+      <p>
+        Step 6 is a pure function: the same inputs always produce the same action. Combined with an
+        append-only event log, that means any run can be replayed offline and the question
+        <em>"why did it do that?"</em> is always answerable after the fact.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="decision">
+  <div class="wrap">
+    <h2><span class="num">05</span>How a number becomes an action</h2>
+    <p class="sub">
+      This is the part worth understanding. A probability is compared to a threshold — but a
+      probability that lands <em>right next to</em> its threshold tells you almost nothing. Acting on
+      it is a coin flip wearing a number.
+    </p>
+
+    <p>
+      So each threshold has a <strong>band</strong> around it. Where the number lands decides what is
+      allowed:
+    </p>
+
+    <figure>
+      <svg viewBox="0 0 900 260" role="img" aria-labelledby="svg-band-title">
+        <title id="svg-band-title">Three zones around a threshold: decisively below, uncertain band, decisively above</title>
+        <defs>
+          <marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--line-strong)"/>
+          </marker>
+        </defs>
+
+        <!-- zones -->
+        <rect class="svg-box-good" x="60" y="70" width="288" height="46" rx="6"/>
+        <rect class="svg-box-warn" x="348" y="70" width="144" height="46" rx="6"/>
+        <rect class="svg-box-good" x="492" y="70" width="288" height="46" rx="6"/>
+
+        <text class="svg-label" x="204" y="99" text-anchor="middle">Decisively below</text>
+        <text class="svg-label" x="420" y="93" text-anchor="middle">Band</text>
+        <text class="svg-sub" x="420" y="109" text-anchor="middle">± margin</text>
+        <text class="svg-label" x="636" y="99" text-anchor="middle">Decisively above</text>
+
+        <!-- axis -->
+        <line x1="60" y1="140" x2="780" y2="140" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <line x1="60" y1="132" x2="60" y2="148" stroke="var(--line-strong)"/>
+        <line x1="780" y1="132" x2="780" y2="148" stroke="var(--line-strong)"/>
+        <line x1="420" y1="128" x2="420" y2="152" stroke="var(--line-strong)" stroke-width="1.5"/>
+        <text class="svg-sub" x="60" y="166" text-anchor="middle">0.0</text>
+        <text class="svg-sub" x="780" y="166" text-anchor="middle">1.0</text>
+        <text class="svg-mono" x="420" y="166" text-anchor="middle">threshold 0.75</text>
+        <text class="svg-sub" x="60" y="184" text-anchor="middle">probability reported by the model</text>
+
+        <!-- outcomes -->
+        <text class="svg-sub" x="204" y="126" text-anchor="middle">rule does not fire</text>
+        <text class="svg-sub" x="420" y="126" text-anchor="middle" fill="var(--warn)">rule is held</text>
+        <text class="svg-sub" x="636" y="126" text-anchor="middle">rule fires</text>
+
+        <!-- annotation arrows -->
+        <path class="svg-arrow svg-dashed" d="M 420 178 L 420 206" marker-end="url(#ah2)"/>
+        <text class="svg-sub" x="420" y="224" text-anchor="middle">held means: refresh the evidence, or ask a human.</text>
+        <text class="svg-sub" x="420" y="240" text-anchor="middle">It does not mean "guess".</text>
+      </svg>
+      <figcaption>
+        The band is a deliberate admission of ignorance. Inside it, the honest answer is "not
+        enough information to act", and the system either goes and gets better evidence or escalates.
+      </figcaption>
+    </figure>
+
+    <h3>Try it</h3>
+    <p class="sub">
+      Drag the probability and watch what aftman would do with it. This is the real decision rule,
+      simplified to one check.
+    </p>
+
+    <div class="explorer">
+      <h3>Decision explorer</h3>
+      <p class="hint">Check: <code>ready_to_finish</code> · threshold <code>0.75</code> · second opinions toggleable. Finishing needs <em>every</em> check satisfied, so read the last box as "does this check let a finish through?".</p>
+
+      <div class="ctrl">
+        <label for="prob">Probability</label>
+        <input id="prob" type="range" min="0" max="1" step="0.01" value="0.91">
+        <output id="probOut">0.91</output>
+      </div>
+      <div class="ctrl">
+        <label for="margin">Band width ±</label>
+        <input id="margin" type="range" min="0" max="0.3" step="0.01" value="0.15">
+        <output id="marginOut">0.15</output>
+      </div>
+
+      <fieldset>
+        <legend>A second opinion (a different model, asked the same question)</legend>
+        <div class="radios">
+          <label><input type="radio" name="op" value="none" checked> not asked</label>
+          <label><input type="radio" name="op" value="confirm"> agrees</label>
+          <label><input type="radio" name="op" value="contest"> disagrees</label>
+        </div>
+      </fieldset>
+
+      <div class="verdict">
+        <div class="vbox" id="zoneBox">
+          <span class="lbl">Zone</span>
+          <span class="val" id="zoneVal">—</span>
+        </div>
+        <div class="vbox" id="fireBox">
+          <span class="lbl">Rule fires?</span>
+          <span class="val" id="fireVal">—</span>
+        </div>
+        <div class="vbox" id="finishBox">
+          <span class="lbl">Finish allowed?</span>
+          <span class="val" id="finishVal">—</span>
+          <span class="why" id="finishWhy"></span>
+        </div>
+      </div>
+    </div>
+
+    <h3>The rule in one sentence</h3>
+    <p>
+      A rule fires only when its number is on the right side of the threshold <em>and</em> far enough
+      from it to be believed. A second opinion can <strong>take permission away</strong> and can
+      never give it.
+    </p>
+    <p class="sub">
+      Disagree with the model and the action is cancelled. Agree with it and nothing changes —
+      agreement is not a licence. That asymmetry is intentional, and the next section is about why.
+    </p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="rules">
+  <div class="wrap">
+    <h2><span class="num">06</span>Three safety rules</h2>
+    <p class="sub">
+      Everything above is a mechanism. These are the properties the mechanism is built to guarantee,
+      stated the way you would state them to a colleague.
+    </p>
+
+    <div class="rule">
+      <h4>1 · The model estimates. Plain code decides.</h4>
+      <p class="short">No model output ever becomes an action directly.</p>
+      <p>
+        Every action depends on things a model cannot know: how many attempts remain, whether a
+        verifier has already run, whether the overall timeout has expired. Those live in ordinary
+        code. The model supplies a number; the code decides what that number is allowed to do.
+      </p>
+    </div>
+
+    <div class="rule">
+      <h4>2 · A second opinion can stop work. Only evidence can finish it.</h4>
+      <p class="short">An opinion may veto. It may never approve.</p>
+      <p>
+        Finishing a job is the one irreversible action. So it is the one action no model opinion can
+        cause. An opinion that says <em>"looks done"</em> is treated as noise. An opinion that says
+        <em>"looks wrong"</em> is allowed to stop, verify, or escalate.
+      </p>
+      <p>
+        To actually finish, aftman has to go and <strong>measure</strong>: run the repository's tests
+        itself, then re-ask the model with the fresh results.
+      </p>
+    </div>
+
+    <div class="rule">
+      <h4>3 · Uncertainty blocks. It never accelerates.</h4>
+      <p class="short">"I don't know" always resolves to the more cautious option.</p>
+      <p>
+        If any check ends up in the band and nobody can resolve it, aftman refuses to declare the job
+        finished — even if every other number looks great. This matters more than it sounds: without
+        it, a check that <em>should</em> block completion is disarmed precisely when its own
+        measurement becomes uncertain, and the run finishes on a technicality.
+      </p>
+    </div>
+
+    <figure>
+      <svg viewBox="0 0 900 190" role="img" aria-labelledby="svg-valve-title">
+        <title id="svg-valve-title">Opinions flow one way: they can only remove permission, never grant it</title>
+        <defs>
+          <marker id="ah3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--line-strong)"/>
+          </marker>
+        </defs>
+
+        <rect class="svg-box" x="30" y="52" width="150" height="66" rx="8"/>
+        <text class="svg-label" x="105" y="78" text-anchor="middle">Opinion says</text>
+        <text class="svg-label" x="105" y="98" text-anchor="middle" fill="var(--good)">"looks done"</text>
+
+        <rect class="svg-box" x="30" y="132" width="150" height="46" rx="8"/>
+        <text class="svg-label" x="105" y="160" text-anchor="middle" fill="var(--stop)">"looks wrong"</text>
+
+        <line class="svg-arrow svg-dashed" x1="184" y1="85" x2="300" y2="85"/>
+        <text class="svg-sub" x="242" y="78" text-anchor="middle">blocked</text>
+        <text class="svg-mono" x="242" y="102" text-anchor="middle">✕</text>
+
+        <line class="svg-arrow" x1="184" y1="155" x2="300" y2="155" marker-end="url(#ah3)"/>
+
+        <rect class="svg-box-warn" x="304" y="60" width="176" height="130" rx="8"/>
+        <text class="svg-label" x="392" y="106" text-anchor="middle">Permission</text>
+        <text class="svg-mono" x="392" y="126" text-anchor="middle">true → false</text>
+        <text class="svg-sub" x="392" y="148" text-anchor="middle">only ever</text>
+        <text class="svg-sub" x="392" y="164" text-anchor="middle">one direction</text>
+
+        <line class="svg-arrow" x1="484" y1="125" x2="600" y2="125" marker-end="url(#ah3)"/>
+
+        <rect class="svg-box-good" x="604" y="66" width="266" height="118" rx="8"/>
+        <text class="svg-label" x="737" y="96" text-anchor="middle">Policy acts, or does not</text>
+        <text class="svg-sub" x="737" y="120" text-anchor="middle">A veto needs no further justification.</text>
+        <text class="svg-sub" x="737" y="140" text-anchor="middle">An approval needs a measurement.</text>
+        <text class="svg-sub" x="737" y="160" text-anchor="middle">Only the measurement can re-open the gate.</text>
+      </svg>
+      <figcaption>
+        There is no code path that turns a model opinion into <code>permission = true</code>. The
+        only thing that can do that is a fresh measurement from actually running something.
+      </figcaption>
+    </figure>
+
+    <h3>And one rule about credentials</h3>
+    <div class="note warn">
+      <span class="tag">Not negotiable</span>
+      <p>
+        The API key that pays for the supervisor is stripped from the agent's environment before the
+        agent is launched. A coding agent has a shell. If it can read the key, then any text it
+        reads from anywhere can leak it. The agent authenticates itself, with its own login, and
+        never sees the supervisor's.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="walkthrough">
+  <div class="wrap">
+    <h2><span class="num">07</span>A worked example</h2>
+    <p class="sub">
+      The most common real failure, start to finish. No second model is involved anywhere in this
+      story — which is rather the point.
+    </p>
+
+    <div class="tablewrap">
+      <table>
+        <thead>
+          <tr><th style="width:6rem">Step</th><th>What happens</th><th style="width:11rem">The number</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Agent works</td>
+            <td>Writes an implementation and a test file. Reports <code>3 passed</code> in its output.</td>
+            <td>—</td>
+          </tr>
+          <tr>
+            <td>Aftman asks</td>
+            <td><em>"Do the work and tests demonstrate the job is complete?"</em></td>
+            <td><code>0.71</code></td>
+          </tr>
+          <tr>
+            <td>Compare</td>
+            <td>Threshold is 0.75. 0.71 is below it — but by less than the band. So this is <strong>not</strong> a "no". It is "I don't know."</td>
+            <td><code>band</code></td>
+          </tr>
+          <tr>
+            <td>Don't finish</td>
+            <td>The rule is held. Crucially, this alone already prevents completion — no guessing in either direction.</td>
+            <td>—</td>
+          </tr>
+          <tr>
+            <td>Get evidence</td>
+            <td>The only evidence was the agent's own claim. So aftman runs the repository's test command itself.</td>
+            <td><code>exit 1</code></td>
+          </tr>
+          <tr>
+            <td>Re-ask</td>
+            <td><code>16 passed, 1 failed</code>. Same question, fresh evidence.</td>
+            <td><code>0.08</code></td>
+          </tr>
+          <tr>
+            <td>Decide</td>
+            <td>0.08 is decisively below. The job is not done. The agent keeps working.</td>
+            <td><code>StartWorker</code></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="note">
+      <span class="tag">The interesting part</span>
+      <p>
+        The agent's <code>3 passed</code> claim was <em>about text</em>. The model was asked to judge
+        that text, and it did — plausibly. The system's response to a plausible-but-unverifiable
+        answer was not to ask a different model. It was to go and run the tests. Making more evidence
+        beats asking another model to guess about thin evidence.
+      </p>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="use">
+  <div class="wrap">
+    <h2><span class="num">08</span>How you use it</h2>
+    <p class="sub">
+      One core process owns the runs and emits one stream of events. Everything else is a client of
+      that core — so you can watch the same run from a terminal, from a browser, or from inside a
+      terminal multiplexer, and none of them is required.
+    </p>
+
+    <figure>
+      <svg viewBox="0 0 900 300" role="img" aria-labelledby="svg-surfaces-title">
+        <title id="svg-surfaces-title">One daemon, one protocol, three interchangeable clients</title>
+        <defs>
+          <marker id="ah4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--line-strong)"/>
+          </marker>
+        </defs>
+
+        <rect class="svg-box-accent" x="300" y="24" width="300" height="104" rx="10"/>
+        <text class="svg-label" x="450" y="52" text-anchor="middle">aftman core</text>
+        <text class="svg-sub" x="450" y="74" text-anchor="middle">owns every run · judges · decides</text>
+        <text class="svg-sub" x="450" y="92" text-anchor="middle">append-only event log · replayable</text>
+        <text class="svg-mono" x="450" y="114" text-anchor="middle">started on demand, keeps running</text>
+
+        <line class="svg-arrow" x1="300" y1="140" x2="140" y2="196" marker-end="url(#ah4)"/>
+        <line class="svg-arrow" x1="450" y1="140" x2="450" y2="196" marker-end="url(#ah4)"/>
+        <line class="svg-arrow" x1="600" y1="140" x2="760" y2="196" marker-end="url(#ah4)"/>
+
+        <rect class="svg-box" x="34" y="200" width="212" height="80" rx="8"/>
+        <text class="svg-label" x="140" y="228" text-anchor="middle">Terminal</text>
+        <text class="svg-sub" x="140" y="248" text-anchor="middle">run · watch · steer · answer</text>
+        <text class="svg-mono" x="140" y="266" text-anchor="middle">works standalone</text>
+
+        <rect class="svg-box" x="344" y="200" width="212" height="80" rx="8"/>
+        <text class="svg-label" x="450" y="228" text-anchor="middle">Browser</text>
+        <text class="svg-sub" x="450" y="248" text-anchor="middle">live timeline · decisions · diff</text>
+        <text class="svg-mono" x="450" y="266" text-anchor="middle">local, LAN, or tailnet</text>
+
+        <rect class="svg-box" x="654" y="200" width="212" height="80" rx="8"/>
+        <text class="svg-label" x="760" y="228" text-anchor="middle">herdr</text>
+        <text class="svg-sub" x="760" y="248" text-anchor="middle">workers run in visible panes</text>
+        <text class="svg-mono" x="760" y="266" text-anchor="middle">watch and take over</text>
+      </svg>
+      <figcaption>
+        Any client can reconnect and resume from where it left off. A dropped SSH session, a browser
+        reload, or a closed pane loses nothing.
+      </figcaption>
+    </figure>
+
+    <h3>What it looks like on the command line</h3>
+<pre style="background:var(--bg-soft); border:1px solid var(--line); border-radius:8px; padding:1rem; overflow-x:auto; font:0.85rem/1.7 var(--mono);"><span style="color:var(--fg-faint)"># hand it a job</span>
+aftman run --repo ./my-project --job "Add request retries with backoff and tests"
+
+<span style="color:var(--fg-faint)"># which agent does the work</span>
+aftman run --repo . --job "..." --worker pi      <span style="color:var(--fg-faint)"># or agy, claude</span>
+
+<span style="color:var(--fg-faint)"># watch a run, live</span>
+aftman watch <span style="color:var(--accent)">&lt;run-id&gt;</span>
+
+<span style="color:var(--fg-faint)"># why did it do that?</span>
+aftman decisions <span style="color:var(--accent)">&lt;run-id&gt;</span>
+</pre>
+
+    <h3>And when it does the interesting thing</h3>
+    <p>
+      Once in a while aftman will decide it genuinely cannot tell, and stop to ask you. That is a
+      goal of the system, not a failure of it — the alternative is a confident guess. The question
+      and everything it knows arrives in whichever surface you are using, and the run waits.
+    </p>
+  </div>
+</section>
+
+<!-- ============================================================ -->
+<section id="limits">
+  <div class="wrap">
+    <h2><span class="num">09</span>What it is not</h2>
+    <p class="sub">
+      A design that does not say what it refuses to do is not a design.
+    </p>
+
+    <div class="twocol">
+      <div class="list-block">
+        <h4>It is</h4>
+        <ul>
+          <li><strong>A supervisor.</strong> It observes an agent, judges its progress, and
+          intervenes.</li>
+          <li><strong>Agent-agnostic.</strong> The same supervision works over different coding
+          agents behind one small interface.</li>
+          <li><strong>Auditable.</strong> Every probability, proposal, rejection, and action is in a
+          log you can replay.</li>
+          <li><strong>Honest about uncertainty.</strong> "Ask a human" is a first-class outcome.</li>
+          <li><strong>Local-first.</strong> It runs on your machine, and remote access is a
+          deliberate choice you make.</li>
+        </ul>
+      </div>
+      <div class="list-block">
+        <h4>It is not</h4>
+        <ul>
+          <li><strong>A coding agent.</strong> Aftman never edits your code. Something else does
+          that.</li>
+          <li><strong>A sandbox.</strong> It does not confine what an agent can touch. Use a
+          container or a throwaway checkout for untrusted jobs.</li>
+          <li><strong>A guarantee.</strong> Calibration is not correctness. This reduces the chance
+          of a wrong call. It does not remove it.</li>
+          <li><strong>A replacement for review.</strong> It makes the diff smaller and the failures
+          louder.</li>
+          <li><strong>An orchestrator of many agents.</strong> One worker at a time, by design —
+          every question above assumes a single active worker.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="note warn">
+      <span class="tag">The honest caveat</span>
+      <p>
+        The central bet is that asking a small decision model narrow questions is fast and cheap
+        enough to run continuously alongside a much slower agent. That bet is the reason the design
+        looks like this — and it is a claim that should be <em>measured</em> in your environment, not
+        taken from a diagram.
+      </p>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <p>
+      This explainer is a narrative rendering of the design documents. Where they disagree, the docs
+      win:
+      <a href="../docs/01-hld.md">01 high-level</a> ·
+      <a href="../docs/02-lld.md">02 low-level</a> ·
+      <a href="../docs/03-jev.md">03 the model contract</a> ·
+      <a href="../docs/04-workers.md">04 workers</a> ·
+      <a href="../docs/05-responsibilities.md">05 responsibilities</a> ·
+      <a href="../docs/06-ensemble.md">06 second opinions</a> ·
+      <a href="../docs/07-surfaces.md">07 surfaces</a> ·
+      <a href="../docs/08-security.md">08 security</a> ·
+      <a href="../docs/09-plan.md">09 plan</a>
+    </p>
+    <p>
+      To view over a tailnet: <code>python3 -m http.server 8080</code> in this directory, then
+      <code>tailscale serve --bg 8080</code>.
+    </p>
+  </div>
+</footer>
+
+<script>
+(function () {
+  "use strict";
+
+    // Zone / rule-firing / finish, mirroring docs/06-ensemble.md.
+    //   decisive  = |p - t| >= margin
+    //   permitted = decisive && !contested
+    //   fires     = permitted && (p >= t)
+    // A confirm changes nothing; a contest removes permission.
+  var THRESHOLD = 0.75;
+
+  var prob = document.getElementById("prob");
+  var margin = document.getElementById("margin");
+  var probOut = document.getElementById("probOut");
+  var marginOut = document.getElementById("marginOut");
+  var zoneVal = document.getElementById("zoneVal");
+  var fireVal = document.getElementById("fireVal");
+  var finishVal = document.getElementById("finishVal");
+  var finishWhy = document.getElementById("finishWhy");
+  var zoneBox = document.getElementById("zoneBox");
+  var fireBox = document.getElementById("fireBox");
+  var finishBox = document.getElementById("finishBox");
+
+  function setBox(box, cls) {
+    box.classList.remove("good", "warn", "stop");
+    if (cls) { box.classList.add(cls); }
+  }
+
+  function render() {
+    var p = parseFloat(prob.value);
+    var m = parseFloat(margin.value);
+    var op = document.querySelector('input[name="op"]:checked').value;
+
+    probOut.textContent = p.toFixed(2);
+    marginOut.textContent = m.toFixed(2);
+
+    var dist = Math.abs(p - THRESHOLD);
+    var decisive = dist >= m;
+    var contested = (op === "contest");
+    var permitted = decisive && !contested;
+    var above = p >= THRESHOLD;
+    var fires = permitted && above;
+
+    // zone
+    var zone, zoneCls;
+    if (!decisive) {
+      zone = "In the band \u2014 held";
+      zoneCls = "warn";
+    } else if (above) {
+      zone = "Decisively above";
+      zoneCls = "good";
+    } else {
+      zone = "Decisively below";
+      zoneCls = "good";
+    }
+    zoneVal.textContent = zone;
+    setBox(zoneBox, zoneCls);
+
+    fireVal.textContent = fires ? "Yes" : "No";
+    setBox(fireBox, fires ? "good" : "warn");
+
+    // can it finish? in this explorer the single check IS a finish conjunct,
+    // and finishing additionally requires every check to be resolved.
+    var canFinish = fires;
+    finishVal.textContent = canFinish ? "This check: yes" : "No";
+    setBox(finishBox, canFinish ? "good" : "stop");
+
+    var why;
+    if (contested) {
+      why = "A second opinion disagreed. Permission is removed and stays removed \u2014 no amount of agreement elsewhere brings it back.";
+    } else if (!decisive) {
+      why = "Too close to the threshold to believe. Aftman would run the tests itself and re-ask, or ask you. It does not guess.";
+    } else if (above) {
+      why = op === "confirm"
+        ? "Decisive and above threshold \u2014 and every other check must also be decisive and above. The agreement changed nothing."
+        : "Decisive and above threshold. Still not sufficient on its own: the other checks must agree too.";
+    } else {
+      why = "Decisively below, so this check blocks a finish. Declining to act is the safe direction here.";
+    }
+    finishWhy.textContent = why;
+  }
+
+  [prob, margin].forEach(function (el) { el.addEventListener("input", render); });
+  Array.prototype.forEach.call(document.querySelectorAll('input[name="op"]'), function (el) {
+    el.addEventListener("change", render);
+  });
+
+  render();
+})();
+</script>
+
+</body>
+</html>

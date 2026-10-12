@@ -17,3 +17,13 @@ When documentation is required by the original job, is the relevant documentatio
 accurate, and consistent with the implemented behavior?
 """
 min_threshold = 0.75
+
+# This responsibility has no runtime-aware logic, so its rule is expressed here. That is
+# the declarative path's purpose: a rule over check results, with no facts a condition
+# cannot see.
+[[rules]]
+id = "quality.documentation:insufficient"
+when = "quality.documentation__documentation_sufficient < 0.75"
+propose = "start-worker"
+reason = "the job requires documentation that is not yet complete"
+stakes = "high"

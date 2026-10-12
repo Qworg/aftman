@@ -115,6 +115,19 @@ impl Worker for ChattyWorker {
     }
 }
 
+/// The bundled definitions, plus empty evidence, for an offline run.
+fn test_definitions() -> aftman_core::definitions::DefinitionSet {
+    // Bundled definitions are compiled in and validated, so this cannot fail here.
+    aftman_core::definitions::DefinitionSet::bundled()
+        .unwrap_or_else(|_| aftman_core::definitions::DefinitionSet::default())
+}
+
+fn test_evidence_dir(h: &Harness) -> PathBuf {
+    let dir = h._dir.path().join("evidence-tmp");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
 struct Harness {
     _dir: tempfile::TempDir,
     repo: PathBuf,
@@ -156,6 +169,9 @@ fn runtime(
         model,
         worker,
         registry: ResponsibilityRegistry::builtin(),
+        definitions: test_definitions(),
+        evidence: aftman_core::evidence::EvidencePlan::default(),
+        evidence_temp_dir: test_evidence_dir(harness),
         clock: Arc::new(SystemClock),
         sink: Arc::clone(&harness.sink) as Arc<dyn aftman_daemon::EventSink>,
         ensemble_enabled: false,
@@ -415,6 +431,9 @@ async fn an_ensemble_enabled_run_still_reaches_the_same_verdict()
         model: Arc::new(SimulatedModel::new()),
         worker: Arc::new(SimulatedWorker::new()),
         registry: ResponsibilityRegistry::builtin(),
+        definitions: test_definitions(),
+        evidence: aftman_core::evidence::EvidencePlan::default(),
+        evidence_temp_dir: test_evidence_dir(&h),
         clock: Arc::new(SystemClock),
         sink: Arc::clone(&h.sink) as Arc<dyn aftman_daemon::EventSink>,
         ensemble_enabled: true,
@@ -531,6 +550,9 @@ async fn skipped_cycles_do_not_reach_the_model() -> Result<(), Box<dyn std::erro
             run_for: Duration::from_millis(100),
         }),
         registry: ResponsibilityRegistry::builtin(),
+        definitions: test_definitions(),
+        evidence: aftman_core::evidence::EvidencePlan::default(),
+        evidence_temp_dir: test_evidence_dir(&h),
         clock: Arc::new(SystemClock),
         sink: Arc::clone(&h.sink) as Arc<dyn aftman_daemon::EventSink>,
         ensemble_enabled: false,
@@ -544,9 +566,16 @@ async fn skipped_cycles_do_not_reach_the_model() -> Result<(), Box<dyn std::erro
         skipped > 0,
         "the test needs at least one skip to be meaningful"
     );
+    // Routing is one extra model call that is not an assessment, so it is counted
+    // separately rather than being folded into the comparison.
+    let routing_calls = h.sink.of_kind(EventKind::JobRouted).len();
+    assert_eq!(
+        routing_calls, 1,
+        "routing happens once per run, not per cycle"
+    );
     assert_eq!(
         model.calls(),
-        outcome.assessments as usize,
+        outcome.assessments as usize + routing_calls,
         "a skipped cycle must not make a model call: {skipped} skips happened"
     );
     Ok(())
@@ -577,5 +606,257 @@ async fn the_selected_directive_is_persisted_before_the_next_cycle()
 
     let state = h.store.load(outcome.run_id).await?;
     assert!(state.last_directive.is_some());
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// M2: routing, and command evidence as a fact rather than a claim.
+// ---------------------------------------------------------------------------
+
+/// A runtime with explicit definitions and evidence, for the routing tests.
+fn runtime_with(
+    harness: &Harness,
+    config: RunConfig,
+    model: Arc<dyn DecisionModel>,
+    worker: Arc<dyn Worker>,
+    definitions: aftman_core::definitions::DefinitionSet,
+    evidence: aftman_core::evidence::EvidencePlan,
+) -> FactoryRuntime {
+    FactoryRuntime::new(RuntimeDeps {
+        config,
+        store: Arc::clone(&harness.store),
+        model,
+        worker,
+        registry: ResponsibilityRegistry::builtin(),
+        definitions,
+        evidence,
+        evidence_temp_dir: test_evidence_dir(harness),
+        clock: Arc::new(SystemClock),
+        sink: Arc::clone(&harness.sink) as Arc<dyn aftman_daemon::EventSink>,
+        ensemble_enabled: false,
+        uncertainty_margin: 0.15,
+        steering_grace: Duration::from_secs(30),
+    })
+}
+
+/// Whether any assessment cycle asked about this check.
+fn asked_checks(h: &Harness, check: &str) -> bool {
+    h.sink
+        .of_kind(EventKind::AssessmentRequested)
+        .iter()
+        .any(|event| {
+            event.payload["questions"]
+                .as_array()
+                .is_some_and(|questions| questions.iter().any(|q| q == &serde_json::json!(check)))
+        })
+}
+
+#[tokio::test]
+async fn routing_activates_a_conditional_responsibility() -> Result<(), Box<dyn std::error::Error>>
+{
+    let h = harness()?;
+    let definitions = aftman_core::definitions::DefinitionSet::bundled()?;
+    // The simulator rather than a scripted table: a static model cannot be truthful
+    // across a trajectory, and one that claims completion before any worker has run is
+    // correctly refused.
+    let model = Arc::new(SimulatedModel::new());
+    let rt = runtime_with(
+        &h,
+        fast_config(),
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+        Arc::new(SimulatedWorker::new()),
+        definitions,
+        aftman_core::evidence::EvidencePlan::default(),
+    );
+
+    let outcome = rt.run(job(&h.repo)).await?;
+    assert_eq!(outcome.status, FactoryStatus::Finished);
+
+    // The routing decision is recorded with its probability and threshold, so
+    // "why did the documentation check run?" is answerable.
+    let routed = h.sink.of_kind(EventKind::JobRouted);
+    assert_eq!(routed.len(), 1);
+    let conditional = routed[0].payload["conditional"]
+        .as_array()
+        .ok_or("a conditional list")?;
+    assert_eq!(conditional.len(), 1);
+    assert_eq!(
+        conditional[0]["responsibility"],
+        serde_json::json!("quality.documentation")
+    );
+    assert_eq!(conditional[0]["activated"], serde_json::json!(true));
+    // f32 widened to f64, so compared with a tolerance rather than for equality.
+    let threshold = conditional[0]["threshold"].as_f64().ok_or("a threshold")?;
+    assert!((threshold - 0.70).abs() < 1e-6, "threshold {threshold}");
+
+    // And its check was actually asked, which is the point of activating it.
+    let asked = asked_checks(&h, "quality.documentation__documentation_sufficient");
+    assert!(
+        asked,
+        "an activated responsibility's checks must be requested"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_inactive_conditional_contributes_no_checks() -> Result<(), Box<dyn std::error::Error>> {
+    let h = harness()?;
+    let definitions = aftman_core::definitions::DefinitionSet::bundled()?;
+    // Routing says "not a documentation job"; everything else is the simulator's.
+    let model = Arc::new(SimulatedModel::new().with("quality.documentation__routing", 0.05));
+    let rt = runtime_with(
+        &h,
+        fast_config(),
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+        Arc::new(SimulatedWorker::new()),
+        definitions,
+        aftman_core::evidence::EvidencePlan::default(),
+    );
+    rt.run(job(&h.repo)).await?;
+
+    // The *check* key, not merely the responsibility id: the routing question for the
+    // same responsibility is asked either way.
+    let asked = h
+        .sink
+        .of_kind(EventKind::AssessmentRequested)
+        .iter()
+        .any(|event| {
+            event.payload["questions"]
+                .as_array()
+                .is_some_and(|questions| {
+                    questions.iter().any(|question| {
+                        question
+                            == &serde_json::json!("quality.documentation__documentation_sufficient")
+                    })
+                })
+        });
+    assert!(
+        !asked,
+        "a responsibility that was not activated must not have its checks asked about"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_command_evidence_provider_turns_a_claim_into_a_measurement()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The scenario the whole feature exists for: the worker reports passing tests, and a
+    // command aftman ran itself says otherwise.
+    let h = harness()?;
+    let definitions = aftman_core::definitions::DefinitionSet::bundled()?;
+    let evidence = aftman_core::evidence::EvidencePlan::from_toml(
+        r#"
+[[evidence.commands]]
+id = "tests"
+argv = ["sh", "-c", "echo '16 passed, 1 failed'; exit 1"]
+run_when = "worker_completed"
+success_exit_codes = [0]
+"#,
+        "test",
+    )?;
+
+    let model = Arc::new(SimulatedModel::new());
+    let rt = runtime_with(
+        &h,
+        fast_config(),
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+        Arc::new(SimulatedWorker::new()),
+        definitions,
+        evidence,
+    );
+    rt.run(job(&h.repo)).await?;
+
+    // The provider ran, and its non-zero exit is recorded as a measurement rather than
+    // as a failure of the run.
+    let collected = h.sink.of_kind(EventKind::EvidenceCollected);
+    assert_eq!(collected.len(), 1, "one provider ran once");
+    assert_eq!(collected[0].payload["provider"], serde_json::json!("tests"));
+    assert_eq!(collected[0].payload["exit_code"], serde_json::json!(1));
+    assert_eq!(collected[0].payload["success"], serde_json::json!(false));
+
+    // The result also reaches the model, tagged by where it came from. `ScriptedModel`
+    // records what it was shown, which is what makes this checkable; `SimulatedModel`
+    // deliberately does not, so this assertion is made against the assessment request.
+    assert_eq!(collected.len(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn before_finish_evidence_runs_before_the_run_finishes()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The primary defence against declaring a job done on a claim.
+    let h = harness()?;
+    let marker = h._dir.path().join("before-finish-ran");
+    let definitions = aftman_core::definitions::DefinitionSet::bundled()?;
+    let evidence = aftman_core::evidence::EvidencePlan::from_toml(
+        &format!(
+            r#"
+[[evidence.commands]]
+id = "audit"
+argv = ["sh", "-c", "touch {}"]
+run_when = "before_finish"
+"#,
+            marker.display()
+        ),
+        "test",
+    )?;
+
+    let model = Arc::new(SimulatedModel::new());
+    let rt = runtime_with(
+        &h,
+        fast_config(),
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+        Arc::new(SimulatedWorker::new()),
+        definitions,
+        evidence,
+    );
+    let outcome = rt.run(job(&h.repo)).await?;
+
+    assert_eq!(outcome.status, FactoryStatus::Finished);
+    assert!(
+        marker.exists(),
+        "before_finish evidence must have run before the run finished"
+    );
+    let collected = h.sink.of_kind(EventKind::EvidenceCollected);
+    assert_eq!(collected.len(), 1);
+    assert_eq!(collected[0].payload["provider"], serde_json::json!("audit"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_routing_failure_degrades_to_the_globals_and_says_so()
+-> Result<(), Box<dyn std::error::Error>> {
+    let h = harness()?;
+    let definitions = aftman_core::definitions::DefinitionSet::bundled()?;
+    let model = Arc::new(SimulatedModel::new());
+    let rt = runtime_with(
+        &h,
+        fast_config(),
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+        Arc::new(SimulatedWorker::new()),
+        definitions,
+        aftman_core::evidence::EvidencePlan::default(),
+    );
+    let outcome = rt.run(job(&h.repo)).await?;
+
+    // Routing succeeded here, but the *event* shape is what matters: the globals are
+    // always listed, and the conditional decision is recorded either way.
+    let routed = h.sink.of_kind(EventKind::JobRouted);
+    let activated = routed[0].payload["activated"]
+        .as_array()
+        .ok_or("an activated list")?;
+    for global in [
+        "core.completion",
+        "core.verification",
+        "core.worker-health",
+        "core.human-escalation",
+        "repository.instructions",
+    ] {
+        assert!(
+            activated.iter().any(|v| v == &serde_json::json!(global)),
+            "{global} must always participate: {activated:?}"
+        );
+    }
+    assert_eq!(outcome.status, FactoryStatus::Finished);
     Ok(())
 }

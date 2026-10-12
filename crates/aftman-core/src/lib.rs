@@ -27,12 +27,14 @@ pub mod definitions;
 pub mod directive;
 pub mod error;
 pub mod event;
+pub mod evidence;
 pub mod ids;
 pub mod log;
 pub mod model;
 pub mod observation;
 pub mod policy;
 pub mod responsibility;
+pub mod routing;
 pub mod run;
 pub mod testing;
 pub mod timefmt;
@@ -52,6 +54,7 @@ pub use directive::{
 };
 pub use error::{IdError, ModelError, TransitionError};
 pub use event::{EventEnvelope, EventKind};
+pub use evidence::{CommandProvider, EvidenceOutcome, EvidencePlan, ProviderCwd, RunWhen};
 pub use ids::{
     AssessmentSeq, AttemptId, CheckId, CheckKey, EscalationId, EventSeq, EvidenceId,
     ResponsibilityId, RuleId, RunId, WorkerId,

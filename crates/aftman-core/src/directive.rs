@@ -124,6 +124,11 @@ pub enum Invariant {
     /// per responsibility, so that a responsibility added later cannot reopen the
     /// hole by forgetting to register itself as a blocker.
     UnresolvedUncertainty,
+    /// No worker has ever run, so there is nothing to declare complete.
+    ///
+    /// A model that answers optimistically on the first cycle — before any work exists —
+    /// would otherwise finish a job that never started.
+    NoWorkAttempted,
 }
 
 /// Why a proposal was not selected.

@@ -305,18 +305,63 @@ async fn build_runtime(
 ) -> Result<FactoryRuntime> {
     let model = build_model(store, simulate_model, quiet)?;
     let worker: Arc<dyn Worker> = build_worker(&config, &options, store, quiet)?;
+    let definitions = load_definitions()?;
+    let evidence = load_evidence()?;
+    let evidence_temp_dir = store.root().join("evidence-tmp");
+    std::fs::create_dir_all(&evidence_temp_dir).context("creating the evidence scratch dir")?;
     Ok(FactoryRuntime::new(RuntimeDeps {
         config,
         store: store.clone(),
         model,
         worker,
+        // Replaced once routing has run; this is the pre-routing placeholder the
+        // runtime needs for its type.
         registry: ResponsibilityRegistry::builtin(),
+        definitions,
+        evidence,
+        evidence_temp_dir,
         clock: Arc::new(SystemClock),
         sink: Arc::new(TerminalSink { quiet }),
         ensemble_enabled: ensemble,
         uncertainty_margin: aftman_daemon::default_margin(),
         steering_grace: std::time::Duration::from_secs(30),
     }))
+}
+
+/// Load the responsibility definitions: the compiled-in set plus any override directory.
+fn load_definitions() -> Result<aftman_core::definitions::DefinitionSet> {
+    let mut set = aftman_core::definitions::DefinitionSet::bundled()
+        .context("loading the bundled responsibility definitions")?;
+    let dir = std::env::var_os("AFTMAN_RESPONSIBILITIES_DIR").map(PathBuf::from);
+    if let Some(dir) = dir {
+        if dir.is_dir() {
+            set.overlay_dir(&dir)
+                .with_context(|| format!("loading definitions from {}", dir.display()))?;
+        }
+    }
+    let unknown = set.unknown_ids();
+    if !unknown.is_empty() {
+        bail!(
+            "these definitions are neither built-in nor declare any rules, so nothing \
+             would ever propose a directive from them: {}",
+            unknown.join(", ")
+        );
+    }
+    Ok(set)
+}
+
+/// Load command evidence providers from the central config directory.
+fn load_evidence() -> Result<aftman_core::evidence::EvidencePlan> {
+    let Some(path) = aftman_core::evidence::default_config_path() else {
+        return Ok(aftman_core::evidence::EvidencePlan::default());
+    };
+    if !path.is_file() {
+        return Ok(aftman_core::evidence::EvidencePlan::default());
+    }
+    let source =
+        std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    aftman_core::evidence::EvidencePlan::from_toml(&source, &path.display().to_string())
+        .context("loading command evidence providers")
 }
 
 /// Construct the configured coding-agent backend.

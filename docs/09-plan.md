@@ -88,8 +88,7 @@ budget module provably refuses to send a request missing the job.
 
 ## M2 — Responsibilities, policy, and a real worker
 
-**Status: the worker backends are complete; the TOML registry, router, and command
-evidence providers are not.** What landed:
+**Status: complete.** What landed:
 
 - `aftman-workers::subprocess` — one process-group spawn path, bounded streaming,
   interrupt-then-kill with a grace period, and a scrubbed environment. Termination
@@ -118,8 +117,30 @@ their logic in code and a condition may only read checks their own definition de
 Pretending otherwise would produce rules that silently mean something weaker than they
 read.
 
-Still outstanding in this milestone: the global/conditional router, and command evidence
-providers with `run_when` scheduling.
+The **router** (`aftman-core::routing`) evaluates every conditional responsibility in one
+request against the job text and nothing else, activates each one that clears its own
+threshold, and records every probability and threshold in `JOB_ROUTED` so "why didn't the
+documentation check run?" has an answer. A model failure degrades to the globals and says
+so. `quality.documentation` is the first bundled responsibility to go through this path,
+and it turned out to have no runtime-aware logic at all — so its rule moved into TOML,
+which is exactly what the declarative form is for.
+
+**Command evidence providers** (`aftman-core::evidence` for configuration and scheduling,
+`aftman-workers::evidence` for execution) run an operator-configured `argv` with a literal
+argument list, a scrubbed environment, an own process group, bounded output, and a hard
+timeout. A non-zero exit is a *measurement*, not a failure: a test command that exits 1
+has still run. `run_when = "before_finish"` is deferred correctly — when `Finish` is
+selected and those providers have not run, they run and the run is judged again rather
+than finishing on a claim.
+
+Two invariants came out of building this, both runtime facts rather than judgements:
+
+- **`Finish` requires that a worker has run at least once** (`Invariant::NoWorkAttempted`).
+  Without it, a model that answers optimistically on the first cycle — before any work
+  exists — ends a job that never started.
+- **An empty proposal set with no active worker escalates** rather than returning
+  `Continue`. Otherwise a correctly-refused `Finish` spins on the idle ticker until the
+  overall timeout, which is the same class of bug as the M0 deadlock by a different route.
 
 Two layering corrections came out of this milestone and are worth keeping: backend
 launch options must **not** live in `RunConfig` (that would make `aftman-core` depend

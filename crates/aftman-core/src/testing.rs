@@ -270,10 +270,17 @@ impl DecisionModel for SimulatedModel {
                 answers.insert(key.clone(), AnswerValue::Noul(*p));
             }
         }
+        // An explicit override always wins. Inserting unconditionally here would
+        // silently ignore `with("…__routing", p)`, which is exactly how a test asking for
+        // "routing says this is not a documentation job" would quietly get the opposite.
+        let mut fill = |key: CheckKey, value: f32| {
+            answers.entry(key).or_insert(AnswerValue::Noul(value));
+        };
+
         // `meaningful_progress` is a plausible inverse of stuckness.
         let progress_key = CheckKey::from("core.worker-health__meaningful_progress");
         if questions.contains_key(&progress_key) {
-            answers.insert(progress_key, AnswerValue::Noul(1.0 - stuck));
+            fill(progress_key, 1.0 - stuck);
         }
         // `agents_md_drift` answers "no" when there is nothing to compare against,
         // which is what the check's instructions demand.
@@ -283,16 +290,29 @@ impl DecisionModel for SimulatedModel {
             let present = state
                 .get("agents_md_instructions")
                 .is_some_and(|v| !v.is_null());
-            answers.insert(
-                drift_key,
-                AnswerValue::Noul(if present { 0.02 } else { 0.0 }),
-            );
+            fill(drift_key, if present { 0.02 } else { 0.0 });
+        }
+        // `quality.documentation` is conditional, so routing may activate it. A check
+        // whose answer is missing is fatal, so the simulator has to answer it too:
+        // documentation is as complete as the change is.
+        let docs_key = CheckKey::from("quality.documentation__documentation_sufficient");
+        if questions.contains_key(&docs_key) {
+            // 0.95 rather than 0.90: against a 0.75 threshold with a 0.15 band, 0.90
+            // sits *exactly* on the edge, and f32 makes `0.90 - 0.75` equal
+            // `0.14999998`, which reads as in band. A simulator that lands on the
+            // boundary is testing float representation rather than the trajectory.
+            let score = if worker_done && exit_ok && diff_present {
+                0.95
+            } else {
+                0.40
+            };
+            fill(docs_key, score);
         }
         // Routing questions are asked per responsibility; answer "yes" so that
         // conditional responsibilities are visible in a demo run.
         for key in questions.keys() {
             if key.as_str().ends_with("__routing") {
-                answers.insert(key.clone(), AnswerValue::Noul(0.75));
+                fill(key.clone(), 0.75);
             }
         }
 

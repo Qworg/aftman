@@ -104,6 +104,15 @@ impl PolicyInput<'_> {
     /// Whether the active worker is inside the post-steer grace window.
     #[must_use]
     pub fn within_steering_grace(&self) -> bool {
+        self.steered_within(self.steering_grace)
+    }
+
+    /// Whether a steer was delivered more recently than `grace` ago.
+    ///
+    /// A responsibility may declare its own grace window in its definition, so the
+    /// duration is a parameter rather than only run configuration.
+    #[must_use]
+    pub fn steered_within(&self, grace: Duration) -> bool {
         let Some(worker) = self.active_worker else {
             return false;
         };
@@ -111,7 +120,19 @@ impl PolicyInput<'_> {
             return false;
         };
         let since: Duration = (self.now - last).try_into().unwrap_or(Duration::ZERO);
-        since < self.steering_grace
+        since < grace
+    }
+
+    /// Whether the worker may be steered, given a responsibility's own steer budget.
+    #[must_use]
+    pub fn steering_available_with_limit(&self, max_steers: u32) -> bool {
+        let Some(worker) = self.active_worker else {
+            return false;
+        };
+        self.config.steering_enabled
+            && worker.supports_steering
+            && worker.steer_count() < max_steers
+            && !self.within_steering_grace()
     }
 
     /// Whether the previous selected directive stopped the worker.
@@ -219,6 +240,9 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
     if uncertainty_blocks_finish {
         invariants.push(Invariant::UnresolvedUncertainty);
     }
+    if input.counters.workers_run == 0 {
+        invariants.push(Invariant::NoWorkAttempted);
+    }
 
     // ---- Phase 2: filter, then take the highest priority -------------------
 
@@ -266,11 +290,21 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
     }
 
     let Some(winner) = surviving.first().cloned() else {
-        // Nothing survived, so the runtime default applies. The suppressions are
-        // kept: when *nothing* happens, "why not?" is the question that matters
-        // most, and dropping the reasons here would leave it unanswerable.
+        // Nothing survived. With a worker running that means "carry on"; with no worker
+        // there is nothing to carry on *with*, and returning `Continue` would spin on the
+        // idle ticker until the run timed out. The suppressions are kept either way:
+        // when nothing happens, "why not?" is the question that matters most.
+        let selected = if input.active_worker.is_none() {
+            Directive::Escalate {
+                reason: "nothing can make progress: no proposal survived and no worker is running"
+                    .into(),
+                ask: "No worker is running and every proposal was refused.".into(),
+            }
+        } else {
+            Directive::Continue
+        };
         return PolicyDecision {
-            selected: Directive::Continue,
+            selected,
             considered: proposals.to_vec(),
             suppressed,
             invariants,
@@ -320,6 +354,13 @@ fn refusal(
     match &proposal.directive {
         // `Finish` is the one irreversible action, so it carries the most guards.
         Directive::Finish { .. } => {
+            // Nothing has been attempted, so nothing can be finished. Without this, a
+            // model that answers optimistically on the first cycle — before any worker
+            // has run — ends a job that never started. This is a runtime fact, not a
+            // judgement, so it belongs here rather than in a check.
+            if input.counters.workers_run == 0 {
+                return Some(SuppressionReason::Invariant(Invariant::NoWorkAttempted));
+            }
             if uncertainty_blocks_finish {
                 return Some(SuppressionReason::Invariant(
                     Invariant::UnresolvedUncertainty,
@@ -440,6 +481,10 @@ mod tests {
         CheckKey::new(&ResponsibilityId::new(responsibility), &CheckId::new(check))
     }
 
+    fn aftman_core_log(capacity: usize) -> crate::log::BoundedLog {
+        crate::log::BoundedLog::new(capacity, capacity)
+    }
+
     fn observation() -> Observation {
         Observation {
             run_id: crate::ids::RunId::new(),
@@ -508,14 +553,43 @@ mod tests {
     }
 
     #[test]
-    fn no_proposals_means_continue() {
+    fn no_proposals_with_no_worker_escalates_rather_than_spinning() {
+        // With nothing to do and nothing running, `Continue` means "wait forever".
         let o = observation();
         let counters = Counters::default();
         let config = RunConfig::default();
         let checks = BTreeMap::new();
         let decision = arbitrate(&input(&o, &counters, &config, &checks), &[]);
+        assert!(
+            matches!(decision.selected, Directive::Escalate { .. }),
+            "{:?}",
+            decision.selected
+        );
+    }
+
+    #[test]
+    fn no_proposals_with_a_running_worker_means_continue() {
+        // The complementary case, and the one the default exists for: a worker is
+        // running and nothing objects, so let it work.
+        let o = observation();
+        let counters = Counters {
+            workers_run: 1,
+            ..Counters::default()
+        };
+        let config = RunConfig::default();
+        let checks = BTreeMap::new();
+        let worker = crate::worker::WorkerRecord::new(
+            crate::ids::WorkerId::new(),
+            WorkerKind::Simulated,
+            crate::job::TaskKind::Code,
+            "mission",
+            aftman_core_log(64),
+            true,
+        );
+        let mut policy_input = input(&o, &counters, &config, &checks);
+        policy_input.active_worker = Some(&worker);
+        let decision = arbitrate(&policy_input, &[]);
         assert_eq!(decision.selected, Directive::Continue);
-        assert!(decision.suppressed.is_empty());
     }
 
     #[test]
@@ -525,6 +599,9 @@ mod tests {
         // documentation check is in band and Finish must be refused.
         let o = observation();
         let counters = Counters {
+            // `Finish` requires that work was attempted, so every test that expects it
+            // to be evaluated has to say that a worker ran.
+            workers_run: 1,
             verifier_completed: true,
             ..Counters::default()
         };
@@ -559,9 +636,38 @@ mod tests {
     }
 
     #[test]
+    fn finish_is_refused_when_no_work_has_been_attempted() {
+        // A model that answers optimistically on the first cycle — before any worker has
+        // run — must not end a job that never started.
+        let o = observation();
+        let counters = Counters {
+            workers_run: 0,
+            verifier_completed: true,
+            ..Counters::default()
+        };
+        let config = RunConfig::default();
+        let checks = checks(&[
+            ("core.completion", "ready_to_finish", 0.95),
+            ("core.completion", "requirements_satisfied", 0.95),
+            ("core.verification", "tests_sufficient", 0.95),
+            ("core.verification", "needs_verification", 0.10),
+        ]);
+        let decision = arbitrate(&input(&o, &counters, &config, &checks), &[finish()]);
+        assert_ne!(decision.selected, finish().directive);
+        assert!(decision.invariants.contains(&Invariant::NoWorkAttempted));
+        assert!(decision.suppressed.iter().any(|s| matches!(
+            s.reason,
+            SuppressionReason::Invariant(Invariant::NoWorkAttempted)
+        )));
+    }
+
+    #[test]
     fn a_fully_resolved_set_lets_finish_through() {
         let o = observation();
         let counters = Counters {
+            // `Finish` requires that work was attempted, so every test that expects it
+            // to be evaluated has to say that a worker ran.
+            workers_run: 1,
             verifier_completed: true,
             ..Counters::default()
         };
@@ -584,7 +690,10 @@ mod tests {
     #[test]
     fn a_low_priority_proposal_loses_to_a_higher_one() {
         let o = observation();
-        let counters = Counters::default();
+        let counters = Counters {
+            workers_run: 1,
+            ..Counters::default()
+        };
         let config = RunConfig::default();
         let checks = BTreeMap::new();
         let escalate = Proposal::new(
@@ -625,8 +734,9 @@ mod tests {
         );
         // No active worker at all, so steering is not available.
         let decision = arbitrate(&input(&o, &counters, &config, &checks), &[steer]);
-        assert_eq!(decision.selected, Directive::Continue);
+        // The steer is refused, and with no worker running there is nothing left to do.
         assert!(!decision.suppressed.is_empty());
+        assert!(matches!(decision.selected, Directive::Escalate { .. }));
     }
 
     #[test]
@@ -648,10 +758,12 @@ mod tests {
             Stakes::High,
         );
         let decision = arbitrate(&input(&o, &counters, &config, &checks), &[retry]);
-        assert_eq!(
-            decision.selected,
-            Directive::Continue,
-            "retry must not be selected"
+        // The retry is refused, and with no worker running there is nothing to continue
+        // with, so the run escalates rather than looping.
+        assert!(
+            !matches!(decision.selected, Directive::Retry { .. }),
+            "retry must not be selected: {:?}",
+            decision.selected
         );
         assert!(decision.invariants.contains(&Invariant::AttemptsExhausted));
     }

@@ -90,6 +90,7 @@ impl ObservationBuilder {
         job: &Job,
         active: Option<&WorkerRecord>,
         event_summaries: Vec<EventSummary>,
+        evidence: &[aftman_core::evidence::EvidenceOutcome],
         now: OffsetDateTime,
     ) -> Observation {
         let counters = Counters {
@@ -110,7 +111,7 @@ impl ObservationBuilder {
             .map(|w| summarize_worker(w, now))
             .collect();
 
-        let (git, untracked, instructions, tests) = if self.simulation {
+        let (git, untracked, instructions, mut tests) = if self.simulation {
             (
                 self.synthetic_git(active),
                 Vec::new(),
@@ -125,9 +126,23 @@ impl ObservationBuilder {
             (git, untracked, instructions, tests)
         };
 
-        let mut evidence = std::collections::BTreeMap::new();
+        // Command evidence arrives as *facts*, tagged so a check can tell them apart
+        // from a worker's claim about the same thing.
+        let mut evidence_map = std::collections::BTreeMap::new();
+        for outcome in evidence {
+            evidence_map.insert(outcome.evidence_key(), outcome.output_excerpt.clone());
+            // A provider that printed test summaries is the measurement the
+            // test-sufficiency check actually wants, rather than the agent's report of
+            // having run something.
+            tests.extend(parse_test_summaries(
+                &outcome.output_excerpt,
+                TestSource::Command {
+                    provider: outcome.provider.to_string(),
+                },
+            ));
+        }
         if self.simulation {
-            evidence.insert(
+            evidence_map.insert(
                 "simulated".to_owned(),
                 "synthetic diff and test results; the repository was not touched".to_owned(),
             );
@@ -159,7 +174,7 @@ impl ObservationBuilder {
                     reason: d.reason().unwrap_or_default().to_owned(),
                 }),
             counters,
-            evidence,
+            evidence: evidence_map,
         }
     }
 

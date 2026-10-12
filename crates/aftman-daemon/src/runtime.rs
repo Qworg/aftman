@@ -15,6 +15,7 @@
 //! supervisor slept until the worker exited. See `docs/02-lld.md` §7.1.
 
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -24,9 +25,11 @@ use tokio::sync::mpsc;
 
 use aftman_core::assessment::{ResolvedCheck, Rung};
 use aftman_core::clock::Clock;
+use aftman_core::definitions::DefinitionSet;
 use aftman_core::directive::{Directive, Invariant, Proposal, SuppressionReason};
 use aftman_core::error::{ModelError, TransitionError};
 use aftman_core::event::{EventEnvelope, EventKind};
+use aftman_core::evidence::{EvidenceOutcome, EvidencePlan, RunWhen};
 use aftman_core::ids::{CheckKey, EscalationId, EventSeq, RunId, WorkerId};
 use aftman_core::job::{FactoryStatus, Job, RunConfig, TaskKind, WorkerStatus};
 use aftman_core::log::BoundedLog;
@@ -34,6 +37,7 @@ use aftman_core::model::{DecisionModel, Purpose, Question};
 use aftman_core::observation::{EventSummary, Observation};
 use aftman_core::policy::{PolicyInput, arbitrate};
 use aftman_core::responsibility::ResponsibilityRegistry;
+use aftman_core::routing;
 use aftman_core::run::{Escalation, EscalationKind, RunHeader, RunState};
 use aftman_core::worker::{
     SteerOutcome, SteerRecord, TerminateReason, Worker, WorkerCtx, WorkerEventSink, WorkerOutcome,
@@ -52,6 +56,12 @@ pub struct RuntimeDeps {
     pub model: Arc<dyn DecisionModel>,
     pub worker: Arc<dyn Worker>,
     pub registry: ResponsibilityRegistry,
+    /// The declarations routing and check construction read.
+    pub definitions: DefinitionSet,
+    /// Command evidence providers.
+    pub evidence: EvidencePlan,
+    /// Scratch space for a provider that runs with `cwd = "temp"`.
+    pub evidence_temp_dir: PathBuf,
     pub clock: Arc<dyn Clock>,
     pub sink: Arc<dyn EventSink>,
     /// Whether the uncertainty band holds a rule. Off by default, which restores
@@ -78,6 +88,9 @@ pub enum RuntimeError {
 
     #[error("illegal status transition: {0}")]
     Transition(#[from] TransitionError),
+
+    #[error("responsibility configuration: {0}")]
+    Responsibility(String),
 }
 
 /// How a run ended.
@@ -153,19 +166,50 @@ impl FactoryRuntime {
         .await?;
 
         self.transition(&mut state, FactoryStatus::Routing).await?;
-        // Routing decides which *conditional* responsibilities participate. In M0
-        // every built-in is global, so nothing is conditional yet; the event is
-        // emitted anyway so the decision is visible and so M2 has somewhere to put
-        // the probabilities and thresholds.
-        self.emit(
-            &mut state,
-            EventKind::JobRouted,
-            json!({
-                "activated": self.deps.registry.active().iter().map(|r| r.id().to_string()).collect::<Vec<_>>(),
-                "conditional": [],
-            }),
+
+        // Routing sees the job text and nothing else, and decides which *conditional*
+        // responsibilities participate. It never decides what happens: a routing mistake
+        // costs a dimension of supervision, not an action.
+        let routing_outcome = routing::route(
+            self.deps.model.as_ref(),
+            &aftman_core::model::AskContext::for_run(
+                Purpose::Routing,
+                run_id,
+                aftman_core::ids::AssessmentSeq(0),
+            ),
+            &self.deps.definitions,
+            &job.prompt,
+            &aftman_core::model::Budget::default(),
         )
-        .await?;
+        .await;
+
+        let mut routing_payload = json!({
+            "activated": routing_outcome.activated.iter().map(ToString::to_string).collect::<Vec<_>>(),
+            "degraded": routing_outcome.degraded,
+            // Rounded because an f32 widened to f64 prints as `0.699999988079071`, and
+            // these numbers are read off the log by people.
+            "conditional": routing_outcome.decisions.iter().map(|decision| json!({
+                "responsibility": decision.responsibility.to_string(),
+                "probability": decision.probability.map(round4),
+                "threshold": round4(decision.threshold),
+                "activated": decision.activated,
+            })).collect::<Vec<_>>(),
+        });
+        if let Some(model) = &routing_outcome.model {
+            routing_payload["model"] = json!(model);
+        }
+        self.emit(&mut state, EventKind::JobRouted, routing_payload)
+            .await?;
+
+        // The registry is built from what routing activated, so a conditional
+        // responsibility that was not activated has no checks to ask.
+        let registry = ResponsibilityRegistry::from_definitions(
+            &self.deps.definitions,
+            &routing_outcome.activated,
+            self.deps.steering_grace.as_secs(),
+            1,
+        )
+        .map_err(RuntimeError::Responsibility)?;
         self.transition(&mut state, FactoryStatus::Running).await?;
 
         let mut worker: Option<WorkerHandle> = None;
@@ -178,6 +222,8 @@ impl FactoryRuntime {
         // rather than after one idle interval.
         let mut activity_pending = true;
         let mut last_digest: Option<String> = None;
+        let mut evidence_outcomes: Vec<EvidenceOutcome> = Vec::new();
+        let mut before_finish_ran = false;
 
         loop {
             if let Some(finish) = self.terminal_status(&state) {
@@ -280,6 +326,16 @@ impl FactoryRuntime {
             }
             if just_finished {
                 worker = None;
+                // Run the evidence providers that are due now, *before* the cycle that
+                // judges the worker. This is what turns the agent's "3 passed" into a
+                // measurement rather than a claim.
+                self.collect_evidence(
+                    &mut state,
+                    &job,
+                    RunWhen::WorkerCompleted,
+                    &mut evidence_outcomes,
+                )
+                .await?;
             }
             // A still-running worker's live output must reach the observation.
             if let Some(handle) = worker.as_ref() {
@@ -300,6 +356,7 @@ impl FactoryRuntime {
                 &job,
                 most_recent.as_ref(),
                 event_summaries,
+                &evidence_outcomes,
                 self.now(),
             );
 
@@ -332,10 +389,8 @@ impl FactoryRuntime {
             }
 
             // ---- ask the model ----------------------------------------------
-            let questions = self.questions();
-            let keys: Vec<(CheckKey, Option<f32>)> = self
-                .deps
-                .registry
+            let questions = self.questions(&registry);
+            let keys: Vec<(CheckKey, Option<f32>)> = registry
                 .checks()
                 .into_iter()
                 .map(|c| (c.key, c.threshold))
@@ -441,7 +496,7 @@ impl FactoryRuntime {
                     ensemble_enabled: self.deps.ensemble_enabled,
                     steering_grace: self.deps.steering_grace,
                 };
-                self.deps.registry.propose(&input)
+                registry.propose(&input)
             };
 
             let decision = {
@@ -513,14 +568,36 @@ impl FactoryRuntime {
             state.last_directive = Some(decision.selected.clone());
 
             // ---- apply -------------------------------------------------------
-            worker = self
-                .apply(
+            //
+            // A `Finish` selected on evidence that has not been refreshed is exactly the
+            // case `run_when = "before_finish"` exists for. Run those providers and judge
+            // again, rather than finishing on a claim.
+            let selected = decision.selected.clone();
+            if matches!(selected, Directive::Finish { .. })
+                && !before_finish_ran
+                && !self.deps.evidence.due(RunWhen::BeforeFinish).is_empty()
+            {
+                before_finish_ran = true;
+                self.collect_evidence(
                     &mut state,
                     &job,
-                    decision.selected.clone(),
-                    worker,
-                    &observation,
+                    RunWhen::BeforeFinish,
+                    &mut evidence_outcomes,
                 )
+                .await?;
+                state.last_directive = Some(selected.clone());
+                last_directive = Some(selected);
+                // The observation has changed, so the digest must not suppress the
+                // re-assessment.
+                last_digest = None;
+                next_assessment_at = self.instant();
+                activity_pending = true;
+                self.snapshot(&mut state).await?;
+                continue;
+            }
+
+            worker = self
+                .apply(&mut state, &job, selected, worker, &observation)
                 .await?;
             // A directive that neither ended the run nor parked it leaves the run
             // supervising, so return to `Running`.
@@ -577,9 +654,8 @@ impl FactoryRuntime {
         None
     }
 
-    fn questions(&self) -> BTreeMap<CheckKey, Question> {
-        self.deps
-            .registry
+    fn questions(&self, registry: &ResponsibilityRegistry) -> BTreeMap<CheckKey, Question> {
+        registry
             .checks()
             .into_iter()
             .map(|c| (c.key, c.question))
@@ -685,6 +761,50 @@ impl FactoryRuntime {
             }),
         )
         .await?;
+        Ok(())
+    }
+
+    /// Run the providers due for one trigger, recording each outcome.
+    ///
+    /// Every provider produces an event whether it succeeded, failed, or could not be
+    /// launched: a check that expects a measurement and silently gets nothing is how a
+    /// run finishes on a claim.
+    async fn collect_evidence(
+        &self,
+        state: &mut RunState,
+        job: &Job,
+        trigger: RunWhen,
+        outcomes: &mut Vec<EvidenceOutcome>,
+    ) -> Result<(), RuntimeError> {
+        let due: Vec<aftman_core::evidence::CommandProvider> = self
+            .deps
+            .evidence
+            .due(trigger)
+            .into_iter()
+            .cloned()
+            .collect();
+        for provider in due {
+            let outcome = aftman_workers::run_provider(
+                &provider,
+                &job.repo,
+                &self.deps.evidence_temp_dir,
+                self.now(),
+            )
+            .await;
+            let payload = json!({
+                "provider": outcome.provider.to_string(),
+                "argv": outcome.argv,
+                "exit_code": outcome.exit_code,
+                "success": outcome.success,
+                "duration_ms": outcome.duration.as_millis() as u64,
+                "truncated": outcome.truncated,
+                "launch_error": outcome.launch_error,
+                "summary": outcome.summary(),
+            });
+            outcomes.push(outcome);
+            self.emit(state, EventKind::EvidenceCollected, payload)
+                .await?;
+        }
         Ok(())
     }
 
@@ -895,6 +1015,11 @@ impl FactoryRuntime {
             }
         }
     }
+}
+
+/// Round a probability to four decimals, for log readability.
+fn round4(value: f32) -> f64 {
+    (f64::from(value) * 10_000.0).round() / 10_000.0
 }
 
 fn escalation_kind(reason: &str) -> EscalationKind {

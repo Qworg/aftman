@@ -20,10 +20,12 @@
 #![forbid(unsafe_code)]
 
 pub mod backends;
+pub mod evidence;
 pub mod simulated;
 pub mod subprocess;
 
 pub use backends::{BackendOptions, PermissionMode, SpecError, SteerProtocol};
+pub use evidence::run_provider;
 pub use simulated::SimulatedWorker;
 pub use subprocess::{CommandSpec, SubprocessWorker};
 

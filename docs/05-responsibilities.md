@@ -342,6 +342,8 @@ Applied before any priority comparison. They cannot be overridden by a score:
 | Assessment budget exhausted | `Stop`, or `Escalate` when verification is pending |
 | Model error this cycle | only conservative directives are permitted (see §7) |
 | **Any active check unresolved** (`UnresolvedInBand`, `SuppressedByContest`, `Unresolved`) | `Finish` suppressed (`Invariant::UnresolvedUncertainty`). A high-priority inhibitor rule that cannot fire because its own measurement is uncertain must not silently disarm: uncertainty about a blocker blocks, it does not permit. |
+| **No worker has ever run** | `Finish` suppressed (`Invariant::NoWorkAttempted`). A model that answers optimistically on the first cycle — before any work exists — would otherwise end a job that never started. Added during M2, after a test model did exactly that. |
+| **No proposal survived and no worker is running** | `Escalate`, not `Continue`. `Continue` with nothing to continue with is a stall, and the run would spin on the idle ticker until the overall timeout. |
 
 ### 6.2 The `Finish` precondition
 

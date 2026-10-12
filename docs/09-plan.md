@@ -6,16 +6,45 @@ The order is chosen so that **nothing real is required to run anything**: M0 wor
 simulated worker and a simulated model, M1 adds a real Jev call, and only then does a real coding
 agent appear. Every milestone ends with the full offline suite green.
 
+## Progress at a glance
+
+| Milestone | Status | Commits |
+| --- | --- | --- |
+| M0 — skeleton, core types, offline run | **complete** | `aaf9cc9` |
+| M1 — real Jev | **complete** | `b826530` |
+| M2 — responsibilities, policy, a real worker | **complete** | `d3730f5`, `6d4b2a9`, `450b1a6` |
+| M3 — daemon, protocol, CLI, TUI | not started | — |
+| M4 — web UI | not started | — |
+| M5 — ensemble S1 and S2 | not started | — |
+| M6 — herdr | not started | — |
+| M7 — ensemble S3 and S4 | not started | — |
+| M8 — backend hardening and verifier missions | not started | — |
+
+As of the M2 commits: **394 tests passing**, `cargo clippy --all-targets --all-features -- -D
+warnings` clean, `cargo fmt --check` clean, and the whole suite green with an empty environment.
+
+### Where the record lives
+
+Each milestone section below carries a `**Status**` paragraph saying what actually landed, which
+exit criteria were met, and — where the code diverged from this plan or from `docs/` — why. The
+per-milestone test count is stated in that paragraph or in its commit message.
+
+The authoritative record of *why* a change was made is the commit message, which states what was
+built, what was found, and any scope decision taken rather than assumed, including the ones where
+the plan turned out to be wrong:
+
+```bash
+git log --oneline          # the milestone commits, in order
+git show <sha>             # the reasoning behind one of them
+```
+
+Two milestone findings changed `docs/` as well as code, and are noted in place:
+
+- the watcher must drain worker completion independently of the trigger that woke it
+  ([02-lld.md §7.1](02-lld.md));
+- `Condition` must not derive `serde` ([02-lld.md](02-lld.md), and the type's own documentation).
+
 ## M0 — Skeleton, core types, offline run
-
-**Status: complete.** `cargo test --workspace` is green (160 tests) with an empty environment, clippy
-is clean under `-D warnings`, and `aftman demo` reaches `finished` with no network, no credentials,
-and no agent binary, leaving the target repository untouched. No design change was needed: every bug
-found during M0 was a deviation of the code from these documents, which is the intended direction.
-
-Two details earned a place in the design from this milestone: the completion channel must be drained
-independently of the trigger that woke the loop (`docs/02-lld.md` §7.1), and the content digest must
-exclude *every* per-cycle counter, including the assessment sequence inside the prior decision.
 
 **Status: complete.** `cargo test --workspace` is green (160 tests) with an empty environment, clippy
 is clean under `-D warnings`, and `aftman demo` reaches `finished` with no network, no credentials,

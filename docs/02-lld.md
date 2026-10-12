@@ -247,8 +247,9 @@ pub enum   SuppressionReason { NotPermitted, Invariant(Invariant), HigherPriorit
 /// self-describing in the event log. Distinct from `CheckSuppression`
 /// (doc 06 §5), which is about measurement quality, not proposal arbitration.
 pub enum   Invariant { OverallTimeout, AttemptsExhausted, WorkerLimit, VerificationAlreadyRun,
-    AssessmentBudget, ModelUnavailable, UnresolvedUncertainty }
-pub struct Condition(String);         // parsed expression; see doc 05 §2
+    AssessmentBudget, ModelUnavailable, UnresolvedUncertainty,
+    // No worker has ever run, so there is nothing to declare complete.
+    NoWorkAttempted }
 pub struct Routing { pub always: bool, pub instructions: Option<String>, pub threshold: f32 }
 
 // ---- store ------------------------------------------------------------
@@ -327,6 +328,24 @@ pub struct Rule {
     pub propose: Directive,
     pub stakes: Stakes,                  // Low | High  (High opts into the ensemble path)
 }
+
+/// A parsed `when` expression. Grammar in doc 05 §2.1; implementation in
+/// `aftman-core::condition`.
+///
+/// **Deliberately not `serde`-derived.** A condition is parsed from a rule's `when`
+/// string and evaluated; it never crosses a boundary, so it needs no representation on
+/// one. Deriving it matters more than it looks: the type is recursive, and serde's
+/// internally-tagged form makes the compiler evaluate a trait bound it cannot resolve
+/// (`overflow evaluating the requirement`). Raising `recursion_limit` does not fix that,
+/// because the cycle is real rather than merely deep — which is a useful thing to
+/// recognise before spending an afternoon on it.
+pub enum Condition {
+    Comparison { key: CheckKey, op: Comparator, value: f32 },
+    Not(Box<Condition>),
+    Conjunction(Vec<Condition>),
+    Disjunction(Vec<Condition>),
+}
+pub enum Comparator { GreaterOrEqual, Greater, LessOrEqual, Less }
 
 /// The single directive vocabulary. Every document and the code use these
 /// names; `docs/05-responsibilities.md` priorities are keyed by them.

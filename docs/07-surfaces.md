@@ -328,7 +328,12 @@ What each surface can do. Blank means "not applicable", not "not implemented by 
 - **The web UI cannot answer a Jev check directly.** It can answer an *escalation*, which policy
   then consumes. There is no path from a browser click to a probability.
 - **The CLI cannot bypass policy.** `aftman steer` sends a message to a worker; it is recorded as a
-  human steer and does not skip the assessment loop. Forcing a directive is not a feature.
+  human steer and does not skip the assessment loop (it marks a cycle pending, subject to the same
+  `min_assessment_interval` debounce as output). An accepted human steer also opens the
+  steering-grace window for that worker, so the supervisor's own stuck/off-track stops are deferred
+  for the window (`steering_grace`, default 30 s). That is intended: an operator who just redirected
+  the worker should not have it killed as stuck before it can react. It does not consume the
+  supervisor's `max_steers_per_worker` budget. Forcing a directive is not a feature.
 - **herdr integration cannot start agents aftman did not spawn.** No adopting arbitrary panes.
 - **No surface can enable `Finish`.** Only the `Finish` precondition in
   [05-responsibilities.md §6.2](05-responsibilities.md) can, and it requires a decisive value that

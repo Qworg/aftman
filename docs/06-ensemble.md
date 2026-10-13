@@ -231,9 +231,12 @@ pub enum HumanDecision {
     /// precondition on its own. This variant does NOT itself satisfy a conjunct.
     ClaimComplete,
     /// Free-form guidance delivered to the worker. Same effect as `Accept` plus a steer.
-    Guidance(String),
+    Guidance { text: String },
 }
 ```
+
+A human `Stop` ends the run as `Cancelled` (reason `"stopped by operator"`), not as `FactoryStatus::Stopped`:
+`Stopped` is non-terminal and `core.completion:retry-stopped` would restart the work a person just stopped.
 
 A human may always **stop** work. A human may never **finish** work by fiat: `ClaimComplete` maps
 to "run R0 and re-assess", because otherwise a human becomes a path around §2.2. This is what
@@ -241,10 +244,15 @@ resolves the apparent conflict with [07-surfaces.md §10](07-surfaces.md): the s
 enable `Finish`, and neither can the operator's own words — only the resulting evidence can.
 
 If a human channel is connected, `Stop` and `Guidance` act immediately. If escalation is answered
-`Accept`, the run continues and the check stays in-band (and therefore still cannot fire a rule).
+`Accept`, the run resumes and **asks again from scratch** in M3: the next cycle is a full assessment
+with no memory that a human accepted the uncertainty, so the same question can be raised again. M5
+makes the accepted check stay in-band for the rest of the run (so it still cannot fire a rule) and
+records the answer as `Resolution::HumanDecided`.
 
-If no human channel is connected, escalation is not a dead end: the run is held in `NeedsHuman` and
-policy is restricted to conservative directives while it waits. It never proceeds on a guess.
+If no human channel is connected (`--no-daemon`, or every control handle dropped), the M3 run
+**ends** with the question recorded: `NeedsHuman` ends the run and the status is reported as
+`needs_human`. It never proceeds on a guess. Holding a run parked with policy restricted to
+conservative directives, with its own timeout, is M7.
 
 ## 5. Resolution
 

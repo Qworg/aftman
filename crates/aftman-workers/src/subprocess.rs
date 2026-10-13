@@ -110,7 +110,33 @@ pub struct SubprocessWorker {
     terminate_grace: Duration,
     /// The process group to signal. Zero means no worker is running.
     pgid: std::sync::atomic::AtomicI32,
+    /// Set by `terminate` once it has a group to signal, so that `run` finishes the
+    /// job with a `SIGKILL` of the whole group after the child is gone: an agent
+    /// that exits on `SIGINT` can leave a grandchild that ignored it.
+    terminating: std::sync::atomic::AtomicBool,
     stdin: tokio::sync::Mutex<Option<ChildStdin>>,
+}
+
+/// Kills the process group if the `run` future is dropped (aborted) while the
+/// worker is live. `kill_on_drop` alone reaches only the direct child.
+struct GroupGuard<'a> {
+    pgid: i32,
+    slot: &'a std::sync::atomic::AtomicI32,
+    armed: bool,
+}
+
+impl Drop for GroupGuard<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            SubprocessWorker::signal_group(self.pgid, Signal::SIGKILL);
+            let _ = self.slot.compare_exchange(
+                self.pgid,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+    }
 }
 
 impl std::fmt::Debug for SubprocessWorker {
@@ -131,6 +157,7 @@ impl SubprocessWorker {
             source: SpecSource::Fixed(spec),
             terminate_grace: DEFAULT_TERMINATE_GRACE,
             pgid: std::sync::atomic::AtomicI32::new(0),
+            terminating: std::sync::atomic::AtomicBool::new(false),
             stdin: tokio::sync::Mutex::new(None),
         }
     }
@@ -152,6 +179,7 @@ impl SubprocessWorker {
             },
             terminate_grace: DEFAULT_TERMINATE_GRACE,
             pgid: std::sync::atomic::AtomicI32::new(0),
+            terminating: std::sync::atomic::AtomicBool::new(false),
             stdin: tokio::sync::Mutex::new(None),
         }
     }
@@ -230,6 +258,8 @@ impl SubprocessWorker {
             message: "the child exited before it could be identified".to_owned(),
         })?;
         let pgid = pid as i32;
+        self.terminating
+            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.pgid.store(pgid, std::sync::atomic::Ordering::SeqCst);
 
         // Move stdin into the shared slot so steering can reach it.
@@ -284,10 +314,23 @@ impl SubprocessWorker {
         }
     }
 
-    fn clear_live(&self) {
-        self.pgid.store(0, std::sync::atomic::Ordering::SeqCst);
-        if let Ok(mut slot) = self.stdin.try_lock() {
-            *slot = None;
+    /// Forget the live worker, but only if `pgid` is still the registered one: a
+    /// superseded `run` finishing late must not zero the group a newer worker just
+    /// stored, which would turn its `terminate` and `steer` into no-ops.
+    fn clear_live(&self, pgid: i32) {
+        let cleared = self
+            .pgid
+            .compare_exchange(
+                pgid,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok();
+        if cleared {
+            if let Ok(mut slot) = self.stdin.try_lock() {
+                *slot = None;
+            }
         }
     }
 }
@@ -342,6 +385,11 @@ impl Worker for SubprocessWorker {
     ) -> Result<WorkerOutcome, WorkerError> {
         let spec = self.resolve_spec(&ctx)?;
         let (mut child, pgid) = self.spawn(&ctx, &spec)?;
+        let mut guard = GroupGuard {
+            pgid,
+            slot: &self.pgid,
+            armed: true,
+        };
 
         // For an RPC backend the mission is the first line of input, not an argument.
         if let Some(initial) = spec.steer.initial_prompt(&ctx.mission) {
@@ -369,6 +417,9 @@ impl Worker for SubprocessWorker {
 
         let outcome = match tokio::time::timeout(ctx.timeout, child.wait()).await {
             Ok(Ok(status)) => {
+                if self.terminating.load(std::sync::atomic::Ordering::SeqCst) {
+                    Self::signal_group(pgid, Signal::SIGKILL);
+                }
                 if status.success() {
                     WorkerOutcome::Completed
                 } else {
@@ -378,7 +429,8 @@ impl Worker for SubprocessWorker {
                 }
             }
             Ok(Err(error)) => {
-                self.clear_live();
+                guard.armed = false;
+                self.clear_live(pgid);
                 return Err(WorkerError::Io(error.to_string()));
             }
             Err(_elapsed) => {
@@ -393,7 +445,8 @@ impl Worker for SubprocessWorker {
         for task in [stdout_task, stderr_task].into_iter().flatten() {
             let _ = task.await;
         }
-        self.clear_live();
+        guard.armed = false;
+        self.clear_live(pgid);
         sink.finished();
         Ok(outcome)
     }
@@ -441,6 +494,8 @@ impl Worker for SubprocessWorker {
             return Ok(());
         }
         tracing::debug!(pgid, ?reason, "terminating the worker process group");
+        self.terminating
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         // `run` observes the process exit and returns; this call does not need to wait
         // for it, which is what lets a termination interrupt a running worker.
         self.stop_group(pgid).await;

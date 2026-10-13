@@ -220,9 +220,11 @@ impl ObservationBuilder {
     }
 }
 
-/// Elapsed wall time for a run, from its header.
+/// Elapsed supervised time for a run: wall time since creation less any time spent
+/// waiting for a human, because this is the figure policy compares to
+/// `overall_timeout`.
 fn elapsed_secs(state: &RunState, now: OffsetDateTime) -> u64 {
-    (now - state.header.created_at).whole_seconds().max(0) as u64
+    state.supervised_elapsed(now).as_secs()
 }
 
 /// Collect git state, degrading to an empty record rather than failing a cycle.

@@ -46,6 +46,13 @@ pub struct RunState {
     pub checks: BTreeMap<CheckKey, ResolvedCheck>,
     pub last_directive: Option<Directive>,
     pub escalations: Vec<Escalation>,
+    /// Milliseconds this run has spent waiting in `NeedsHuman` with a human channel
+    /// attached. Subtracted from elapsed time wherever `overall_timeout` is
+    /// evaluated, so a person who is away does not use up the run's budget. Kept
+    /// here and not in `Counters`, which is serialized into the model-facing
+    /// observation.
+    #[serde(default)]
+    pub human_wait_ms: u64,
 }
 
 impl RunState {
@@ -60,7 +67,19 @@ impl RunState {
             checks: BTreeMap::new(),
             last_directive: None,
             escalations: Vec::new(),
+            human_wait_ms: 0,
         }
+    }
+
+    /// Time the run has been supervised: wall time since creation, minus time spent
+    /// waiting for a human. This is the elapsed time `overall_timeout` is measured
+    /// against.
+    #[must_use]
+    pub fn supervised_elapsed(&self, now: OffsetDateTime) -> std::time::Duration {
+        let wall: std::time::Duration = (now - self.header.created_at)
+            .try_into()
+            .unwrap_or(std::time::Duration::ZERO);
+        wall.saturating_sub(std::time::Duration::from_millis(self.human_wait_ms))
     }
 
     #[must_use]
@@ -200,6 +219,37 @@ mod tests {
         assert_eq!(state.last_seq, EventSeq(0));
         assert!(state.active_worker().is_none());
         assert!(!state.has_open_escalation());
+    }
+
+    #[test]
+    fn human_wait_is_subtracted_from_supervised_elapsed() {
+        let mut state = RunState::new(header(), FactoryStatus::Running);
+        let later = datetime!(2026-01-01 01:00:00 UTC);
+        assert_eq!(
+            state.supervised_elapsed(later),
+            std::time::Duration::from_secs(3600)
+        );
+        state.human_wait_ms = 2_400_000;
+        assert_eq!(
+            state.supervised_elapsed(later),
+            std::time::Duration::from_secs(1200)
+        );
+        // More waiting than elapsed (clock skew) saturates rather than underflowing.
+        state.human_wait_ms = u64::MAX;
+        assert_eq!(state.supervised_elapsed(later), std::time::Duration::ZERO);
+    }
+
+    #[test]
+    fn a_snapshot_without_human_wait_loads_as_zero() -> Result<(), Box<dyn std::error::Error>> {
+        let state = RunState::new(header(), FactoryStatus::Running);
+        let mut value = serde_json::to_value(&state)?;
+        value
+            .as_object_mut()
+            .ok_or("an object")?
+            .remove("human_wait_ms");
+        let loaded: RunState = serde_json::from_value(value)?;
+        assert_eq!(loaded.human_wait_ms, 0);
+        Ok(())
     }
 
     #[test]

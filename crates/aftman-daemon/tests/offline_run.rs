@@ -298,7 +298,9 @@ async fn the_run_reports_running_then_assessing_rather_than_jumping()
     Ok(())
 }
 
-#[tokio::test]
+// Virtual time: the 5 ms ticker and the 120 ms worker are both on the paused tokio
+// clock, so the number of ticks inside the worker's lifetime is fixed, not a race.
+#[tokio::test(start_paused = true)]
 async fn a_silent_worker_does_not_burn_the_assessment_budget()
 -> Result<(), Box<dyn std::error::Error>> {
     // The regression the design review caught: with a single short ticker and no
@@ -535,7 +537,7 @@ impl DecisionModel for CountingModel {
     }
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn skipped_cycles_do_not_reach_the_model() -> Result<(), Box<dyn std::error::Error>> {
     let h = harness()?;
     let model = Arc::new(CountingModel::new());

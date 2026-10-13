@@ -202,7 +202,13 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
         return PolicyDecision {
             selected: Directive::Escalate {
                 reason: "assessment budget exhausted".into(),
-                ask: "Supervision has used its whole assessment budget for this run.".into(),
+                ask: format!(
+                    "The assessment budget ({} model calls) is spent, so aftman will not ask the \
+                     model again for this run. Stop ends the run. Any other answer lets the \
+                     worker continue without model supervision, and this question will be \
+                     raised again at the next cycle.",
+                    input.config.max_assessments
+                ),
             },
             considered: proposals.to_vec(),
             suppressed,

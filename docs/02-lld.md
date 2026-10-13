@@ -259,7 +259,11 @@ pub struct RunHeader { pub id: RunId, pub created_at: OffsetDateTime, pub job: J
 pub struct RunState { pub header: RunHeader, pub status: FactoryStatus,
     pub last_seq: EventSeq, pub counters: Counters, pub workers: Vec<WorkerRecord>,
     pub checks: BTreeMap<CheckKey, ResolvedCheck>, pub last_directive: Option<Directive>,
-    pub escalations: Vec<Escalation> }
+    pub escalations: Vec<Escalation>,
+    /// Milliseconds spent in `NeedsHuman` with a control channel attached (§7.1). Subtracted
+    /// from elapsed time wherever `overall_timeout` is evaluated. `#[serde(default)]`; lives
+    /// here and not in `Counters`, which is serialized into the model-facing observation.
+    pub human_wait_ms: u64 }
 pub struct RunSummary { pub id: RunId, pub status: FactoryStatus, pub created_at: OffsetDateTime,
     pub elapsed: Duration, pub job_excerpt: String, pub repo: PathBuf,
     pub worker: WorkerKind, pub last_directive: Option<Directive> }
@@ -288,7 +292,13 @@ pub struct Budget { pub pair_bytes: usize, pub request_bytes: usize,
 // ---- worker runtime ---------------------------------------------------
 pub struct WorkerEnv(Vec<(String, String)>);   // built only by worker_environment()
 pub struct SteerRecord { pub at: OffsetDateTime, pub message_excerpt: String,
-    pub outcome: SteerOutcome, pub queue_depth: Option<u32> }
+    pub outcome: SteerOutcome, pub queue_depth: Option<u32>,
+    /// `#[serde(default)]` = `Supervisor`, so older snapshots load.
+    pub source: SteerSource }
+/// Only `Supervisor` steers count against `max_steers_per_worker`: `WorkerRecord::steer_count()`
+/// (what policy reads) excludes `Human` ones, and a human steer does not increment
+/// `counters.steers_sent`. An operator's guidance must not use up the supervisor's budget.
+pub enum   SteerSource { Supervisor, Human }
 pub enum   WorkerOutcome { Completed, Failed { code: Option<i32> }, TimedOut,
     Terminated(TerminateReason), StreamError(String) }
 pub struct WorkerEventSink { /* sends WorkerSignal; see §7.1 */ }
@@ -499,8 +509,46 @@ didn't it stop?" is always answerable from the log.
         └──► Cancel  ──► Cancelled
 ```
 
-Terminal states: `Finished`, `Failed`, `Cancelled`. `NeedsHuman` is a wait state with its own
-timeout (default: none; `--escalation-timeout` optional).
+Terminal states: `Finished`, `Failed`, `Cancelled`. `NeedsHuman` is a wait state. A timeout of its
+own (default: none; `--escalation-timeout` optional) is **M7 and not implemented**: today a parked run
+waits for an answer, a cancel, or for every control handle to be dropped.
+
+**`NeedsHuman` is a wait only when something can answer.** With a control channel attached
+(`FactoryRuntime::drive(started, Some(control))`, §7.1) the run parks: no assessment cycles, no model
+calls, no `AssessmentSkippedUnchanged` events, and the task sleeps on its channels rather than
+polling. It leaves `NeedsHuman` only by an answer (`Accept`/`Recheck`/`ClaimComplete`/`Guidance` →
+`Running`; `Stop` → `Cancelled`) or a cancel. A worker that completes meanwhile is still folded
+into state. If every control handle is dropped while parked, the run ends as it does with no
+channel at all (the `--no-daemon` path): `NeedsHuman` ends the run with the question recorded.
+Time spent parked is accumulated in `RunState.human_wait_ms` and **excluded from
+`overall_timeout`**, wherever it is evaluated (the post-cycle check, `time_driven_check_due`,
+the observation's `elapsed_secs` that policy reads). `worker_timeout` is the backend's own and
+is unaffected.
+
+**Runtime API.** `FactoryRuntime::start(job) -> StartedRun` validates the repository and persists the
+run (store header, `RunCreated`, a first snapshot) before any supervision, so a caller knows the
+`RunId` and the run is addressable; a bad repository fails here, before any run state exists.
+`drive(started, Option<ControlReceiver>) -> RunOutcome` then supervises it. `run(job)` is
+`start` + `drive(.., None)`. A `RunControl` (`steer`, `cancel`, `answer`; cheap to clone) is created
+with `RunControl::channel()`.
+
+**No worker outlives its run.** Whenever `drive` returns, and whenever a cancel or stop reply
+is sent, no worker process of the run is alive or can still come alive. Every path that ends a worker
+(cancel, human `Stop`, `Directive::Stop`, supersede on `Retry`, every handle dropped while parked, the
+no-channel `NeedsHuman` end, `Finished`/`Failed` with a worker live, and error returns) goes through one
+`stop_worker`: it keeps the worker task's `JoinHandle`, calls `Worker::terminate` and **re-issues it
+every 50 ms until the task reports** (a terminate that arrives before the backend has launched is a
+no-op, so a single call can be missed), aborts the task after 30 s (backends kill their process group
+when dropped), and only then flushes the final output and records the end. A new worker is never
+started before the old one is reaped. A completion already in the channel wins over a termination.
+`max_assessments` is a hard ceiling: once spent the model is not asked again (policy gets an empty
+check set and its budget invariant escalates; `BudgetExceeded` is emitted), however the run was
+resumed. A human steer is debounced like activity: it marks a cycle pending for the next
+`min_assessment_interval` boundary instead of forcing one.
+
+**Cancel is legal from every non-terminal state**, including `NeedsHuman` and `Stopped`. It
+terminates the active worker with `TerminateReason::Cancelled`, emits `WorkerTerminated`
+(`cause: "cancelled"`, `reason`), and `RunFinished` carries the same `reason`.
 
 **`Stopped` is a state, not a terminal one.** `Stop` terminates the active worker; it does not end
 the run. The factory sits in `Stopped` with no active worker, and on the next cycle
@@ -544,11 +592,23 @@ Variant notes, because three of these were previously cited in prose without exi
   because a rate limit and a malformed answer are different operational events and the UI shows
   them differently. `Error` remains for internal faults only.
 
+Payloads added for the control plane (every payload also carries `schema_version`):
+
+| Kind | Fields |
+| --- | --- |
+| `WorkerOutput` | `worker_id`, `text` (only the bytes that arrived since the previous flush, at most `WORKER_OUTPUT_EVENT_CAP_BYTES` = 8192, newest kept, cut on a character boundary), `bytes` (how many new bytes arrived), `truncated` (`bytes` > `text` length), `exit` (the worker's final flush). Never emitted empty, so **the end of a worker is signalled by `WorkerCompleted` / `WorkerTerminated`, not by the presence of an `exit: true` output event** (a worker whose last bytes were already flushed has none). Every path that ends a worker (completion, cancel, `Stop`, supersede, run end) reaps it and then flushes what remains. Deliberately left out of the event summaries fed to the model: summaries carry no payload text, and output must not be echoed into the model-facing history through the log. |
+| `WorkerSteered` | `source` (`supervisor` \| `human`), `worker_id`, `outcome`, `accepted`, and for a human steer `excerpt` (≤ 200 chars). |
+| `WorkerTerminated` | Uniform: `worker_id`, `cause` (`stopped` for a `Stop` directive, `cancelled`, `superseded` for a `Retry`, `run_ended` when the run ended with a worker still live), `reason`. A worker that had already completed when its stop was seen is recorded by `WorkerCompleted` instead. |
+| `EscalationRaised` | `escalation_id` (what `run.answer` needs), `kind`, `reason`, `ask`. |
+| `EscalationAnswered` | `escalation_id`, `surface`, `decision` (the serialized `HumanDecision`), `note` (≤ 2000 chars). |
+| `Notification` (`code: "guidance_not_delivered"`) | A `Guidance` answer with no active worker to receive it; recorded, not an error. |
+| `RunFinished` | `status`, counts, and `reason` when something stated one (a cancel's reason, `"stopped by operator"`). |
+
 Rules:
 
 - events are *immutable*; corrections are new events;
 - `WorkerOutput` is **not** written per line. Output is buffered and flushed as one event per
-  observation cycle (plus one on worker exit). This keeps the log proportional to decisions
+  observation cycle (plus one on worker exit), and only when new bytes arrived. This keeps the log proportional to decisions
   rather than to agent verbosity;
 - aftman-generated events never enter the assessment queue;
 - every event carries a `schema_version` inside `payload`.
@@ -559,7 +619,7 @@ An earlier revision said a cycle begins when "a worker event enters the queue", 
 `WorkerOutput` is only flushed *at* a cycle. That is circular, and would have meant the supervisor
 slept until the worker exited — defeating the entire premise of supervising work in flight.
 
-The watcher selects over three sources, and persisted events are an *output* of a cycle, not its
+The watcher selects over four sources, and persisted events are an *output* of a cycle, not its
 input:
 
 | Source | Purpose |
@@ -567,6 +627,21 @@ input:
 | **Activity channel** (`tokio::mpsc`, unpersisted) | Signalled by each stdout/stderr chunk as `BoundedLog` absorbs it. Cheap, lossy, coalesced. |
 | **Lifecycle channel** | `WorkerStarted`, `WorkerCompleted`, `WorkerSteered`, `WorkerTerminated`. Completion forces an immediate cycle. |
 | **Idle ticker** | `idle_poll_interval` (default 30s), deliberately **not** `min_assessment_interval`. Guarantees forward progress for a silent worker without burning the assessment budget. |
+| **Control channel** | Bounded `tokio::mpsc` of `steer` / `cancel` / `answer` requests from a `RunControl` handle, each carrying a `oneshot` reply. Optional: absent for `run()` / `--no-daemon`. |
+
+The control channel is **drained without blocking at the top of every iteration**, for the same
+reason as the completion channel (below), and is also an arm of the wait `select!`, so an idle run
+reacts immediately. A request is applied between cycles, never inside one (a model call in flight
+is not interrupted), and its reply is sent only after the effect is applied **and persisted**. A
+request to a run that has ended gets `ControlError::RunEnded` (the loop dropped the reply slot), never
+a hang. A human steer invalidates the observation digest and requests a cycle: it "does not skip
+the assessment loop" ([07-surfaces.md §10](07-surfaces.md)).
+
+`ControlError` is what the protocol layer maps to the §11 codes: `WrongState(msg)` →
+`wrong_state`; `RunEnded` / `UnknownEscalation` → `unknown_run` / `wrong_state` as the method
+dictates; `Invalid(msg)` → `invalid_config`; `Internal(msg)` → `internal`. A backend that
+refuses or cannot take a human steer is a successful reply carrying `Rejected` / `Unsupported`
+(the protocol layer turns `Unsupported` into `steering_unsupported` if it wants a hard error).
 
 Debounce rules:
 
@@ -587,9 +662,13 @@ Debounce rules:
     because that serializes `elapsed`, the digest changed on every tick, making the skip dead code
     and letting a silent worker burn the whole assessment budget anyway;
   - `time_driven_check_due` is true when a time-based boundary will trip within the next tick:
-    `overall_timeout`, `worker_timeout`, the steering grace window, or an escalation timeout.
+    `overall_timeout`, `worker_timeout`, the steering grace window, or (M7, not built) an escalation timeout.
     Without this, the skip could suppress the one cycle that would notice a timeout;
   - a skipped cycle records `AssessmentSkippedUnchanged` and consumes no assessment budget;
+- while parked in `NeedsHuman` there is no cycle to flush on, so `WorkerOutput` is flushed on the
+  **idle interval** instead (at most once per `idle_poll_interval`). This is the one stated exception
+  to "the log is proportional to decisions": a chatty worker under a parked run costs one event per
+  idle interval, not one per debounce interval;
 - `WorkerOutput` is flushed only when new bytes actually arrived, so an idle tick never emits an
   empty output event;
 - a worker-completion event always forces an immediate cycle, regardless of the interval, after

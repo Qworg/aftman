@@ -65,6 +65,34 @@ pub enum TerminateReason {
     Superseded,
 }
 
+/// Who originated a steer.
+///
+/// Only [`SteerSource::Supervisor`] steers count against `max_steers_per_worker`: that
+/// budget bounds how often *aftman's own policy* may interrupt a worker, and an
+/// operator typing guidance must not use it up.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum SteerSource {
+    /// A directive chosen by policy. The default, so snapshots written before this
+    /// field existed load unchanged.
+    #[default]
+    Supervisor,
+    /// A person, through `run.steer` or a `Guidance` answer.
+    Human,
+}
+
+impl SteerSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Supervisor => "supervisor",
+            Self::Human => "human",
+        }
+    }
+}
+
 /// One delivered steering attempt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SteerRecord {
@@ -73,6 +101,8 @@ pub struct SteerRecord {
     pub message_excerpt: String,
     pub outcome: SteerOutcome,
     pub queue_depth: Option<u32>,
+    #[serde(default)]
+    pub source: SteerSource,
 }
 
 /// How a worker run ended.
@@ -250,11 +280,24 @@ impl WorkerRecord {
         }
     }
 
+    /// Accepted steers that count against the supervisor's steer budget.
+    ///
+    /// Human steers are excluded: policy compares this to `max_steers_per_worker`.
     #[must_use]
     pub fn steer_count(&self) -> u32 {
+        self.accepted_steers(SteerSource::Supervisor)
+    }
+
+    /// Accepted steers an operator delivered to this worker.
+    #[must_use]
+    pub fn human_steer_count(&self) -> u32 {
+        self.accepted_steers(SteerSource::Human)
+    }
+
+    fn accepted_steers(&self, source: SteerSource) -> u32 {
         self.steers
             .iter()
-            .filter(|s| s.outcome.is_accepted())
+            .filter(|s| s.source == source && s.outcome.is_accepted())
             .count()
             .try_into()
             .unwrap_or(u32::MAX)
@@ -402,9 +445,43 @@ mod tests {
                 message_excerpt: "x".into(),
                 outcome,
                 queue_depth: None,
+                source: super::SteerSource::Supervisor,
             });
         }
         assert_eq!(record.steer_count(), 1, "only the accepted steer counts");
+    }
+
+    #[test]
+    fn human_steers_do_not_count_against_the_supervisor_budget() {
+        let mut record = WorkerRecord::new(
+            WorkerId::new(),
+            WorkerKind::Simulated,
+            crate::job::TaskKind::Code,
+            "do the thing",
+            BoundedLog::new(16, 16),
+            true,
+        );
+        let at = datetime!(2026-01-01 00:00:00 UTC);
+        for source in [super::SteerSource::Human, super::SteerSource::Human] {
+            record.steers.push(super::SteerRecord {
+                at,
+                message_excerpt: "x".into(),
+                outcome: SteerOutcome::Queued,
+                queue_depth: None,
+                source,
+            });
+        }
+        assert_eq!(record.steer_count(), 0);
+        assert_eq!(record.human_steer_count(), 2);
+    }
+
+    #[test]
+    fn a_steer_record_without_a_source_loads_as_supervisor() -> Result<(), serde_json::Error> {
+        let old = r#"{"at":"2026-01-01T00:00:00Z","message_excerpt":"x",
+            "outcome":{"outcome":"queued"},"queue_depth":null}"#;
+        let record: super::SteerRecord = serde_json::from_str(old)?;
+        assert_eq!(record.source, super::SteerSource::Supervisor);
+        Ok(())
     }
 
     #[test]

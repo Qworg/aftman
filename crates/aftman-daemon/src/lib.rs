@@ -10,16 +10,18 @@
 
 #![forbid(unsafe_code)]
 
+pub mod control;
 pub mod hub;
 pub mod obs;
 pub mod protocol;
 pub mod runtime;
 pub mod sink;
 
+pub use control::{ControlError, ControlReceiver, RunControl};
 pub use hub::{EventHub, HubConfig, Lagged, SubscribeError, Subscription};
 pub use obs::{ObsCaps, ObservationBuilder, parse_test_summaries};
 pub use runtime::{
-    FactoryRuntime, RunOutcome, RuntimeDeps, RuntimeError, code_mission, default_margin,
-    verify_mission,
+    FactoryRuntime, RunOutcome, RuntimeDeps, RuntimeError, StartedRun, code_mission,
+    default_margin, verify_mission,
 };
 pub use sink::{EventSink, MultiSink, NullSink, VecSink};

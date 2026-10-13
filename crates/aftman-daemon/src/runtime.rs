@@ -21,9 +21,9 @@ use std::time::Duration;
 
 use serde_json::json;
 use time::OffsetDateTime;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
-use aftman_core::assessment::{ResolvedCheck, Rung};
+use aftman_core::assessment::{HumanDecision, ResolvedCheck, Rung};
 use aftman_core::clock::Clock;
 use aftman_core::definitions::DefinitionSet;
 use aftman_core::directive::{Directive, Invariant, Proposal, SuppressionReason};
@@ -38,13 +38,14 @@ use aftman_core::observation::{EventSummary, Observation};
 use aftman_core::policy::{PolicyInput, arbitrate};
 use aftman_core::responsibility::ResponsibilityRegistry;
 use aftman_core::routing;
-use aftman_core::run::{Escalation, EscalationKind, RunHeader, RunState};
+use aftman_core::run::{AnsweredEscalation, Escalation, EscalationKind, RunHeader, RunState};
 use aftman_core::worker::{
-    SteerOutcome, SteerRecord, TerminateReason, Worker, WorkerCtx, WorkerEventSink, WorkerOutcome,
-    WorkerRecord, WorkerSignal,
+    SteerOutcome, SteerRecord, SteerSource, TerminateReason, Worker, WorkerCtx, WorkerError,
+    WorkerEventSink, WorkerOutcome, WorkerRecord, WorkerSignal,
 };
 use aftman_store::{RunStore, StoreError};
 
+use crate::control::{ControlError, ControlMessage, ControlReceiver};
 use crate::obs::ObservationBuilder;
 use crate::sink::EventSink;
 
@@ -84,7 +85,7 @@ pub enum RuntimeError {
     Model(#[from] ModelError),
 
     #[error("worker error: {0}")]
-    Worker(#[from] aftman_core::worker::WorkerError),
+    Worker(#[from] WorkerError),
 
     #[error("illegal status transition: {0}")]
     Transition(#[from] TransitionError),
@@ -104,6 +105,149 @@ pub struct RunOutcome {
     /// Cycles skipped because the observation content was unchanged.
     pub skipped: u32,
     pub counters: aftman_core::observation::Counters,
+    /// Why the run ended, when something said so: a cancel's reason, or
+    /// `"stopped by operator"`. `None` for a run that simply finished or failed.
+    pub reason: Option<String>,
+}
+
+/// A run that has been persisted but is not yet being supervised.
+///
+/// Returned by [`FactoryRuntime::start`]; consumed by [`FactoryRuntime::drive`].
+pub struct StartedRun {
+    job: Job,
+    state: RunState,
+}
+
+impl StartedRun {
+    #[must_use]
+    pub fn run_id(&self) -> RunId {
+        self.state.header.id
+    }
+
+    #[must_use]
+    pub fn job(&self) -> &Job {
+        &self.job
+    }
+
+    /// The state as persisted by `start`.
+    #[must_use]
+    pub fn state(&self) -> &RunState {
+        &self.state
+    }
+}
+
+/// Longest steer message a human may send, in characters.
+pub const MAX_STEER_CHARS: usize = 8_000;
+/// Longest note stored with an answer, in characters.
+pub const MAX_NOTE_CHARS: usize = 2_000;
+/// Longest cancel reason stored, in characters.
+const MAX_REASON_CHARS: usize = 500;
+/// The most worker output one `WorkerOutput` event carries, in bytes. Anything
+/// beyond is dropped from the front and flagged with `truncated`.
+pub const WORKER_OUTPUT_EVENT_CAP_BYTES: usize = 8_192;
+
+/// The run loop's mutable bookkeeping, gathered so that control handlers can adjust
+/// it (invalidate the digest, request a cycle) without a dozen `&mut` parameters.
+struct Loop {
+    worker: Option<WorkerHandle>,
+    last_directive: Option<Directive>,
+    assessments: u32,
+    skipped: u32,
+    next_assessment_at: tokio::time::Instant,
+    next_idle_at: tokio::time::Instant,
+    /// Earliest next `WorkerOutput` flush while parked in `NeedsHuman`, where no
+    /// cycle exists to flush on.
+    next_flush_at: tokio::time::Instant,
+    // Start with a cycle pending so the first assessment happens immediately
+    // rather than after one idle interval.
+    activity_pending: bool,
+    last_digest: Option<String>,
+    evidence_outcomes: Vec<EvidenceOutcome>,
+    before_finish_ran: bool,
+    /// Wall-clock time the current human wait began.
+    wait_started: Option<OffsetDateTime>,
+    /// A worker completed while the run waited for a human, so its
+    /// `WorkerCompleted` evidence providers have not run yet.
+    completed_while_waiting: bool,
+    finish_reason: Option<String>,
+}
+
+impl Loop {
+    fn new(now: tokio::time::Instant, config: &RunConfig) -> Self {
+        Self {
+            worker: None,
+            last_directive: None,
+            assessments: 0,
+            skipped: 0,
+            next_assessment_at: now,
+            next_idle_at: now + config.idle_poll_interval,
+            next_flush_at: now,
+            activity_pending: true,
+            last_digest: None,
+            evidence_outcomes: Vec::new(),
+            before_finish_ran: false,
+            wait_started: None,
+            completed_while_waiting: false,
+            finish_reason: None,
+        }
+    }
+
+    /// Ask for a fresh assessment as soon as the loop can run one, even if the
+    /// observation looks unchanged.
+    /// Mark a cycle pending without bypassing the debounce window: the cycle runs
+    /// at `next_assessment_at`, which already sits one `min_assessment_interval`
+    /// after the previous cycle. Used for a human steer, so a burst of steers costs
+    /// one assessment, not one each.
+    fn request_assessment_debounced(&mut self) {
+        self.last_digest = None;
+        self.activity_pending = true;
+    }
+
+    fn request_assessment(&mut self, now: tokio::time::Instant) {
+        self.last_digest = None;
+        self.activity_pending = true;
+        self.next_assessment_at = now;
+    }
+}
+
+/// Wait for the next control message; pends forever if no channel is attached.
+/// `None` means the channel closed.
+async fn recv_control(control: &mut Option<ControlReceiver>) -> Option<ControlMessage> {
+    match control {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+fn has_unflushed(handle: &WorkerHandle) -> bool {
+    handle
+        .output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .has_unflushed()
+}
+
+/// Send a reply, and surface a fatal runtime error after telling the caller.
+fn settle<T>(
+    reply: oneshot::Sender<Result<T, ControlError>>,
+    result: Result<Result<T, ControlError>, RuntimeError>,
+) -> Result<(), RuntimeError> {
+    match result {
+        Ok(answer) => {
+            // A caller that stopped waiting is not an error.
+            let _ = reply.send(answer);
+            Ok(())
+        }
+        Err(error) => {
+            let _ = reply.send(Err(ControlError::Internal(error.to_string())));
+            Err(error)
+        }
+    }
+}
+
+/// A prefix of `text` of at most `max` characters.
+fn truncate_chars(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
 }
 
 /// A live worker task.
@@ -112,12 +256,62 @@ struct WorkerHandle {
     outcome: Option<WorkerOutcome>,
 
     signals: mpsc::UnboundedReceiver<WorkerSignal>,
-    done: mpsc::UnboundedReceiver<Result<WorkerOutcome, aftman_core::worker::WorkerError>>,
+    done: mpsc::UnboundedReceiver<Result<WorkerOutcome, WorkerError>>,
     /// The live log the worker streams into. Kept here so the runtime can copy it
     /// into the worker record before every observation — otherwise a running
     /// worker's tail would always read as empty, and the supervisor would be
     /// judging a worker it cannot see.
     output: Arc<Mutex<BoundedLog>>,
+    /// The worker's task, kept so a stop can reap or abort it.
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// Why a worker is being ended; decides the termination reason and the
+/// `WorkerTerminated` payload.
+enum StopWhy<'a> {
+    Cancelled(&'a str),
+    Stopped(&'a str),
+    Superseded,
+    RunEnded(&'a str),
+}
+
+impl StopWhy<'_> {
+    fn terminate_reason(&self) -> TerminateReason {
+        match self {
+            Self::Cancelled(_) => TerminateReason::Cancelled,
+            Self::Stopped(_) | Self::RunEnded(_) => TerminateReason::Stopped,
+            Self::Superseded => TerminateReason::Superseded,
+        }
+    }
+
+    fn cause(&self) -> &'static str {
+        match self {
+            Self::Cancelled(_) => "cancelled",
+            Self::Stopped(_) => "stopped",
+            Self::Superseded => "superseded",
+            Self::RunEnded(_) => "run_ended",
+        }
+    }
+
+    fn reason(&self) -> &str {
+        match self {
+            Self::Cancelled(r) | Self::Stopped(r) | Self::RunEnded(r) => r,
+            Self::Superseded => "superseded",
+        }
+    }
+}
+
+/// How often `terminate` is re-issued to a worker that has not yet reported.
+const REAP_REISSUE: Duration = Duration::from_millis(50);
+/// The longest a stop waits for a worker task before aborting it. Must exceed a
+/// backend's own interrupt-then-kill grace (5 s by default).
+const REAP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The outcome recorded for a worker task that ended without reporting (a panic).
+fn lost_worker_outcome() -> WorkerOutcome {
+    WorkerOutcome::StreamError {
+        message: "worker task ended without reporting a result".to_owned(),
+    }
 }
 
 /// The run loop.
@@ -133,7 +327,11 @@ impl FactoryRuntime {
         Self { deps, builder }
     }
 
-    /// Run one job to a terminal state.
+    /// Run one job to a terminal state, with no control channel attached.
+    ///
+    /// This is the `--no-daemon` path: equivalent to [`FactoryRuntime::start`]
+    /// followed by [`FactoryRuntime::drive`] with `None`, so `NeedsHuman` ends the
+    /// run rather than waiting for an answer nobody can give.
     ///
     /// # Errors
     /// Returns an error only for conditions that make the run impossible to start or
@@ -142,6 +340,20 @@ impl FactoryRuntime {
     /// conservative directive, because a supervisor that dies when its model is
     /// briefly unavailable is worse than one that says so.
     pub async fn run(&self, job: Job) -> Result<RunOutcome, RuntimeError> {
+        let started = self.start(job).await?;
+        self.drive(started, None).await
+    }
+
+    /// Validate the job and persist a new run, without supervising it yet.
+    ///
+    /// On `Ok`, the run id is known, the store header exists, and `RunCreated` has
+    /// been emitted: a caller can answer "which run?" and safely list or subscribe to
+    /// it before [`FactoryRuntime::drive`] begins. A bad repository fails here, before
+    /// any run state exists.
+    ///
+    /// # Errors
+    /// [`RuntimeError::BadRepo`] or a store failure.
+    pub async fn start(&self, job: Job) -> Result<StartedRun, RuntimeError> {
         if !job.repo.is_dir() {
             return Err(RuntimeError::BadRepo(job.repo.display().to_string()));
         }
@@ -164,8 +376,56 @@ impl FactoryRuntime {
             json!({ "repo": job.repo.display().to_string() }),
         )
         .await?;
+        // A snapshot now, so the run is loadable (`run.get`) while it is still routing.
+        self.snapshot(&mut state).await?;
+        Ok(StartedRun { job, state })
+    }
 
-        self.transition(&mut state, FactoryStatus::Routing).await?;
+    /// Supervise a started run to the end.
+    ///
+    /// With `control` attached, the run can be steered, cancelled, and answered while
+    /// it runs, and `NeedsHuman` becomes a *wait* state: no cycles, no model calls,
+    /// until an answer or a cancel arrives. If every [`RunControl`] handle is dropped
+    /// while waiting, the run ends the way [`FactoryRuntime::run`] ends it. Without
+    /// `control`, `NeedsHuman` ends the run.
+    ///
+    /// Control messages are observed at the top of every loop iteration and in the
+    /// wait `select!`; a cycle in progress is never interrupted, and a reply is sent
+    /// only after its effect is applied and persisted. Routing is a model call and
+    /// counts as a cycle in progress.
+    ///
+    /// # Errors
+    /// As [`FactoryRuntime::run`].
+    pub async fn drive(
+        &self,
+        started: StartedRun,
+        control: Option<ControlReceiver>,
+    ) -> Result<RunOutcome, RuntimeError> {
+        let StartedRun { job, mut state } = started;
+        let mut ls = Loop::new(self.instant(), &self.deps.config);
+        let result = self.drive_inner(job, &mut state, &mut ls, control).await;
+        if result.is_err() {
+            // An error return must not leave a worker running against the repository.
+            if let Some(handle) = ls.worker.take() {
+                let _ = self
+                    .stop_worker(&mut state, handle, StopWhy::RunEnded("run failed"))
+                    .await;
+                let _ = self.snapshot(&mut state).await;
+            }
+        }
+        result
+    }
+
+    async fn drive_inner(
+        &self,
+        job: Job,
+        state: &mut RunState,
+        ls: &mut Loop,
+        mut control: Option<ControlReceiver>,
+    ) -> Result<RunOutcome, RuntimeError> {
+        let run_id = state.header.id;
+
+        self.transition(state, FactoryStatus::Routing).await?;
 
         // Routing sees the job text and nothing else, and decides which *conditional*
         // responsibilities participate. It never decides what happens: a routing mistake
@@ -198,7 +458,7 @@ impl FactoryRuntime {
         if let Some(model) = &routing_outcome.model {
             routing_payload["model"] = json!(model);
         }
-        self.emit(&mut state, EventKind::JobRouted, routing_payload)
+        self.emit(state, EventKind::JobRouted, routing_payload)
             .await?;
 
         // The registry is built from what routing activated, so a conditional
@@ -210,41 +470,46 @@ impl FactoryRuntime {
             1,
         )
         .map_err(RuntimeError::Responsibility)?;
-        self.transition(&mut state, FactoryStatus::Running).await?;
-
-        let mut worker: Option<WorkerHandle> = None;
-        let mut last_directive: Option<Directive> = None;
-        let mut assessments: u32 = 0;
-        let mut skipped: u32 = 0;
-        let mut next_assessment_at = self.instant();
-        let mut next_idle_at = self.instant() + self.deps.config.idle_poll_interval;
-        // Start with a cycle pending so the first assessment happens immediately
-        // rather than after one idle interval.
-        let mut activity_pending = true;
-        let mut last_digest: Option<String> = None;
-        let mut evidence_outcomes: Vec<EvidenceOutcome> = Vec::new();
-        let mut before_finish_ran = false;
+        self.transition(state, FactoryStatus::Running).await?;
 
         loop {
-            if let Some(finish) = self.terminal_status(&state) {
+            // ---- control ------------------------------------------------------
+            //
+            // Drained without blocking at the top of every iteration, for the same
+            // reason the completion channel is (LLD §7.1): a cancel observed only in
+            // the wait branch would never be seen by a run whose cycles outlast the
+            // idle interval. It is never observed mid-cycle.
+            self.drain_control(state, &job, ls, &mut control).await?;
+
+            if let Some(finish) = self.terminal_status(state, control.is_some()) {
+                // No exit path may leave a worker of this run alive, and no human wait
+                // may be left open: close both before the run is reported over.
+                self.end_human_wait(state, ls);
+                if let Some(handle) = ls.worker.take() {
+                    self.stop_worker(state, handle, StopWhy::RunEnded(finish.as_str()))
+                        .await?;
+                }
                 let outcome = RunOutcome {
                     run_id,
                     status: finish,
-                    directive: last_directive.unwrap_or(Directive::Continue),
-                    assessments,
-                    skipped,
+                    directive: ls.last_directive.take().unwrap_or(Directive::Continue),
+                    assessments: ls.assessments,
+                    skipped: ls.skipped,
                     counters: state.counters.clone(),
+                    reason: ls.finish_reason.clone(),
                 };
                 // Build the payload before taking the mutable borrow.
-                let payload = json!({
+                let mut payload = json!({
                     "status": finish.as_str(),
-                    "assessments": assessments,
-                    "assessments_skipped": skipped,
+                    "assessments": ls.assessments,
+                    "assessments_skipped": ls.skipped,
                     "workers_run": state.counters.workers_run,
                 });
-                self.emit(&mut state, EventKind::RunFinished, payload)
-                    .await?;
-                self.snapshot(&mut state).await?;
+                if let Some(reason) = &ls.finish_reason {
+                    payload["reason"] = json!(reason);
+                }
+                self.emit(state, EventKind::RunFinished, payload).await?;
+                self.snapshot(state).await?;
                 return Ok(outcome);
             }
 
@@ -256,57 +521,91 @@ impl FactoryRuntime {
             // which a real model call easily does — `idle_due` is true every
             // iteration, the wait branch is never reached, and the completion is
             // never seen. The run then supervises a worker that no longer exists.
-            if let Some(handle) = worker.as_mut() {
-                match handle.done.try_recv() {
-                    Ok(outcome) => handle.outcome = Some(outcome?),
-                    Err(
-                        mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected,
-                    ) => {}
+            if let Some(handle) = ls.worker.as_mut() {
+                if handle.outcome.is_none() {
+                    match handle.done.try_recv() {
+                        Ok(outcome) => handle.outcome = Some(outcome?),
+                        // The task ended without reporting (it panicked). Record a
+                        // failure rather than supervising a worker that is gone.
+                        Err(mpsc::error::TryRecvError::Disconnected) => {
+                            handle.outcome = Some(lost_worker_outcome());
+                        }
+                        Err(mpsc::error::TryRecvError::Empty) => {}
+                    }
                 }
                 while handle.signals.try_recv().is_ok() {
-                    activity_pending = true;
-                    next_assessment_at = self.instant() + self.deps.config.min_assessment_interval;
+                    ls.activity_pending = true;
+                    ls.next_assessment_at =
+                        self.instant() + self.deps.config.min_assessment_interval;
                 }
             }
 
+            // ---- waiting for a human ------------------------------------------
+            //
+            // With a control channel attached, `NeedsHuman` is a wait state: no
+            // cycles, no model calls, no skipped-cycle events. Only a control message,
+            // a worker finishing, or buffered output to flush wakes the loop.
+            if state.status == FactoryStatus::NeedsHuman {
+                ls.wait_started.get_or_insert_with(|| self.now());
+                self.wait_for_human(state, &job, ls, &mut control).await?;
+                continue;
+            }
+
             // ---- wait for a reason to think ---------------------------------
-            let idle_due = self.instant() >= next_idle_at;
-            let activity_due = activity_pending && self.instant() >= next_assessment_at;
-            let worker_finished = worker.as_ref().is_some_and(|w| w.outcome.is_some());
+            let idle_due = self.instant() >= ls.next_idle_at;
+            let activity_due = ls.activity_pending && self.instant() >= ls.next_assessment_at;
+            let worker_finished = ls.worker.as_ref().is_some_and(|w| w.outcome.is_some());
             if !(idle_due || activity_due || worker_finished) {
-                let deadline = if activity_pending {
-                    next_assessment_at
+                let deadline = if ls.activity_pending {
+                    ls.next_assessment_at
                 } else {
-                    next_idle_at
+                    ls.next_idle_at
                 };
                 let wake = tokio::time::sleep_until(deadline);
                 tokio::pin!(wake);
-                match worker.as_mut() {
+                // `Some(None)` is a closed channel, `Some(Some(_))` a message.
+                let mut message: Option<Option<ControlMessage>> = None;
+                match ls.worker.as_mut() {
                     Some(handle) => {
                         tokio::select! {
                             biased;
-                            Some(outcome) = handle.done.recv() => { handle.outcome = Some(outcome?); }
+                            msg = recv_control(&mut control) => { message = Some(msg); }
+                            outcome = handle.done.recv() => {
+                                handle.outcome = Some(match outcome {
+                                    Some(outcome) => outcome?,
+                                    None => lost_worker_outcome(),
+                                });
+                            }
                             Some(_signal) = handle.signals.recv() => {
-                                activity_pending = true;
-                                next_assessment_at = self.instant() + self.deps.config.min_assessment_interval;
+                                ls.activity_pending = true;
+                                ls.next_assessment_at = self.instant() + self.deps.config.min_assessment_interval;
                             }
                             () = &mut wake => {}
                         }
                     }
                     None => {
                         tokio::select! {
+                            biased;
+                            msg = recv_control(&mut control) => { message = Some(msg); }
                             () = &mut wake => {}
                         }
                     }
                 }
+                match message {
+                    Some(Some(message)) => {
+                        self.handle_control(state, &job, ls, message).await?;
+                    }
+                    Some(None) => control = None,
+                    None => {}
+                }
                 continue;
             }
             if idle_due {
-                next_idle_at = self.instant() + self.deps.config.idle_poll_interval;
+                ls.next_idle_at = self.instant() + self.deps.config.idle_poll_interval;
             }
             // Coalesce: this cycle consumes the pending activity.
-            activity_pending = false;
-            next_assessment_at = self.instant() + self.deps.config.min_assessment_interval;
+            ls.activity_pending = false;
+            ls.next_assessment_at = self.instant() + self.deps.config.min_assessment_interval;
 
             let forced = worker_finished;
 
@@ -316,30 +615,34 @@ impl FactoryRuntime {
             // `worker_finished` would never become true again, so the run would
             // spin on the idle ticker forever making no progress.
             let mut just_finished = false;
-            if let Some(handle) = worker.as_mut() {
+            if let Some(handle) = ls.worker.as_mut() {
                 if let Some(outcome) = handle.outcome.take() {
-                    self.finish_worker(&mut state, handle.id, &outcome, handle)
+                    self.finish_worker(state, handle.id, &outcome, handle)
                         .await?;
                     state.counters.failures += u32::from(!outcome.is_success());
                     just_finished = true;
                 }
             }
             if just_finished {
-                worker = None;
+                ls.worker = None;
                 // Run the evidence providers that are due now, *before* the cycle that
                 // judges the worker. This is what turns the agent's "3 passed" into a
                 // measurement rather than a claim.
                 self.collect_evidence(
-                    &mut state,
+                    state,
                     &job,
                     RunWhen::WorkerCompleted,
-                    &mut evidence_outcomes,
+                    &mut ls.evidence_outcomes,
                 )
                 .await?;
             }
-            // A still-running worker's live output must reach the observation.
-            if let Some(handle) = worker.as_ref() {
-                self.sync_output(&mut state, handle);
+            // A still-running worker's live output must reach the observation, and
+            // be flushed to the log as one `WorkerOutput` event for this cycle (only
+            // if new bytes arrived). Flush first: the record's copy of the log is
+            // taken after, so it carries no stale unflushed count.
+            if let Some(handle) = ls.worker.as_ref() {
+                self.flush_output(state, handle, false).await?;
+                self.sync_output(state, handle);
             }
 
             // ---- gather evidence --------------------------------------------
@@ -352,11 +655,11 @@ impl FactoryRuntime {
             let event_summaries = self.recent_event_summaries(run_id).await;
             let most_recent = state.workers.last().cloned();
             let observation = self.builder.build(
-                &state,
+                state,
                 &job,
                 most_recent.as_ref(),
                 event_summaries,
-                &evidence_outcomes,
+                &ls.evidence_outcomes,
                 self.now(),
             );
 
@@ -364,28 +667,27 @@ impl FactoryRuntime {
             let digest = observation.content_digest();
             if self.deps.config.skip_unchanged_assessments
                 && !forced
-                && last_digest.as_deref() == Some(digest.as_str())
-                && !self.time_driven_check_due(&state)
+                && ls.last_digest.as_deref() == Some(digest.as_str())
+                && !self.time_driven_check_due(state)
             {
-                skipped = state.counters.assessments_skipped + 1;
-                state.counters.assessments_skipped = skipped;
+                ls.skipped = state.counters.assessments_skipped + 1;
+                state.counters.assessments_skipped = ls.skipped;
                 self.emit(
-                    &mut state,
+                    state,
                     EventKind::AssessmentSkippedUnchanged,
                     json!({ "digest": digest }),
                 )
                 .await?;
                 continue;
             }
-            last_digest = Some(digest);
+            ls.last_digest = Some(digest);
 
             // A judgement is formed in `Assessing`, not in `Running`. The state
             // machine encodes this deliberately: `Running -> Finished` is not a legal
             // transition, because a run must pass through the state where the
             // question was asked. `apply` returns it to `Running` afterwards.
             if state.status == FactoryStatus::Running {
-                self.transition(&mut state, FactoryStatus::Assessing)
-                    .await?;
+                self.transition(state, FactoryStatus::Assessing).await?;
             }
 
             // ---- ask the model ----------------------------------------------
@@ -398,72 +700,94 @@ impl FactoryRuntime {
             let state_json = observation.state_for(&aftman_core::observation::default_evidence());
 
             self.emit(
-                &mut state,
+                state,
                 EventKind::AssessmentRequested,
                 json!({ "questions": questions.keys().map(ToString::to_string).collect::<Vec<_>>() }),
             )
             .await?;
 
-            let (checks, model_name, usage) = match self
-                .deps
-                .model
-                .ask(
-                    &aftman_core::model::AskContext::for_run(
-                        Purpose::Assessment,
-                        run_id,
-                        aftman_core::ids::AssessmentSeq(assessments.into()),
-                    ),
-                    &state_json,
-                    &questions,
-                    &aftman_core::model::Budget::default(),
+            // `max_assessments` is a hard ceiling: once it is spent the model is not
+            // asked again, however the run got here. Policy is handed an empty check
+            // set, exactly as on a model failure, and its budget invariant escalates.
+            let budget_spent = ls.assessments >= self.deps.config.max_assessments;
+            if budget_spent {
+                self.emit(
+                    state,
+                    EventKind::BudgetExceeded,
+                    json!({ "max_assessments": self.deps.config.max_assessments }),
                 )
-                .await
-            {
-                Ok(answers) => {
-                    state.counters.consecutive_model_failures = 0;
-                    let resolved = aftman_core::model::resolve_checks(
-                        &answers,
-                        &keys,
-                        self.deps.uncertainty_margin,
-                        self.deps.ensemble_enabled,
-                    );
-                    (resolved, answers.model, answers.usage)
-                }
-                Err(error) => {
-                    state.counters.consecutive_model_failures += 1;
-                    // A rate limit is a different operational event from a malformed
-                    // answer, and the UI shows them differently, so they are distinct
-                    // event kinds rather than one `Error` with a code inside.
-                    let kind = if matches!(error, ModelError::RateLimited { .. }) {
-                        EventKind::RateLimited
-                    } else {
-                        EventKind::ModelError
-                    };
-                    self.emit(
-                        &mut state,
-                        kind,
-                        json!({
-                            "code": error.code(),
-                            "message": error.to_string(),
-                            "retryable": error.is_retryable(),
-                        }),
+                .await?;
+            }
+            let (checks, model_name, usage) = if budget_spent {
+                (
+                    BTreeMap::new(),
+                    "budget_exhausted".to_owned(),
+                    usage_default(),
+                )
+            } else {
+                match self
+                    .deps
+                    .model
+                    .ask(
+                        &aftman_core::model::AskContext::for_run(
+                            Purpose::Assessment,
+                            run_id,
+                            aftman_core::ids::AssessmentSeq(ls.assessments.into()),
+                        ),
+                        &state_json,
+                        &questions,
+                        &aftman_core::model::Budget::default(),
                     )
-                    .await?;
-                    // No guesses: an empty check set can only produce conservative
-                    // directives.
-                    (BTreeMap::new(), "unavailable".to_owned(), usage_default())
+                    .await
+                {
+                    Ok(answers) => {
+                        state.counters.consecutive_model_failures = 0;
+                        let resolved = aftman_core::model::resolve_checks(
+                            &answers,
+                            &keys,
+                            self.deps.uncertainty_margin,
+                            self.deps.ensemble_enabled,
+                        );
+                        (resolved, answers.model, answers.usage)
+                    }
+                    Err(error) => {
+                        state.counters.consecutive_model_failures += 1;
+                        // A rate limit is a different operational event from a malformed
+                        // answer, and the UI shows them differently, so they are distinct
+                        // event kinds rather than one `Error` with a code inside.
+                        let kind = if matches!(error, ModelError::RateLimited { .. }) {
+                            EventKind::RateLimited
+                        } else {
+                            EventKind::ModelError
+                        };
+                        self.emit(
+                            state,
+                            kind,
+                            json!({
+                                "code": error.code(),
+                                "message": error.to_string(),
+                                "retryable": error.is_retryable(),
+                            }),
+                        )
+                        .await?;
+                        // No guesses: an empty check set can only produce conservative
+                        // directives.
+                        (BTreeMap::new(), "unavailable".to_owned(), usage_default())
+                    }
                 }
             };
 
-            assessments += 1;
-            state.counters.assessments = assessments;
+            if !budget_spent {
+                ls.assessments += 1;
+            }
+            state.counters.assessments = ls.assessments;
 
             // ---- record the assessment --------------------------------------
             self.emit(
-                &mut state,
+                state,
                 EventKind::AssessmentCompleted,
                 json!({
-                    "assessment_seq": assessments,
+                    "assessment_seq": ls.assessments,
                     "model": model_name,
                     "input_tokens": usage.input_tokens,
                     "output_tokens": usage.output_tokens,
@@ -483,6 +807,9 @@ impl FactoryRuntime {
             .await?;
 
             // ---- arbitrate ---------------------------------------------------
+            // Policy reads `state.counters`, so the elapsed figure its timeout invariant
+            // compares must be current there too (supervised time: human waits excluded).
+            state.counters.elapsed_secs = state.supervised_elapsed(self.now()).as_secs();
             let proposals = {
                 let input = PolicyInput {
                     status: state.status,
@@ -492,7 +819,7 @@ impl FactoryRuntime {
                     observation: &observation,
                     now: self.now(),
                     active_worker: state.active_worker(),
-                    last_directive: last_directive.as_ref(),
+                    last_directive: ls.last_directive.as_ref(),
                     ensemble_enabled: self.deps.ensemble_enabled,
                     steering_grace: self.deps.steering_grace,
                 };
@@ -508,7 +835,7 @@ impl FactoryRuntime {
                     observation: &observation,
                     now: self.now(),
                     active_worker: state.active_worker(),
-                    last_directive: last_directive.as_ref(),
+                    last_directive: ls.last_directive.as_ref(),
                     ensemble_enabled: self.deps.ensemble_enabled,
                     steering_grace: self.deps.steering_grace,
                 };
@@ -519,7 +846,7 @@ impl FactoryRuntime {
             // baseline resolution, and the invariant list is still reported so the
             // log shows what the band would have done.
             self.emit(
-                &mut state,
+                state,
                 EventKind::EnsembleResolved,
                 json!({
                     "enabled": self.deps.ensemble_enabled,
@@ -532,7 +859,7 @@ impl FactoryRuntime {
 
             for proposal in &decision.considered {
                 self.emit(
-                    &mut state,
+                    state,
                     EventKind::DirectiveProposed,
                     json!({
                         "responsibility": proposal.responsibility.to_string(),
@@ -544,7 +871,7 @@ impl FactoryRuntime {
                 .await?;
             }
             self.emit(
-                &mut state,
+                state,
                 EventKind::DirectiveSelected,
                 json!({
                     "directive": decision.selected.name(),
@@ -564,7 +891,7 @@ impl FactoryRuntime {
             .await?;
 
             state.checks = checks;
-            state.counters.assessments = assessments;
+            state.counters.assessments = ls.assessments;
             state.last_directive = Some(decision.selected.clone());
 
             // ---- apply -------------------------------------------------------
@@ -574,41 +901,46 @@ impl FactoryRuntime {
             // again, rather than finishing on a claim.
             let selected = decision.selected.clone();
             if matches!(selected, Directive::Finish { .. })
-                && !before_finish_ran
+                && !ls.before_finish_ran
                 && !self.deps.evidence.due(RunWhen::BeforeFinish).is_empty()
             {
-                before_finish_ran = true;
+                ls.before_finish_ran = true;
                 self.collect_evidence(
-                    &mut state,
+                    state,
                     &job,
                     RunWhen::BeforeFinish,
-                    &mut evidence_outcomes,
+                    &mut ls.evidence_outcomes,
                 )
                 .await?;
                 state.last_directive = Some(selected.clone());
-                last_directive = Some(selected);
+                ls.last_directive = Some(selected);
                 // The observation has changed, so the digest must not suppress the
                 // re-assessment.
-                last_digest = None;
-                next_assessment_at = self.instant();
-                activity_pending = true;
-                self.snapshot(&mut state).await?;
+                ls.last_digest = None;
+                ls.next_assessment_at = self.instant();
+                ls.activity_pending = true;
+                self.snapshot(state).await?;
                 continue;
             }
 
-            worker = self
-                .apply(&mut state, &job, selected, worker, &observation)
+            ls.worker = self
+                .apply(state, &job, selected, ls.worker.take(), &observation)
                 .await?;
             // A directive that neither ended the run nor parked it leaves the run
             // supervising, so return to `Running`.
             if state.status == FactoryStatus::Assessing {
-                self.transition(&mut state, FactoryStatus::Running).await?;
+                self.transition(state, FactoryStatus::Running).await?;
             }
-            last_directive = Some(decision.selected.clone());
-            self.snapshot(&mut state).await?;
+            ls.last_directive = Some(decision.selected.clone());
+            if state.status == FactoryStatus::NeedsHuman {
+                // Time from here until an answer does not count against the overall
+                // timeout (only meaningful with a control channel attached).
+                ls.wait_started.get_or_insert_with(|| self.now());
+            }
+            self.snapshot(state).await?;
 
-            if self.timeout_exceeded(&state) {
-                self.transition(&mut state, FactoryStatus::Failed).await?;
+            if !state.status.is_terminal() && self.timeout_exceeded(state) {
+                self.transition(state, FactoryStatus::Failed).await?;
             }
         }
     }
@@ -623,9 +955,10 @@ impl FactoryRuntime {
         self.deps.clock.instant()
     }
 
+    /// Whether `overall_timeout` has passed. Time spent waiting for a human is not
+    /// counted (`RunState::human_wait_ms`).
     fn timeout_exceeded(&self, state: &RunState) -> bool {
-        let elapsed = (self.now() - state.header.created_at).unsigned_abs();
-        elapsed >= self.deps.config.overall_timeout
+        state.supervised_elapsed(self.now()) >= self.deps.config.overall_timeout
     }
 
     /// Whether a time-based decision will trip within the next tick.
@@ -634,7 +967,7 @@ impl FactoryRuntime {
     /// approaching is invisible to it. Without this check the digest skip could
     /// suppress the one cycle that would notice the timeout.
     fn time_driven_check_due(&self, state: &RunState) -> bool {
-        let elapsed = (self.now() - state.header.created_at).unsigned_abs();
+        let elapsed = state.supervised_elapsed(self.now());
         let tick = self.deps.config.idle_poll_interval;
         let remaining = self.deps.config.overall_timeout.saturating_sub(elapsed);
         remaining <= tick
@@ -642,16 +975,584 @@ impl FactoryRuntime {
 
     /// A terminal status, or `None` to keep supervising.
     ///
-    /// `NeedsHuman` ends an M0 run: there is no answer channel yet, so the run stops
-    /// with the question recorded rather than proceeding on a guess.
-    fn terminal_status(&self, state: &RunState) -> Option<FactoryStatus> {
+    /// Without a control channel `NeedsHuman` ends the run: nobody can answer, so the
+    /// run stops with the question recorded rather than proceeding on a guess. With
+    /// one attached it is a wait state and the run keeps going.
+    fn terminal_status(&self, state: &RunState, has_control: bool) -> Option<FactoryStatus> {
         if state.status.is_terminal() {
             return Some(state.status);
         }
-        if state.status == FactoryStatus::NeedsHuman {
+        if state.status == FactoryStatus::NeedsHuman && !has_control {
             return Some(FactoryStatus::NeedsHuman);
         }
         None
+    }
+
+    // ---- control plane ------------------------------------------------------
+
+    /// Apply every control message already queued, without waiting for more.
+    async fn drain_control(
+        &self,
+        state: &mut RunState,
+        job: &Job,
+        ls: &mut Loop,
+        control: &mut Option<ControlReceiver>,
+    ) -> Result<(), RuntimeError> {
+        loop {
+            let Some(receiver) = control.as_mut() else {
+                return Ok(());
+            };
+            match receiver.try_recv() {
+                Ok(message) => self.handle_control(state, job, ls, message).await?,
+                Err(mpsc::error::TryRecvError::Empty) => return Ok(()),
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    *control = None;
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    /// Park in `NeedsHuman` until something happens, doing only bookkeeping.
+    ///
+    /// Makes no model call and starts no cycle. A worker that completes is folded
+    /// into state (its completion must not be lost), and buffered worker output is
+    /// flushed at most once per `min_assessment_interval`. With nothing to do the
+    /// task is asleep on the channels, not polling.
+    async fn wait_for_human(
+        &self,
+        state: &mut RunState,
+        job: &Job,
+        ls: &mut Loop,
+        control: &mut Option<ControlReceiver>,
+    ) -> Result<(), RuntimeError> {
+        if ls.worker.as_ref().is_some_and(|w| w.outcome.is_some()) {
+            if let Some(mut handle) = ls.worker.take() {
+                if let Some(outcome) = handle.outcome.take() {
+                    self.finish_worker(state, handle.id, &outcome, &handle)
+                        .await?;
+                    state.counters.failures += u32::from(!outcome.is_success());
+                    ls.completed_while_waiting = true;
+                    self.snapshot(state).await?;
+                }
+            }
+            return Ok(());
+        }
+
+        let unflushed = ls.worker.as_ref().is_some_and(has_unflushed);
+        if unflushed && self.instant() >= ls.next_flush_at {
+            if let Some(handle) = ls.worker.as_ref() {
+                self.flush_output(state, handle, false).await?;
+            }
+            // While parked there are no decisions to be proportional to, so output
+            // is flushed on the (coarse) idle interval, not the debounce interval.
+            ls.next_flush_at = self.instant() + self.deps.config.idle_poll_interval;
+            return Ok(());
+        }
+        let flush_at = unflushed.then_some(ls.next_flush_at);
+        let timer = async move {
+            match flush_at {
+                Some(at) => tokio::time::sleep_until(at).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::pin!(timer);
+
+        enum Wake {
+            Control(Option<ControlMessage>),
+            Done(Option<Result<WorkerOutcome, WorkerError>>),
+            Other,
+        }
+        let wake = match ls.worker.as_mut() {
+            Some(handle) => {
+                tokio::select! {
+                    biased;
+                    message = recv_control(control) => Wake::Control(message),
+                    done = handle.done.recv() => Wake::Done(done),
+                    Some(_signal) = handle.signals.recv() => Wake::Other,
+                    () = &mut timer => Wake::Other,
+                }
+            }
+            None => {
+                tokio::select! {
+                    biased;
+                    message = recv_control(control) => Wake::Control(message),
+                    () = &mut timer => Wake::Other,
+                }
+            }
+        };
+        match wake {
+            Wake::Control(Some(message)) => self.handle_control(state, job, ls, message).await,
+            Wake::Control(None) => {
+                // Every handle is gone: nobody can answer, so end as `run()` would.
+                *control = None;
+                Ok(())
+            }
+            Wake::Done(result) => {
+                if let Some(handle) = ls.worker.as_mut() {
+                    handle.outcome = Some(match result {
+                        Some(result) => result?,
+                        // The worker task vanished without reporting. Treat it as a
+                        // stream failure rather than waiting on it forever.
+                        None => lost_worker_outcome(),
+                    });
+                }
+                Ok(())
+            }
+            Wake::Other => Ok(()),
+        }
+    }
+
+    /// Apply one control message and send its reply.
+    ///
+    /// The reply goes out only after the effect is applied and persisted. A storage
+    /// failure is reported to the caller as `Internal` *and* ends the run, as it
+    /// would anywhere else in the loop.
+    async fn handle_control(
+        &self,
+        state: &mut RunState,
+        job: &Job,
+        ls: &mut Loop,
+        message: ControlMessage,
+    ) -> Result<(), RuntimeError> {
+        match message {
+            ControlMessage::Steer { message, reply } => {
+                let result = self.control_steer(state, ls, &message).await;
+                settle(reply, result)
+            }
+            ControlMessage::Cancel { reason, reply } => {
+                let result = self.control_cancel(state, ls, &reason).await;
+                settle(reply, result)
+            }
+            ControlMessage::Answer {
+                escalation_id,
+                decision,
+                note,
+                surface,
+                reply,
+            } => {
+                let result = self
+                    .control_answer(state, job, ls, escalation_id, decision, &note, &surface)
+                    .await;
+                settle(reply, result)
+            }
+        }
+    }
+
+    async fn control_steer(
+        &self,
+        state: &mut RunState,
+        ls: &mut Loop,
+        message: &str,
+    ) -> Result<Result<SteerOutcome, ControlError>, RuntimeError> {
+        if state.status.is_terminal() {
+            return Ok(Err(ControlError::RunEnded));
+        }
+        if message.trim().is_empty() {
+            return Ok(Err(ControlError::Invalid(
+                "steer message is empty".to_owned(),
+            )));
+        }
+        if message.chars().count() > MAX_STEER_CHARS {
+            return Ok(Err(ControlError::Invalid(format!(
+                "steer message is longer than {MAX_STEER_CHARS} characters"
+            ))));
+        }
+        let Some(outcome) = self.deliver_human_steer(state, ls, message).await? else {
+            return Ok(Err(ControlError::WrongState(format!(
+                "the run has no active worker to steer (status: {})",
+                state.status
+            ))));
+        };
+        // "Does not skip the assessment loop" (docs/07 §10): a steer is new
+        // information, so the next cycle must not be suppressed as unchanged.
+        ls.request_assessment_debounced();
+        self.snapshot(state).await?;
+        Ok(Ok(outcome))
+    }
+
+    async fn control_cancel(
+        &self,
+        state: &mut RunState,
+        ls: &mut Loop,
+        reason: &str,
+    ) -> Result<Result<(), ControlError>, RuntimeError> {
+        if state.status.is_terminal() {
+            return Ok(Err(ControlError::RunEnded));
+        }
+        let reason = if reason.trim().is_empty() {
+            "cancelled by operator".to_owned()
+        } else {
+            truncate_chars(reason, MAX_REASON_CHARS)
+        };
+        self.cancel_run(state, ls, &reason).await?;
+        Ok(Ok(()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn control_answer(
+        &self,
+        state: &mut RunState,
+        job: &Job,
+        ls: &mut Loop,
+        escalation_id: EscalationId,
+        mut decision: HumanDecision,
+        note: &str,
+        surface: &str,
+    ) -> Result<Result<(), ControlError>, RuntimeError> {
+        if state.status.is_terminal() {
+            return Ok(Err(ControlError::RunEnded));
+        }
+        let Some(index) = state
+            .escalations
+            .iter()
+            .position(|e| e.id == escalation_id && e.answered.is_none())
+        else {
+            return Ok(Err(ControlError::UnknownEscalation(escalation_id)));
+        };
+        if state.status != FactoryStatus::NeedsHuman {
+            return Ok(Err(ControlError::WrongState(format!(
+                "the run is not waiting for a human (status: {})",
+                state.status
+            ))));
+        }
+        if let HumanDecision::Guidance { text } = &mut decision {
+            if text.trim().is_empty() {
+                return Ok(Err(ControlError::Invalid(
+                    "guidance text is empty".to_owned(),
+                )));
+            }
+            if text.chars().count() > MAX_STEER_CHARS {
+                return Ok(Err(ControlError::Invalid(format!(
+                    "guidance is longer than {MAX_STEER_CHARS} characters"
+                ))));
+            }
+        }
+        let note = truncate_chars(note, MAX_NOTE_CHARS);
+        let surface = truncate_chars(surface, 32);
+
+        state.escalations[index].answered = Some(AnsweredEscalation {
+            at: self.now(),
+            surface: surface.clone(),
+            decision: decision.clone(),
+            note: note.clone(),
+        });
+        self.emit(
+            state,
+            EventKind::EscalationAnswered,
+            json!({
+                "escalation_id": escalation_id.to_string(),
+                "surface": surface,
+                "decision": serde_json::to_value(&decision).unwrap_or(serde_json::Value::Null),
+                "note": note,
+            }),
+        )
+        .await?;
+
+        // docs/06-ensemble.md "R3 — Human". An answer is an authorization, never a
+        // directive: the only thing a person can cause directly is a stop. Nothing
+        // below can produce `Finish`; `ClaimComplete` only buys a re-measurement, and
+        // the next cycle's policy decision stands on the evidence.
+        match decision {
+            HumanDecision::Stop => {
+                self.cancel_run(state, ls, "stopped by operator").await?;
+            }
+            HumanDecision::Accept => self.resume(state, job, ls, false).await?,
+            HumanDecision::Recheck | HumanDecision::ClaimComplete => {
+                self.resume(state, job, ls, true).await?;
+            }
+            HumanDecision::Guidance { text } => {
+                if self.deliver_human_steer(state, ls, &text).await?.is_none() {
+                    self.emit(
+                        state,
+                        EventKind::Notification,
+                        json!({
+                            "code": "guidance_not_delivered",
+                            "message": "guidance was recorded but there is no active worker to receive it",
+                            "escalation_id": escalation_id.to_string(),
+                        }),
+                    )
+                    .await?;
+                }
+                self.resume(state, job, ls, false).await?;
+            }
+        }
+        self.snapshot(state).await?;
+        Ok(Ok(()))
+    }
+
+    /// Leave `NeedsHuman` for `Running` and arrange an immediate re-assessment.
+    ///
+    /// With `refresh`, re-run the command evidence providers first (the M2
+    /// mechanism; the full R0 rung is M5). `BeforeFinish` providers are not run here:
+    /// they stay behind the gate in front of `Finish`, which a refresh re-arms.
+    async fn resume(
+        &self,
+        state: &mut RunState,
+        job: &Job,
+        ls: &mut Loop,
+        refresh: bool,
+    ) -> Result<(), RuntimeError> {
+        self.end_human_wait(state, ls);
+        self.transition(state, FactoryStatus::Running).await?;
+        if refresh {
+            for trigger in [RunWhen::WorkerCompleted, RunWhen::OnDemand] {
+                self.collect_evidence(state, job, trigger, &mut ls.evidence_outcomes)
+                    .await?;
+            }
+            ls.before_finish_ran = false;
+            ls.completed_while_waiting = false;
+        } else if ls.completed_while_waiting {
+            // The worker finished while nobody was looking; its evidence is still due.
+            self.collect_evidence(
+                state,
+                job,
+                RunWhen::WorkerCompleted,
+                &mut ls.evidence_outcomes,
+            )
+            .await?;
+            ls.completed_while_waiting = false;
+        }
+        let now = self.instant();
+        ls.next_idle_at = now + self.deps.config.idle_poll_interval;
+        ls.request_assessment(now);
+        Ok(())
+    }
+
+    /// Add the time since the current human wait began to the run's account.
+    fn end_human_wait(&self, state: &mut RunState, ls: &mut Loop) {
+        if let Some(started) = ls.wait_started.take() {
+            let waited = (self.now() - started)
+                .whole_milliseconds()
+                .clamp(0, i128::from(u64::MAX));
+            state.human_wait_ms = state
+                .human_wait_ms
+                .saturating_add(u64::try_from(waited).unwrap_or(0));
+        }
+    }
+
+    /// End the run as `Cancelled`: terminate the active worker through the normal
+    /// path, record it, and transition. Legal from every non-terminal state.
+    async fn cancel_run(
+        &self,
+        state: &mut RunState,
+        ls: &mut Loop,
+        reason: &str,
+    ) -> Result<(), RuntimeError> {
+        self.end_human_wait(state, ls);
+        if let Some(handle) = ls.worker.take() {
+            self.stop_worker(state, handle, StopWhy::Cancelled(reason))
+                .await?;
+        }
+        self.transition(state, FactoryStatus::Cancelled).await?;
+        ls.finish_reason = Some(reason.to_owned());
+        self.snapshot(state).await?;
+        Ok(())
+    }
+
+    /// Fold a worker's reported outcome into state.
+    async fn fold_finished(
+        &self,
+        state: &mut RunState,
+        handle: &WorkerHandle,
+        outcome: &WorkerOutcome,
+    ) -> Result<(), RuntimeError> {
+        self.finish_worker(state, handle.id, outcome, handle)
+            .await?;
+        state.counters.failures += u32::from(!outcome.is_success());
+        Ok(())
+    }
+
+    /// End a worker and **reap** it: when this returns, the worker's task has
+    /// ended and (for a subprocess) its process group has been signalled to death,
+    /// so no process of this run is alive or can still come alive.
+    ///
+    /// A completion already in the channel wins over a termination: a worker that
+    /// finished before the stop was seen is recorded as completed, not as killed.
+    /// The final output is synced and flushed after the reap, so the last bytes
+    /// the pumps delivered are not lost.
+    async fn stop_worker(
+        &self,
+        state: &mut RunState,
+        mut handle: WorkerHandle,
+        why: StopWhy<'_>,
+    ) -> Result<(), RuntimeError> {
+        if handle.outcome.is_none() {
+            match handle.done.try_recv() {
+                Ok(result) => handle.outcome = Some(result?),
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    handle.outcome = Some(lost_worker_outcome());
+                }
+                Err(mpsc::error::TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(outcome) = handle.outcome.take() {
+            // It had already finished on its own; there is nothing to terminate.
+            return self.fold_finished(state, &handle, &outcome).await;
+        }
+
+        self.terminate_and_reap(&mut handle, why.terminate_reason())
+            .await;
+
+        self.flush_output(state, &handle, true).await?;
+        let snapshot = handle
+            .output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let ended_at = self.now();
+        if let Some(record) = state.workers.iter_mut().find(|w| w.id == handle.id) {
+            record.status = WorkerStatus::Stopped;
+            record.exit = Some(aftman_core::job::WorkerExit::terminated());
+            record.ended_at = Some(ended_at);
+            record.output = snapshot;
+        }
+        self.emit(
+            state,
+            EventKind::WorkerTerminated,
+            json!({
+                "worker_id": handle.id.to_string(),
+                "cause": why.cause(),
+                "reason": why.reason(),
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Terminate a worker, re-issuing until its task reports.
+    ///
+    /// `Worker::terminate` only affects a worker that has already launched. A task
+    /// that was spawned but has not yet reached `Worker::run` would otherwise be
+    /// missed, and would launch after the run was reported over. So the call is
+    /// repeated until the task reports, and the task is aborted if it does not within
+    /// `REAP_TIMEOUT` (backends kill their process group when dropped).
+    async fn terminate_and_reap(&self, handle: &mut WorkerHandle, reason: TerminateReason) {
+        let worker = Arc::clone(&self.deps.worker);
+        let id = handle.id;
+        let reissue = async {
+            loop {
+                if let Err(error) = worker.terminate(reason).await {
+                    tracing::warn!(%error, worker = %id, "terminate failed; will retry");
+                }
+                tokio::time::sleep(REAP_REISSUE).await;
+            }
+        };
+        let done = &mut handle.done;
+        let reaped = tokio::time::timeout(REAP_TIMEOUT, async {
+            tokio::select! {
+                _ = done.recv() => {}
+                _ = reissue => {}
+            }
+        })
+        .await
+        .is_ok();
+        if !reaped {
+            tracing::warn!(worker = %id, "worker did not stop in time; aborting its task");
+        }
+        handle.task.abort();
+        let _ = (&mut handle.task).await;
+    }
+
+    /// Deliver a human steer to the active worker and record it.
+    ///
+    /// `None` when there is no active worker. A refusal or an unsupported backend is
+    /// an outcome, not an error. The supervisor's steer budget is untouched: the
+    /// record carries `SteerSource::Human` and `steers_sent` is not incremented.
+    async fn deliver_human_steer(
+        &self,
+        state: &mut RunState,
+        ls: &Loop,
+        message: &str,
+    ) -> Result<Option<SteerOutcome>, RuntimeError> {
+        let Some(worker_id) = ls
+            .worker
+            .as_ref()
+            .filter(|h| h.outcome.is_none())
+            .map(|h| h.id)
+        else {
+            return Ok(None);
+        };
+        let outcome = match self.deps.worker.steer(message).await {
+            Ok(outcome) => outcome,
+            Err(WorkerError::SteeringUnsupported) => SteerOutcome::Unsupported,
+            Err(error) => SteerOutcome::Rejected {
+                reason: truncate_chars(&error.to_string(), 200),
+            },
+        };
+        let at = self.now();
+        let excerpt = truncate_chars(message, 200);
+        if let Some(record) = state.workers.iter_mut().find(|w| w.id == worker_id) {
+            // The grace window protects a worker that was actually interrupted.
+            if outcome.is_accepted() {
+                record.last_steered_at = Some(at);
+            }
+            record.steers.push(SteerRecord {
+                at,
+                message_excerpt: excerpt.clone(),
+                outcome: outcome.clone(),
+                queue_depth: None,
+                source: SteerSource::Human,
+            });
+        }
+        self.emit(
+            state,
+            EventKind::WorkerSteered,
+            json!({
+                "source": SteerSource::Human.as_str(),
+                "worker_id": worker_id.to_string(),
+                "outcome": format!("{outcome:?}"),
+                "accepted": outcome.is_accepted(),
+                "excerpt": excerpt,
+            }),
+        )
+        .await?;
+        Ok(Some(outcome))
+    }
+
+    /// Flush the worker's new output as one `WorkerOutput` event.
+    ///
+    /// Carries only the text that arrived since the previous flush, capped at
+    /// [`WORKER_OUTPUT_EVENT_CAP_BYTES`], and is a no-op when nothing arrived — an
+    /// idle tick must never emit an empty event. `exit` marks the last flush of a
+    /// worker.
+    async fn flush_output(
+        &self,
+        state: &mut RunState,
+        handle: &WorkerHandle,
+        exit: bool,
+    ) -> Result<(), RuntimeError> {
+        let (text, new_bytes, truncated) = {
+            let mut log = handle
+                .output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let new_bytes = log.take_unflushed();
+            if new_bytes == 0 {
+                return Ok(());
+            }
+            let wanted = usize::try_from(new_bytes)
+                .unwrap_or(usize::MAX)
+                .min(WORKER_OUTPUT_EVENT_CAP_BYTES);
+            // The tail holds the newest bytes, so the last `wanted` bytes of it are
+            // the new text (less whatever the log itself had to drop).
+            let text = log.tail(wanted).to_owned();
+            let truncated = (text.len() as u64) < new_bytes;
+            (text, new_bytes, truncated)
+        };
+        self.emit(
+            state,
+            EventKind::WorkerOutput,
+            json!({
+                "worker_id": handle.id.to_string(),
+                "text": text,
+                "bytes": new_bytes,
+                "truncated": truncated,
+                "exit": exit,
+            }),
+        )
+        .await?;
+        Ok(())
     }
 
     fn questions(&self, registry: &ResponsibilityRegistry) -> BTreeMap<CheckKey, Question> {
@@ -700,8 +1601,13 @@ impl FactoryRuntime {
     async fn recent_event_summaries(&self, run_id: RunId) -> Vec<EventSummary> {
         let from = EventSeq(1);
         match self.deps.store.events(run_id, from).await {
+            // `WorkerOutput` is left out of the model-facing history: summaries carry
+            // no payload text anyway, and worker output must not be echoed into what
+            // reaches the model through the event log (hard rule 5: every field that
+            // reaches a model is capped, and output has its own path).
             Ok(events) => events
                 .into_iter()
+                .filter(|e| e.kind != EventKind::WorkerOutput)
                 .map(|e| EventSummary {
                     seq: e.seq,
                     kind: e.kind.as_str().to_owned(),
@@ -737,6 +1643,8 @@ impl FactoryRuntime {
         outcome: &WorkerOutcome,
         handle: &WorkerHandle,
     ) -> Result<(), RuntimeError> {
+        // The worker's last words, flushed before its completion is recorded.
+        self.flush_output(state, handle, true).await?;
         let ended_at = self.now();
         let snapshot = handle
             .output
@@ -872,7 +1780,7 @@ impl FactoryRuntime {
         };
 
         let worker = Arc::clone(&self.deps.worker);
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let outcome = worker.run(ctx, sink).await;
             let _ = done_tx.send(outcome);
         });
@@ -883,6 +1791,7 @@ impl FactoryRuntime {
             signals: signal_rx,
             done: done_rx,
             output,
+            task,
         })
     }
 
@@ -911,17 +1820,8 @@ impl FactoryRuntime {
 
             Directive::Retry { .. } => {
                 // A retry supersedes whatever was running.
-                if worker.is_some() {
-                    self.deps
-                        .worker
-                        .terminate(TerminateReason::Superseded)
-                        .await?;
-                    self.emit(
-                        state,
-                        EventKind::WorkerTerminated,
-                        json!({ "reason": "superseded" }),
-                    )
-                    .await?;
+                if let Some(old) = worker {
+                    self.stop_worker(state, old, StopWhy::Superseded).await?;
                 }
                 let mission = code_mission(job, observation);
                 Ok(Some(
@@ -943,7 +1843,15 @@ impl FactoryRuntime {
                     return Ok(worker);
                 };
                 let message = reason.clone();
-                let outcome = self.deps.worker.steer(&message).await?;
+                // A failed delivery is an outcome, not a reason to drop the handle (and
+                // with it the only way to reap the worker).
+                let outcome = match self.deps.worker.steer(&message).await {
+                    Ok(outcome) => outcome,
+                    Err(WorkerError::SteeringUnsupported) => SteerOutcome::Unsupported,
+                    Err(error) => SteerOutcome::Rejected {
+                        reason: truncate_chars(&error.to_string(), 200),
+                    },
+                };
                 if let Some(record) = state.workers.iter_mut().find(|w| w.id == handle.id) {
                     record.last_steered_at = Some(self.now());
                     record.steers.push(SteerRecord {
@@ -951,6 +1859,7 @@ impl FactoryRuntime {
                         message_excerpt: message.chars().take(200).collect(),
                         outcome: outcome.clone(),
                         queue_depth: None,
+                        source: SteerSource::Supervisor,
                     });
                 }
                 if outcome.is_accepted() {
@@ -959,31 +1868,25 @@ impl FactoryRuntime {
                 self.emit(
                     state,
                     EventKind::WorkerSteered,
-                    json!({ "outcome": format!("{outcome:?}") }),
+                    json!({
+                        "source": SteerSource::Supervisor.as_str(),
+                        "worker_id": handle.id.to_string(),
+                        "outcome": format!("{outcome:?}"),
+                        "accepted": outcome.is_accepted(),
+                    }),
                 )
                 .await?;
                 Ok(worker)
             }
 
             Directive::Stop { ref reason } => {
-                self.deps.worker.terminate(TerminateReason::Stopped).await?;
-                let ended_at = self.now();
-                if let Some(handle) = worker.as_ref() {
-                    if let Some(record) = state.workers.iter_mut().find(|w| w.id == handle.id) {
-                        record.status = WorkerStatus::Stopped;
-                        record.exit = Some(aftman_core::job::WorkerExit::terminated());
-                        record.ended_at = Some(ended_at);
-                    }
+                if let Some(handle) = worker {
+                    self.stop_worker(state, handle, StopWhy::Stopped(reason))
+                        .await?;
                 }
-                self.emit(
-                    state,
-                    EventKind::WorkerTerminated,
-                    json!({ "reason": reason, "cause": "stopped" }),
-                )
-                .await?;
                 self.transition(state, FactoryStatus::Stopped).await?;
-                // The handle is dropped: the worker is stopped, and a later `Retry`
-                // starts a fresh one.
+                // The handle is gone: the worker is stopped and reaped, and a later
+                // `Retry` starts a fresh one.
                 Ok(None)
             }
 
@@ -993,9 +1896,11 @@ impl FactoryRuntime {
             }
 
             Directive::Escalate { reason, ask } => {
+                let escalation_id = EscalationId::new();
+                let kind = escalation_kind(&reason);
                 let escalation = Escalation {
-                    id: EscalationId::new(),
-                    kind: escalation_kind(&reason),
+                    id: escalation_id,
+                    kind,
                     raised_at: self.now(),
                     check: None,
                     ask: ask.clone(),
@@ -1007,7 +1912,13 @@ impl FactoryRuntime {
                 self.emit(
                     state,
                     EventKind::EscalationRaised,
-                    json!({ "reason": reason, "ask": ask }),
+                    json!({
+                        // The id a surface needs to answer with (`run.answer`).
+                        "escalation_id": escalation_id.to_string(),
+                        "kind": kind,
+                        "reason": reason,
+                        "ask": ask,
+                    }),
                 )
                 .await?;
                 self.transition(state, FactoryStatus::NeedsHuman).await?;

@@ -55,6 +55,22 @@ AFTMAN_JEV_API_KEY, AFTMAN_WEB_TOKEN, AFTMAN_* (prefix)
 OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY     # unless explicitly granted
 ```
 
+**Every subprocess the supervisor starts, and where its environment comes from.** Hard rule 3
+(`worker_environment()` for anything that spawns) holds everywhere except the one entry marked:
+
+| Spawn site | Environment |
+| --- | --- |
+| coding-agent workers (`aftman-workers/subprocess.rs`) | `worker_environment()` |
+| command evidence providers (`aftman-workers/evidence.rs`) | `worker_environment()` |
+| the supervisor's own `git` for observation (`aftman-daemon/obs.rs`) | `worker_environment()` minus every `GIT_*`, plus the hardening in section 3.2 |
+| `ps`, non-Linux orphan identification (`aftman-workers/process.rs`) | `worker_environment()` |
+| `aftman-jev/build.rs` (`rustc -vV`, at build time, no secrets exist) | build environment; not a runtime spawn |
+| **daemon auto-start** (`aftman-cli/autostart.rs`) | **inherited whole, the one exception** (below) |
+| tests | not production code |
+
+`worker_environment()` reads the environment with `vars_os`: an entry that is not valid UTF-8 is
+dropped, deliberately, instead of panicking the supervisor.
+
 **The one exception, and it is not a worker.** Auto-starting the daemon makes the CLI spawn
 `current_exe() serve --detached` ([07-surfaces.md section 1](07-surfaces.md)). That is the
 supervisor re-executing itself, and it must inherit its environment whole because it needs the
@@ -145,6 +161,37 @@ mode = "sandboxed"   # sandboxed | auto-approve | interactive
 **Aftman is not a sandbox.** It does not confine the filesystem, network, or syscalls of a worker.
 The correct controls are the agent's own sandbox, a container, or a throwaway checkout, and
 [04-workers.md §8](04-workers.md) says so in the same words.
+
+### 3.2 The supervisor's own `git`
+
+The daemon runs `git status`/`diff`/`rev-parse`/`branch`/`config` in the repository on every
+cycle. The repository is **controlled by the worker**, which can write `.git/config`,
+`.gitattributes`, `.git/info/attributes` and hooks, and git executes programs named there. An
+unhardened `git status` would therefore run the worker's code with the supervisor's
+credentials, and be a way out of a `sandboxed` worker. Every such `git` is run with
+(`obs::GIT_FORCED_CONFIG` and `git_command`):
+
+| Disabled | Why |
+| --- | --- |
+| the daemon's secrets (`worker_environment()`), and every inherited `GIT_*` | hard rule 3; `GIT_DIR`, `GIT_EXTERNAL_DIFF`, `GIT_SSH_COMMAND`, ... must not redirect or execute anything |
+| `core.fsmonitor=false` | an fsmonitor hook is an arbitrary program run by `status`/`diff` |
+| `core.hooksPath=/dev/null` | hooks (none run for these commands today; defence in depth) |
+| `--no-ext-diff`, `--no-textconv` | `diff.external` and `diff.<driver>.textconv` are programs |
+| `filter.<name>.clean/smudge/process/required` | clean filters run when git compares work tree and index; every filter the repo's local config defines is overridden (`cat` / empty command) per run |
+| `core.pager`, `GIT_PAGER`, `PAGER` | a pager is a program |
+| `core.sshCommand`, `core.gitProxy`, `core.askPass`, `credential.helper`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_TERMINAL_PROMPT=0`, `protocol.ext.allow=never` | transports and credential helpers, which a lazy fetch would run |
+| `GIT_NO_LAZY_FETCH=1` | a partial clone's promisor remote is not contacted (git 2.44+; older git has no lazy fetch for these commands that we rely on) |
+| `--no-optional-locks`, `GIT_OPTIONAL_LOCKS=0` | `status` must not rewrite the index behind the worker |
+| `--ignore-submodules=all` | submodules' configs are repository-controlled too |
+| `GIT_CONFIG_GLOBAL/SYSTEM=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` | user and system config are not the supervisor's to depend on |
+
+Consequences stated plainly: `safe.directory` entries in global config are ignored, so a
+repository owned by another user is "dubious" to git and yields no git evidence (it is never
+trusted by adding `safe.directory=*`); and a repository relying on a clean filter for correct
+`status` output sees the filter replaced by `cat`, which only affects what the supervisor
+*observes*, never the working tree. The same rule covers the other reads: only regular files
+are opened, never a FIFO, device or symlink, and never without a byte cap. Regression tests
+plant each of these in a real repository and require that the marker is never created.
 
 ## 4. Network exposure
 

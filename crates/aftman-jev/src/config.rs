@@ -182,6 +182,16 @@ pub const ENV_KEYS: &[&str] = &[
     "AFTMAN_JEV_REQUEST_BUDGET_BYTES",
 ];
 
+/// How to configure the provider, in words: the one place that names the variables to a
+/// person, so no other crate has to (hard rule 2).
+#[must_use]
+pub fn setup_hint(env_file: &str) -> String {
+    format!(
+        "Set {} (and optionally {}) in the environment, or in {env_file}.",
+        ENV_KEYS[0], ENV_KEYS[1]
+    )
+}
+
 /// The values of [`ENV_KEYS`] that `env` has.
 #[must_use]
 pub fn snapshot_env(env: &dyn Fn(&str) -> Option<String>) -> BTreeMap<String, String> {

@@ -364,3 +364,69 @@ fn watch_last_with_no_runs_and_a_hostile_run_argument_are_plain_usage_errors() {
     assert_no_escapes(&hostile);
     assert!(!hostile.all().contains("pwned\u{7}"), "{}", hostile.all());
 }
+
+#[test]
+fn ctrl_c_on_a_plain_watch_of_a_run_waiting_for_a_human_exits_three_like_the_tui() {
+    let sb = Sandbox::new();
+    // A worker that exits at once without doing the job: the run ends up waiting.
+    let args = sb.run_args(&[
+        "--worker",
+        "generic",
+        "--external-sandbox",
+        "--cmd",
+        "true {repo}",
+    ]);
+    let run = sb.run(&args);
+    assert_eq!(run.code, 3, "{}", run.all());
+    let id = sb.wait_for_run_with_status("needs-human");
+
+    let watch = sb.spawn(&["watch", &id]);
+    sb.wait_for("the watch to replay the escalation", || {
+        let (stdout, _) = watch.output();
+        stdout.contains("ESCALATION_RAISED").then_some(())
+    });
+    // It does not end by itself: the run is still waiting.
+    std::thread::sleep(Duration::from_millis(300));
+    watch.signal(Signal::SIGINT);
+    let out = watch.wait(PATIENCE);
+    assert_eq!(out.code, 3, "{}", out.all());
+    assert!(out.stdout.contains("detached"), "{}", out.stdout);
+    assert_no_escapes(&out);
+    // The run is untouched.
+    let show = sb.run(&["show", &id]);
+    assert!(show.stdout.contains("needs"), "{}", show.stdout);
+}
+
+#[test]
+fn watching_a_run_that_is_live_in_another_process_polls_and_ends_with_it() {
+    let sb = Sandbox::new();
+    // An embedded run: this process owns it, the daemon does not drive it.
+    let cmd = "sh -c 'sleep 600.402' {repo}".to_owned();
+    let mut args = vec!["--no-daemon"];
+    args.extend(sb.run_args(&["--worker", "generic", "--external-sandbox", "--cmd", &cmd]));
+    let embedded = sb.spawn(&args);
+    let id = sb.wait_for("the embedded run to be listed as running", || {
+        let out = sb.run(&["--no-daemon", "ls", "--status", "running"]);
+        out.stdout
+            .lines()
+            .nth(1)
+            .and_then(|l| l.split_whitespace().next())
+            .map(ToOwned::to_owned)
+    });
+
+    let watch = sb.spawn(&["watch", &id]);
+    sb.wait_for("the watch to follow the other process's run", || {
+        let (stdout, stderr) = watch.output();
+        (stdout.contains("WORKER_STARTED") && stderr.contains("not being driven by this daemon"))
+            .then_some(())
+    });
+
+    // End the run from its own process (Ctrl-C cancels an embedded run); the watch
+    // sees it end and exits with the run's code.
+    embedded.signal(Signal::SIGINT);
+    let out = watch.wait(PATIENCE);
+    assert_eq!(out.code, 1, "cancelled: {}", out.all());
+    assert!(out.stdout.contains("RUN_FINISHED"), "{}", out.stdout);
+    assert_no_escapes(&out);
+    let _ = embedded.wait(PATIENCE);
+}

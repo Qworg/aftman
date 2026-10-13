@@ -764,3 +764,51 @@ fn the_assessment_pane_reports_one_scroll_limit() {
     at_limit.assess_scroll = max - 1;
     assert_ne!(bottom, screen(100, 30, &state, &at_limit));
 }
+
+#[test]
+fn the_decision_popup_lists_every_open_escalation() {
+    let second = "0193a000-0000-7000-8000-00000000beef";
+    let mut state = waiting();
+    state.apply(&ev(
+        11,
+        EventKind::EscalationRaised,
+        json!({"escalation_id": second, "kind": "check", "ask": "Also: rotate the key?"}),
+    ));
+    let mut u = ui();
+    u.mode = Mode::Decide {
+        escalation: escalation_id(),
+        position: (1, 2),
+        selected: 0,
+    };
+    let s = screen(120, 40, &state, &u);
+    assert_has(
+        &s,
+        &[
+            "2 open escalations",
+            &escalation_id().to_string(),
+            second,
+            "Also: rotate the key?",
+        ],
+    );
+    assert_has(&screen(120, 40, &state, &ui()), &["(+1 more"]);
+}
+
+#[test]
+fn a_hostile_launch_map_cannot_reach_the_header_as_anything_but_text() {
+    let mut events = running_events();
+    events[0] = ev(
+        1,
+        EventKind::RunCreated,
+        json!({"repo": "/r", "launch": {
+            "permissions": "sandboxed\u{1b}]0;pwned\u{7}",
+            "steering": "avail\u{1b}[2Jable\u{202e}",
+            "worker\u{1b}[31m": "x",
+            "external_sandbox": "true\r= [ 12] RUN_FINISHED"
+        }}),
+    );
+    let state = state_of(&events);
+    let s = screen(200, 40, &state, &ui());
+    assert!(!s.contains("pwned"), "{s}");
+    assert!(s.chars().all(|c| c == '\n' || !c.is_control()));
+    assert_has(&s, &["permissions sandboxed", "steering available"]);
+}

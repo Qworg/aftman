@@ -37,7 +37,7 @@ pub use client::{ProbeResult, SystemOneClient};
 pub use config::{
     CredentialSource, ENV_KEYS, JevSettings, SettingsError, SettingsView, default_env_file,
     default_env_file_with, describe, load_env_file, parse_env_file, redact_url, resolve,
-    resolve_with, snapshot_env,
+    resolve_with, setup_hint, snapshot_env,
 };
 pub use retry::{RetryAfter, RetryPolicy, retry_after};
 pub use transport::{

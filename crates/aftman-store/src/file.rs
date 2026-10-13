@@ -29,7 +29,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -41,7 +41,8 @@ use aftman_core::job::FactoryStatus;
 use aftman_core::run::{RunFilter, RunHeader, RunState, RunSummary};
 
 use crate::{
-    EventLogRead, RunClaim, RunStore, StoreError, io_err, parse_event_log, summarize, write_atomic,
+    EventLogRead, EventsPage, RunClaim, RunStore, StoreError, io_err, parse_event_log, summarize,
+    write_atomic,
 };
 
 /// Paths inside one run directory.
@@ -101,6 +102,154 @@ fn mkdir_private(dir: &Path) -> Result<(), StoreError> {
         .map_err(|e| io_err(dir.display(), e))
 }
 
+/// The longest log line the ranged read will buffer; a longer one sends it to the
+/// full-parse fallback instead of growing memory.
+const MAX_PAGE_LINE_BYTES: u64 = 8 * 1024 * 1024;
+
+enum Next {
+    Line,
+    Eof,
+    TooLong,
+}
+
+fn is_blank(line: &[u8]) -> bool {
+    line.iter().all(u8::is_ascii_whitespace)
+}
+
+/// Read the page `[from, from+limit)` of events without parsing anything outside it.
+///
+/// `seq` N is the Nth event line of a well-formed log, so the `from - 1` event lines before
+/// the page are skipped by counting lines (blank lines are not events, exactly as in
+/// `parse_event_log`). That assumption is *checked*: the first line of the page must carry
+/// `seq == from`, which, because `append` only ever writes strictly increasing `seq`s,
+/// proves the skipped lines were `1..from`. If it does not hold, or a line is too long to
+/// buffer, this returns `None` and the caller falls back to the full parse. Events are
+/// parsed one at a time and reading stops after `limit + 1`, so memory is bounded by the
+/// page. A malformed line inside the page is corruption unless it is the last non-blank
+/// line (a torn append), the same rule as `parse_event_log`; corruption in the skipped
+/// region is not looked for.
+fn read_page(
+    id: RunId,
+    path: &Path,
+    from: u64,
+    limit: usize,
+) -> Result<Option<EventsPage>, StoreError> {
+    use std::io::{BufRead as _, BufReader};
+    let file = std::fs::File::open(path).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::NotFound {
+            StoreError::NotFound(id)
+        } else {
+            io_err(path.display(), e)
+        }
+    })?;
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut line_number = 0usize;
+
+    let next_line =
+        |reader: &mut BufReader<std::fs::File>, line: &mut Vec<u8>| -> Result<Next, StoreError> {
+            line.clear();
+            let read = (&mut *reader)
+                .take(MAX_PAGE_LINE_BYTES)
+                .read_until(b'\n', line)
+                .map_err(|e| io_err(path.display(), e))?;
+            Ok(if read == 0 {
+                Next::Eof
+            } else if line.len() as u64 >= MAX_PAGE_LINE_BYTES && line.last() != Some(&b'\n') {
+                Next::TooLong
+            } else {
+                Next::Line
+            })
+        };
+
+    let skip = from.saturating_sub(1);
+    let mut skipped = 0u64;
+    // The last event line skipped, kept so that an empty page can still be vouched for.
+    let mut last_skipped: Vec<u8> = Vec::new();
+    let mut at_eof = false;
+    while skipped < skip {
+        match next_line(&mut reader, &mut line)? {
+            Next::Line => {}
+            Next::Eof => {
+                at_eof = true;
+                break;
+            }
+            Next::TooLong => return Ok(None),
+        }
+        line_number += 1;
+        if !is_blank(&line) {
+            skipped += 1;
+            std::mem::swap(&mut line, &mut last_skipped);
+        }
+    }
+
+    let mut events: Vec<EventEnvelope> = Vec::new();
+    let mut first = true;
+    loop {
+        if at_eof {
+            break;
+        }
+        match next_line(&mut reader, &mut line)? {
+            Next::Line => {}
+            Next::Eof => break,
+            Next::TooLong => return Ok(None),
+        }
+        line_number += 1;
+        let text = String::from_utf8_lossy(&line);
+        let text = text.trim_end_matches(['\n', '\r']);
+        if text.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<EventEnvelope>(text) {
+            Ok(event) => {
+                if first {
+                    first = false;
+                    if skip > 0 && event.seq.get() != from {
+                        return Ok(None);
+                    }
+                }
+                events.push(event);
+                if events.len() > limit {
+                    break;
+                }
+            }
+            Err(error) => {
+                // Only the final non-blank line may be torn.
+                loop {
+                    match next_line(&mut reader, &mut line)? {
+                        Next::Line => {
+                            if !is_blank(&line) {
+                                return Err(StoreError::CorruptLog {
+                                    run_id: id,
+                                    line: line_number,
+                                    detail: error.to_string(),
+                                });
+                            }
+                        }
+                        Next::Eof => break,
+                        Next::TooLong => return Ok(None),
+                    }
+                }
+                break;
+            }
+        }
+    }
+    if events.is_empty() && skipped > 0 {
+        // No event in the page to check the line/seq correspondence against, so check
+        // the last event before it: it must carry the seq its position implies.
+        let text = String::from_utf8_lossy(&last_skipped);
+        let vouched = serde_json::from_str::<EventEnvelope>(text.trim())
+            .is_ok_and(|e| e.seq.get() == skipped);
+        if !vouched {
+            return Ok(None);
+        }
+    }
+    events.retain(|e| e.seq.get() >= from);
+    let has_more = events.len() > limit;
+    events.truncate(limit);
+    Ok(Some(EventsPage { events, has_more }))
+}
+
 /// The recorded worker processes; unreadable or absent means none.
 fn read_processes(
     path: &Path,
@@ -127,7 +276,16 @@ fn write_atomic_sync(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
         .ok_or_else(|| io_err(path.display(), std::io::Error::other("path has no parent")))?;
     let temp = path.with_extension("tmp");
     {
-        let mut file = std::fs::File::create(&temp).map_err(|e| io_err(temp.display(), e))?;
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temp)
+                .map_err(|e| io_err(temp.display(), e))?
+        };
         file.write_all(bytes)
             .map_err(|e| io_err(temp.display(), e))?;
         file.sync_all().map_err(|e| io_err(temp.display(), e))?;
@@ -336,6 +494,7 @@ impl FileRunStore {
                 .truncate(false)
                 .read(true)
                 .write(true)
+                .mode(0o600)
                 .open(&paths.lock)
             {
                 Ok(file) => file,
@@ -447,6 +606,31 @@ impl RunStore for FileRunStore {
         serde_json::from_slice::<RunState>(&bytes)
             .map(|s| s.status)
             .map_err(|e| StoreError::Encode(e.to_string()))
+    }
+
+    async fn events_page(
+        &self,
+        id: RunId,
+        from_seq: EventSeq,
+        limit: usize,
+    ) -> Result<EventsPage, StoreError> {
+        let path = self.paths(id).events;
+        let ranged = tokio::task::spawn_blocking({
+            let path = path.clone();
+            move || read_page(id, &path, from_seq.get(), limit)
+        })
+        .await
+        .map_err(join_error)??;
+        match ranged {
+            Some(page) => Ok(page),
+            // The ranged read could not vouch for itself: do it the slow, certain way.
+            None => {
+                let mut events = self.events(id, from_seq).await?;
+                let has_more = events.len() > limit;
+                events.truncate(limit);
+                Ok(EventsPage { events, has_more })
+            }
+        }
     }
 
     async fn ends_with_run_finished(&self, id: RunId) -> Result<bool, StoreError> {

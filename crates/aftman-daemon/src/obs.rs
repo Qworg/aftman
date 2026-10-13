@@ -14,8 +14,11 @@
 //! present. The synthesis is labelled in `evidence["simulated"]`, so a reader — or a
 //! model — can tell that the diff did not come from a real tree.
 
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use tokio::io::AsyncReadExt as _;
+use tokio::process::Command;
 
 use time::OffsetDateTime;
 
@@ -63,6 +66,11 @@ pub struct ObservationBuilder {
     pub caps: ObsCaps,
     /// Produce synthetic evidence instead of reading the repository.
     pub simulation: bool,
+    /// The program run as `git`. `"git"` (found on `PATH`) unless a test substitutes a
+    /// fake one.
+    pub git_program: std::ffi::OsString,
+    /// The overall limit on assembling the repository evidence of one observation.
+    pub timeout: Duration,
 }
 
 impl ObservationBuilder {
@@ -71,6 +79,8 @@ impl ObservationBuilder {
         Self {
             caps: ObsCaps::default(),
             simulation,
+            git_program: "git".into(),
+            timeout: OBSERVATION_TIMEOUT,
         }
     }
 
@@ -83,8 +93,14 @@ impl ObservationBuilder {
     ///
     /// `events` are the recent persisted event summaries, already capped by the
     /// caller's window.
-    #[must_use]
-    pub fn build(
+    ///
+    /// Reading the repository (git, untracked files, `AGENTS.md`) is bounded and never
+    /// blocks the caller's thread: git runs as a child process under a timeout, files
+    /// are read on blocking threads, only if they are regular files, up to a byte cap,
+    /// and the whole assembly shares one deadline ([`OBSERVATION_TIMEOUT`]). On
+    /// timeout the repository evidence is omitted and a note says so under
+    /// `evidence["observation_note"]`.
+    pub async fn build(
         &self,
         state: &RunState,
         job: &Job,
@@ -111,6 +127,7 @@ impl ObservationBuilder {
             .map(|w| summarize_worker(w, now))
             .collect();
 
+        let mut note = None;
         let (git, untracked, instructions, mut tests) = if self.simulation {
             (
                 self.synthetic_git(active),
@@ -119,11 +136,15 @@ impl ObservationBuilder {
                 self.synthetic_tests(active),
             )
         } else {
-            let git = git_evidence(&job.repo, self.caps);
-            let untracked = untracked_excerpts(&job.repo, self.caps);
-            let instructions = read_instructions(&job.repo, self.caps.instruction_chars);
             let tests = active.map_or_else(Vec::new, |w| parse_worker_tests(&w.output));
-            (git, untracked, instructions, tests)
+            match collect_repo(&job.repo, self.caps, self.timeout, &self.git_program).await {
+                Ok(repo) => (repo.git, repo.untracked, repo.instructions, tests),
+                Err(why) => {
+                    tracing::warn!(repo = %job.repo.display(), why, "repository evidence omitted");
+                    note = Some(why);
+                    (GitEvidence::default(), Vec::new(), None, tests)
+                }
+            }
         };
 
         // Command evidence arrives as *facts*, tagged so a check can tell them apart
@@ -140,6 +161,9 @@ impl ObservationBuilder {
                     provider: outcome.provider.to_string(),
                 },
             ));
+        }
+        if let Some(why) = note {
+            evidence_map.insert("observation_note".to_owned(), why);
         }
         if self.simulation {
             evidence_map.insert(
@@ -227,21 +251,90 @@ fn elapsed_secs(state: &RunState, now: OffsetDateTime) -> u64 {
     state.supervised_elapsed(now).as_secs()
 }
 
+/// The hard limit on assembling the repository part of one observation.
+pub const OBSERVATION_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Most bytes of one git command's output that are kept; git is stopped past this.
+pub const MAX_GIT_OUTPUT_BYTES: usize = 256 * 1024;
+
+/// Repository evidence for one observation.
+struct RepoEvidence {
+    git: GitEvidence,
+    untracked: Vec<UntrackedExcerpt>,
+    instructions: Option<RepoInstructions>,
+}
+
+/// Collect everything repository-shaped, under one deadline. `Err` carries the note to
+/// record when the deadline passes.
+async fn collect_repo(
+    repo: &Path,
+    caps: ObsCaps,
+    limit: Duration,
+    program: &std::ffi::OsStr,
+) -> Result<RepoEvidence, String> {
+    let deadline = tokio::time::Instant::now() + limit;
+    let work = async {
+        let config = repo_config_overrides(repo, deadline, program).await;
+        let git = git_evidence(repo, caps, deadline, program, &config).await;
+        let untracked = untracked_excerpts(repo, caps, deadline, program, &config).await;
+        let instructions = read_instructions(repo, caps.instruction_chars).await;
+        RepoEvidence {
+            git,
+            untracked,
+            instructions,
+        }
+    };
+    tokio::time::timeout_at(deadline, work).await.map_err(|_| {
+        format!(
+            "repository observation exceeded {}s; git, untracked-file and AGENTS.md evidence \
+             were omitted for this cycle",
+            limit.as_secs()
+        )
+    })
+}
+
 /// Collect git state, degrading to an empty record rather than failing a cycle.
 ///
-/// A slow or huge `git diff` must not be able to stall supervision, so every command
-/// has a bounded output budget and any failure is reported as absent evidence
-/// rather than as an error.
-fn git_evidence(repo: &Path, caps: ObsCaps) -> GitEvidence {
+/// Every command has a bounded output budget and a deadline, and any failure is
+/// reported as absent evidence rather than as an error.
+async fn git_evidence(
+    repo: &Path,
+    caps: ObsCaps,
+    deadline: tokio::time::Instant,
+    program: &std::ffi::OsStr,
+    config: &[String],
+) -> GitEvidence {
     if !repo.is_dir() {
         return GitEvidence::default();
     }
+    let git = |args: &'static [&'static str]| run_git(repo, args, config, deadline, program);
     // `--untracked-files=all` matters: a collapsed `dir/` entry hides the individual
     // new files a worker just wrote.
-    let status_short =
-        run_git(repo, &["status", "--short", "--untracked-files=all"]).unwrap_or_default();
-    let diff_stat = run_git(repo, &["diff", "--stat"]).unwrap_or_default();
-    let full_diff = run_git(repo, &["diff"]).unwrap_or_default();
+    let status_short = git(&[
+        "status",
+        "--short",
+        "--untracked-files=all",
+        "--ignore-submodules=all",
+    ])
+    .await
+    .unwrap_or_default();
+    let diff_stat = git(&[
+        "diff",
+        "--stat",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=all",
+    ])
+    .await
+    .unwrap_or_default();
+    let full_diff = git(&[
+        "diff",
+        "--no-ext-diff",
+        "--no-textconv",
+        "--ignore-submodules=all",
+    ])
+    .await
+    .unwrap_or_default();
     let (diff_excerpt, truncated) = cap_text(&full_diff, caps.diff_chars);
     let changed_files = status_short
         .lines()
@@ -255,32 +348,263 @@ fn git_evidence(repo: &Path, caps: ObsCaps) -> GitEvidence {
         diff_excerpt,
         diff_stat,
         changed_files,
-        head_sha: run_git(repo, &["rev-parse", "HEAD"]).map(|s| s.trim().to_owned()),
-        branch: run_git(repo, &["branch", "--show-current"]).map(|s| s.trim().to_owned()),
+        head_sha: git(&["rev-parse", "HEAD"])
+            .await
+            .map(|s| s.trim().to_owned()),
+        branch: git(&["branch", "--show-current"])
+            .await
+            .map(|s| s.trim().to_owned()),
         truncated,
     }
 }
 
-/// Run one git command, returning `None` on any failure.
-fn run_git(repo: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+/// Configuration that is **forced** on every `git` the supervisor runs (the `-c` options
+/// below have higher precedence than any config file), and why. The repository is
+/// controlled by the worker, which can write `.git/config`, `.gitattributes`,
+/// `.git/info/attributes`, and hooks; git reads all of them. A `git status` in a
+/// worker-written repository must not be a way to run the worker's code with the
+/// supervisor's privileges and credentials (hard rule 3), nor to escape a sandboxed
+/// worker.
+///
+/// | Disabled | Why |
+/// | --- | --- |
+/// | `core.fsmonitor=false` | an fsmonitor hook/daemon is an arbitrary program run by `status`/`diff` |
+/// | `core.hooksPath=/dev/null` | hooks (none run for these commands today; defence in depth) |
+/// | `--no-ext-diff`, `--no-textconv` | `diff.external` and `diff.<driver>.textconv` are programs |
+/// | `filter.<name>.{clean,smudge,process}` | clean filters run when git compares work tree to index; every filter named in the repo's config is replaced with `cat`/empty |
+/// | `core.pager=cat`, `GIT_PAGER=cat`, `PAGER=cat` | a pager is a program |
+/// | `core.sshCommand`, `core.gitProxy`, `core.askPass`, `credential.helper`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_TERMINAL_PROMPT=0` | transports and credential helpers (a lazy fetch would run them) |
+/// | `GIT_NO_LAZY_FETCH=1` | a partial clone's promisor remote must not be contacted |
+/// | `--no-optional-locks`, `GIT_OPTIONAL_LOCKS=0` | `status` must not write `index` behind the worker's back |
+/// | `--ignore-submodules=all` | do not descend into submodules, whose configs are repository-controlled too |
+/// | `GIT_CONFIG_GLOBAL=/dev/null`, `GIT_CONFIG_SYSTEM=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` | user/system config is not the supervisor's to depend on (this also means a global `safe.directory` is ignored; a repository owned by another user is "dubious" and yields no evidence rather than being trusted) |
+/// | every `GIT_*` variable of the daemon | `GIT_DIR`, `GIT_EXTERNAL_DIFF`, `GIT_SSH_COMMAND`, ... must not redirect or execute anything |
+///
+/// The environment of the child is `worker_environment()`, i.e. without
+/// `TYPESAFE_*`/`AFTMAN_*` secrets, so whatever else a repository manages to run cannot
+/// read them.
+const GIT_FORCED_CONFIG: &[&str] = &[
+    "core.fsmonitor=false",
+    "core.hooksPath=/dev/null",
+    "core.pager=cat",
+    "core.sshCommand=/bin/false",
+    "core.gitProxy=",
+    "core.askPass=/bin/false",
+    "credential.helper=",
+    "protocol.ext.allow=never",
+];
+
+/// Build the (sanitized) command. Shared by the real run and the tests.
+fn git_command(
+    repo: &Path,
+    args: &[&str],
+    config: &[String],
+    program: &std::ffi::OsStr,
+) -> Command {
+    git_command_with_base(repo, args, config, program, std::env::vars_os())
+}
+
+/// [`git_command`] over an explicit base environment (so the scrubbing is testable
+/// without touching the test process's own environment).
+fn git_command_with_base(
+    repo: &Path,
+    args: &[&str],
+    config: &[String],
+    program: &std::ffi::OsStr,
+    base: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> Command {
+    let mut command = Command::new(program);
+    command.env_clear();
+    // Hard rule 3: the supervisor's credentials never reach a subprocess. Then drop every
+    // GIT_* variable the daemon happened to inherit; ours are set below.
+    command.envs(
+        aftman_workers::build_worker_environment(
+            base.into_iter()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+            &[],
+        )
+        .into_iter()
+        .filter(|(key, _)| !key.starts_with("GIT_")),
+    );
+    command.envs([
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("GIT_ASKPASS", "/bin/false"),
+        ("SSH_ASKPASS", "/bin/false"),
+        ("GIT_PAGER", "cat"),
+        ("PAGER", "cat"),
+        ("GIT_OPTIONAL_LOCKS", "0"),
+        ("GIT_NO_LAZY_FETCH", "1"),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_SYSTEM", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]);
+    command.arg("--no-optional-locks");
+    for forced in GIT_FORCED_CONFIG {
+        command.arg("-c").arg(forced);
     }
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
+    for extra in config {
+        command.arg("-c").arg(extra);
+    }
+    command.arg("-C").arg(repo).args(args);
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::piped());
+    command.stderr(std::process::Stdio::null());
+    command.kill_on_drop(true);
+    command.process_group(0);
+    command
+}
+
+/// `-c` overrides that neutralize the repository's own `filter.<name>.*` drivers.
+///
+/// A clean filter named by `.gitattributes` is run by `git status`/`git diff` to compare
+/// the work tree with the index. There is no switch that turns filters off, so each
+/// filter the repository's *local* config defines is overridden: `clean`/`smudge` become
+/// `cat` and `process` becomes empty (an empty command is not run). Reading the config
+/// (`git config --list --local --name-only`) executes nothing.
+async fn repo_config_overrides(
+    repo: &Path,
+    deadline: tokio::time::Instant,
+    program: &std::ffi::OsStr,
+) -> Vec<String> {
+    let keys = run_git(
+        repo,
+        &["config", "--list", "--local", "--name-only"],
+        &[],
+        deadline,
+        program,
+    )
+    .await
+    .unwrap_or_default();
+    let mut overrides = Vec::new();
+    for key in keys.lines() {
+        let Some(rest) = key.strip_prefix("filter.") else {
+            continue;
+        };
+        let Some((name, field)) = rest.rsplit_once('.') else {
+            continue;
+        };
+        match field {
+            "clean" | "smudge" => overrides.push(format!("filter.{name}.{field}=cat")),
+            "process" => overrides.push(format!("filter.{name}.process=")),
+            "required" => overrides.push(format!("filter.{name}.required=false")),
+            _ => {}
+        }
+    }
+    overrides
+}
+
+/// Kills a git process group when dropped while armed: a timed-out or abandoned git
+/// (or something it spawned) must not outlive the observation that asked for it.
+struct KillGroup {
+    pgid: Option<i32>,
+}
+
+impl Drop for KillGroup {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.pgid {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(-pgid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
+}
+
+/// Run one git command, returning `None` on any failure or when `deadline` passes.
+///
+/// Output is capped at [`MAX_GIT_OUTPUT_BYTES`] (git is killed past it, and what was read
+/// is kept); the child is killed if the future is dropped, and its group on timeout.
+async fn run_git(
+    repo: &Path,
+    args: &[&str],
+    config: &[String],
+    deadline: tokio::time::Instant,
+    program: &std::ffi::OsStr,
+) -> Option<String> {
+    let mut child = git_command(repo, args, config, program).spawn().ok()?;
+    let mut group = KillGroup {
+        pgid: child.id().and_then(|pid| i32::try_from(pid).ok()),
+    };
+    let mut stdout = child.stdout.take()?;
+    let work = async {
+        let mut kept = Vec::new();
+        let mut reader = (&mut stdout).take(MAX_GIT_OUTPUT_BYTES as u64 + 1);
+        reader.read_to_end(&mut kept).await.ok()?;
+        let overflowed = kept.len() > MAX_GIT_OUTPUT_BYTES;
+        kept.truncate(MAX_GIT_OUTPUT_BYTES);
+        if overflowed {
+            // More than we will use: stop git rather than wait for it to finish.
+            let _ = child.start_kill();
+        }
+        let status = child.wait().await.ok()?;
+        // Reaped: the group id may be reused from now on, so it is never signalled again.
+        group.pgid = None;
+        (overflowed || status.success()).then_some(kept)
+    };
+    let kept = match tokio::time::timeout_at(deadline, work).await {
+        Ok(kept) => kept?,
+        Err(_) => return None, // kill_on_drop reaps the child
+    };
+    Some(String::from_utf8_lossy(&kept).into_owned())
+}
+
+/// Open `path` for reading only if it is a regular file, without ever blocking and
+/// without following a symlink: `O_NONBLOCK` makes opening a FIFO return at once (it is
+/// then rejected), `O_NOFOLLOW` rejects a symlink (a link to `/dev/zero`, or out of the
+/// repository). The type is re-checked on the opened handle, so a swap between check and
+/// open cannot slip through. Returns the file and its size.
+fn open_regular(path: &Path) -> Option<(std::fs::File, u64)> {
+    use nix::fcntl::OFlag;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((OFlag::O_NONBLOCK | OFlag::O_NOFOLLOW).bits())
+        .open(path)
+        .ok()?;
+    let meta = file.metadata().ok()?;
+    meta.is_file().then_some((file, meta.len()))
+}
+
+/// Read at most `cap` bytes of a regular file, on a blocking thread. `None` for anything
+/// that is not a regular file. The size reported is the file's whole size.
+async fn read_capped(path: PathBuf, cap: usize) -> Option<(Vec<u8>, u64)> {
+    tokio::task::spawn_blocking(move || {
+        use std::io::Read as _;
+        let (file, size) = open_regular(&path)?;
+        let mut bytes = Vec::new();
+        file.take(cap as u64).read_to_end(&mut bytes).ok()?;
+        Some((bytes, size))
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Bounded excerpts of untracked text files.
 ///
 /// `git diff` never shows untracked files, so a new test or source file written by a
 /// worker is invisible to the supervisor without this.
-fn untracked_excerpts(repo: &Path, caps: ObsCaps) -> Vec<UntrackedExcerpt> {
-    let status = run_git(repo, &["status", "--short", "--untracked-files=all"]).unwrap_or_default();
+async fn untracked_excerpts(
+    repo: &Path,
+    caps: ObsCaps,
+    deadline: tokio::time::Instant,
+    program: &std::ffi::OsStr,
+    config: &[String],
+) -> Vec<UntrackedExcerpt> {
+    let status = run_git(
+        repo,
+        &[
+            "status",
+            "--short",
+            "--untracked-files=all",
+            "--ignore-submodules=all",
+        ],
+        config,
+        deadline,
+        program,
+    )
+    .await
+    .unwrap_or_default();
     let mut budget = caps.untracked_bytes;
     let mut excerpts = Vec::new();
 
@@ -297,8 +621,8 @@ fn untracked_excerpts(repo: &Path, caps: ObsCaps) -> Vec<UntrackedExcerpt> {
         if relative.is_empty() || !is_safe_to_read(relative) {
             continue;
         }
-        let path = repo.join(relative);
-        let Ok(bytes) = std::fs::read(&path) else {
+        // Read at most the budget, plus enough to see a NUL in the first 4 KiB.
+        let Some((bytes, size)) = read_capped(repo.join(relative), budget.max(4096)).await else {
             continue;
         };
         // Binary-looking files are skipped: a NUL in the first 4 KiB is the same
@@ -307,14 +631,14 @@ fn untracked_excerpts(repo: &Path, caps: ObsCaps) -> Vec<UntrackedExcerpt> {
             continue;
         }
         let take = bytes.len().min(budget);
-        let truncated = bytes.len() > take;
+        let truncated = size > take as u64;
         // Truncate on a raw byte boundary *before* decoding, so multibyte text can
         // never exceed the byte budget.
         let content = String::from_utf8_lossy(&bytes[..take]).into_owned();
         budget = budget.saturating_sub(take);
         excerpts.push(UntrackedExcerpt {
             path: relative.to_owned(),
-            bytes: bytes.len(),
+            bytes: usize::try_from(size).unwrap_or(usize::MAX),
             content,
             truncated,
         });
@@ -346,18 +670,20 @@ fn is_safe_to_read(relative: &str) -> bool {
 /// Read repository-root instructions.
 ///
 /// Transient: the contents are included in a request and never persisted, because
-/// repository prose must not land in the run log.
-fn read_instructions(repo: &Path, cap_chars: usize) -> Option<RepoInstructions> {
+/// repository prose must not land in the run log. Only a regular file is read (a FIFO or
+/// a symlink named `AGENTS.md` is skipped), and at most `4 * cap_chars + 4` bytes of it.
+async fn read_instructions(repo: &Path, cap_chars: usize) -> Option<RepoInstructions> {
     for file in ["AGENTS.override.md", "AGENTS.md"] {
-        let path = repo.join(file);
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let byte_cap = cap_chars.saturating_mul(4).saturating_add(4);
+        let Some((bytes, size)) = read_capped(repo.join(file), byte_cap).await else {
             continue;
         };
+        let text = String::from_utf8_lossy(&bytes);
         let (excerpt, truncated) = cap_text(&text, cap_chars);
         return Some(RepoInstructions {
             file: file.to_owned(),
             excerpt,
-            truncated,
+            truncated: truncated || size > bytes.len() as u64,
         });
     }
     None

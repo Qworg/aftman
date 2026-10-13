@@ -265,11 +265,10 @@ pub struct RunState { pub header: RunHeader, pub status: FactoryStatus,
     /// here and not in `Counters`, which is serialized into the model-facing observation.
     pub human_wait_ms: u64 }
 pub struct RunSummary { pub id: RunId, pub status: FactoryStatus, pub created_at: OffsetDateTime,
-    pub elapsed: Duration, pub job_excerpt: String, pub repo: PathBuf,
-    pub worker: WorkerKind, pub last_directive: Option<Directive> }
+    pub elapsed_secs: u64, pub job_excerpt: String, pub repo: PathBuf,
+    pub worker: WorkerKind, pub last_directive: Option<String> /* the directive's name */ }
 pub struct RunFilter { pub status: Option<Vec<FactoryStatus>>, pub repo: Option<PathBuf>,
-    pub limit: Option<u32>, pub cursor: Option<RunId> }
-pub struct EventStream { /* async iterator over EventEnvelope, resume by EventSeq */ }
+    pub limit: Option<usize>, pub cursor: Option<RunId> }
 pub struct Escalation { pub id: EscalationId, pub kind: EscalationKind,
     pub raised_at: OffsetDateTime,
     /// `None` when the escalation is not about one check — budget exhaustion and
@@ -643,9 +642,11 @@ request to a run that has ended gets `ControlError::RunEnded` (the loop dropped 
 a hang. A human steer invalidates the observation digest and requests a cycle: it "does not skip
 the assessment loop" ([07-surfaces.md §10](07-surfaces.md)).
 
-`ControlError` is what the protocol layer maps to the §11 codes: `WrongState(msg)` →
-`wrong_state`; `RunEnded` / `UnknownEscalation` → `unknown_run` / `wrong_state` as the method
-dictates; `Invalid(msg)` → `invalid_config`; `Internal(msg)` → `internal`. A backend that
+`ControlError` is what `RunManager` maps to the §11 codes (`manager::control_error`):
+`WrongState(msg)` → `wrong_state`; `RunEnded` → `wrong_state` ("the run has ended");
+`UnknownEscalation` → `wrong_state` (the run exists; the escalation is unknown or already answered);
+`Invalid(msg)` → `invalid_request`; `Internal(msg)` → `internal`. `unknown_run` is decided before
+the run is asked, from the store: an id it has never seen. A backend that
 refuses or cannot take a human steer is a successful reply carrying `Rejected` / `Unsupported`
 (the protocol layer turns `Unsupported` into `steering_unsupported` if it wants a hard error).
 
@@ -702,6 +703,7 @@ $XDG_STATE_HOME/aftman/            (default ~/.local/state/aftman)
 │     ├─ state.json                # latest snapshot, atomic
 │     ├─ events.jsonl              # append-only
 │     ├─ run.lock                  # advisory flock held by the process driving the run
+│     ├─ processes.json            # worker processes launched and not yet reaped (docs/04 §11)
 │     └─ artifacts/                # diffs captured at decision points, evidence blobs
 ├─ index.sqlite                    # optional: run list queries when the dir grows
 └─ jev-usage.jsonl                 # one line per model request
@@ -716,8 +718,11 @@ pub trait RunStore: Send + Sync {
     async fn append(&self, event: &EventEnvelope) -> Result<()>;
     async fn snapshot(&self, state: &RunState) -> Result<()>;
     async fn load(&self, id: RunId) -> Result<RunState>;
-    async fn events(&self, id: RunId, from: EventSeq) -> Result<EventStream>;
-    async fn list(&self, filter: RunFilter) -> Result<Vec<RunSummary>>;
+    async fn events(&self, id: RunId, from: EventSeq) -> Result<Vec<EventEnvelope>>;
+    /// A page: up to `limit` events at or after `from`, and whether more follow. The file
+    /// store answers from a ranged read that parses only the page (see below).
+    async fn events_page(&self, id: RunId, from: EventSeq, limit: usize) -> Result<EventsPage>;
+    async fn list(&self, filter: &RunFilter) -> Result<Vec<RunSummary>>;
     async fn read_log(&self, id: RunId) -> Result<EventLogRead>;   // reports a torn final line
 
     /// Delete one run's data completely (`aftman purge`). No soft delete.
@@ -732,8 +737,21 @@ pub trait RunStore: Send + Sync {
     /// Hints that avoid reading whole logs (defaults read everything):
     async fn snapshot_status(&self, id: RunId) -> Result<FactoryStatus>;
     async fn ends_with_run_finished(&self, id: RunId) -> Result<bool>;
+    /// Record / clear the process a worker launched, so recovery can end it (docs/04 §11).
+    async fn set_worker_process(&self, run: RunId, worker: WorkerId, p: Option<ProcessIdentity>)
+        -> Result<()>;
+    async fn worker_processes(&self, run: RunId) -> Result<Vec<(WorkerId, ProcessIdentity)>>;
 }
 ```
+
+**Ranged paging.** `events_page` does not parse the log outside the page. Event `seq` N is the
+Nth event line of a well-formed log, so the lines before the page are skipped by counting (blank
+lines are not events, as in `parse_event_log`) and the first line of the page must carry
+`seq == from` — which, because `append` writes strictly increasing `seq`s, proves what was
+skipped. If that check fails, or a line is too long to buffer (8 MiB), the store falls back to the
+full parse. Memory per call is the page (reading stops after `limit + 1` events); a malformed line
+inside the page is corruption unless it is the final line (a torn append); corruption in the
+skipped region is not looked for. `run.events` uses it, so paging a long run costs a page per call.
 
 **Run ownership.** Exactly one process may write to a run's log. The process that drives a run
 holds `claim(id)` for the run's lifetime: an exclusive, non-blocking `flock` on `run.lock` in the
@@ -858,7 +876,10 @@ be parsed). A slow subscriber is dropped with this, after receiving a correct ga
 `params` must be a JSON object (or `null`/absent for "none"); an array or scalar is
 `invalid_request`. A client must tolerate an error `code` it does not know (it decodes as
 `unknown`). The `decision` of `run.answer` is decoded strictly (unknown fields are rejected;
-guidance text must be non-empty).
+guidance text must be non-empty). The optional `surface` of `run.answer` names the surface the
+answer comes from and is recorded in `ESCALATION_ANSWERED`; it must be one of `cli`, `tui`, `web`,
+`herdr` (anything else is `invalid_request`), and absent means the transport's own default
+(`cli` on the Unix socket).
 
 Methods (every params struct rejects unknown fields; a method with no params accepts `{}`,
 `null`, or no `params`):
@@ -875,7 +896,7 @@ Methods (every params struct rejects unknown fields; a method with no params acc
 | `subscription.close` | none | `{closed}` |
 | `run.steer` | `run_id, message` | `SteerOutcome` |
 | `run.cancel` | `run_id` | `{ok}` |
-| `run.answer` | `run_id, escalation_id, decision, note?` | `{ok}` |
+| `run.answer` | `run_id, escalation_id, decision, note?, surface?` | `{ok}` |
 | `run.purge` | exactly one of `run_id` or `all: true` | `{purged}` |
 | `responsibility.list` | none | `{responsibilities: [{id, description, checks[]}]}` |
 | `jev.usage` | `since?` (RFC 3339), `run_id?` | aggregated token usage (opaque to the protocol crate) |
@@ -917,6 +938,25 @@ what was already queued, and then gets the `subscriber_lagged` push. For a singl
 there; for an all-runs subscription (live-only, no replay) `data.run_id` and `data.resume_from`
 are both `null` and the client simply re-subscribes.
 
+**Abandoned runs.** If the daemon stops driving a run and cannot record its end (the store keeps
+failing: a read-only file, a full disk, the directory removed underneath), every subscriber
+scoped to that run is sent one id-less error push and its stream ends:
+
+```jsonc
+{"error":{"code":"run_abandoned","retryable":false,
+          "message":"the daemon stopped driving run 0193... and could not record its end: <reason>",
+          "data":{"run_id":"0193...","reason":"<reason>"}}}
+```
+
+It follows the events that were already queued, nothing is sent after it on that subscription,
+and the connection stays open (like `subscriber_lagged`). It is **not retryable**: the run's record
+is unfinished until a daemon restart repairs it, so a client should report an error rather than
+wait. A subscriber that opens later (`subscription.open` for that run) receives the history and
+then the same push; the hub remembers the last 256 abandoned runs, until the run is forgotten
+(`run.purge`). All-runs streams are not ended by it. The reason is at most 512 bytes. The same
+applies at shutdown to a run task that cannot be stopped: the daemon records `Failed` itself (it
+holds the claim), and abandons the run only if that fails too.
+
 **Replay.** The hub keeps a bounded ring (`HubConfig::replay_capacity`, default 10,000 events
 across all runs, oldest evicted first) and falls back to `RunStore::events` when the ring does not
 reach back to `from_seq`. Correctness depends on the runtime appending to the store *before* it
@@ -935,7 +975,8 @@ Errors are structured (`data` is optional and omitted when absent):
 
 Codes: `invalid_repo`, `invalid_config`, `unknown_run`, `wrong_state`, `steering_unsupported`,
 `model_unavailable`, `rate_limited`, `internal`, plus `invalid_request` (malformed JSON, bad
-envelope, unknown or missing params, oversize field), `unknown_method`, and `subscriber_lagged`.
+envelope, unknown or missing params, oversize field), `unknown_method`, and the two out-of-band
+push codes `subscriber_lagged` and `run_abandoned`.
 A request that fails to decode still gets a response echoing its `id` when one could be parsed;
 otherwise the reply is an id-less error push.
 
@@ -1115,6 +1156,15 @@ upstream names for compatibility: `TYPESAFE_API_KEY`, `TYPESAFE_BASE_URL`.
 
 Config is parsed with `deny_unknown_fields` so a typo is an error, not a silent default.
 
+**Status (M3): the file above is the design; no `config.toml` is read yet.** What exists today:
+CLI flags and their environment variables (`AFTMAN_DATA_DIR`, `AFTMAN_SOCKET`, the Jev
+credentials `TYPESAFE_*`), the bundled responsibility definitions and evidence plan (TOML,
+parsed with `deny_unknown_fields`), and compiled defaults for the sections above: `[obs]` is
+`ObsCaps::default()`, `[runtime]` is `RunConfig::default()`, `[jev.budget]` is the budget
+module's constants. Every key in the block is **designed but not yet read**, including
+`[workers]`, `[ensemble]`, `[herdr]` and `[web]` (the web surface is M4). Do not rely on a key
+here having an effect until the milestone that builds it lands.
+
 ## 13. Logging and observability
 
 - `tracing` with a `--log-level` flag; JSON logs when not attached to a TTY.
@@ -1149,9 +1199,14 @@ network access**.
   one-hour job makes at most ~720 requests if every cycle fires, typically far fewer.
 - Request size is bounded by the budget module, so cost is bounded by *cycles*, not by repository
   size.
-- Observation assembly (git + filesystem) runs in `spawn_blocking` with a hard timeout (default
-  8s); a slow `git diff` on a huge repo degrades to `git diff --stat` output rather than failing
-  the cycle.
+- Observation assembly (git + filesystem) never blocks the run loop and is bounded by one 8 s
+  deadline (`obs::OBSERVATION_TIMEOUT`). Git runs as a child process (killed, with its process
+  group, on timeout; output capped at 256 KiB per command); file reads happen on blocking threads,
+  only for regular files opened `O_NONBLOCK | O_NOFOLLOW` (a FIFO or symlink named `AGENTS.md`, or
+  among the untracked files, is skipped), with a byte cap enforced while reading. On timeout the
+  repository evidence of that cycle is omitted and `evidence["observation_note"]` says so; the
+  cycle still runs and a cancel is answered. Every git is hardened as described in
+  [08-security.md section 3.2](08-security.md).
 - The daemon holds at most one `WorkerRecord::output` ring per run; ended runs drop their logs to
   disk and keep only summaries in memory. Default in-memory budget: 50 MB, configurable.
 

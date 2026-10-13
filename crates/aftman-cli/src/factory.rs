@@ -415,10 +415,7 @@ impl CliFactory {
             ),
             Mode::Embedded => (
                 "No provider is configured in this process's environment.".to_owned(),
-                format!(
-                    "Set TYPESAFE_API_KEY (and optionally TYPESAFE_BASE_URL) in the \
-                     environment, or in {file}."
-                ),
+                aftman_jev::setup_hint(&file),
             ),
         };
         format!(
@@ -829,7 +826,7 @@ mod tests {
             let error = factory.prepare(&p, context()).await.err().unwrap();
             assert_eq!(error.code, ErrorCode::ModelUnavailable);
             assert!(error.message.contains("--simulate-model"));
-            assert!(error.message.contains("TYPESAFE_API_KEY") || mode == Mode::Daemon);
+            assert!(error.message.contains(aftman_jev::ENV_KEYS[0]) || mode == Mode::Daemon);
             if mode == Mode::Daemon {
                 assert!(error.message.contains("aftman stop"), "{}", error.message);
                 assert!(error.message.contains("started without a provider"));
@@ -841,9 +838,12 @@ mod tests {
     async fn a_configured_provider_builds_and_the_view_is_redacted() {
         let inputs = FactoryInputs {
             provider_env: BTreeMap::from([
-                ("TYPESAFE_API_KEY".to_owned(), "sk-very-secret".to_owned()),
                 (
-                    "TYPESAFE_BASE_URL".to_owned(),
+                    aftman_jev::ENV_KEYS[0].to_owned(),
+                    "sk-very-secret".to_owned(),
+                ),
+                (
+                    aftman_jev::ENV_KEYS[1].to_owned(),
                     "https://user:hunter2@api.example.com/api".to_owned(),
                 ),
             ]),

@@ -220,6 +220,7 @@ struct Harness {
     paths: DaemonPaths,
     repo: PathBuf,
     parked: Arc<Parked>,
+    store: Arc<FileRunStore>,
     task: Option<JoinHandle<()>>,
     stop: Option<oneshot::Sender<()>>,
 }
@@ -240,7 +241,7 @@ impl Harness {
         };
         let daemon = Daemon::start(
             DaemonConfig::new(paths.clone()),
-            store,
+            store.clone(),
             Arc::new(factory),
             Arc::new(SystemClock),
         )
@@ -258,6 +259,7 @@ impl Harness {
             paths,
             repo,
             parked,
+            store,
             task: Some(task),
             stop: Some(stop),
         })
@@ -318,6 +320,100 @@ impl Harness {
         options
     }
 
+    /// Write a finished run of `events` events straight into the store: the shape of
+    /// a long history (decisions, assessments, output) with a `RUN_FINISHED` at the
+    /// end. The daemon is not driving it, so a watcher replays it from the log.
+    async fn seed_finished_run(&self, events: u64) -> Result<RunId, Box<dyn std::error::Error>> {
+        use aftman_core::event::EventEnvelope;
+        use aftman_core::run::{RunHeader, RunState};
+        use aftman_store::RunStore as _;
+        let id = RunId::new();
+        let start = time::OffsetDateTime::now_utc();
+        let header = RunHeader {
+            id,
+            created_at: start,
+            job: Job {
+                prompt: "replay a very long history".into(),
+                repo: self.repo.clone(),
+                source: JobSource::Cli,
+            },
+            config: RunConfig::default(),
+            aftman_version: "0".into(),
+            worker_versions: Default::default(),
+            granted_key_names: Vec::new(),
+        };
+        self.store.create(&header).await?;
+        let mut seq = 0u64;
+        let mut push = |kind: EventKind, payload: Value| {
+            seq += 1;
+            EventEnvelope::new(
+                EventSeq(seq),
+                id,
+                start + time::Duration::milliseconds(seq as i64),
+                kind,
+                payload,
+            )
+        };
+        let mut all = vec![
+            push(EventKind::RunCreated, json!({"repo": "/r"})),
+            push(
+                EventKind::StateChanged,
+                json!({"from": "routing", "to": "running"}),
+            ),
+        ];
+        let mut cycle = 0u64;
+        while (all.len() as u64) < events - 1 {
+            cycle += 1;
+            all.push(push(
+                EventKind::WorkerOutput,
+                json!({"worker_id": "w1", "text": format!("cycle {cycle}: compiling a crate\nwarning: something to read\n")}),
+            ));
+            all.push(push(
+                EventKind::AssessmentCompleted,
+                json!({"assessment_seq": cycle, "model": "m", "checks": [
+                    {"key": "core.completion.a", "jev_p": 0.8, "threshold": 0.7, "decisive": true, "permitted": true},
+                    {"key": "core.completion.b", "jev_p": 0.3, "threshold": 0.7, "decisive": true, "permitted": true},
+                    {"key": "core.verification.c", "jev_p": 0.5, "threshold": 0.5, "contested": true, "permitted": false}
+                ]}),
+            ));
+            all.push(push(
+                EventKind::DirectiveProposed,
+                json!({"responsibility": "core.completion", "rule": "r", "directive": "continue", "priority": 1}),
+            ));
+            all.push(push(
+                EventKind::DirectiveSelected,
+                json!({"directive": "continue", "reason": format!("cycle {cycle}: tests are not yet green"), "invariants": ["MinWorkTime"], "suppressed": []}),
+            ));
+            all.push(push(
+                EventKind::StateChanged,
+                json!({"from": "running", "to": "assessing"}),
+            ));
+            all.push(push(
+                EventKind::StateChanged,
+                json!({"from": "assessing", "to": "running"}),
+            ));
+        }
+        all.truncate((events - 1) as usize);
+        all.push(push(EventKind::RunFinished, json!({"status": "finished"})));
+        // Truncating left a gap in the numbering: renumber 1..=n.
+        for (i, event) in all.iter_mut().enumerate() {
+            event.seq = EventSeq(i as u64 + 1);
+        }
+        // The store's own `append` re-checks the log on every call; a long history is
+        // written in one go instead (the file is the source of truth).
+        let mut log = String::new();
+        for event in &all {
+            log.push_str(&serde_json::to_string(event)?);
+            log.push('\n');
+        }
+        let paths = aftman_store::RunPaths::new(self.store.root(), id);
+        std::fs::write(&paths.events, log)?;
+        let mut state = RunState::new(header, FactoryStatus::Finished);
+        state.last_seq = EventSeq(all.len() as u64);
+        self.store.snapshot(&state).await?;
+        Ok(id)
+    }
+
     /// Stop whatever is still live, so no run outlives its test.
     async fn cancel_all(&self) {
         let Ok(mut client) = self.client().await else {
@@ -368,11 +464,19 @@ async fn wait_for_status(
 /// `TestBackend` behind a lock: the driver owns the `Terminal`, the test reads the
 /// screen it drew while the driver is still running.
 #[derive(Clone)]
-struct SharedBackend(Arc<Mutex<TestBackend>>);
+struct SharedBackend(
+    Arc<Mutex<TestBackend>>,
+    Arc<std::sync::atomic::AtomicU64>,
+    Arc<AtomicBool>,
+);
 
 impl SharedBackend {
     fn new(width: u16, height: u16) -> Self {
-        Self(Arc::new(Mutex::new(TestBackend::new(width, height))))
+        Self(
+            Arc::new(Mutex::new(TestBackend::new(width, height))),
+            Arc::default(),
+            Arc::default(),
+        )
     }
 
     fn with<T>(&self, f: impl FnOnce(&mut TestBackend) -> T) -> T {
@@ -381,6 +485,10 @@ impl SharedBackend {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         f(&mut guard)
+    }
+
+    fn draws(&self) -> u64 {
+        self.1.load(Ordering::SeqCst)
     }
 
     fn screen(&self) -> String {
@@ -411,6 +519,10 @@ impl Backend for SharedBackend {
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
+        assert!(
+            !self.2.load(Ordering::SeqCst),
+            "the backend was told to panic"
+        );
         self.with(|b| b.draw(content))
     }
 
@@ -452,6 +564,8 @@ impl Backend for SharedBackend {
     }
 
     fn flush(&mut self) -> io::Result<()> {
+        // One flush per frame: the number of draws.
+        self.1.fetch_add(1, Ordering::SeqCst);
         self.with(Backend::flush)
     }
 }
@@ -828,6 +942,10 @@ async fn an_escalation_is_answered_from_the_tui_and_the_run_continues() -> TestR
         .ok_or("the answer event")?;
     assert_eq!(answered.payload["decision"]["decision"], "recheck");
     assert_eq!(answered.payload["note"], "worth another look");
+    assert_eq!(
+        answered.payload["surface"], "tui",
+        "recorded as the TUI, not the CLI"
+    );
     assert!(
         events.last().map(|e| e.seq) > Some(answered.seq),
         "the run continued after the answer"
@@ -1172,5 +1290,89 @@ async fn json_events_with_new_fields_do_not_disturb_the_watcher() -> TestResult 
     }
     assert_eq!(state.last_seq, 3);
     assert_eq!(state.status_label(), "routing");
+    Ok(())
+}
+
+/// How many events the replay tests feed through the real driver.
+const LONG_LOG: u64 = 40_000;
+
+#[tokio::test]
+async fn a_forty_thousand_event_history_replays_in_bounded_work() -> TestResult {
+    // The cause of the quadratic this pins: events were read in a `select!` with the
+    // frame tick, so every tick abandoned the page of the log being fetched, and its
+    // response was still read and thrown away. The work is counted, not timed: one
+    // reducer step per event, and draws bounded by the frame rate and not by the
+    // number of events.
+    let mut h = Harness::start().await?;
+    let run = h.seed_finished_run(LONG_LOG).await?;
+    let mut options = h.options();
+    options.frame_interval = Duration::from_millis(100);
+    let watcher = Watcher::spawn_with(options, run, 120, 40)?;
+    let backend = watcher.backend.clone();
+    let screen = watcher
+        .until("the replay to finish", |s| s.contains("run ended"))
+        .await;
+    assert!(
+        screen.contains("FINISHED"),
+        "the final status is shown:\n{screen}"
+    );
+    assert!(!screen.contains("REPLAYING"), "{screen}");
+    let draws = backend.draws();
+    let outcome = watcher.quit().await;
+    assert_eq!(
+        outcome.state.counts.events, LONG_LOG,
+        "one reducer step per event"
+    );
+    assert_eq!(outcome.state.last_seq, LONG_LOG);
+    assert!(draws <= 400, "drawn {draws} times for {LONG_LOG} events");
+    assert!(outcome.state.timeline.len() <= 400);
+    h.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn quitting_during_a_long_replay_is_prompt_and_the_header_says_it_is_history() -> TestResult {
+    let mut h = Harness::start().await?;
+    let run = h.seed_finished_run(LONG_LOG).await?;
+    let watcher = Watcher::spawn(&h, run, 120, 40)?;
+    let screen = watcher
+        .until("the replay banner", |s| s.contains("REPLAYING history"))
+        .await;
+    assert!(screen.contains(&format!("of {LONG_LOG}")), "{screen}");
+    assert!(
+        !screen.contains("FINISHED"),
+        "no stale status while replaying:\n{screen}"
+    );
+    let started = std::time::Instant::now();
+    let outcome = watcher.quit().await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(matches!(outcome.how, How::Quit));
+    assert!(outcome.state.last_seq < LONG_LOG, "it left before the end");
+    h.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_panic_while_drawing_unwinds_out_of_the_driver_and_leaves_the_run_alone() -> TestResult {
+    // The real terminal is restored by the session guard's `Drop` (and the panic hook)
+    // as this unwinds; here the point is that nothing swallows the panic and nothing
+    // the driver spawned outlives it or touches the run.
+    let mut h = Harness::start().await?;
+    let mut client = h.client().await?;
+    let run = client.run_start(h.parked_run()).await?;
+    let watcher = Watcher::spawn(&h, run, 100, 30)?;
+    watcher.contains("parked and waiting").await;
+    watcher.backend.2.store(true, Ordering::SeqCst);
+    watcher.ch('?').await;
+    let error = within("the driver to unwind", watcher.task)
+        .await
+        .expect_err("the driver panicked");
+    assert!(error.is_panic(), "{error}");
+    assert!(!client.run_get(run).await?.status.is_terminal());
+    h.shutdown().await;
     Ok(())
 }

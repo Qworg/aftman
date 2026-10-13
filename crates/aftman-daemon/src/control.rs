@@ -83,6 +83,18 @@ pub struct RunControl {
 #[derive(Debug)]
 pub struct ControlReceiver {
     rx: mpsc::Receiver<ControlMessage>,
+    /// Whether anything can answer an escalation through this channel. When false the
+    /// channel is for cancel (and steer) only, and `NeedsHuman` ends the run.
+    human: bool,
+}
+
+impl ControlReceiver {
+    /// Whether a human can answer through this channel (see [`RunControl::channel`] and
+    /// [`RunControl::channel_without_human`]).
+    #[must_use]
+    pub fn has_human(&self) -> bool {
+        self.human
+    }
 }
 
 impl RunControl {
@@ -90,7 +102,18 @@ impl RunControl {
     #[must_use]
     pub fn channel() -> (Self, ControlReceiver) {
         let (tx, rx) = mpsc::channel(CONTROL_QUEUE_DEPTH);
-        (Self { tx }, ControlReceiver { rx })
+        (Self { tx }, ControlReceiver { rx, human: true })
+    }
+
+    /// A control channel for a run nobody can answer: the embedded `--no-daemon` run,
+    /// which wants to be cancellable (SIGINT, SIGTERM) but has no surface that could
+    /// deliver an answer. `NeedsHuman` ends such a run, with the question recorded,
+    /// exactly as it does with no channel at all.
+    #[must_use]
+    pub fn channel_without_human() -> (Self, ControlReceiver) {
+        let (control, mut receiver) = Self::channel();
+        receiver.human = false;
+        (control, receiver)
     }
 
     /// Deliver guidance to the active worker as a human steer.

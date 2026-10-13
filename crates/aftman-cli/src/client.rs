@@ -116,6 +116,25 @@ pub enum ClientError {
     )]
     Reconnect { attempts: u32, last: String },
 
+    /// The daemon stopped driving this run and could not record its end (`run_abandoned`,
+    /// an error push, final for that subscription). `reason` is the daemon's.
+    #[error("run {run_id} was abandoned by the daemon: {reason}")]
+    RunAbandoned { run_id: String, reason: String },
+
+    /// The daemon is not supervising this run, it is not finished, and its log has
+    /// stopped moving: nothing will ever end it. Reported instead of waiting forever.
+    #[error(
+        "run {run_id} is no longer being driven: the daemon is not supervising it, it has \
+         not finished (status {status}), and its log has not moved for {silent_secs}s \
+         (last event {last_seq})"
+    )]
+    NotDriven {
+        run_id: String,
+        status: String,
+        last_seq: u64,
+        silent_secs: u64,
+    },
+
     /// A call was made on a connection that already timed out or failed.
     #[error("this connection is no longer usable ({0}); connect again")]
     Poisoned(String),
@@ -174,7 +193,12 @@ impl Connection {
             Ok(Err(error))
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                    std::io::ErrorKind::NotFound
+                        | std::io::ErrorKind::ConnectionRefused
+                        // A listener being replaced or closed while we connect: nobody
+                        // is accepting right now, which is what "not running" means.
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionAborted
                 ) =>
             {
                 return Err(ClientError::NotRunning(path.to_owned()));
@@ -469,12 +493,30 @@ impl Client {
         decision: HumanDecision,
         note: impl Into<String>,
     ) -> Result<(), ClientError> {
+        self.run_answer_as(run_id, escalation_id, decision, note, None)
+            .await
+    }
+
+    /// `run.answer`, naming the surface it comes from (`"tui"`, ...), which the daemon
+    /// records with the answer. `None` leaves it to the daemon's default.
+    ///
+    /// # Errors
+    /// As [`Client::run_answer`], and `invalid_request` for a surface it does not know.
+    pub async fn run_answer_as(
+        &mut self,
+        run_id: RunId,
+        escalation_id: EscalationId,
+        decision: HumanDecision,
+        note: impl Into<String>,
+        surface: Option<&str>,
+    ) -> Result<(), ClientError> {
         self.call::<OkResult>(Request::RunAnswer(
             aftman_daemon::protocol::RunAnswerParams {
                 run_id,
                 escalation_id,
                 decision,
                 note: note.into(),
+                surface: surface.map(ToOwned::to_owned),
             },
         ))
         .await
@@ -574,4 +616,4 @@ impl Client {
     }
 }
 
-pub use crate::follow::{Follow, FollowStats};
+pub use crate::follow::{Follow, FollowStats, FollowStatus};

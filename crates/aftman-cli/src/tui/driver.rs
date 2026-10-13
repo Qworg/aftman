@@ -50,7 +50,7 @@ use time::OffsetDateTime;
 
 use crate::client::{Client, ClientConfig, ClientError};
 use crate::error::{client_exit_code, exit, run_exit_code};
-use crate::follow::Follow;
+use crate::follow::{Follow, FollowStatus};
 
 use super::input::{Action, Link, Tone, UiState, handle_key, handle_key_at, handle_paste};
 use super::state::WatchState;
@@ -207,7 +207,7 @@ async fn answer(
         HumanDecision::Guidance { .. } => "guidance",
     };
     client
-        .run_answer(run_id, escalation, decision, note)
+        .run_answer_as(run_id, escalation, decision, note, Some("tui"))
         .await
         .map(|()| format!("answered the escalation: {what}"))
         .map_err(|e| e.to_string())
@@ -237,6 +237,80 @@ fn draw<B: Backend>(
         .map_err(|e| WatchError::Terminal(std::io::Error::other(e.to_string())))
 }
 
+/// Events buffered between the stream task and the screen. Bounded: a slow screen slows
+/// the reader, never memory.
+const EVENT_QUEUE: usize = 4096;
+
+/// Most events folded into the state before the loop looks at the keyboard and the
+/// clock again. Events are applied in batches and drawn at the frame rate, never one
+/// draw per event.
+const MAX_BATCH: usize = 2048;
+
+type Pumped = Result<Option<aftman_core::event::EventEnvelope>, ClientError>;
+
+/// Stops the stream task when the watch ends, however it ends.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// Read the follow stream on a task of its own, so a slow screen slows only the reader
+/// (the queue to the screen is bounded), and the stream's health is read from its
+/// [`FollowStatus`] handle, which `Follow` keeps up to date itself: nothing here has to
+/// interrupt a read to learn whether the link is up. (`Follow::next` is cancel-safe and
+/// resumes a page in flight, so even a caller that drops it loses no work.)
+fn pump(mut follow: Follow) -> (mpsc::Receiver<Pumped>, FollowStatus, AbortOnDrop) {
+    let (tx, rx) = mpsc::channel(EVENT_QUEUE);
+    let status = follow.status();
+    let task = tokio::spawn(async move {
+        loop {
+            let item = follow.next().await;
+            let last = !matches!(item, Ok(Some(_)));
+            if tx.send(item).await.is_err() || last {
+                return;
+            }
+        }
+    });
+    (rx, status, AbortOnDrop(task))
+}
+
+/// Fold one item from the stream task into the state. `Some(error)` when the stream is
+/// lost for good.
+fn fold(
+    item: Option<Pumped>,
+    state: &mut WatchState,
+    ui: &mut UiState,
+    stream_open: &mut bool,
+) -> Option<ClientError> {
+    match item.unwrap_or(Err(ClientError::Closed)) {
+        Ok(Some(event)) => {
+            state.apply(&event);
+            // The stream moved: whatever was wrong with the link is over.
+            if ui.link != Link::Live {
+                ui.link = Link::Live;
+            }
+            None
+        }
+        Ok(None) => {
+            *stream_open = false;
+            ui.stream_ended = true;
+            // Do not bury a more specific message (a refusal, a result) that arrived in
+            // the same breath.
+            if ui.message.is_none() {
+                ui.set_message(
+                    Tone::Info,
+                    &format!("the run ended ({}); press q to quit", state.status_label()),
+                );
+            }
+            None
+        }
+        Err(error) => Some(error),
+    }
+}
+
 /// Watch one run until the user quits or the daemon is lost.
 ///
 /// # Errors
@@ -248,12 +322,18 @@ pub async fn run_watch<B: Backend>(
     run_id: RunId,
     options: &WatchOptions,
 ) -> Result<WatchOutcome, WatchError> {
-    let mut follow = Follow::open(&options.socket, run_id, EventSeq::FIRST, options.client).await?;
+    let follow = Follow::open(&options.socket, run_id, EventSeq::FIRST, options.client).await?;
+    let (mut events, link_status, _pump) = pump(follow);
 
     let mut state = WatchState::new();
     let mut ui = UiState::new(options.clock.now());
     match header(options, run_id).await {
-        Ok(run) => state.set_header(&run),
+        Ok(run) => {
+            // What the log held when we looked: the screen says "replaying" until the
+            // fold has caught up with it.
+            ui.replay_target = Some(run.last_seq.get());
+            state.set_header(&run);
+        }
         Err(error) => ui.set_message(
             Tone::Info,
             &format!("could not read the run header: {error}"),
@@ -271,29 +351,17 @@ pub async fn run_watch<B: Backend>(
 
     let how = loop {
         tokio::select! {
-            next = follow.next(), if stream_open => match next {
-                Ok(Some(event)) => {
-                    state.apply(&event);
-                    dirty = true;
-                    // The stream moved: whatever was wrong with the link is over.
-                    if ui.link != Link::Live {
-                        ui.link = Link::Live;
-                    }
+            next = events.recv(), if stream_open => {
+                let mut lost = fold(next, &mut state, &mut ui, &mut stream_open);
+                // Everything else already waiting, without drawing in between.
+                let mut taken = 1;
+                while lost.is_none() && stream_open && taken < MAX_BATCH {
+                    let Ok(more) = events.try_recv() else { break };
+                    lost = fold(Some(more), &mut state, &mut ui, &mut stream_open);
+                    taken += 1;
                 }
-                Ok(None) => {
-                    stream_open = false;
-                    ui.stream_ended = true;
-                    // Do not bury a more specific message (a refusal, a result) that
-                    // arrived in the same breath.
-                    if ui.message.is_none() {
-                        ui.set_message(
-                            Tone::Info,
-                            &format!("the run ended ({}); press q to quit", state.status_label()),
-                        );
-                    }
-                    dirty = true;
-                }
-                Err(error) => {
+                dirty = true;
+                if let Some(error) = lost {
                     ui.set_message(Tone::Error, &format!("lost the daemon: {error}"));
                     if !matches!(ui.link, Link::Lost { .. }) {
                         ui.link = Link::Lost { failures: 1 };
@@ -337,9 +405,9 @@ pub async fn run_watch<B: Backend>(
                 // What the stream knows about its own health: failed attempts to
                 // re-establish it (a first quick retry is not alarming), and whether
                 // the daemon is driving this run at all.
-                let failures = follow.reconnect_failures();
+                let failures = link_status.reconnect_failures();
                 let link = if failures > 0 { Link::Lost { failures } } else { Link::Live };
-                let polling = follow.is_polling();
+                let polling = link_status.is_polling();
                 if link != ui.link || polling != ui.polling {
                     ui.link = link;
                     ui.polling = polling;
@@ -435,5 +503,45 @@ fn finish(ui: &mut UiState, joined: Result<Done, tokio::task::JoinError>, still_
             Tone::Error,
             &format!("the action did not complete: {error}"),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_action_task_that_panics_is_reported_in_the_footer_and_clears_busy() {
+        let task = tokio::spawn(async { panic!("the action blew up") });
+        let joined: Result<Done, tokio::task::JoinError> = match task.await {
+            Err(error) => Err(error),
+            Ok(()) => unreachable!("the task panics"),
+        };
+        let mut ui = UiState::new(OffsetDateTime::now_utc());
+        ui.busy = Some("sending steer...".into());
+        finish(&mut ui, joined, 0);
+        assert!(ui.busy.is_none());
+        let message = ui.message.expect("a message");
+        assert_eq!(message.tone, Tone::Error);
+        assert!(
+            message.text.contains("did not complete"),
+            "{}",
+            message.text
+        );
+    }
+
+    #[tokio::test]
+    async fn busy_stays_while_another_action_is_still_in_flight() {
+        let mut ui = UiState::new(OffsetDateTime::now_utc());
+        ui.busy = Some("cancelling the run...".into());
+        finish(
+            &mut ui,
+            Ok(Done {
+                kind: ActionKind::Steer,
+                result: Ok("steer delivered".into()),
+            }),
+            1,
+        );
+        assert!(ui.busy.is_some());
     }
 }

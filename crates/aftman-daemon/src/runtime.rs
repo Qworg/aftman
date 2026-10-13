@@ -325,6 +325,15 @@ fn settle<T>(
     }
 }
 
+/// Record a provider outcome, replacing any earlier one from the same provider: the
+/// observation carries the latest result per provider, not every result ever, so a stale
+/// failure does not shadow a later pass and the vector is bounded by the number of
+/// providers.
+fn keep_latest(outcomes: &mut Vec<EvidenceOutcome>, outcome: EvidenceOutcome) {
+    outcomes.retain(|existing| existing.provider != outcome.provider);
+    outcomes.push(outcome);
+}
+
 /// A prefix of `text` of at most `max` characters.
 fn truncate_chars(text: &str, max: usize) -> String {
     text.chars().take(max).collect()
@@ -412,6 +421,22 @@ pub struct FactoryRuntime {
 }
 
 impl FactoryRuntime {
+    /// Change the limit on assembling the repository evidence of one observation
+    /// (default 8 s). For tests.
+    #[must_use]
+    pub fn with_observation_timeout(mut self, timeout: Duration) -> Self {
+        self.builder.timeout = timeout;
+        self
+    }
+
+    /// Run a different program as `git` for observation (a test double). Everything
+    /// else about how git is invoked stays as hardened in `obs`.
+    #[must_use]
+    pub fn with_git_program(mut self, program: impl Into<std::ffi::OsString>) -> Self {
+        self.builder.git_program = program.into();
+        self
+    }
+
     #[must_use]
     pub fn new(deps: RuntimeDeps) -> Self {
         let builder = ObservationBuilder::for_worker(deps.config.worker);
@@ -605,7 +630,10 @@ impl FactoryRuntime {
             // idle interval. It is never observed mid-cycle.
             self.drain_control(state, &job, ls, &mut control).await?;
 
-            if let Some(finish) = self.terminal_status(state, control.is_some()) {
+            if let Some(finish) = self.terminal_status(
+                state,
+                control.as_ref().is_some_and(ControlReceiver::has_human),
+            ) {
                 // No exit path may leave a worker of this run alive, and no human wait
                 // may be left open: close both before the run is reported over.
                 self.end_human_wait(state, ls);
@@ -777,14 +805,17 @@ impl FactoryRuntime {
             // "may I steer it" and "may I start another" are about the live process.
             let event_summaries = self.recent_event_summaries(run_id).await;
             let most_recent = state.workers.last().cloned();
-            let observation = self.builder.build(
-                state,
-                &job,
-                most_recent.as_ref(),
-                event_summaries,
-                &ls.evidence_outcomes,
-                self.now(),
-            );
+            let observation = self
+                .builder
+                .build(
+                    state,
+                    &job,
+                    most_recent.as_ref(),
+                    event_summaries,
+                    &ls.evidence_outcomes,
+                    self.now(),
+                )
+                .await;
 
             // ---- skip an unchanged observation ------------------------------
             let digest = observation.content_digest();
@@ -1089,18 +1120,51 @@ impl FactoryRuntime {
     /// The content digest deliberately ignores elapsed time, so a timeout
     /// approaching is invisible to it. Without this check the digest skip could
     /// suppress the one cycle that would notice the timeout.
+    ///
+    /// The boundaries: `overall_timeout`; the active worker's `worker_timeout`; and the end
+    /// of the steering-grace window after an accepted steer (when the suppressed stop
+    /// checks come back). The escalation timeout is M7 and not built.
     fn time_driven_check_due(&self, state: &RunState) -> bool {
-        let elapsed = state.supervised_elapsed(self.now());
+        let now = self.now();
         let tick = self.deps.config.idle_poll_interval;
-        let remaining = self.deps.config.overall_timeout.saturating_sub(elapsed);
-        remaining <= tick
+        let elapsed = state.supervised_elapsed(now);
+        if self.deps.config.overall_timeout.saturating_sub(elapsed) <= tick {
+            return true;
+        }
+        let since = |at: OffsetDateTime| -> Duration {
+            // A wall clock that stepped backwards reads as "just now", not as a panic.
+            Duration::try_from(now - at).unwrap_or(Duration::ZERO)
+        };
+        let Some(worker) = state.active_worker() else {
+            return false;
+        };
+        if let Some(started) = worker.started_at {
+            let remaining = self
+                .deps
+                .config
+                .worker_timeout
+                .saturating_sub(since(started));
+            if remaining <= tick {
+                return true;
+            }
+        }
+        if let Some(steered) = worker.last_steered_at {
+            let age = since(steered);
+            let grace = self.deps.steering_grace;
+            // Inside the window and about to leave it.
+            if age < grace && grace - age <= tick {
+                return true;
+            }
+        }
+        false
     }
 
     /// A terminal status, or `None` to keep supervising.
     ///
-    /// Without a control channel `NeedsHuman` ends the run: nobody can answer, so the
-    /// run stops with the question recorded rather than proceeding on a guess. With
-    /// one attached it is a wait state and the run keeps going.
+    /// Without a channel a human can answer through, `NeedsHuman` ends the run: nobody
+    /// can answer, so the run stops with the question recorded rather than proceeding
+    /// on a guess. With one attached it is a wait state and the run keeps going. (A
+    /// cancel-only channel, `RunControl::channel_without_human`, is not one.)
     fn terminal_status(&self, state: &RunState, has_control: bool) -> Option<FactoryStatus> {
         if state.status.is_terminal() {
             return Some(state.status);
@@ -1856,7 +1920,7 @@ impl FactoryRuntime {
                 "launch_error": outcome.launch_error,
                 "summary": outcome.summary(),
             });
-            outcomes.push(outcome);
+            keep_latest(outcomes, outcome);
             self.emit(state, EventKind::EvidenceCollected, payload)
                 .await?;
         }
@@ -2190,6 +2254,42 @@ pub fn default_margin() -> f32 {
 
 #[cfg(test)]
 mod tests {
+    use aftman_core::evidence::EvidenceOutcome;
+    use aftman_core::ids::EvidenceId;
+
+    fn outcome(provider: &str, success: bool) -> EvidenceOutcome {
+        EvidenceOutcome {
+            provider: EvidenceId::from(provider),
+            argv: vec!["t".into()],
+            cwd: PathBuf::from("/r"),
+            exit_code: Some(i32::from(!success)),
+            success,
+            duration: std::time::Duration::ZERO,
+            output_excerpt: String::new(),
+            truncated: false,
+            at: time::OffsetDateTime::UNIX_EPOCH,
+            launch_error: None,
+        }
+    }
+
+    #[test]
+    fn only_the_latest_outcome_per_provider_is_kept() {
+        let mut outcomes = Vec::new();
+        super::keep_latest(&mut outcomes, outcome("tests", false));
+        super::keep_latest(&mut outcomes, outcome("lint", true));
+        for _ in 0..100 {
+            super::keep_latest(&mut outcomes, outcome("tests", true));
+        }
+        assert_eq!(outcomes.len(), 2, "bounded by the number of providers");
+        let tests = outcomes
+            .iter()
+            .find(|o| o.provider == EvidenceId::from("tests"))
+            .expect("tests");
+        assert!(
+            tests.success,
+            "the stale failure no longer shadows the later pass"
+        );
+    }
 
     #[test]
     fn the_recorded_launch_posture_is_bounded() {

@@ -150,14 +150,23 @@ pub async fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), St
     let parent = path
         .parent()
         .ok_or_else(|| io_err(path.display(), std::io::Error::other("path has no parent")))?;
-    tokio::fs::create_dir_all(parent)
+    // Created owner-only, like every directory and file the store makes.
+    tokio::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
         .await
         .map_err(|e| io_err(parent.display(), e))?;
 
     let temp = path.with_extension("tmp");
     {
         use tokio::io::AsyncWriteExt;
-        let mut file = tokio::fs::File::create(&temp)
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&temp)
             .await
             .map_err(|e| io_err(temp.display(), e))?;
         file.write_all(bytes)
@@ -182,6 +191,14 @@ pub async fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> Result<(), St
     Ok(())
 }
 
+/// One page of a run's events.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct EventsPage {
+    pub events: Vec<EventEnvelope>,
+    /// True when events exist past this page.
+    pub has_more: bool,
+}
+
 /// Storage for runs.
 #[async_trait]
 pub trait RunStore: Send + Sync {
@@ -200,6 +217,23 @@ pub trait RunStore: Send + Sync {
     /// Read events at or after `from_seq`.
     async fn events(&self, id: RunId, from_seq: EventSeq)
     -> Result<Vec<EventEnvelope>, StoreError>;
+
+    /// Up to `limit` events at or after `from_seq`, and whether more follow.
+    ///
+    /// The default reads the whole log; the file store answers from a bounded ranged
+    /// read that does not parse events outside the page, so paging through a long run
+    /// costs a page each time, not the whole log.
+    async fn events_page(
+        &self,
+        id: RunId,
+        from_seq: EventSeq,
+        limit: usize,
+    ) -> Result<EventsPage, StoreError> {
+        let mut events = self.events(id, from_seq).await?;
+        let has_more = events.len() > limit;
+        events.truncate(limit);
+        Ok(EventsPage { events, has_more })
+    }
 
     /// List runs, newest first.
     async fn list(&self, filter: &RunFilter) -> Result<Vec<RunSummary>, StoreError>;

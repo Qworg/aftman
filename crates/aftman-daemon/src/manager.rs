@@ -91,6 +91,26 @@ const FAIL_ATTEMPTS: u32 = 5;
 const FAIL_BACKOFF: Duration = Duration::from_millis(100);
 /// Re-reads after losing a race with a write that was still in flight.
 const CONFLICT_RETRIES: u32 = 5;
+/// Longest reason string that reaches an event, in bytes (hard rule 5). Longer reasons
+/// are cut on a character boundary and marked with an ellipsis.
+pub const MAX_REASON_BYTES: usize = 512;
+
+/// `reason` capped at [`MAX_REASON_BYTES`].
+#[must_use]
+pub fn cap_reason(reason: &str) -> String {
+    if reason.len() <= MAX_REASON_BYTES {
+        return reason.to_owned();
+    }
+    let mut end = MAX_REASON_BYTES - 3;
+    while !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}...", &reason[..end])
+}
+
+/// Runs restart recovery handles at once. Reaping orphans waits on process groups, so
+/// this is a bound on concurrent waits, not on CPU.
+pub const RECOVERY_CONCURRENCY: usize = 32;
 
 /// The reason recorded for a run an earlier daemon process left unfinished.
 pub const RESTART_REASON: &str = "daemon restarted";
@@ -428,23 +448,42 @@ pub async fn fail_run_detailed(
     id: RunId,
     reason: &str,
 ) -> Result<FailReport, FailRunError> {
-    let _claim = match store.claim(id).await {
-        Ok(Some(claim)) => claim,
-        Ok(None) => {
-            return Ok(FailReport {
-                outcome: FailOutcome::Claimed,
-                orphans: Vec::new(),
-            });
+    fail_run_inner(store, sink, clock, id, reason, false).await
+}
+
+/// [`fail_run_detailed`]; with `owned` the caller asserts that *this process* already holds
+/// the run's claim (a task of its own that cannot be stopped), so none is taken.
+async fn fail_run_inner(
+    store: &dyn RunStore,
+    sink: &dyn FailSink,
+    clock: &dyn Clock,
+    id: RunId,
+    reason: &str,
+    owned: bool,
+) -> Result<FailReport, FailRunError> {
+    let _claim = if owned {
+        None
+    } else {
+        match store.claim(id).await {
+            Ok(Some(claim)) => Some(claim),
+            Ok(None) => {
+                return Ok(FailReport {
+                    outcome: FailOutcome::Claimed,
+                    orphans: Vec::new(),
+                });
+            }
+            Err(StoreError::NotFound(_)) => {
+                return Ok(FailReport {
+                    outcome: FailOutcome::Gone,
+                    orphans: Vec::new(),
+                });
+            }
+            Err(error) => return Err(error.into()),
         }
-        Err(StoreError::NotFound(_)) => {
-            return Ok(FailReport {
-                outcome: FailOutcome::Gone,
-                orphans: Vec::new(),
-            });
-        }
-        Err(error) => return Err(error.into()),
     };
     let orphans = reap_orphans(store, id).await;
+    let reason = cap_reason(reason);
+    let reason = reason.as_str();
     // A write from a task that was aborted may still be in flight; the store
     // serializes it and refuses a duplicate `seq`, so re-read and go on.
     let mut attempts = 0;
@@ -465,9 +504,24 @@ pub async fn fail_run_detailed(
 /// run's claim.
 async fn reap_orphans(store: &dyn RunStore, id: RunId) -> Vec<OrphanReport> {
     let recorded = store.worker_processes(id).await.unwrap_or_default();
+    // A run can have several recorded workers (a worker and a verifier); each is given
+    // its grace period at the same time rather than one after another.
+    let mut ending: JoinSet<(usize, OrphanOutcome)> = JoinSet::new();
+    for (index, (_, identity)) in recorded.iter().enumerate() {
+        let identity = identity.clone();
+        ending.spawn(async move { (index, end_orphan(&identity, ORPHAN_GRACE).await) });
+    }
+    let mut outcomes: Vec<Option<OrphanOutcome>> = vec![None; recorded.len()];
+    while let Some(joined) = ending.join_next().await {
+        if let Ok((index, outcome)) = joined {
+            outcomes[index] = Some(outcome);
+        }
+    }
     let mut reports = Vec::new();
-    for (worker, identity) in recorded {
-        let outcome = end_orphan(&identity, ORPHAN_GRACE).await;
+    for ((worker, identity), outcome) in recorded.into_iter().zip(outcomes) {
+        let outcome = outcome.unwrap_or_else(|| {
+            OrphanOutcome::Unverified("the task that ends the worker failed".to_owned())
+        });
         match &outcome {
             OrphanOutcome::Killed => {
                 tracing::warn!(run_id = %id, %worker, pgid = identity.pgid, "ended a worker orphaned by a dead supervisor");
@@ -488,6 +542,72 @@ async fn reap_orphans(store: &dyn RunStore, id: RunId) -> Vec<OrphanReport> {
         });
     }
     reports
+}
+
+/// Do for a run about to be purged what recovery would do for it: end its orphaned
+/// worker processes and remove their mission files, so deleting the run directory does
+/// not destroy the only record of a process still running (`processes.json` goes with the
+/// directory) or leave the job text behind in a mission file.
+///
+/// The caller holds the run's claim, so nobody is driving it. Workers are ended only if
+/// they can be positively identified as this run's ([`end_orphan`]). If any cannot, its
+/// record and files are left in place and `Err` says why: the caller must refuse to purge.
+///
+/// # Errors
+/// A worker that may still be running but could not be verified, or a record that cannot
+/// be read.
+pub async fn end_orphans_before_purge(
+    store: &dyn RunStore,
+    id: RunId,
+) -> Result<Vec<OrphanReport>, String> {
+    let recorded = store
+        .worker_processes(id)
+        .await
+        .map_err(|e| format!("could not read the run's worker records: {e}"))?;
+    let mut ending: JoinSet<(usize, OrphanOutcome)> = JoinSet::new();
+    for (index, (_, identity)) in recorded.iter().enumerate() {
+        let identity = identity.clone();
+        ending.spawn(async move { (index, end_orphan(&identity, ORPHAN_GRACE).await) });
+    }
+    let mut outcomes: Vec<Option<OrphanOutcome>> = vec![None; recorded.len()];
+    while let Some(joined) = ending.join_next().await {
+        if let Ok((index, outcome)) = joined {
+            outcomes[index] = Some(outcome);
+        }
+    }
+    let mut reports = Vec::new();
+    let mut refused = Vec::new();
+    for ((worker, identity), outcome) in recorded.into_iter().zip(outcomes) {
+        let outcome = outcome.unwrap_or_else(|| {
+            OrphanOutcome::Unverified("the task that ends the worker failed".to_owned())
+        });
+        if let OrphanOutcome::Unverified(why) = &outcome {
+            refused.push(format!(
+                "worker {worker} (process group {}) may still be running but could not be \
+                 identified as aftman's ({why})",
+                identity.pgid
+            ));
+        } else {
+            if let Some(file) = &identity.mission_file {
+                let _ = tokio::fs::remove_file(file).await;
+            }
+            let _ = store.set_worker_process(id, worker, None).await;
+        }
+        reports.push(OrphanReport {
+            worker,
+            pgid: identity.pgid,
+            outcome,
+        });
+    }
+    if refused.is_empty() {
+        Ok(reports)
+    } else {
+        Err(format!(
+            "{}; not purging, because that would delete the only record of it. Stop it by \
+             hand, then purge again",
+            refused.join("; ")
+        ))
+    }
 }
 
 async fn fail_attempt(
@@ -856,6 +976,15 @@ impl RunManager {
                 return report;
             }
         };
+        // Orphan reaping waits up to `ORPHAN_GRACE` per worker, and nothing is served
+        // until recovery is done, so doing the runs one after another would make the
+        // first command after a crash wait N x grace. Handle them concurrently (bounded):
+        // the total is about one grace period however many orphans there are, and every
+        // run is still failed, with its orphans' fate recorded, before the socket binds.
+        let mut handled = Vec::new();
+        let mut tasks: JoinSet<(usize, RunId, Result<FailReport, FailRunError>)> = JoinSet::new();
+        let limit = Arc::new(tokio::sync::Semaphore::new(RECOVERY_CONCURRENCY));
+        let mut order = 0usize;
         for id in ids {
             if self
                 .store
@@ -867,15 +996,36 @@ impl RunManager {
                 report.untouched.push(id);
                 continue;
             }
-            let detailed = fail_run_detailed(
-                self.store.as_ref(),
-                self.sink.as_ref(),
-                self.clock.as_ref(),
-                id,
-                RESTART_REASON,
-            )
-            .await;
-            self.sink.release(id);
+            let index = order;
+            order += 1;
+            let (store, sink, clock) = (
+                Arc::clone(&self.store),
+                Arc::clone(&self.sink),
+                Arc::clone(&self.clock),
+            );
+            let permit = Arc::clone(&limit);
+            tasks.spawn(async move {
+                let _permit = permit.acquire_owned().await;
+                let detailed = fail_run_detailed(
+                    store.as_ref(),
+                    sink.as_ref(),
+                    clock.as_ref(),
+                    id,
+                    RESTART_REASON,
+                )
+                .await;
+                sink.release(id);
+                (index, id, detailed)
+            });
+        }
+        while let Some(joined) = tasks.join_next().await {
+            match joined {
+                Ok(done) => handled.push(done),
+                Err(error) => tracing::error!(%error, "a recovery task failed"),
+            }
+        }
+        handled.sort_by_key(|(index, _, _)| *index);
+        for (_, id, detailed) in handled {
             let outcome = detailed.map(|found| {
                 report
                     .orphans
@@ -1036,7 +1186,9 @@ impl RunManager {
             // terminal rather than leave it.
             drop(started);
             drop(live);
-            self.fail_after_the_fact(run_id, SHUTDOWN_REASON).await;
+            let _ = self
+                .fail_after_the_fact(run_id, SHUTDOWN_REASON, false)
+                .await;
             return Err(ProtocolError::new(
                 ErrorCode::WrongState,
                 "the daemon shut down while the run was being started",
@@ -1069,13 +1221,16 @@ impl RunManager {
                 tracing::info!(%run_id, status = %outcome.status.as_str(), "run ended");
                 None
             }
-            Ok(Err(error)) => Some(format!("run failed: {error}")),
+            Ok(Err(error)) => Some(cap_reason(&format!("run failed: {error}"))),
             Err(join) if join.is_panic() => Some("run task panicked".to_owned()),
             Err(_) => Some("run task aborted".to_owned()),
         };
         if let Some(reason) = failure {
             tracing::error!(%run_id, %reason, "run ended abnormally");
-            self.fail_after_the_fact(run_id, &reason).await;
+            if let Err(why) = self.fail_after_the_fact(run_id, &reason, false).await {
+                // Followers would otherwise wait on this run forever.
+                self.hub().abandon(run_id, &why);
+            }
         }
         self.live().runs.remove(&run_id);
         self.sink.release(run_id);
@@ -1087,24 +1242,43 @@ impl RunManager {
     /// this runs. Retried with backoff, since the usual cause of failure is a store
     /// that is struggling; if it never works, the next restart's recovery is the last
     /// resort and this says so loudly.
-    async fn fail_after_the_fact(&self, run_id: RunId, reason: &str) {
+    async fn fail_after_the_fact(
+        &self,
+        run_id: RunId,
+        reason: &str,
+        owned: bool,
+    ) -> Result<(), String> {
         let mut backoff = FAIL_BACKOFF;
+        let mut last = String::new();
         for attempt in 1..=FAIL_ATTEMPTS {
-            match fail_run(
+            match fail_run_inner(
                 self.store.as_ref(),
                 self.sink.as_ref(),
                 self.clock.as_ref(),
                 run_id,
                 reason,
+                owned,
             )
             .await
             {
-                Ok(outcome) => {
-                    tracing::debug!(%run_id, ?outcome, "recorded an abnormal run end");
-                    return;
-                }
+                Ok(report) => match report.outcome {
+                    FailOutcome::Failed
+                    | FailOutcome::AlreadyFinished
+                    | FailOutcome::Repaired
+                    | FailOutcome::Removed => {
+                        tracing::debug!(%run_id, outcome = ?report.outcome, "recorded an abnormal run end");
+                        return Ok(());
+                    }
+                    FailOutcome::Gone => {
+                        return Err(format!("{reason}; the run's data was removed while it ran"));
+                    }
+                    FailOutcome::Claimed => {
+                        return Err(format!("{reason}; another process holds the run"));
+                    }
+                },
                 Err(error) => {
                     tracing::error!(%run_id, %error, attempt, "could not record an abnormal run end");
+                    last = error.to_string();
                     if attempt < FAIL_ATTEMPTS {
                         tokio::time::sleep(backoff).await;
                         backoff *= 2;
@@ -1116,6 +1290,9 @@ impl RunManager {
             %run_id,
             "GIVING UP recording a run as failed; it stays non-terminal until the next daemon start recovers it"
         );
+        Err(cap_reason(&format!(
+            "{reason}; recording it failed: {last}"
+        )))
     }
 
     // ---- reads --------------------------------------------------------------
@@ -1171,14 +1348,16 @@ impl RunManager {
         Request::RunEvents(params.clone()).validate()?;
         let limit = effective_limit(params.limit, DEFAULT_EVENTS_LIMIT, MAX_EVENTS_LIMIT)?;
         let from = params.from_seq.unwrap_or(EventSeq::FIRST);
-        let mut events = self
+        // A ranged read: a page costs a page, not the whole log.
+        let page = self
             .store
-            .events(params.run_id, from)
+            .events_page(params.run_id, from, limit)
             .await
             .map_err(|e| store_error(&e))?;
-        let has_more = events.len() > limit;
-        events.truncate(limit);
-        Ok(RunEventsResult { events, has_more })
+        Ok(RunEventsResult {
+            events: page.events,
+            has_more: page.has_more,
+        })
     }
 
     /// `responsibility.list`.
@@ -1390,6 +1569,14 @@ impl RunManager {
             Err(StoreError::NotFound(_)) => return Ok(Purge::Gone),
             Err(error) => return Err(store_error(&error)),
         };
+        // What recovery would do for a run nobody is driving: end its orphaned worker and
+        // remove its mission file first, or refuse and say why.
+        if let Err(why) = end_orphans_before_purge(self.store.as_ref(), run_id).await {
+            return Err(ProtocolError::new(
+                ErrorCode::WrongState,
+                format!("run {run_id}: {why}"),
+            ));
+        }
         let outcome = match self.store.delete(run_id).await {
             Ok(()) => Purge::Purged,
             // Deleted by someone between claiming and now.
@@ -1413,22 +1600,27 @@ impl RunManager {
     /// Idempotent.
     pub async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::SeqCst);
-        let deadline = tokio::time::Instant::now() + self.config.shutdown_grace;
 
         // A start that began before the flag is allowed to finish, and is then
-        // cancelled like any other run. Bounded: a factory that never returns must
-        // not hold the daemon up.
+        // cancelled like any other run. Bounded by its own grace period: a factory that
+        // never returns must not hold the daemon up, and the time it uses must not eat
+        // the runs' time to stop (or every graceful cancel would become an abort).
+        let start_deadline = tokio::time::Instant::now() + self.config.shutdown_grace;
         loop {
             let changed = self.changed.notified();
             if self.live().reserved == 0 {
                 break;
             }
-            if tokio::time::timeout_at(deadline, changed).await.is_err() {
-                tracing::error!("a run.start outlasted the shutdown wait");
+            if tokio::time::timeout_at(start_deadline, changed)
+                .await
+                .is_err()
+            {
+                tracing::error!("a run.start outlasted the shutdown wait; it will be refused");
                 break;
             }
         }
 
+        let deadline = tokio::time::Instant::now() + self.config.shutdown_grace;
         loop {
             let (controls, mut tasks) = {
                 let mut live = self.live();
@@ -1442,11 +1634,16 @@ impl RunManager {
                         });
                     }
                 }
+                if controls.is_empty() {
+                    // Decided under the same lock `run.start` inserts under: a run
+                    // inserted before this point was seen by a pass above; one that
+                    // arrives after finds `closed` and is refused (and recorded), so
+                    // none can be live and never cancelled.
+                    self.closed.store(true, Ordering::SeqCst);
+                    break;
+                }
                 (controls, tasks)
             };
-            if controls.is_empty() {
-                break;
-            }
             let mut cancels = JoinSet::new();
             for (id, control) in controls {
                 cancels.spawn(async move {
@@ -1467,11 +1664,31 @@ impl RunManager {
                 }
                 // Supervisors notice the abort and record the failure.
                 let settle = async { while tasks.join_next().await.is_some() {} };
-                let _ = tokio::time::timeout(ABORT_SETTLE, settle).await;
+                let patience = ABORT_SETTLE.min(self.config.shutdown_grace);
+                let _ = tokio::time::timeout(patience, settle).await;
                 break;
             }
         }
         self.closed.store(true, Ordering::SeqCst);
+
+        // A task that ignores `abort` (it is stuck in a call that never yields) cannot
+        // be made to record its own end, and the process is about to go. This daemon
+        // holds the run's claim, so it records the end itself and tells followers if even
+        // that fails: a run must not be left `running` by a daemon that exits.
+        let stuck: Vec<RunId> = self.live().runs.keys().copied().collect();
+        for run_id in stuck {
+            tracing::error!(%run_id, "a run task could not be stopped; recording it Failed");
+            if let Err(why) = self
+                .fail_after_the_fact(
+                    run_id,
+                    "the run task could not be stopped at shutdown",
+                    true,
+                )
+                .await
+            {
+                self.hub().abandon(run_id, &why);
+            }
+        }
         self.hub().close_all();
     }
 }

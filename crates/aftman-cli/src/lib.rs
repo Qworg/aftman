@@ -66,7 +66,12 @@ pub fn main_entry() -> ExitCode {
             return ExitCode::from(error::exit::CONFIG);
         }
     };
-    match runtime.block_on(commands::dispatch(cli)) {
+    let result = runtime.block_on(commands::dispatch(cli));
+    // The graceful paths (the daemon's shutdown, an embedded run's cancel) have run by
+    // now. Whatever is still on the blocking pool - a filesystem call stuck on a slow or
+    // hung mount - must not hold the process at exit: give it a moment, then go.
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
+    match result {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
             // A closed pipe is the reader's choice, not a failure. Anything else is
@@ -78,3 +83,6 @@ pub fn main_entry() -> ExitCode {
         }
     }
 }
+
+/// How long exit waits for blocking-pool work still running after the command is done.
+pub const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(2);

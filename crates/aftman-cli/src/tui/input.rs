@@ -14,8 +14,10 @@
 //! - **Decide**: pick how to answer an escalation (`docs/06-ensemble.md` "R3 - Human").
 //! - **Confirm**: `cancel` and an answer of `stop` ask first, and the confirmation is a whole
 //!   word (`cancel` / `stop`) plus Enter, which type-ahead or an unbracketed paste cannot
-//!   produce by accident. Keys that arrive in the same burst as the key that opened a
-//!   modal are swallowed (see [`BURST_GAP`]).
+//!   produce by accident. Two narrow rules do that (see [`BURST_GAP`]): the rest of a burst
+//!   that opened a modal is swallowed, and an Enter that arrives in the same burst as the
+//!   keys before it never confirms. Characters typed quickly inside the confirmation are
+//!   just text.
 //! - **Help**: the key list.
 
 use aftman_core::assessment::HumanDecision;
@@ -238,10 +240,13 @@ pub const LINES_PER_CHECK: usize = 2;
 /// Rows a page key moves.
 const PAGE: usize = 10;
 
-/// Keys closer together than this came from a paste or type-ahead, not a person. A
-/// burst cannot open or drive a modal, cannot issue a command, and an Enter inside one
-/// is a space, never a submit. Only keys that carry a timestamp
-/// ([`handle_key_at`]) are subject to it.
+/// Keys closer together than this are a burst: a paste or type-ahead, or a fast typist.
+/// What a burst may not do is narrow: issue a command from the main screen; carry on
+/// driving a modal that it opened (the keys that follow the opener without a pause are
+/// swallowed); and confirm (an Enter in the same burst as the keys before it is a space
+/// in a text editor and "press Enter again" in a confirmation). Plain characters typed
+/// quickly into an editor or a confirmation are text. Only keys that carry a timestamp
+/// ([`handle_key_at`]) are subject to any of this.
 pub const BURST_GAP: time::Duration = time::Duration::milliseconds(25);
 
 /// The smallest terminal the confirmation popup is drawn in full on. Below it the
@@ -279,10 +284,17 @@ pub struct UiState {
     pub viewport: Option<(u16, u16)>,
     /// The time of the previous timestamped key (for burst detection).
     pub last_key_at: Option<OffsetDateTime>,
+    /// The current burst began with the key that opened a modal: its remainder is
+    /// swallowed. Cleared by the first key after a pause.
+    pub opener_chain: bool,
     pub link: Link,
     /// The daemon is not driving this run (it lives in another process, or is an
     /// orphan): the stream polls the log.
     pub polling: bool,
+    /// The highest `seq` the run's snapshot held when the watch began. The fold has
+    /// "caught up" once it reaches it (or the stream has ended); until then what is
+    /// on screen is history being replayed, not the run's present.
+    pub replay_target: Option<u64>,
     pub message: Option<Message>,
     /// An action in flight ("cancelling...").
     pub busy: Option<String>,
@@ -306,8 +318,10 @@ impl UiState {
             assess_max: Cell::new(0),
             viewport: None,
             last_key_at: None,
+            opener_chain: false,
             link: Link::Live,
             polling: false,
+            replay_target: None,
             message: None,
             busy: None,
             now,
@@ -344,6 +358,13 @@ impl UiState {
             self.message = None;
         }
         seconds_changed || expired
+    }
+
+    /// While the fold is still catching up with the log: `(applied seq, target seq)`.
+    #[must_use]
+    pub fn replaying(&self, applied: u64) -> Option<(u64, u64)> {
+        let target = self.replay_target?;
+        (!self.stream_ended && applied < target).then_some((applied, target))
     }
 
     /// Whether the terminal is known to be too small for the popup `min` describes.
@@ -609,8 +630,17 @@ pub fn handle_key_at(
         }
         None => false,
     };
+    if !burst {
+        ui.opener_chain = false;
+    }
     let interrupt = ctrl(&key) && matches!(key.code, KeyCode::Char('c'));
-    match ui.mode.clone() {
+    let was_plain = !matches!(
+        ui.mode,
+        Mode::Confirm { .. } | Mode::Decide { .. } | Mode::Help
+    );
+    // The rest of a burst that opened a modal is not for the modal.
+    let swallow = burst && ui.opener_chain;
+    let action = match ui.mode.clone() {
         Mode::Normal => {
             if burst && !is_navigation(&key) && !interrupt {
                 return None;
@@ -618,7 +648,7 @@ pub fn handle_key_at(
             normal_key(ui, state, key)
         }
         Mode::Help => {
-            if burst {
+            if swallow {
                 return None;
             }
             if interrupt {
@@ -633,18 +663,28 @@ pub fn handle_key_at(
             position,
             selected,
         } => {
-            if burst {
+            if swallow {
                 return None;
             }
-            decide_key(ui, escalation, position, selected, key)
+            decide_key(ui, state, escalation, position, selected, key)
         }
         Mode::Confirm { what, typed } => {
-            if burst {
+            if swallow {
                 return None;
             }
-            confirm_key(ui, what, typed, key)
+            confirm_key(ui, what, typed, key, burst)
         }
+    };
+    if at.is_some()
+        && was_plain
+        && matches!(
+            ui.mode,
+            Mode::Confirm { .. } | Mode::Decide { .. } | Mode::Help
+        )
+    {
+        ui.opener_chain = true;
     }
+    action
 }
 
 /// Handle pasted text. Only meaningful while typing.
@@ -811,6 +851,7 @@ fn start_answer(ui: &mut UiState, state: &WatchState) {
 
 fn decide_key(
     ui: &mut UiState,
+    state: &WatchState,
     escalation: EscalationId,
     position: (usize, usize),
     selected: usize,
@@ -839,6 +880,26 @@ fn decide_key(
     let count = Choice::ALL.len();
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') => ui.mode = Mode::Normal,
+        // With several open escalations the operator chooses which one this answers.
+        KeyCode::Tab | KeyCode::BackTab => {
+            let ids: Vec<EscalationId> = state
+                .open_escalations()
+                .filter_map(|e| e.id.parse().ok())
+                .collect();
+            if ids.len() > 1 {
+                let here = ids.iter().position(|id| *id == escalation).unwrap_or(0);
+                let next = if matches!(key.code, KeyCode::Tab) {
+                    (here + 1) % ids.len()
+                } else {
+                    here.checked_sub(1).unwrap_or(ids.len() - 1)
+                };
+                ui.mode = Mode::Decide {
+                    escalation: ids[next],
+                    position: (next + 1, ids.len()),
+                    selected,
+                };
+            }
+        }
         KeyCode::Up | KeyCode::Char('k') => set(ui, selected.checked_sub(1).unwrap_or(count - 1)),
         KeyCode::Down | KeyCode::Char('j') => set(ui, (selected + 1) % count),
         KeyCode::Char(c @ '1'..='5') => {
@@ -868,6 +929,7 @@ fn confirm_key(
     what: Confirm,
     mut typed: String,
     key: KeyEvent,
+    burst: bool,
 ) -> Option<Action> {
     let back = |ui: &mut UiState, why: &str| {
         ui.mode = Mode::Normal;
@@ -884,6 +946,11 @@ fn confirm_key(
     match key.code {
         KeyCode::Esc => back(ui, "not confirmed; nothing was sent"),
         _ if too_small => {}
+        KeyCode::Enter if burst => {
+            // Typed or pasted in one go with what came before: not a deliberate act.
+            ui.mode = Mode::Confirm { what, typed };
+            ui.set_message(Tone::Info, "press Enter again to confirm");
+        }
         KeyCode::Enter => {
             if !typed.trim().eq_ignore_ascii_case(what.word()) {
                 back(
@@ -1125,7 +1192,9 @@ pub fn hints(mode: &Mode, finished: bool, needs_human: bool) -> String {
             out
         }
         Mode::Input { .. } => "Enter send  Esc cancel  Ctrl-U clear line".to_owned(),
-        Mode::Decide { .. } => "j/k or 1-5 choose  Enter select  Esc back".to_owned(),
+        Mode::Decide { .. } => {
+            "j/k or 1-5 choose  Enter select  Tab next escalation  Esc back".to_owned()
+        }
         Mode::Confirm { what, .. } => {
             format!("type {} then Enter to confirm  Esc back", what.word())
         }
@@ -2261,5 +2330,203 @@ mod tests {
         assert!(!hints(&Mode::Normal, true, false).contains("s steer"));
         assert!(hints(&Mode::Normal, false, true).contains("a ANSWER"));
         assert!(hints(&Mode::Help, false, false).contains("help"));
+    }
+
+    // ---- the narrowed burst guard ---------------------------------------------
+
+    fn typed_in(u: &UiState) -> String {
+        match &u.mode {
+            Mode::Confirm { typed, .. } => typed.clone(),
+            other => panic!("not in a confirmation: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_fast_typist_confirms_with_a_separate_enter() {
+        // The reviewer's sequence: `c` opens the prompt; then c,a 10 ms apart and
+        // n,c,e,l; then Enter as its own act.
+        let state = live();
+        let mut u = ui();
+        handle_key_at(&mut u, &state, chr('c'), at(0));
+        assert!(matches!(u.mode, Mode::Confirm { .. }));
+        for (c, ms) in [
+            ('c', 400),
+            ('a', 410),
+            ('n', 600),
+            ('c', 700),
+            ('e', 800),
+            ('l', 900),
+        ] {
+            assert_eq!(handle_key_at(&mut u, &state, chr(c), at(ms)), None);
+        }
+        assert_eq!(typed_in(&u), "cancel");
+        assert_eq!(
+            handle_key_at(&mut u, &state, key(KeyCode::Enter), at(1500)),
+            Some(Action::Cancel)
+        );
+    }
+
+    #[test]
+    fn characters_typed_quickly_inside_the_confirmation_are_text() {
+        let state = live();
+        let mut u = ui();
+        handle_key_at(&mut u, &state, chr('c'), at(0));
+        // After a pause, six characters 2 ms apart (key repeat, a jittery link).
+        for (i, c) in "cancel".chars().enumerate() {
+            handle_key_at(&mut u, &state, chr(c), at(1000 + 2 * i as i64));
+        }
+        assert_eq!(typed_in(&u), "cancel");
+    }
+
+    #[test]
+    fn an_enter_in_the_same_burst_as_the_text_does_not_confirm_and_keeps_the_text() {
+        let state = live();
+        let mut u = ui();
+        handle_key_at(&mut u, &state, chr('c'), at(0));
+        // A paste of `cancel\n` into the open confirmation, after a pause.
+        let actions = burst(&mut u, &state, "cancel\n", 1000);
+        assert_eq!(actions, vec![]);
+        assert_eq!(
+            typed_in(&u),
+            "cancel",
+            "the text is intact and the prompt is open"
+        );
+        assert!(
+            u.message
+                .as_ref()
+                .is_some_and(|m| m.text.contains("press Enter again"))
+        );
+        // A deliberate Enter afterwards does confirm.
+        assert_eq!(
+            handle_key_at(&mut u, &state, key(KeyCode::Enter), at(4000)),
+            Some(Action::Cancel)
+        );
+    }
+
+    #[test]
+    fn plain_keystrokes_spelling_a_sentence_cannot_cancel_at_any_pace() {
+        for pace in [1, 20, 120, 400] {
+            let state = live();
+            let mut u = ui();
+            let mut actions = Vec::new();
+            for (i, c) in "update the policy doc".chars().enumerate() {
+                actions.extend(handle_key_at(&mut u, &state, chr(c), at(i as i64 * pace)));
+            }
+            assert_eq!(actions, vec![], "pace {pace} ms");
+        }
+        // Unstamped keys (tests, non-keyboard sources) too.
+        let state = live();
+        let mut u = ui();
+        for c in "update the policy doc".chars() {
+            assert_eq!(handle_key(&mut u, &state, chr(c)), None);
+        }
+    }
+
+    #[test]
+    fn an_unbracketed_multi_line_paste_with_cancel_in_it_cannot_cancel() {
+        for text in [
+            "notes\nc\ncancel\n",
+            "cancel\n",
+            "cancel\ncancel\n",
+            "ok\ncancel\n\ncancel\n",
+        ] {
+            let state = live();
+            let mut u = ui();
+            let actions = burst(&mut u, &state, text, 0);
+            assert_eq!(actions, vec![], "{text:?}");
+        }
+        // The same into the steer editor.
+        let state = live();
+        let mut u = ui();
+        handle_key_at(&mut u, &state, chr('s'), at(0));
+        assert_eq!(burst(&mut u, &state, "c\ncancel\n", 1000), vec![]);
+    }
+
+    #[test]
+    fn the_rest_of_a_burst_that_opened_a_modal_is_swallowed_but_a_pause_ends_it() {
+        let id = EscalationId::new();
+        let state = waiting(&id);
+        let mut u = ui();
+        // `a` by a person, then `3` and Enter in the same burst: nothing is chosen.
+        handle_key_at(&mut u, &state, chr('a'), at(0));
+        assert!(matches!(u.mode, Mode::Decide { selected: 0, .. }));
+        handle_key_at(&mut u, &state, chr('3'), at(2));
+        handle_key_at(&mut u, &state, key(KeyCode::Enter), at(3));
+        assert!(
+            matches!(u.mode, Mode::Decide { selected: 0, .. }),
+            "{:?}",
+            u.mode
+        );
+        // After a pause the same keys work.
+        handle_key_at(&mut u, &state, chr('3'), at(500));
+        assert!(matches!(u.mode, Mode::Decide { selected: 2, .. }));
+    }
+
+    #[test]
+    fn with_several_open_escalations_tab_chooses_which_one_is_answered() {
+        let first = EscalationId::new();
+        let second = EscalationId::new();
+        let third = EscalationId::new();
+        let mut state = waiting(&first);
+        state.apply(&ev(
+            4,
+            EventKind::EscalationRaised,
+            json!({"escalation_id": second.to_string()}),
+        ));
+        state.apply(&ev(
+            5,
+            EventKind::EscalationRaised,
+            json!({"escalation_id": third.to_string()}),
+        ));
+        let mut u = ui();
+        handle_key(&mut u, &state, chr('a'));
+        assert_eq!(
+            u.mode,
+            Mode::Decide {
+                escalation: first,
+                position: (1, 3),
+                selected: 0
+            }
+        );
+        handle_key(&mut u, &state, key(KeyCode::Tab));
+        assert_eq!(
+            u.mode,
+            Mode::Decide {
+                escalation: second,
+                position: (2, 3),
+                selected: 0
+            }
+        );
+        handle_key(&mut u, &state, key(KeyCode::Tab));
+        handle_key(&mut u, &state, key(KeyCode::Tab));
+        assert!(
+            matches!(u.mode, Mode::Decide { escalation, position: (1, 3), .. } if escalation == first),
+            "wraps"
+        );
+        handle_key(&mut u, &state, key(KeyCode::BackTab));
+        assert!(
+            matches!(u.mode, Mode::Decide { escalation, position: (3, 3), .. } if escalation == third)
+        );
+        handle_key(&mut u, &state, chr('1'));
+        handle_key(&mut u, &state, key(KeyCode::Enter));
+        assert_eq!(
+            handle_key(&mut u, &state, key(KeyCode::Enter)),
+            Some(Action::Answer {
+                escalation: third,
+                decision: HumanDecision::Accept,
+                note: String::new()
+            })
+        );
+    }
+
+    #[test]
+    fn tab_with_one_open_escalation_changes_nothing() {
+        let id = EscalationId::new();
+        let state = waiting(&id);
+        let mut u = ui();
+        handle_key(&mut u, &state, chr('a'));
+        let before = u.mode.clone();
+        handle_key(&mut u, &state, key(KeyCode::Tab));
+        assert_eq!(u.mode, before);
     }
 }

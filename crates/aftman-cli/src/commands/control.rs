@@ -15,8 +15,8 @@ use crate::cli::{AnswerArgs, RunTarget};
 use crate::commands::Ctx;
 use crate::commands::inspect::{Reader, target};
 use crate::error::{CliError, exit};
-use crate::outln;
 use crate::runid::RunSpec;
+use crate::{errln, outln};
 
 /// `aftman steer <run> "<message>"`.
 ///
@@ -195,6 +195,17 @@ async fn purge_store(
             }
             continue;
         };
+        // What recovery would do for a run nobody drives: end its orphaned worker and
+        // remove its mission file first. A worker that cannot be verified is not
+        // touched, and neither is the record of it: refuse rather than delete the only
+        // trace of a process that may still be running.
+        if let Err(why) = aftman_daemon::end_orphans_before_purge(store, id).await {
+            if only.is_some() {
+                return Err(CliError::Failed(format!("run {id}: {why}")));
+            }
+            errln!("not purging run {id}: {why}");
+            continue;
+        }
         match store.delete(id).await {
             Ok(()) => purged += 1,
             Err(StoreError::NotFound(missing)) => {

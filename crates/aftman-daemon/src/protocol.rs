@@ -68,6 +68,9 @@ pub enum ErrorCode {
     UnknownMethod,
     /// Out-of-band push: this subscriber fell behind and was dropped.
     SubscriberLagged,
+    /// Out-of-band push: the daemon stopped driving the run this subscription follows
+    /// and could not record how it ended. The stream has ended; do not wait for more.
+    RunAbandoned,
     /// A code this build does not know (a newer daemon). Decoding tolerates it;
     /// it re-serializes as `"unknown"`, the original string is not preserved.
     #[serde(other)]
@@ -89,6 +92,7 @@ impl ErrorCode {
             Self::InvalidRequest => "invalid_request",
             Self::UnknownMethod => "unknown_method",
             Self::SubscriberLagged => "subscriber_lagged",
+            Self::RunAbandoned => "run_abandoned",
             Self::Unknown => "unknown",
         }
     }
@@ -136,6 +140,20 @@ impl ProtocolError {
     pub fn with_data(mut self, data: Value) -> Self {
         self.data = Some(data);
         self
+    }
+
+    /// The push sent to a run's subscribers when the daemon stopped driving the run
+    /// without being able to record its end. Not retryable: the run's record is
+    /// unfinished until a daemon restart repairs it. `data` carries `run_id` and `reason`.
+    #[must_use]
+    pub fn abandoned(run_id: RunId, reason: &str) -> Self {
+        Self::new(
+            ErrorCode::RunAbandoned,
+            format!(
+                "the daemon stopped driving run {run_id} and could not record its end: {reason}"
+            ),
+        )
+        .with_data(serde_json::json!({ "run_id": run_id, "reason": reason }))
     }
 
     /// The push sent when a subscriber is dropped for being slow.
@@ -364,7 +382,14 @@ pub struct RunAnswerParams {
     pub decision: HumanDecision,
     #[serde(default)]
     pub note: String,
+    /// Which surface the answer came from, recorded with it (`ESCALATION_ANSWERED`).
+    /// One of [`ANSWER_SURFACES`]; absent means the server's own default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surface: Option<String>,
 }
+
+/// The surfaces a `run.answer` may name itself as.
+pub const ANSWER_SURFACES: [&str; 4] = ["cli", "tui", "web", "herdr"];
 
 /// `HumanDecision` lives in core and tolerates unknown fields; on the wire a typo
 /// must be an error, so decode through this strict mirror and convert.
@@ -671,6 +696,14 @@ impl Request {
             }
             Self::RunAnswer(p) => {
                 check_len("note", &p.note, MAX_ANSWER_BYTES)?;
+                if let Some(surface) = &p.surface {
+                    if !ANSWER_SURFACES.contains(&surface.as_str()) {
+                        return Err(ProtocolError::invalid(format!(
+                            "surface must be one of {}",
+                            ANSWER_SURFACES.join(", ")
+                        )));
+                    }
+                }
                 if let HumanDecision::Guidance { text } = &p.decision {
                     check_len("guidance text", text, MAX_ANSWER_BYTES)?;
                     if text.trim().is_empty() {
@@ -906,6 +939,13 @@ impl ServerMessage {
     }
 
     #[must_use]
+    pub fn abandoned(run_id: RunId, reason: &str) -> Self {
+        Self::Error(ErrorPush {
+            error: ProtocolError::abandoned(run_id, reason),
+        })
+    }
+
+    #[must_use]
     pub fn lagged(run_id: Option<RunId>, resume_from: Option<EventSeq>) -> Self {
         Self::Error(ErrorPush {
             error: ProtocolError::lagged(run_id, resume_from),
@@ -994,6 +1034,7 @@ mod tests {
                 escalation_id: EscalationId::new(),
                 decision: HumanDecision::Guidance { text: "hi".into() },
                 note: "n".into(),
+                surface: Some("tui".into()),
             }),
             Request::RunPurge(RunPurgeParams {
                 run_id: Some(run_id),
@@ -1361,5 +1402,30 @@ mod tests {
             assert_eq!(serde_json::to_value(code)?, json!(code.as_str()));
         }
         Ok(())
+    }
+
+    #[test]
+    fn an_answer_may_name_its_surface_from_a_closed_set() {
+        let answer = |surface: Option<&str>| {
+            Request::RunAnswer(RunAnswerParams {
+                run_id: RunId::new(),
+                escalation_id: EscalationId::new(),
+                decision: HumanDecision::Accept,
+                note: String::new(),
+                surface: surface.map(ToOwned::to_owned),
+            })
+        };
+        for ok in [None, Some("cli"), Some("tui"), Some("web"), Some("herdr")] {
+            assert!(answer(ok).validate().is_ok(), "{ok:?}");
+        }
+        for bad in ["", "TUI", "tui ", "admin", "x".repeat(10_000).as_str()] {
+            let error = answer(Some(bad)).validate().expect_err("refused");
+            assert_eq!(error.code, ErrorCode::InvalidRequest, "{bad:?}");
+        }
+        // Absent on the wire stays absent; present round-trips; unknown fields stay refused.
+        let wire = answer(None).to_wire(1).expect("wire");
+        assert!(wire.params.get("surface").is_none());
+        let with = answer(Some("tui")).to_wire(1).expect("wire");
+        assert_eq!(with.params["surface"], "tui");
     }
 }

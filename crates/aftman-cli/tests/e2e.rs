@@ -20,6 +20,9 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
 const PATIENCE: Duration = Duration::from_secs(30);
+/// The provider variables, named by the one crate that may (hard rule 2).
+const API_KEY_VAR: &str = aftman_jev::ENV_KEYS[0];
+const BASE_URL_VAR: &str = aftman_jev::ENV_KEYS[1];
 
 // ===========================================================================
 // The sandbox
@@ -176,8 +179,8 @@ impl Drop for Sandbox {
         for pid in serving(&self.socket) {
             let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
         }
-        // Any worker still sleeping under this sandbox's repo.
-        for pid in processes_mentioning(self.repo.to_str().unwrap_or("/nonexistent")) {
+        // Any worker still running under this sandbox (its repo, or a script in it).
+        for pid in processes_mentioning(self.dir.path().to_str().unwrap_or("/nonexistent")) {
             let _ = kill(Pid::from_raw(pid as i32), Signal::SIGKILL);
         }
     }
@@ -1141,8 +1144,8 @@ fn the_daemons_environment_is_frozen_and_the_cli_says_so() {
 
     // A later shell has one. `status` shows both views and flags the disagreement.
     let status = sb.run_with(&["status"], |c| {
-        c.env("TYPESAFE_API_KEY", "sk-test-secret-1234")
-            .env("TYPESAFE_BASE_URL", "https://user:hunter2@api.example.com");
+        c.env(API_KEY_VAR, "sk-test-secret-1234")
+            .env(BASE_URL_VAR, "https://user:hunter2@api.example.com");
     });
     assert_eq!(status.code, 0, "{}", status.all());
     assert!(
@@ -1171,8 +1174,8 @@ fn the_daemons_environment_is_frozen_and_the_cli_says_so() {
         status.stdout
     );
     let doctor = sb.run_with(&["doctor"], |c| {
-        c.env("TYPESAFE_API_KEY", "sk-test-secret-1234")
-            .env("TYPESAFE_BASE_URL", "https://user:hunter2@api.example.com");
+        c.env(API_KEY_VAR, "sk-test-secret-1234")
+            .env(BASE_URL_VAR, "https://user:hunter2@api.example.com");
     });
     assert!(
         doctor
@@ -1193,7 +1196,7 @@ fn the_daemons_environment_is_frozen_and_the_cli_says_so() {
             "x",
         ],
         |c| {
-            c.env("TYPESAFE_API_KEY", "sk-test-secret-1234");
+            c.env(API_KEY_VAR, "sk-test-secret-1234");
         },
     );
     assert_eq!(run.code, 2, "{}", run.all());
@@ -1213,8 +1216,8 @@ fn a_provider_run_through_the_daemon_prints_the_supervisor_line_and_never_the_ke
     // Nothing listens on port 9: the model is unreachable, but the run starts and says
     // what it is supervised by.
     let env = |c: &mut Command| {
-        c.env("TYPESAFE_API_KEY", secret)
-            .env("TYPESAFE_BASE_URL", "http://user:hunter2@127.0.0.1:9");
+        c.env(API_KEY_VAR, secret)
+            .env(BASE_URL_VAR, "http://user:hunter2@127.0.0.1:9");
     };
     let mut command = sb.command(&sb.run_args(&[]));
     // (`--simulate-model` is part of run_args; run the real-provider variant by hand.)
@@ -1684,4 +1687,372 @@ fn status_says_when_a_daemon_holds_its_lock_but_does_not_answer() {
         "{}",
         status.stdout
     );
+}
+
+// ===========================================================================
+// Final-review fixes, part 1
+// ===========================================================================
+
+#[test]
+fn an_embedded_run_that_needs_a_human_ends_with_exit_three() {
+    // A control channel is attached (so a signal can cancel the run) but nothing can
+    // answer it: NeedsHuman must end the run with the question recorded, not park it.
+    let sb = Sandbox::new();
+    let args = sb.run_args(&[
+        "--no-daemon",
+        "--worker",
+        "generic",
+        "--cmd",
+        "true {repo}",
+        "--external-sandbox",
+    ]);
+    let out = sb.run(&args); // `wait` has a deadline: a hang is a failure, not a stall
+    assert_eq!(out.code, 3, "{}", out.all());
+    assert!(out.stdout.contains("ESCALATION_RAISED"), "{}", out.stdout);
+    assert!(out.stdout.contains("RUN_FINISHED"), "{}", out.stdout);
+    assert_eq!(after(&out.stdout, "status"), Some("needs_human"));
+    assert!(!sb.socket.exists(), "no daemon was involved");
+
+    // The question is on record, and the run is over (nobody is driving it).
+    let id = run_id_of(&out);
+    let show = sb.run(&["--no-daemon", "show", &id]);
+    assert!(show.stdout.contains("open escalation"), "{}", show.stdout);
+    assert!(
+        !show.stdout.contains("aftman answer"),
+        "no answer hint for a run nobody can answer: {}",
+        show.stdout
+    );
+}
+
+#[test]
+fn the_other_embedded_outcomes_still_behave() {
+    let sb = Sandbox::new();
+    // Finished.
+    let done = sb.run(&sb.run_args(&["--no-daemon"]));
+    assert_eq!(done.code, 0, "{}", done.all());
+    // Failed (the worker cannot launch).
+    let failed = sb.run(&sb.run_args(&[
+        "--no-daemon",
+        "--worker",
+        "generic",
+        "--external-sandbox",
+        "--cmd",
+        "/nonexistent/aftman-test-binary {repo}",
+    ]));
+    assert_eq!(failed.code, 1, "{}", failed.all());
+    // Cancelled by a signal, while the worker is running.
+    let (cmd_flag, cmd) = sleeper(&tag("600.411"));
+    let args = sb.run_args(&[
+        "--no-daemon",
+        "--worker",
+        "generic",
+        "--external-sandbox",
+        &cmd_flag,
+        &cmd,
+    ]);
+    let run = sb.spawn(&args);
+    sb.wait_for("the worker", || {
+        (!sleepers(&tag("600.411")).is_empty()).then_some(())
+    });
+    run.signal(Signal::SIGINT);
+    let out = run.wait(PATIENCE);
+    assert_eq!(out.code, 130, "{}", out.all());
+    let ls = sb.run(&["--no-daemon", "ls"]);
+    assert!(ls.stdout.contains("cancelled"), "{}", ls.stdout);
+    assert!(ls.stdout.contains("failed") && ls.stdout.contains("finished"));
+}
+
+/// A worker that ignores the polite interrupt (so ending it costs the full grace) and
+/// would outlive its supervisor.
+fn stubborn_worker(sb: &Sandbox) -> (PathBuf, String) {
+    let script = sb.dir.path().join("stubborn.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\ntrap '' INT\nwhile :; do sleep 1; done\n",
+    )
+    .expect("script");
+    let cmd = format!("sh {}", script.display());
+    (script, cmd)
+}
+
+#[test]
+fn the_first_command_after_a_crash_waits_for_recovery_and_followers_survive_it() {
+    let sb = Sandbox::new();
+    let (script, cmd) = stubborn_worker(&sb);
+    let args = sb.run_args(&["--worker", "generic", "--external-sandbox", "--cmd", &cmd]);
+    let long = sb.spawn(&args);
+    let id = sb.wait_for_run_with_status("running");
+    let pid = sb.status_pid().expect("the daemon is up");
+    sb.wait_for("the stubborn worker", || {
+        (!processes_mentioning(script.to_str().expect("utf-8")).is_empty()).then_some(())
+    });
+
+    // A follower attached across the crash.
+    let mut follower = sb.spawn(&["logs", &id, "-f"]);
+    std::thread::sleep(Duration::from_millis(600));
+    assert!(
+        follower.try_wait().is_none(),
+        "the follower is attached and waiting"
+    );
+
+    // The daemon dies with the worker still running (its group ignores SIGINT).
+    kill(Pid::from_raw(pid as i32), Signal::SIGKILL).expect("kill the daemon");
+    sb.wait_for("the daemon to die", || (!alive(pid)).then_some(()));
+    drop(long);
+
+    // The first command afterwards starts a new daemon. Recovery gives the stubborn
+    // worker its grace (about 5 s) before the socket exists; the command must wait for
+    // it, say so, and succeed.
+    let began = Instant::now();
+    let ls = sb.run(&["ls"]);
+    assert_eq!(ls.code, 0, "{}", ls.all());
+    assert!(
+        began.elapsed() > Duration::from_secs(2),
+        "recovery really did take a while ({:?})",
+        began.elapsed()
+    );
+    assert!(ls.stdout.contains("failed"), "{}", ls.stdout);
+    assert!(ls.stderr.contains("recovering"), "{}", ls.stderr);
+    sb.wait_for("the orphan to be gone", || {
+        processes_mentioning(script.to_str().expect("utf-8"))
+            .is_empty()
+            .then_some(())
+    });
+
+    // The follower rode out the outage and ended with the run.
+    let done = follower.wait(PATIENCE);
+    assert_eq!(done.code, 0, "{}", done.all());
+    // The orphan's fate is on the record, truthfully.
+    assert!(!tree_contains(&sb.data.join("runs"), "\"cause\":\"orphaned\"").is_empty());
+    assert!(!tree_contains(&sb.data.join("runs"), "\"result\":\"killed\"").is_empty());
+}
+
+// ===========================================================================
+// Final-review fixes, part 2
+// ===========================================================================
+
+#[test]
+fn purge_after_a_crash_ends_the_orphan_and_leaves_no_trace_of_the_job() {
+    let sb = Sandbox::new();
+    let (script, cmd) = stubborn_worker(&sb);
+    let unique = "UNIQUE-JOB-TEXT-77aa31";
+    let long = sb.spawn(&[
+        "run",
+        "--repo",
+        sb.repo.to_str().expect("utf-8"),
+        "--job",
+        unique,
+        "--simulate-model",
+        "--worker",
+        "generic",
+        "--external-sandbox",
+        "--cmd",
+        &cmd,
+    ]);
+    let id = sb.wait_for_run_with_status("running");
+    let pid = sb.status_pid().expect("the daemon is up");
+    let script_path = script.to_str().expect("utf-8").to_owned();
+    sb.wait_for("the worker", || {
+        (!processes_mentioning(&script_path).is_empty()).then_some(())
+    });
+    assert!(
+        !tree_contains(&sb.data.join("missions"), unique).is_empty(),
+        "the mission file holds the job text while the worker runs"
+    );
+
+    // The daemon dies mid-run; nothing has recovered the run yet.
+    kill(Pid::from_raw(pid as i32), Signal::SIGKILL).expect("kill the daemon");
+    sb.wait_for("the daemon to die", || (!alive(pid)).then_some(()));
+    drop(long);
+    assert!(
+        !processes_mentioning(&script_path).is_empty(),
+        "the orphan lives on"
+    );
+
+    // Purging without a daemon does what recovery would: ends the worker, removes its
+    // mission file, and only then deletes the run.
+    let purge = sb.run(&["--no-daemon", "purge", &id]);
+    assert_eq!(purge.code, 0, "{}", purge.all());
+    assert!(purge.stdout.contains("purged 1"), "{}", purge.stdout);
+    assert!(
+        tree_contains(&sb.data, unique).is_empty(),
+        "the job text survives under the state dir: {:?}",
+        tree_contains(&sb.data, unique)
+    );
+    sb.wait_for("the orphan to be gone", || {
+        processes_mentioning(&script_path).is_empty().then_some(())
+    });
+}
+
+#[test]
+fn a_daemon_purge_of_a_crashed_run_also_leaves_nothing() {
+    // Same, through a daemon: restart recovery has already failed the run and reaped the
+    // worker; the purge must still leave no mission file or job text.
+    let sb = Sandbox::new();
+    let (script, cmd) = stubborn_worker(&sb);
+    let unique = "UNIQUE-JOB-TEXT-5d2c90";
+    let long = sb.spawn(&[
+        "run",
+        "--repo",
+        sb.repo.to_str().expect("utf-8"),
+        "--job",
+        unique,
+        "--simulate-model",
+        "--worker",
+        "generic",
+        "--external-sandbox",
+        "--cmd",
+        &cmd,
+    ]);
+    let id = sb.wait_for_run_with_status("running");
+    let pid = sb.status_pid().expect("the daemon is up");
+    let script_path = script.to_str().expect("utf-8").to_owned();
+    sb.wait_for("the worker", || {
+        (!processes_mentioning(&script_path).is_empty()).then_some(())
+    });
+    kill(Pid::from_raw(pid as i32), Signal::SIGKILL).expect("kill the daemon");
+    sb.wait_for("the daemon to die", || (!alive(pid)).then_some(()));
+    drop(long);
+
+    let purge = sb.run(&["purge", &id]);
+    assert_eq!(purge.code, 0, "{}", purge.all());
+    assert!(tree_contains(&sb.data, unique).is_empty());
+    sb.wait_for("the orphan to be gone", || {
+        processes_mentioning(&script_path).is_empty().then_some(())
+    });
+}
+
+#[test]
+fn stop_and_auto_start_during_a_daemon_shutdown_wait_for_it() {
+    let sb = Sandbox::new();
+    let (_script, cmd) = stubborn_worker(&sb);
+    // A worker that ignores the polite interrupt makes the shutdown take a while.
+    let long =
+        sb.spawn(&sb.run_args(&["--worker", "generic", "--external-sandbox", "--cmd", &cmd]));
+    let _id = sb.wait_for_run_with_status("running");
+    let pid = sb.status_pid().expect("the daemon is up");
+
+    let first_stop = sb.spawn(&["stop"]);
+    sb.wait_for("the daemon to be shutting down", || {
+        let status = sb.run(&["status"]);
+        status
+            .stdout
+            .contains("starting up or shutting down")
+            .then_some(())
+    });
+    let status = sb.run(&["status"]);
+    assert_eq!(status.code, 1, "{}", status.all());
+    assert!(
+        status.stdout.contains(&format!("pid {pid}")),
+        "{}",
+        status.stdout
+    );
+
+    // A second stop does not claim nothing is running; it waits for the first to finish.
+    let second_stop = sb.run(&["stop"]);
+    assert_eq!(second_stop.code, 0, "{}", second_stop.all());
+    assert!(
+        !second_stop.stdout.contains("is not running"),
+        "{}",
+        second_stop.stdout
+    );
+
+    // A command that needs a daemon waits for the old one to finish, then starts a new
+    // one (a different pid), instead of failing or racing it.
+    let ls = sb.run(&["ls"]);
+    assert_eq!(ls.code, 0, "{}", ls.all());
+    let new_pid = sb.status_pid().expect("a new daemon");
+    assert_ne!(new_pid, pid);
+    let done = first_stop.wait(PATIENCE);
+    assert_eq!(done.code, 0, "{}", done.all());
+    drop(long);
+}
+
+#[test]
+fn ctrl_c_while_the_run_is_being_started_is_effective_and_says_what_may_have_happened() {
+    use std::io::{BufRead as _, BufReader, Write as _};
+    use std::os::unix::net::UnixListener;
+    let sb = Sandbox::new();
+    std::fs::create_dir_all(&sb.data).expect("data dir");
+    // A daemon that answers `daemon.status` correctly and then never answers `run.start`.
+    let listener = UnixListener::bind(&sb.socket).expect("bind");
+    let data = sb.data.display().to_string();
+    let started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = started.clone();
+    std::thread::spawn(move || {
+        let Ok((stream, _)) = listener.accept() else {
+            return;
+        };
+        let mut writer = stream.try_clone().expect("clone");
+        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap_or_default();
+            let id = value["id"].as_u64().unwrap_or(0);
+            match value["method"].as_str() {
+                Some("daemon.status") => {
+                    let reply = serde_json::json!({"id": id, "error": null, "result": {
+                        "version": env!("CARGO_PKG_VERSION"), "uptime_secs": 1, "pid": 1,
+                        "runs_total": 0, "runs_active": 0, "state_dir": data,
+                    }});
+                    let _ = writeln!(writer, "{reply}");
+                }
+                Some("run.start") => {
+                    seen.store(true, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_secs(120));
+                }
+                _ => {}
+            }
+        }
+    });
+    let run = sb.spawn(&sb.run_args(&[]));
+    sb.wait_for("run.start to be sent", || {
+        started
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .then_some(())
+    });
+    run.signal(Signal::SIGINT);
+    let out = run.wait(Duration::from_secs(10)); // effective at once, not after the 30 s timeout
+    assert_eq!(out.code, 130, "{}", out.all());
+    assert!(
+        out.stderr.contains("may have been started"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stderr.contains("aftman ls"), "{}", out.stderr);
+}
+
+// ===========================================================================
+// Integration: an abandoned run ends its followers
+// ===========================================================================
+
+#[test]
+fn followers_of_a_run_the_daemon_could_not_record_exit_with_the_reason() {
+    if nix::unistd::geteuid().is_root() {
+        return; // root ignores file modes: the log would stay writable
+    }
+    use std::os::unix::fs::PermissionsExt as _;
+    let sb = Sandbox::new();
+    let (cmd_flag, cmd) = sleeper(&tag("600.421"));
+    let args = sb.run_args(&["--worker", "generic", "--external-sandbox", &cmd_flag, &cmd]);
+    let run = sb.spawn(&args);
+    let id = sb.wait_for_run_with_status("running");
+    let follower = sb.spawn(&["logs", &id, "-f"]);
+    std::thread::sleep(Duration::from_millis(500));
+
+    // The run's log becomes unwritable mid-run; the next thing the run records (here, a
+    // cancel) cannot be written, and the daemon gives the run up.
+    let log = sb.data.join("runs").join(&id).join("events.jsonl");
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o444)).expect("chmod");
+    let _ = sb.run(&["cancel", &id]);
+
+    let ran = run.wait(PATIENCE);
+    assert_ne!(ran.code, 0, "{}", ran.all());
+    assert!(
+        ran.stderr.contains("abandoned") || ran.stdout.contains("abandoned"),
+        "the reason is printed: {}",
+        ran.all()
+    );
+    let followed = follower.wait(PATIENCE);
+    assert_ne!(followed.code, 0, "{}", followed.all());
+    assert!(followed.stderr.contains("abandoned"), "{}", followed.stderr);
+    std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).expect("chmod back");
 }

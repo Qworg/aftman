@@ -416,8 +416,88 @@ async fn recovery_ends_an_orphaned_worker_it_can_identify_and_spares_one_it_cann
         assert_eq!(terminated.payload["result"], result);
         assert!(h.store.worker_processes(run).await?.is_empty());
     }
-    let _ = unrelated.kill();
+    // The whole group: `sh -c` may have forked the sleep.
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(-pgid_b),
+        nix::sys::signal::Signal::SIGKILL,
+    );
     let _ = unrelated.wait();
+    Ok(())
+}
+
+/// A worker group that ignores the polite interrupt, so ending it costs the full grace.
+fn spawn_stubborn() -> (std::process::Child, i32) {
+    let child = std::process::Command::new("/bin/sh")
+        .args(["-c", "trap '' INT; while :; do sleep 1; done"])
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let pgid = i32::try_from(child.id()).expect("pid");
+    (child, pgid)
+}
+
+#[tokio::test]
+async fn recovery_reaps_many_stubborn_orphans_in_about_one_grace_period() -> TestResult {
+    const ORPHANS: usize = 4;
+    let dir = short_tempdir()?;
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo)?;
+    let state = dir.path().join("state");
+    let store: Arc<dyn RunStore> = Arc::new(FileRunStore::new(&state));
+    let factory = TestFactory::new(dir.path());
+
+    let mut runs = Vec::new();
+    let mut children = Vec::new();
+    for _ in 0..ORPHANS {
+        let (started, _) = started_run(&factory, &store, &repo, json!({})).await?;
+        let run = started.run_id();
+        drop(started);
+        let (child, pgid) = spawn_stubborn();
+        store
+            .set_worker_process(run, WorkerId::new(), Some(identify(pgid, None)))
+            .await?;
+        runs.push(run);
+        children.push(child);
+    }
+    let reapers: Vec<_> = children
+        .into_iter()
+        .map(|mut c| std::thread::spawn(move || c.wait()))
+        .collect();
+
+    // One after another this would be ORPHANS x ORPHAN_GRACE (20 s).
+    let began = std::time::Instant::now();
+    let h = Harness::start_in(dir, repo, state, |_| {}).await?;
+    let took = began.elapsed();
+    assert!(
+        took < Duration::from_secs(12),
+        "recovery took {took:?}; orphans must be reaped concurrently"
+    );
+    assert_eq!(h.recovery.orphans.len(), ORPHANS);
+    for (_, orphan) in &h.recovery.orphans {
+        assert_eq!(orphan.outcome, OrphanOutcome::Killed);
+    }
+    // Every run is Failed, its orphan named in a contiguous log, ending in RUN_FINISHED.
+    for run in runs {
+        assert_eq!(h.status_of(run).await?, "failed");
+        let log = h.store.read_log(run).await?;
+        let seqs: Vec<u64> = log.events.iter().map(|e| e.seq.get()).collect();
+        assert_eq!(seqs, (1..=seqs.len() as u64).collect::<Vec<_>>());
+        assert_eq!(
+            log.events.last().map(|e| e.kind),
+            Some(EventKind::RunFinished)
+        );
+        assert!(
+            log.events
+                .iter()
+                .any(|e| e.kind == EventKind::WorkerTerminated && e.payload["result"] == "killed")
+        );
+    }
+    for reaper in reapers {
+        wait_until("the orphan to die", || async { reaper.is_finished() }).await;
+    }
     Ok(())
 }
 

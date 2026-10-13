@@ -38,7 +38,7 @@ use ratatui::crossterm::terminal::{
 };
 use tokio::sync::mpsc;
 
-use aftman_core::clock::{Clock as _, SystemClock};
+use aftman_core::clock::Clock;
 
 use super::driver::TermEvent;
 
@@ -155,7 +155,8 @@ pub type InputParts = (
     InputThread,
 );
 
-/// Start reading terminal events on a dedicated thread.
+/// Start reading terminal events on a dedicated thread. Keys are stamped with `clock`
+/// (the injected one) when they are read.
 ///
 /// # Errors
 /// The thread could not be spawned.
@@ -169,7 +170,7 @@ impl Drop for ClosedOnDrop {
     }
 }
 
-pub fn spawn_input_thread() -> io::Result<InputParts> {
+pub fn spawn_input_thread(clock: Arc<dyn Clock>) -> io::Result<InputParts> {
     let (tx, rx) = mpsc::channel(INPUT_QUEUE);
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
@@ -183,7 +184,7 @@ pub fn spawn_input_thread() -> io::Result<InputParts> {
                     Ok(false) => {}
                     Ok(true) => {
                         let forwarded = match event::read() {
-                            Ok(Event::Key(key)) => Some(TermEvent::Stamped(key, SystemClock.now())),
+                            Ok(Event::Key(key)) => Some(TermEvent::Stamped(key, clock.now())),
                             Ok(Event::Paste(text)) => Some(TermEvent::Paste(text)),
                             Ok(Event::Resize(..)) => Some(TermEvent::Resize),
                             Ok(_) => None,

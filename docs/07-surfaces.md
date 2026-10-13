@@ -38,7 +38,7 @@ aftman serve [--socket <path>]          # foreground; --bind / --print-url arriv
 - **HTTP:** disabled unless `--bind` or `web.enabled = true`. Default bind `127.0.0.1:8787`.
   (Not built yet: M4.)
 - **Auto-start:** the first `aftman` subcommand that needs run state (`run`, `ls`, `show`,
-  `decisions`, `logs`, `steer`, `cancel`, `answer`, `purge`) connects to the socket; if it is absent
+  `decisions`, `logs`, `watch`, `steer`, `cancel`, `answer`, `purge`) connects to the socket; if it is absent
   or stale (`ENOENT`, `ECONNREFUSED`) it starts the daemon, polls `connect` until it succeeds
   (15 ms first, growing to 150 ms; **5 s total** timeout), and then speaks to it. `status`, `stop`,
   `usage`, `doctor`, `responsibilities` and `demo` never start a daemon.
@@ -280,12 +280,27 @@ including inside a herdr pane, with no herdr awareness at all.
   or a terminal status; the polling lives in the client's `Follow` stream, so the TUI gets it.
 - **`purge --no-daemon` refuses while a daemon serves the state directory** (deleting files from
   under it would leave its replay ring serving a purged run). `purge` also removes the mission
-  files; after `purge --all` the job text is nowhere under the state directory.
+  files; after `purge --all` the job text is nowhere under the state directory. To make that true
+  for a run whose supervisor died, `purge` (the daemon's and the `--no-daemon` one alike) first
+  does what restart recovery would for it: it ends the run's orphaned worker (only if it can be
+  positively identified as that worker) and removes its mission file, and only then deletes the
+  directory. A worker that cannot be verified is not touched, and the purge is refused with the
+  reason - deleting the run would destroy the only record of a process that may still be
+  running (`purge --all` skips such a run and says so).
 - **`show` reconciles with the log**: the snapshot trails the event log, so when the log is
   ahead the last `STATE_CHANGED` decides the status, and open escalations are read from the log.
   It prints how the run was launched (permissions, external sandbox, steering). The
   `aftman answer ...` hint is printed only for a daemon-backed run that is waiting, with the
   user's `--socket` / `--data-dir` repeated.
+- **A followed run that nobody drives ends the stream.** `Follow` (so `run`, `logs -f`, `watch`)
+  treats a non-retryable error push as final and exits non-zero with its reason. Independently,
+  after 30 s of silence it asks the daemon whether the run is still driven (one `run.get`, then
+  a fresh subscription, whose `live` flag answers and which replays anything missed). A run that
+  is neither driven nor finished and whose log has not moved for three such intervals ends the
+  stream with "no longer being driven" instead of waiting forever. While the daemon holds its
+  lock but does not answer (restart recovery), a stream and auto-start wait for it up to 75 s
+  without spending their reconnect budget; recovery itself reaps orphaned workers concurrently,
+  so it takes about one 5 s grace period however many there are, before the socket is bound.
 - **Output.** All output goes through one writer: a closed pipe (`aftman ls | head`) ends the
   process quietly with exit `0`.
 - **Ctrl-C while `run.start` is pending** is effective at once; it (and a `run.start` timeout)
@@ -315,6 +330,17 @@ if none is running (then, having no such run, says so: `unknown_run`, or "there 
 skew. It needs a daemon: `--no-daemon` is a usage error (exit `2`). A run the daemon is not driving
 (another process owns it, or it is an orphan) is followed by polling its log; the header says so
 ("not live in this daemon") and the stream ends when the log does.
+
+**Replay.** The fold starts at `seq 1`, applies events in batches (up to 2,048 between looks at the
+keyboard) and draws at the frame rate (50 ms), never once per event; the stream is read on a task of
+its own, because a read abandoned half-way (for a run the daemon is not driving it is a request for
+a page of up to 5,000 events) is restarted and its response still read and thrown away, which made
+replay time quadratic in the length of the log. Until the fold has reached the `last_seq` the run's
+snapshot held when the watch began, the header says `REPLAYING history (seq N of M)` instead of a
+status (the status at some past `seq` is not the run's), and the NEEDS-A-HUMAN banner is withheld.
+"Caught up" is therefore as honest as that snapshot: if it lags the log, the banner appears when the
+fold passes it, a few events early at worst; if the snapshot cannot be read, there is no replay
+indicator.
 
 **Structure.** A pure state model (`WatchState::apply(&EventEnvelope)`: a fold, idempotent on a
 repeated `seq`, tolerant of unknown or malformed payloads; an event kind this build does not know
@@ -404,11 +430,18 @@ ended, three panes, a footer.
   Choosing one opens the editor for a note (optional, 2,000 characters; required for guidance).
 - **Destructive actions need a word, not a letter.** `c` (cancel) and an answer of `stop` open a
   confirmation where you type `cancel` / `stop` and press Enter; anything else backs out, as does
-  Esc. A stream of text (type-ahead, a paste that arrives without bracketed paste) cannot do this by
-  accident: keys closer together than 25 ms are a burst, and a burst cannot issue a command, open or
-  drive a modal, or confirm anything; an Enter inside a burst in the editors is a space, never a
-  submit. Prompts that cannot be shown in full (under 44x9 for the confirmation, 44x10 for the
-  decision list) say "terminal too small" and accept nothing but Esc.
+  Esc. Characters typed in the confirmation are just text, however fast. What a stream of text
+  (type-ahead, a paste that arrives without bracketed paste) cannot do is *confirm*: keys closer
+  together than 25 ms are a burst, and (1) commands from the main screen are ignored inside one,
+  (2) the rest of a burst that opened a modal is swallowed, and (3) an Enter in the same burst as the
+  keys before it never confirms (it leaves the prompt open with its text and says "press Enter
+  again"; in the text editors it is a space, never a submit). Keys are stamped when read, with the
+  injected clock. Prompts that cannot be shown in full (under 44x9 for the confirmation, 44x10 for
+  the decision list) say "terminal too small" and accept nothing but Esc.
+- With several open escalations, `a` opens the oldest; **Tab / Shift-Tab in the answer dialog** choose
+  which one the answer is for, and the dialog lists them all (the banner says "+N more"). An answer
+  from the TUI is recorded with surface `tui` (`run.answer`'s optional `surface`,
+  `docs/02-lld.md` section 11).
 - Only one steer or answer is in flight at a time: a second is refused before its prompt closes, so
   nothing typed is lost. A cancel can always be issued. While an action is in flight the screen keeps
   updating; quitting waits up to two seconds for it (saying so; any key leaves at once).
@@ -426,7 +459,8 @@ out. The commands it prints for re-attaching, answering and cancelling carry `--
 **Not a terminal.** When stdout or stdin is not a terminal, `watch` draws nothing and emits no escape
 sequence: it prints one line per event through the CLI's sanitising output (the format of
 `aftman run`, one line per event whatever the text contains, plus the launch lines) until the run
-ends, and Ctrl-C detaches (`130`). `needs_human` is printed as it happens but does not end the
+ends, and Ctrl-C detaches: `130`, or `3` if the run is waiting for a human at that moment (the
+same codes as quitting the TUI). `needs_human` is printed as it happens but does not end the
 follow.
 
 **Terminal hygiene.** Raw mode, the alternate screen and bracketed paste are entered once and undone

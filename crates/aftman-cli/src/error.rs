@@ -131,6 +131,7 @@ pub const fn protocol_exit_code(code: ErrorCode) -> u8 {
         | ErrorCode::RateLimited
         | ErrorCode::Internal
         | ErrorCode::SubscriberLagged
+        | ErrorCode::RunAbandoned
         | ErrorCode::Unknown => exit::FAILED,
     }
 }

@@ -126,10 +126,27 @@ pub struct Lagged {
     pub resume_from: Option<EventSeq>,
 }
 
+/// Why a run's subscribers were told the run's story would not be finished.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Abandoned {
+    pub run_id: RunId,
+    pub reason: String,
+}
+
+/// Longest abandonment reason kept, in bytes.
+pub const MAX_ABANDON_REASON_BYTES: usize = 512;
+
+/// How many abandoned runs the hub remembers, so a follower that subscribes after the
+/// fact is told too. Oldest forgotten first.
+const ABANDONED_MEMORY: usize = 256;
+
+type AbandonedSlot = Arc<Mutex<Option<Abandoned>>>;
+
 struct Subscriber {
     run: Option<RunId>,
     tx: mpsc::Sender<Arc<EventEnvelope>>,
     lagged: Arc<AtomicBool>,
+    abandoned: AbandonedSlot,
 }
 
 #[derive(Default)]
@@ -142,6 +159,9 @@ struct State {
     next_id: u64,
     /// Sticky: set by shutdown, refuses new subscriptions.
     closed: bool,
+    /// Runs whose end the daemon could not record, with the reason.
+    abandoned: HashMap<RunId, String>,
+    abandoned_order: VecDeque<RunId>,
 }
 
 struct Shared {
@@ -252,6 +272,7 @@ impl EventHub {
     fn register(&self, run: Option<RunId>, from: u64) -> Result<Subscription, SubscribeError> {
         let (tx, rx) = mpsc::channel(self.shared.config.subscriber_capacity);
         let lagged = Arc::new(AtomicBool::new(false));
+        let abandoned_slot: AbandonedSlot = Arc::new(Mutex::new(None));
         let mut backlog = VecDeque::new();
         let mut covered = run.is_none();
         let id;
@@ -271,14 +292,30 @@ impl EventHub {
                     }
                 }
             }
-            state.subscribers.insert(
-                id,
-                Subscriber {
-                    run,
-                    tx,
-                    lagged: lagged.clone(),
-                },
-            );
+            let already = run.and_then(|r| {
+                state.abandoned.get(&r).map(|reason| Abandoned {
+                    run_id: r,
+                    reason: reason.clone(),
+                })
+            });
+            if let Some(already) = already {
+                // Told at once: the backlog is still delivered, then the stream ends
+                // with the abandonment.
+                *abandoned_slot
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(already);
+                drop(tx);
+            } else {
+                state.subscribers.insert(
+                    id,
+                    Subscriber {
+                        run,
+                        tx,
+                        lagged: lagged.clone(),
+                        abandoned: abandoned_slot.clone(),
+                    },
+                );
+            }
         }
         let sub = Subscription {
             id,
@@ -289,6 +326,7 @@ impl EventHub {
             backlog_covered: covered,
             next_seq: from,
             lagged,
+            abandoned: abandoned_slot,
             ended: false,
         };
         Ok(sub)
@@ -323,9 +361,59 @@ impl EventHub {
     /// subscribers cleanly. For `run.purge`. Later subscriptions to the run are
     /// served from the store only (so `UnknownRun` once the store has purged it).
     /// The caller must not emit further events for the run.
+    /// The daemon has stopped driving `run` and could not record its end. Every
+    /// subscriber scoped to that run (all-runs streams are unaffected) receives what was
+    /// already queued and then its stream ends; [`Subscription::abandoned`] says why, so
+    /// the transport can tell the client explicitly instead of leaving it waiting. A
+    /// subscriber that arrives later is told the same. Remembered for the last
+    /// 256 abandoned runs, and until [`EventHub::forget`].
+    pub fn abandon(&self, run: RunId, reason: &str) {
+        let reason: String = {
+            let mut end = reason.len().min(MAX_ABANDON_REASON_BYTES);
+            while !reason.is_char_boundary(end) {
+                end -= 1;
+            }
+            reason[..end].to_owned()
+        };
+        let dropped = {
+            let mut state = self.shared.lock();
+            if state.abandoned.insert(run, reason.clone()).is_none() {
+                state.abandoned_order.push_back(run);
+                while state.abandoned_order.len() > ABANDONED_MEMORY {
+                    if let Some(old) = state.abandoned_order.pop_front() {
+                        state.abandoned.remove(&old);
+                    }
+                }
+            }
+            let ids: Vec<u64> = state
+                .subscribers
+                .iter()
+                .filter(|(_, s)| s.run == Some(run))
+                .map(|(id, _)| *id)
+                .collect();
+            let mut dropped = Vec::new();
+            for id in ids {
+                if let Some(sub) = state.subscribers.remove(&id) {
+                    *sub.abandoned
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Abandoned {
+                        run_id: run,
+                        reason: reason.clone(),
+                    });
+                    dropped.push(sub);
+                }
+            }
+            dropped
+        };
+        // Dropped outside the lock: closing the channels wakes the subscribers.
+        drop(dropped);
+    }
+
     pub fn forget(&self, run: RunId) {
         let (ring, dropped) = {
             let mut state = self.shared.lock();
+            state.abandoned.remove(&run);
+            state.abandoned_order.retain(|r| *r != run);
             let ring = state.ring.remove(&run);
             state.order.retain(|r| *r != run);
             let ids: Vec<u64> = state
@@ -407,6 +495,7 @@ pub struct Subscription {
     /// Next `seq` to deliver (single-run subscriptions only).
     next_seq: u64,
     lagged: Arc<AtomicBool>,
+    abandoned: AbandonedSlot,
     ended: bool,
 }
 
@@ -429,6 +518,16 @@ impl Subscription {
 
     /// The next event, `Some(Err(Lagged))` once if the hub dropped this
     /// subscriber for being too slow, then `None`. Cancel-safe.
+    /// Why the stream ended, if it ended because the run was abandoned (see
+    /// [`EventHub::abandon`]). Meaningful once [`Subscription::next`] has returned `None`.
+    #[must_use]
+    pub fn abandoned(&self) -> Option<Abandoned> {
+        self.abandoned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
     pub async fn next(&mut self) -> Option<Result<Arc<EventEnvelope>, Lagged>> {
         loop {
             if self.ended {

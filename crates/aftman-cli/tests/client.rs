@@ -70,6 +70,39 @@ struct Daemonized {
     stop: Option<oneshot::Sender<()>>,
 }
 
+/// Remove a test directory even if a run's background write is still landing in it.
+///
+/// A test can end with a run still going: its task is dropped with the runtime, but a
+/// snapshot already handed to the blocking pool finishes afterwards and recreates files
+/// in a directory `TempDir` has just deleted (or makes the delete fail "not empty"),
+/// leaving `/tmp/aft*` behind. Blocking here keeps the async tasks from writing any
+/// more, lets in-flight blocking work land, and retries until the tree is gone.
+pub fn remove_dir_for_certain(path: &std::path::Path) {
+    use std::io::ErrorKind;
+    use std::time::{Duration as Wait, Instant as Clock};
+    let deadline = Clock::now() + Wait::from_secs(5);
+    loop {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(error) if error.kind() == ErrorKind::NotFound => return,
+            Err(_) if Clock::now() < deadline => std::thread::sleep(Wait::from_millis(20)),
+            Err(_) => return,
+        }
+    }
+}
+
+impl Drop for Daemonized {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        remove_dir_for_certain(self._dir.path());
+    }
+}
+
 impl Daemonized {
     async fn start() -> Result<Self, Box<dyn std::error::Error>> {
         let dir = short_tempdir()?;
@@ -514,7 +547,7 @@ impl Step {
 }
 
 struct Fake {
-    _dir: tempfile::TempDir,
+    _dir: Option<tempfile::TempDir>,
     socket: PathBuf,
     run_id: RunId,
     opens: Arc<Mutex<Vec<u64>>>,
@@ -526,8 +559,18 @@ impl Fake {
     fn start(scripts: Vec<Vec<Step>>) -> Result<Self, Box<dyn std::error::Error>> {
         let dir = short_tempdir()?;
         let socket = dir.path().join("f.sock");
+        Self::start_at(socket, RunId::new(), scripts, Some(dir))
+    }
+
+    /// Serve on `socket` (replacing a stale socket file there) for `run_id`.
+    fn start_at(
+        socket: PathBuf,
+        run_id: RunId,
+        scripts: Vec<Vec<Step>>,
+        dir: Option<tempfile::TempDir>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let _ = std::fs::remove_file(&socket);
         let listener = UnixListener::bind(&socket)?;
-        let run_id = RunId::new();
         let opens = Arc::new(Mutex::new(Vec::new()));
         let failures = Arc::new(Mutex::new(Vec::new()));
         let (o, f) = (opens.clone(), failures.clone());
@@ -737,6 +780,8 @@ async fn a_failing_reconnect_is_retried_with_backoff_then_succeeds() -> TestResu
         vec![Step::ExpectOpen(1), Step::events(1..=2), Step::Close],
         // The first re-establish attempt is dropped before it can be answered.
         vec![Step::Close],
+        // The presence probe after that failure connects too, and is dropped.
+        vec![Step::Close],
         vec![Step::ExpectOpen(3), Step::finishing(3..=3)],
     ])?;
     let mut follow = fake.follow(fast()).await?;
@@ -849,6 +894,58 @@ async fn a_run_nobody_drives_is_followed_by_polling_its_log() -> TestResult {
     );
     assert_eq!(seen.last().map(|e| e.kind), Some(EventKind::RunFinished));
     d.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_busy_daemon_is_waited_for_not_given_up_on() -> TestResult {
+    // The daemon went away mid-run and a successor holds the lock while it recovers:
+    // it does not answer yet. With only four attempts and a 10-40 ms backoff the
+    // stream would give up within ~100 ms if it spent its budget on this.
+    use nix::fcntl::{Flock, FlockArg};
+    let dir = short_tempdir()?;
+    let socket = dir.path().join("f.sock");
+    let run_id = RunId::new();
+    let first = Fake::start_at(
+        socket.clone(),
+        run_id,
+        vec![vec![Step::ExpectOpen(1), Step::events(1..=2), Step::Close]],
+        None,
+    )?;
+    let mut follow = Follow::open(&socket, run_id, EventSeq::FIRST, fast()).await?;
+    assert_eq!(follow.next().await?.map(|e| e.seq.get()), Some(1));
+    assert_eq!(follow.next().await?.map(|e| e.seq.get()), Some(2));
+    drop(first); // the listener is gone; the socket file is stale
+
+    let lock_file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(socket.with_extension("pid"))?;
+    let lock =
+        Flock::lock(lock_file, FlockArg::LockExclusiveNonblock).map_err(|(_, errno)| errno)?;
+
+    let successor = {
+        let socket = socket.clone();
+        tokio::spawn(async move {
+            // Recovery takes a while; then the socket appears and the lock is let go.
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let fake = Fake::start_at(
+                socket,
+                run_id,
+                vec![vec![Step::ExpectOpen(3), Step::finishing(3..=4)]],
+                None,
+            )
+            .map_err(|e| e.to_string());
+            drop(lock);
+            fake
+        })
+    };
+    let rest = collect(&mut follow).await?;
+    assert_eq!(seqs(&rest), [3, 4], "resumed with no gap once it was back");
+    let fake = successor.await??;
+    assert_eq!(fake.opens(), [3]);
+    fake.assert_clean();
     Ok(())
 }
 
@@ -1004,5 +1101,392 @@ async fn a_stream_survives_the_real_daemon_restarting_the_connection_underneath(
     assert!(follow.stats().reconnects >= 1);
     relay_task.abort();
     d.shutdown().await;
+    Ok(())
+}
+
+// ===========================================================================
+// Final-review fixes: purge, liveness, a purged run
+// ===========================================================================
+
+/// A run that was started and then abandoned: persisted, not terminal, nobody driving.
+async fn abandoned_run(d: &Daemonized) -> Result<RunId, Box<dyn std::error::Error>> {
+    let factory = CliFactory::new(
+        d._dir.path().join("state"),
+        FactoryInputs::empty(),
+        Mode::Embedded,
+    );
+    let prepared = factory
+        .prepare(
+            &d.simulated(),
+            aftman_daemon::RuntimeContext {
+                store: d.store.clone(),
+                sink: Arc::new(aftman_daemon::VecSink::default()),
+                clock: Arc::new(SystemClock),
+            },
+        )
+        .await?;
+    let started = prepared.built.runtime.start(prepared.built.job).await?;
+    let run = started.run_id();
+    drop(started); // releases the claim: the supervisor "died"
+    Ok(run)
+}
+
+fn stubborn_group() -> (std::process::Child, i32) {
+    use std::os::unix::process::CommandExt as _;
+    let child = std::process::Command::new("/bin/sh")
+        .args(["-c", "trap '' INT; while :; do sleep 1; done"])
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("spawn");
+    let pgid = i32::try_from(child.id()).expect("pid");
+    (child, pgid)
+}
+
+#[tokio::test]
+async fn purging_an_abandoned_run_ends_its_worker_and_removes_its_mission_file() -> TestResult {
+    let mut d = Daemonized::start().await?;
+    let mut client = d.client().await?;
+    let run = abandoned_run(&d).await?;
+    let (child, pgid) = stubborn_group();
+    let reaper = std::thread::spawn(move || {
+        let mut child = child;
+        child.wait()
+    });
+    let mission = d._dir.path().join("state/missions/mission-x.md");
+    std::fs::create_dir_all(mission.parent().ok_or("parent")?)?;
+    std::fs::write(&mission, "SECRET-JOB-TEXT-4471")?;
+    d.store
+        .set_worker_process(
+            run,
+            aftman_core::ids::WorkerId::new(),
+            Some(aftman_workers::process::identify(
+                pgid,
+                Some(mission.clone()),
+            )),
+        )
+        .await?;
+
+    let purged = client
+        .run_purge(RunPurgeParams {
+            run_id: Some(run),
+            all: false,
+        })
+        .await?;
+    assert_eq!(purged, 1);
+    assert!(!mission.exists(), "the mission file went with the run");
+    assert!(
+        reaper.is_finished() || {
+            within("the orphan to die", async {
+                while !reaper.is_finished() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            true
+        }
+    );
+    assert!(d.store.ids().await?.is_empty());
+    d.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn purge_refuses_when_it_cannot_verify_the_worker_and_keeps_the_record() -> TestResult {
+    let mut d = Daemonized::start().await?;
+    let mut client = d.client().await?;
+    let run = abandoned_run(&d).await?;
+    let (mut child, pgid) = stubborn_group();
+    let mission = d._dir.path().join("state/missions/mission-y.md");
+    std::fs::create_dir_all(mission.parent().ok_or("parent")?)?;
+    std::fs::write(&mission, "SECRET-JOB-TEXT-9912")?;
+    let mut recycled = aftman_workers::process::identify(pgid, Some(mission.clone()));
+    recycled.start_token = Some("1".to_owned()); // not the process now at that pgid
+    d.store
+        .set_worker_process(run, aftman_core::ids::WorkerId::new(), Some(recycled))
+        .await?;
+
+    let refused = client
+        .run_purge(RunPurgeParams {
+            run_id: Some(run),
+            all: false,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        refused.protocol().map(|e| e.code),
+        Some(ErrorCode::WrongState)
+    );
+    assert!(refused.to_string().contains("only record"), "{refused}");
+    assert!(
+        d.store.ids().await?.contains(&run),
+        "the run was not deleted"
+    );
+    assert_eq!(d.store.worker_processes(run).await?.len(), 1, "record kept");
+    assert!(mission.exists());
+    assert!(
+        child.try_wait()?.is_none(),
+        "the unrelated process was not touched"
+    );
+    let _ = child.kill();
+    let _ = child.wait();
+    d.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_run_nobody_drives_whose_log_stops_moving_ends_the_stream_with_an_error() -> TestResult {
+    let mut d = Daemonized::start().await?;
+    let run = abandoned_run(&d).await?;
+    let mut follow = d
+        .follow(run)
+        .await?
+        .with_liveness(Duration::from_millis(80));
+    assert!(follow.is_polling());
+    let mut events = 0;
+    let error = within("the stream to give up", async {
+        loop {
+            match follow.next().await {
+                Ok(Some(_)) => events += 1,
+                Ok(None) => panic!("the run never ends"),
+                Err(error) => return error,
+            }
+        }
+    })
+    .await;
+    assert!(matches!(error, ClientError::NotDriven { .. }), "{error}");
+    assert!(error.to_string().contains("no longer being driven"));
+    assert!(events > 0, "what the log had was delivered first");
+    d.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_run_purged_while_followed_ends_the_stream_with_unknown_run() -> TestResult {
+    let mut d = Daemonized::start().await?;
+    let mut client = d.client().await?;
+    let run = abandoned_run(&d).await?;
+    let mut follow = d.follow(run).await?;
+    assert!(follow.is_polling());
+    // Drain what the log has, then purge the run out from under the follower.
+    for _ in 0..1 {
+        within("an event", follow.next()).await?;
+    }
+    client
+        .run_purge(RunPurgeParams {
+            run_id: Some(run),
+            all: false,
+        })
+        .await?;
+    let error = within("the stream to notice", async {
+        loop {
+            match follow.next().await {
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("a purged run does not end cleanly"),
+                Err(error) => return error,
+            }
+        }
+    })
+    .await;
+    assert_eq!(
+        error.protocol().map(|e| e.code),
+        Some(ErrorCode::UnknownRun),
+        "{error}"
+    );
+    d.shutdown().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_non_retryable_error_push_ends_the_stream_with_that_error() -> TestResult {
+    // Whatever the daemon calls it, an error push it does not mark retryable is final.
+    let dir = short_tempdir()?;
+    let socket = dir.path().join("f.sock");
+    let run_id = RunId::new();
+    let listener = UnixListener::bind(&socket)?;
+    let server = tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        let Ok(Some(line)) = lines.next_line().await else {
+            return;
+        };
+        let Ok(envelope) = decode_request(&line) else {
+            return;
+        };
+        let opened = SubscriptionOpenResult {
+            run_id: Some(run_id),
+            from_seq: Some(EventSeq(1)),
+            replaced: false,
+            live: true,
+        };
+        if let Ok(response) = Response::ok(envelope.id, &opened) {
+            let _ = send(&mut write, &ServerMessage::Response(response)).await;
+        }
+        let push = ServerMessage::Error(aftman_daemon::protocol::ErrorPush {
+            error: ProtocolError {
+                code: ErrorCode::Unknown,
+                message: "the daemon stopped driving this run and could not record its end".into(),
+                retryable: false,
+                data: None,
+            },
+        });
+        let _ = send(&mut write, &push).await;
+        let _ = lines.next_line().await;
+    });
+    let mut follow = Follow::open(&socket, run_id, EventSeq::FIRST, fast()).await?;
+    let error = within("the push", follow.next()).await.unwrap_err();
+    assert!(
+        error.to_string().contains("could not record its end"),
+        "{error}"
+    );
+    assert!(follow.next().await.is_err(), "the stream stays dead");
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_dropped_next_resumes_the_page_in_flight_instead_of_asking_again() -> TestResult {
+    // A run nobody drives, with a log of three pages, served slowly. The caller polls
+    // `next()` under a `select!` with a tight tick, so the future is dropped many times
+    // per page. Every page must be requested exactly once: dropping must not lose work.
+    use aftman_daemon::protocol::RunEventsResult;
+    const PAGE: u64 = 40;
+    const PAGES: u64 = 3;
+    let dir = short_tempdir()?;
+    let socket = dir.path().join("f.sock");
+    let run_id = RunId::new();
+    let listener = UnixListener::bind(&socket)?;
+    let requests = Arc::new(Mutex::new(Vec::<u64>::new()));
+    let seen = requests.clone();
+    let server = tokio::spawn(async move {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let (read, mut write) = stream.into_split();
+        let mut lines = BufReader::new(read).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let Ok(envelope) = decode_request(&line) else {
+                continue;
+            };
+            let message = match envelope.request {
+                Request::SubscriptionOpen(_) => {
+                    let opened = SubscriptionOpenResult {
+                        run_id: Some(run_id),
+                        from_seq: Some(EventSeq(1)),
+                        replaced: false,
+                        live: false,
+                    };
+                    Response::ok(envelope.id, &opened)
+                }
+                Request::SubscriptionClose => Response::ok(
+                    envelope.id,
+                    &aftman_daemon::protocol::SubscriptionCloseResult { closed: true },
+                ),
+                Request::RunEvents(params) => {
+                    let from = params.from_seq.map_or(1, EventSeq::get);
+                    if let Ok(mut r) = seen.lock() {
+                        r.push(from);
+                    }
+                    // Slow enough that the caller's tick fires many times meanwhile.
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    let last = PAGE * PAGES;
+                    let events: Vec<EventEnvelope> = (from..from + PAGE)
+                        .take_while(|seq| *seq <= last)
+                        .map(|seq| {
+                            let finish = seq == last;
+                            EventEnvelope::new(
+                                EventSeq(seq),
+                                run_id,
+                                time::OffsetDateTime::now_utc(),
+                                if finish {
+                                    EventKind::RunFinished
+                                } else {
+                                    EventKind::WorkerOutput
+                                },
+                                json!({ "status": "finished", "text": "x" }),
+                            )
+                        })
+                        .collect();
+                    let has_more = from + PAGE <= last;
+                    Response::ok(envelope.id, &RunEventsResult { events, has_more })
+                }
+                _ => continue,
+            };
+            if let Ok(response) = message {
+                if !send(&mut write, &ServerMessage::Response(response)).await {
+                    return;
+                }
+            }
+        }
+    });
+
+    let mut follow = Follow::open(&socket, run_id, EventSeq::FIRST, fast()).await?;
+    assert!(follow.is_polling());
+    let status = follow.status();
+    let mut got = Vec::new();
+    within("the log to be replayed", async {
+        loop {
+            tokio::select! {
+                next = follow.next() => match next {
+                    Ok(Some(event)) => got.push(event.seq.get()),
+                    Ok(None) => return,
+                    Err(error) => panic!("{error}"),
+                },
+                () = tokio::time::sleep(Duration::from_millis(3)) => {}
+            }
+        }
+    })
+    .await;
+    assert_eq!(
+        got,
+        (1..=PAGE * PAGES).collect::<Vec<_>>(),
+        "every event, once, in order"
+    );
+    let asked = requests.lock().map(|r| r.clone()).unwrap_or_default();
+    assert_eq!(
+        asked,
+        [1, 1 + PAGE, 1 + 2 * PAGE],
+        "one run.events request per page, however often next() was dropped"
+    );
+    assert!(status.is_polling() && status.is_finished());
+    assert_eq!(status.next_seq().get(), PAGE * PAGES + 1);
+    assert_eq!(status.reconnect_failures(), 0);
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn the_status_handle_shows_a_lost_daemon_without_touching_the_stream() -> TestResult {
+    let fake = Fake::start(vec![vec![
+        Step::ExpectOpen(1),
+        Step::events(1..=1),
+        Step::Close,
+    ]])?;
+    let mut follow = fake.follow(fast()).await?;
+    let status = follow.status();
+    assert!(status.is_connected() && !status.is_polling());
+    assert_eq!(follow.next().await?.map(|e| e.seq.get()), Some(1));
+    assert_eq!(status.next_seq().get(), 2);
+    // The daemon is gone for good: failures climb, observed from outside.
+    let reader = tokio::spawn({
+        let status = status.clone();
+        async move {
+            let mut peak = 0;
+            for _ in 0..500 {
+                peak = peak.max(status.reconnect_failures());
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            peak
+        }
+    });
+    let error = within("the give-up", follow.next()).await.unwrap_err();
+    assert!(matches!(error, ClientError::Reconnect { .. }), "{error}");
+    assert!(!status.is_connected());
+    assert!(reader.await? >= 1, "the handle showed failed attempts");
     Ok(())
 }

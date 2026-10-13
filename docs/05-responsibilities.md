@@ -287,12 +287,11 @@ Rules:
 Deterministic, bounded, and concurrent:
 
 ```rust
-let (git, untracked, instructions, events) = tokio::join!(
-    git_evidence(&repo, &cfg),          // spawn_blocking, 8s timeout
-    untracked_excerpts(&repo, &cfg),    // spawn_blocking, 8s timeout
-    repo_instructions(&repo, &cfg),     // transient
-    recent_events(&store, run_id, cfg),
-);
+// Repository evidence: one deadline (8 s) for all of it, git as a killed-on-timeout child
+// process, file reads on blocking threads and only of regular files, byte-capped while
+// reading (docs/02-lld.md section 15). On timeout it is omitted and a note is recorded.
+let (git, untracked, instructions) = collect_repo(&repo, &cfg, deadline).await;
+let events = recent_events(&store, run_id, cfg).await;
 ```
 
 Byte caps (defaults, all configurable): diff 20,000 chars; each output tail 12,000 chars;

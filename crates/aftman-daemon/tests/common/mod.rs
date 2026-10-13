@@ -56,7 +56,7 @@ pub const PATIENCE: Duration = Duration::from_secs(20);
 
 /// A temp directory with a path short enough for a Unix socket, whatever `TMPDIR` is.
 pub fn short_tempdir() -> Result<tempfile::TempDir, std::io::Error> {
-    tempfile::Builder::new().prefix("aft").tempdir_in("/tmp")
+    tempfile::Builder::new().prefix("aftd").tempdir_in("/tmp")
 }
 
 /// Poll `condition` until it holds. Event-driven in spirit: the condition is about
@@ -205,6 +205,33 @@ impl DecisionModel for PanicModel {
         _budget: &Budget,
     ) -> Result<ModelAnswers, ModelError> {
         panic!("the model panicked (intentionally, in a test)");
+    }
+}
+
+/// A model that blocks its *thread* (not the task) inside an assessment, ignoring
+/// cancellation entirely, until released: a run task that cannot be aborted.
+pub struct BlockingModel {
+    pub dial: Arc<DialModel>,
+    pub entered: Arc<std::sync::atomic::AtomicBool>,
+    pub release: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl DecisionModel for BlockingModel {
+    async fn ask(
+        &self,
+        context: &AskContext,
+        state: &Value,
+        questions: &BTreeMap<CheckKey, Question>,
+        budget: &Budget,
+    ) -> Result<ModelAnswers, ModelError> {
+        if context.purpose == Purpose::Assessment {
+            self.entered.store(true, Ordering::SeqCst);
+            while !self.release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        self.dial.ask(context, state, questions, budget).await
     }
 }
 
@@ -433,10 +460,15 @@ pub fn fast_config() -> RunConfig {
 ///   `"fail-create"`: its first append (`RUN_CREATED`) fails;
 ///   `"panic-model"`: the model panics in routing; `"panic-late"`: on its first
 ///   assessment, with a worker running; `"panic-factory"`: the factory itself panics;
-///   `"slow-build"`: the factory takes 300 ms.
+///   `"slow-build"`: the factory takes 300 ms; `"block-model"`: the model blocks a thread
+///   in its first assessment until `block_release` is set.
 pub struct TestFactory {
     pub workers: Mutex<Vec<Arc<ScriptWorker>>>,
     pub models: Mutex<Vec<Arc<DialModel>>>,
+    /// Set by a `block-model` run once its model is blocking a thread.
+    pub block_entered: Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the test to let a `block-model` run's thread go.
+    pub block_release: Arc<std::sync::atomic::AtomicBool>,
     scratch: PathBuf,
 }
 
@@ -445,6 +477,8 @@ impl TestFactory {
         Arc::new(Self {
             workers: Mutex::new(Vec::new()),
             models: Mutex::new(Vec::new()),
+            block_entered: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            block_release: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             scratch: scratch.to_owned(),
         })
     }
@@ -531,6 +565,11 @@ impl RuntimeFactory for TestFactory {
                 let model: Arc<dyn DecisionModel> = match params.verify.as_deref() {
                     Some("panic-model") => Arc::new(PanicModel),
                     Some("panic-late") => Arc::new(PanicLateModel(dial, script.clone())),
+                    Some("block-model") => Arc::new(BlockingModel {
+                        dial,
+                        entered: self.block_entered.clone(),
+                        release: self.block_release.clone(),
+                    }),
                     _ => dial,
                 };
                 (model, script)
@@ -609,6 +648,39 @@ pub struct Harness {
     pub task: Option<JoinHandle<()>>,
     pub recovery: RecoveryReport,
     stop: Option<oneshot::Sender<()>>,
+}
+
+/// Remove a test directory even if a run's background write is still landing in it.
+///
+/// A test can end with a run still going: its task is dropped with the runtime, but a
+/// snapshot already handed to the blocking pool finishes afterwards and recreates files
+/// in a directory `TempDir` has just deleted (or makes the delete fail "not empty"),
+/// leaving `/tmp/aft*` behind. Blocking here keeps the async tasks from writing any
+/// more, lets in-flight blocking work land, and retries until the tree is gone.
+pub fn remove_dir_for_certain(path: &Path) {
+    use std::io::ErrorKind;
+    use std::time::{Duration as Wait, Instant as Clock};
+    let deadline = Clock::now() + Wait::from_secs(5);
+    loop {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(error) if error.kind() == ErrorKind::NotFound => return,
+            Err(_) if Clock::now() < deadline => std::thread::sleep(Wait::from_millis(20)),
+            Err(_) => return,
+        }
+    }
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        remove_dir_for_certain(self.dir.path());
+    }
 }
 
 impl Harness {

@@ -40,7 +40,28 @@ not the model, decides what happens next.
 
 ## Status
 
-**Design phase.** No implementation yet.
+**Milestones M0-M3 are built.** There is a runtime that supervises a coding agent against a job
+(deterministic policy over a decision model's probabilities, with an offline simulated model and
+worker for tests and `aftman demo`), a file-backed append-only run store, a daemon that serves a
+Unix-socket protocol, and a command-line client and terminal UI for it. The HTTP/web surface (M4)
+and the herdr integration (M6) are not built; the docs describe them as design.
+
+```bash
+cargo build --release                     # the binary is target/release/aftman
+aftman demo                               # simulated worker and model, no network, no credentials
+aftman run --repo . --job "Add retries"   # starts the daemon on first use; needs a provider,
+                                          #   or add --simulate-model to run offline
+aftman run --repo . --job "..." --no-daemon   # embed the runtime in this process (CI, scripts)
+aftman ls | show <run> | logs <run> -f | decisions <run>
+aftman steer <run> "..." | cancel <run> | answer <run> <escalation> --accept
+aftman watch <run>                        # terminal UI
+aftman status | stop | doctor
+```
+
+Exit codes: `0` finished, `1` failed or cancelled, `2` configuration or usage error, `3` a person
+must look (an escalation). The full command surface, flags and behaviour are in
+[docs/07-surfaces.md](docs/07-surfaces.md). A daemon keeps the environment it was started with;
+see there before relying on a key exported in your shell.
 
 - **New here?** Read the [visual explainer](explainer/index.html) first — one self-contained HTML
   page, no build step, no network. Open the file directly, or serve it over a tailnet. It is a

@@ -73,7 +73,12 @@ pub fn draw(frame: &mut Frame, state: &WatchState, ui: &UiState) {
         (12.., _) => 2,
         _ => 1,
     };
-    let banner_h = banner_height(area, state);
+    let replaying = ui.replaying(state.last_seq);
+    let banner_h = if replaying.is_some() {
+        0
+    } else {
+        banner_height(area, state)
+    };
     let body_h = area
         .height
         .saturating_sub(footer_h)
@@ -90,7 +95,7 @@ pub fn draw(frame: &mut Frame, state: &WatchState, ui: &UiState) {
 
     draw_header(frame, header, state, ui);
     if banner_h > 0 {
-        draw_banner(frame, banner, state);
+        draw_banner(frame, banner, state, ui);
     }
     draw_body(frame, body, state, ui);
     if typing_box {
@@ -127,7 +132,18 @@ pub fn draw(frame: &mut Frame, state: &WatchState, ui: &UiState) {
 
 /// The badge text and style for the run's status. Distinct for every state that
 /// matters: a person must never mistake "needs a human" for "failed".
-fn badge(state: &WatchState) -> (String, Style) {
+fn badge(state: &WatchState, ui: &UiState) -> (String, Style) {
+    // While history is still being folded in, the status is the state at some past
+    // moment, not the run's present: say so instead of showing a stale one.
+    if let Some((applied, target)) = ui.replaying(state.last_seq) {
+        return (
+            format!(" REPLAYING history (seq {applied} of {target}) "),
+            Style::new()
+                .fg(Color::Black)
+                .bg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
     let label = state.status_label();
     let finished_as = state.finished.as_ref().map(|f| f.status.as_str());
     let status = finished_as.unwrap_or(label.as_str());
@@ -172,7 +188,7 @@ fn short(id: &str) -> String {
 }
 
 fn draw_tiny(frame: &mut Frame, area: Rect, state: &WatchState, ui: &UiState) {
-    let (text, style) = badge(state);
+    let (text, style) = badge(state, ui);
     let mut spans = vec![Span::styled(text.trim().to_owned(), style)];
     if state.open_escalations().next().is_some() {
         spans.push(Span::styled(" ASK", bold()));
@@ -184,7 +200,7 @@ fn draw_tiny(frame: &mut Frame, area: Rect, state: &WatchState, ui: &UiState) {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, state: &WatchState, ui: &UiState) {
-    let (text, style) = badge(state);
+    let (text, style) = badge(state, ui);
     let mut first = Vec::new();
     if state.auto_approve() {
         // Never subtle: the agent's approval prompts are off and nothing sandboxes it.
@@ -376,9 +392,9 @@ fn banner_height(area: Rect, state: &WatchState) -> u16 {
     }
 }
 
-fn draw_banner(frame: &mut Frame, area: Rect, state: &WatchState) {
+fn draw_banner(frame: &mut Frame, area: Rect, state: &WatchState, ui: &UiState) {
     if state.is_finished() {
-        let (text, style) = badge(state);
+        let (text, style) = badge(state, ui);
         let reason = state
             .finished
             .as_ref()
@@ -404,7 +420,7 @@ fn draw_banner(frame: &mut Frame, area: Rect, state: &WatchState) {
     let first = open.first().copied();
     let id = first.map_or("(not yet reported)", |e| e.id.as_str());
     let more = if open.len() > 1 {
-        format!("  (+{} more)", open.len() - 1)
+        format!("  (+{} more: Tab in the answer dialog)", open.len() - 1)
     } else {
         String::new()
     };
@@ -1173,6 +1189,22 @@ fn draw_decide(
         lines.push(Line::raw(""));
         for piece in wrap(&format!("ask: {ask}"), inner_cols, 3) {
             lines.push(Line::styled(piece, dim()));
+        }
+    }
+    // Every open escalation is listed, so the operator can see what else is waiting.
+    let open: Vec<_> = state.open_escalations().collect();
+    if open.len() > 1 {
+        lines.push(Line::raw(""));
+        lines.push(Line::styled(
+            format!("{} open escalations (Tab chooses):", open.len()),
+            bold(),
+        ));
+        for e in open.iter().take(6) {
+            let mark = if e.id == escalation { ">" } else { " " };
+            lines.push(Line::styled(
+                clip(&format!("{mark} {}  {}", e.id, e.ask), inner_cols),
+                if e.id == escalation { bold() } else { dim() },
+            ));
         }
     }
     popup(frame, area, "Answer the escalation", lines, Color::Yellow);

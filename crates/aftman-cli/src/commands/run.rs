@@ -121,7 +121,7 @@ async fn embedded(ctx: &Ctx, params: RunStartParams) -> Result<u8, CliError> {
         .await
         .map_err(|e| CliError::internal(format!("starting the run: {e}")))?;
     let run_id = started.run_id();
-    let (control, receiver) = RunControl::channel();
+    let (control, receiver) = RunControl::channel_without_human();
     let drive = runtime.drive(started, Some(receiver));
     tokio::pin!(drive);
 
@@ -335,19 +335,9 @@ async fn needs_human(
 /// whatever happens here: the stored state is read on a best-effort basis.
 async fn finish(ctx: &Ctx, run_id: RunId, status: &str) -> Result<(), CliError> {
     let state = match fresh(ctx).await {
-        Ok(mut client) => {
-            // The runtime snapshots just *after* it emits `RUN_FINISHED`, so the state
-            // may trail the event by a moment.
-            let mut state = client.run_get(run_id).await.ok();
-            for _ in 0..40 {
-                if state.as_ref().is_none_or(|s| s.status.is_terminal()) {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                state = client.run_get(run_id).await.ok();
-            }
-            state
-        }
+        // The runtime writes the final snapshot *before* it announces `RUN_FINISHED`
+        // (`emit_final`), so this read already sees the terminal state.
+        Ok(mut client) => client.run_get(run_id).await.ok(),
         Err(_) => None,
     };
     outln!()?;

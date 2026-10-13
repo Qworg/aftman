@@ -310,6 +310,12 @@ async fn forward(mut subscription: Subscription, out: Outbound) {
             return;
         }
     }
+    // The stream ended. If it ended because the daemon stopped driving the run without
+    // being able to record its end, say so explicitly: the client would otherwise wait
+    // on a socket that will never speak again.
+    if let Some(gone) = subscription.abandoned() {
+        let _ = send(&out, &ServerMessage::abandoned(gone.run_id, &gone.reason)).await;
+    }
 }
 
 /// Run one request that is not a subscription call, and answer it. A panicking
@@ -329,7 +335,12 @@ async fn execute(
             Request::RunEvents(p) => respond(id, manager.run_events(p).await),
             Request::RunSteer(p) => respond(id, manager.run_steer(p).await),
             Request::RunCancel(p) => respond(id, manager.run_cancel(p).await),
-            Request::RunAnswer(p) => respond(id, manager.run_answer(p, surface).await),
+            Request::RunAnswer(p) => {
+                // The client may name its own surface (validated against a closed set);
+                // otherwise it is the transport's.
+                let who = p.surface.clone().unwrap_or_else(|| surface.to_owned());
+                respond(id, manager.run_answer(p, &who).await)
+            }
             Request::RunPurge(p) => respond(id, manager.run_purge(p).await),
             Request::ResponsibilityList => respond(id, manager.responsibilities().await),
             Request::JevUsage(p) => respond(id, manager.jev_usage(p).await),

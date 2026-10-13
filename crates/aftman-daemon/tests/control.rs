@@ -322,6 +322,8 @@ struct Options {
     gated: bool,
     panic_on_start: bool,
     panic_on_finish: bool,
+    /// A cancel-only channel, like the embedded `--no-daemon` run's.
+    no_human: bool,
 }
 
 impl Options {
@@ -334,7 +336,13 @@ impl Options {
             gated: false,
             panic_on_start: false,
             panic_on_finish: false,
+            no_human: false,
         }
+    }
+
+    fn no_human(mut self) -> Self {
+        self.no_human = true;
+        self
     }
 
     fn gated(mut self) -> Self {
@@ -443,7 +451,11 @@ async fn launch(options: Options) -> Result<Fixture, Box<dyn std::error::Error>>
     );
     let started = rt.start(job(&repo)).await?;
     let run_id = started.run_id();
-    let (control, receiver) = RunControl::channel();
+    let (control, receiver) = if options.no_human {
+        RunControl::channel_without_human()
+    } else {
+        RunControl::channel()
+    };
     let task = tokio::spawn({
         let rt = Arc::clone(&rt);
         async move { rt.drive(started, Some(receiver)).await }
@@ -651,6 +663,34 @@ async fn cancel_works_with_no_worker_in_needs_human() -> TestResult {
     let mut fx = launch(Options::new(Mode::Escalate)).await?;
     fx.needs_human(1).await?;
     assert_eq!(fx.worker.starts.load(Ordering::SeqCst), 0);
+    let outcome = fx.cancel_and_join().await?;
+    assert_eq!(outcome.status, FactoryStatus::Cancelled);
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_only_channel_still_ends_a_needs_human_run() -> TestResult {
+    // The embedded `--no-daemon` run has a control channel (so a signal can cancel it)
+    // but nothing that could answer: NeedsHuman must end it, question recorded, worker
+    // reaped, RUN_FINISHED written.
+    let mut fx = launch(Options::new(Mode::Escalate).no_human()).await?;
+    fx.needs_human(1).await?;
+    let outcome = fx.finish().await?;
+    assert_eq!(outcome.status, FactoryStatus::NeedsHuman);
+    assert_eq!(fx.count(EventKind::RunFinished), 1);
+    assert_eq!(
+        fx.of_kind(EventKind::RunFinished)[0].payload["status"],
+        "needs_human"
+    );
+    let state = fx.store.load(fx.run_id).await?;
+    assert!(state.has_open_escalation(), "the question is recorded");
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_cancel_only_channel_still_cancels_before_the_escalation() -> TestResult {
+    let mut fx = launch(Options::new(Mode::Working).no_human()).await?;
+    fx.worker_running().await;
     let outcome = fx.cancel_and_join().await?;
     assert_eq!(outcome.status, FactoryStatus::Cancelled);
     Ok(())
@@ -2042,5 +2082,60 @@ async fn a_recheck_re_arms_the_before_finish_gate() -> TestResult {
         2,
         "the recheck re-armed the gate, so Finish measured again before it took effect"
     );
+    Ok(())
+}
+
+// ---- time-driven checks beyond the overall timeout ---------------------------------
+
+#[tokio::test(start_paused = true)]
+async fn a_worker_timeout_about_to_trip_forces_a_cycle_even_when_nothing_changed() -> TestResult {
+    let mut fx = launch(Options::new(Mode::Working).tweak(|c| {
+        c.skip_unchanged_assessments = true;
+        c.idle_poll_interval = Duration::from_secs(5);
+        c.worker_timeout = Duration::from_secs(60);
+    }))
+    .await?;
+    fx.worker_running().await;
+    tokio::time::sleep(Duration::from_secs(40)).await;
+    let before = fx.count(EventKind::AssessmentRequested);
+    assert!(before >= 1);
+    tokio::time::sleep(Duration::from_secs(10)).await; // 50 s: 10 s left, more than a tick
+    assert_eq!(
+        fx.count(EventKind::AssessmentRequested),
+        before,
+        "nothing changed and no boundary is near, so the cycle is skipped"
+    );
+    tokio::time::sleep(Duration::from_secs(12)).await; // 62 s: crossed the 55 s mark
+    assert!(
+        fx.count(EventKind::AssessmentRequested) > before,
+        "within one tick of the worker timeout, an unchanged observation is still assessed"
+    );
+    fx.cancel_and_join().await?;
+    Ok(())
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_end_of_the_steering_grace_window_forces_a_cycle() -> TestResult {
+    let mut fx = launch(Options::new(Mode::Working).tweak(|c| {
+        c.skip_unchanged_assessments = true;
+        c.idle_poll_interval = Duration::from_secs(5);
+    }))
+    .await?;
+    fx.worker_running().await;
+    fx.control.steer("try the other approach").await?;
+    tokio::time::sleep(Duration::from_secs(12)).await;
+    let before = fx.count(EventKind::AssessmentRequested);
+    tokio::time::sleep(Duration::from_secs(8)).await; // 20 s into a 30 s window
+    assert_eq!(
+        fx.count(EventKind::AssessmentRequested),
+        before,
+        "inside the window, far from its end: skipped"
+    );
+    tokio::time::sleep(Duration::from_secs(14)).await; // 34 s: the window ended at 30 s
+    assert!(
+        fx.count(EventKind::AssessmentRequested) > before,
+        "the suppressed checks come back when the window closes, so a cycle must run"
+    );
+    fx.cancel_and_join().await?;
     Ok(())
 }

@@ -37,7 +37,7 @@ pub async fn run_provider(
         ProviderCwd::Repo => repo.to_path_buf(),
         ProviderCwd::Temp => temp_dir.to_path_buf(),
     };
-    let started = std::time::Instant::now();
+    let started = tokio::time::Instant::now();
     let outcome = run(provider, &cwd).await;
     let duration = started.elapsed();
 
@@ -308,7 +308,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut configured = provider(&["sleep", "60"]);
         configured.timeout_seconds = 1;
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let outcome = run_provider(&configured, dir.path(), dir.path(), now()).await;
         assert!(outcome.launch_error.is_some(), "a timeout is reported");
         assert!(

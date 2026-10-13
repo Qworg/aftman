@@ -77,7 +77,11 @@ fn observe(pid: i32) -> Option<Observed> {
 #[cfg(not(target_os = "linux"))]
 fn observe(pid: i32) -> Option<Observed> {
     let ps = |column: &str| -> Option<String> {
+        // Hard rule 3: every subprocess gets the scrubbed environment (`ps` needs none
+        // of the supervisor's secrets).
         let out = std::process::Command::new("ps")
+            .env_clear()
+            .envs(crate::worker_environment(&[]))
             .args(["-o", column, "-p", &pid.to_string()])
             .output()
             .ok()?;
@@ -226,6 +230,15 @@ mod tests {
             .expect("spawn")
     }
 
+    /// Tests leave nothing running: kill the whole group (a forked `sleep` included).
+    fn kill_group_and_reap(child: &mut std::process::Child) {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(-i32::try_from(child.id()).expect("pid")),
+            nix::sys::signal::Signal::SIGKILL,
+        );
+        let _ = child.wait();
+    }
+
     #[tokio::test]
     async fn an_identified_group_is_ended_and_an_absent_one_is_not_an_error() {
         let child = spawn_group("sleep 60");
@@ -261,8 +274,7 @@ mod tests {
             "{outcome:?}"
         );
         assert!(child.try_wait().expect("wait").is_none(), "still running");
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_group_and_reap(&mut child);
     }
 
     #[tokio::test]
@@ -276,8 +288,7 @@ mod tests {
             OrphanOutcome::Unverified(_)
         ));
         assert!(child.try_wait().expect("wait").is_none());
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_group_and_reap(&mut child);
     }
 
     #[tokio::test]
@@ -293,8 +304,7 @@ mod tests {
             );
             assert!(child.try_wait().expect("wait").is_none(), "left alone");
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_group_and_reap(&mut child);
     }
 
     #[tokio::test]

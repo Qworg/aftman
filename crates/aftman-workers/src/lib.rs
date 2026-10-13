@@ -41,7 +41,14 @@ pub use subprocess::{CommandSpec, SubprocessWorker};
 /// function. Never `std::env::inherit`.
 #[must_use]
 pub fn worker_environment(extra: &[(String, String)]) -> Vec<(String, String)> {
-    build_worker_environment(std::env::vars(), extra)
+    // `vars_os`, not `vars`: `vars` panics on an entry that is not valid UTF-8. Such an
+    // entry is dropped, deliberately: the scrubbing below works on names and values as
+    // text, and an agent gains nothing it needs from a variable that is not text.
+    build_worker_environment(
+        std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
+        extra,
+    )
 }
 
 /// The pure half of [`worker_environment`].

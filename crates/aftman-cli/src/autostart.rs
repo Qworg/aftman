@@ -164,6 +164,20 @@ pub enum AutostartError {
     StillShuttingDown { pid: u32, after: Duration },
 }
 
+/// Where a long wait reports to ("the daemon is recovering runs"). A command prints it
+/// to stderr; a full-screen UI shows it in its own way.
+#[derive(Clone)]
+pub struct Progress(pub std::sync::Arc<dyn Fn(&str) + Send + Sync>);
+
+impl std::fmt::Debug for Progress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Progress(..)")
+    }
+}
+
+/// How long to keep waiting, silently, before saying the daemon is busy.
+pub const PROGRESS_AFTER: Duration = Duration::from_millis(1500);
+
 /// How to start the daemon.
 #[derive(Debug, Clone)]
 pub struct Starter {
@@ -174,6 +188,8 @@ pub struct Starter {
     pub ready_timeout: Duration,
     pub shutdown_wait: Duration,
     pub client: ClientConfig,
+    /// Told when a wait is long enough to explain.
+    pub progress: Option<Progress>,
 }
 
 impl Starter {
@@ -190,6 +206,7 @@ impl Starter {
             ready_timeout: READY_TIMEOUT,
             shutdown_wait: SHUTDOWN_WAIT,
             client: ClientConfig::default(),
+            progress: None,
         })
     }
 
@@ -287,7 +304,15 @@ pub async fn ensure_daemon(
     }
 
     let mut child = spawn_detached(starter).await?;
-    let deadline = Instant::now() + starter.ready_timeout;
+    // A freshly started daemon holds its lock from the first moment but binds its socket
+    // only after restart recovery, which can take a while (each orphaned worker is given
+    // a grace period to end). While it holds the lock it is working, not stuck: wait for
+    // it, up to the documented bound, and say what it is doing. Only a daemon that
+    // holds nothing and does not answer for `ready_timeout` is given up on.
+    let started = Instant::now();
+    let mut quiet_since = started;
+    let mut busy_since: Option<Instant> = None;
+    let mut told = false;
     let mut pause = FIRST_POLL;
     loop {
         match Client::connect_with(&paths.socket, starter.client).await {
@@ -300,21 +325,49 @@ pub async fn ensure_daemon(
             Err(error) if error.is_not_running() => {}
             Err(error) => return Err(error.into()),
         }
-        // A child that died with an error will never become ready. One that exited 0
-        // lost the start race to a daemon whose socket we are about to see.
-        if let Ok(Some(status)) = child.try_wait() {
-            if !status.success() {
-                return Err(AutostartError::Exited {
-                    status: status.to_string(),
-                    log: starter.log_path(),
-                });
+        let now = Instant::now();
+        match probe(paths).await {
+            DaemonPresence::Busy { pid } => {
+                let since = *busy_since.get_or_insert(now);
+                quiet_since = now;
+                if now.duration_since(since) >= starter.shutdown_wait {
+                    return Err(AutostartError::NotReady {
+                        after: starter.shutdown_wait,
+                        log: starter.log_path(),
+                    });
+                }
+                if !told && now.duration_since(started) >= PROGRESS_AFTER {
+                    told = true;
+                    if let Some(progress) = &starter.progress {
+                        (progress.0)(&format!(
+                            "the aftman daemon (pid {pid}) is starting up, recovering runs \
+                             from before; waiting (this can take a few seconds per orphaned \
+                             worker)..."
+                        ));
+                    }
+                }
             }
-        }
-        if Instant::now() >= deadline {
-            return Err(AutostartError::NotReady {
-                after: starter.ready_timeout,
-                log: starter.log_path(),
-            });
+            DaemonPresence::Running { .. } => quiet_since = now,
+            DaemonPresence::NotRunning => {
+                busy_since = None;
+                // A child that died with an error will never become ready. One that
+                // exited 0 lost the start race to a daemon whose socket we are about
+                // to see.
+                if let Ok(Some(status)) = child.try_wait() {
+                    if !status.success() {
+                        return Err(AutostartError::Exited {
+                            status: status.to_string(),
+                            log: starter.log_path(),
+                        });
+                    }
+                }
+                if now.duration_since(quiet_since) >= starter.ready_timeout {
+                    return Err(AutostartError::NotReady {
+                        after: starter.ready_timeout,
+                        log: starter.log_path(),
+                    });
+                }
+            }
         }
         tokio::time::sleep(pause).await;
         pause = (pause * 3 / 2).min(MAX_POLL);
@@ -454,6 +507,7 @@ mod tests {
             ready_timeout: READY_TIMEOUT,
             shutdown_wait: SHUTDOWN_WAIT,
             client: ClientConfig::default(),
+            progress: None,
         };
         let args: Vec<String> = starter
             .args()

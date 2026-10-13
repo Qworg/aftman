@@ -113,6 +113,7 @@ impl Ctx {
         let paths = self.paths()?;
         let mut starter = Starter::for_current_exe(&self.locations)?;
         starter.client = self.client;
+        starter.progress = Some(autostart::Progress(Arc::new(|line| errln!("{line}"))));
         let mut client = autostart::ensure_daemon(&paths, &starter).await?;
         let status = client.status().await?;
         self.check_daemon(&paths, &status)?;

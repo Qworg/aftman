@@ -84,8 +84,8 @@ async fn interactive(ctx: &Ctx, socket: &Path, run_id: RunId) -> Result<u8, CliE
     terminal::install_panic_hook();
     let mut session = terminal::TerminalSession::enter()
         .map_err(|e| CliError::io("setting up the terminal", e))?;
-    let (mut input, tx, thread) =
-        terminal::spawn_input_thread().map_err(|e| CliError::io("reading the keyboard", e))?;
+    let (mut input, tx, thread) = terminal::spawn_input_thread(Arc::clone(&options.clock))
+        .map_err(|e| CliError::io("reading the keyboard", e))?;
     // SIGINT / SIGQUIT / SIGTERM / SIGHUP end the TUI like a quit, so the terminal is
     // restored (in raw mode Ctrl-C is a key, but `kill -INT` is a signal).
     let signals = signals.spawn(tx);

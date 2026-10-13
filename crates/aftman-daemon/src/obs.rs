@@ -138,7 +138,12 @@ impl ObservationBuilder {
         } else {
             let tests = active.map_or_else(Vec::new, |w| parse_worker_tests(&w.output));
             match collect_repo(&job.repo, self.caps, self.timeout, &self.git_program).await {
-                Ok(repo) => (repo.git, repo.untracked, repo.instructions, tests),
+                Ok(repo) => {
+                    if let Some(why) = repo.note {
+                        note = Some(why);
+                    }
+                    (repo.git, repo.untracked, repo.instructions, tests)
+                }
                 Err(why) => {
                     tracing::warn!(repo = %job.repo.display(), why, "repository evidence omitted");
                     note = Some(why);
@@ -262,6 +267,9 @@ struct RepoEvidence {
     git: GitEvidence,
     untracked: Vec<UntrackedExcerpt>,
     instructions: Option<RepoInstructions>,
+    /// Set when the code-executing configuration changed while the observation ran, in
+    /// which case `git` and `untracked` have been discarded.
+    note: Option<String>,
 }
 
 /// Collect everything repository-shaped, under one deadline. `Err` carries the note to
@@ -274,14 +282,44 @@ async fn collect_repo(
 ) -> Result<RepoEvidence, String> {
     let deadline = tokio::time::Instant::now() + limit;
     let work = async {
-        let config = repo_config_overrides(repo, deadline, program).await;
-        let git = git_evidence(repo, caps, deadline, program, &config).await;
-        let untracked = untracked_excerpts(repo, caps, deadline, program, &config).await;
+        let before = config_scan(repo, deadline, program).await;
+        let mut git = git_evidence(repo, caps, deadline, program, &before.overrides).await;
+        let mut untracked =
+            untracked_excerpts(repo, caps, deadline, program, &before.overrides).await;
         let instructions = read_instructions(repo, caps.instruction_chars).await;
+        // The worker runs concurrently and controls the configuration: if the set of
+        // code-executing entries changed under us, a command above may have run something
+        // the scan did not know to neutralize. Name-based overriding cannot close that
+        // (git has no switch for it), so the cycle's git evidence is thrown away and the
+        // fact is recorded.
+        let after = config_scan(repo, deadline, program).await;
+        let mut note = None;
+        if before.exec_keys != after.exec_keys {
+            let added: Vec<&String> = after
+                .exec_keys
+                .iter()
+                .filter(|k| !before.exec_keys.contains(k))
+                .collect();
+            tracing::warn!(
+                repo = %repo.display(),
+                ?added,
+                "git configuration that can run programs changed during the observation; \
+                 discarding this cycle's git evidence"
+            );
+            note = Some(
+                "the repository's git configuration (filters, diff drivers, includes, ...) \
+                 changed during the observation; git and untracked-file evidence for this \
+                 cycle was discarded"
+                    .to_owned(),
+            );
+            git = GitEvidence::default();
+            untracked = Vec::new();
+        }
         RepoEvidence {
             git,
             untracked,
             instructions,
+            note,
         }
     };
     tokio::time::timeout_at(deadline, work).await.map_err(|_| {
@@ -302,7 +340,7 @@ async fn git_evidence(
     caps: ObsCaps,
     deadline: tokio::time::Instant,
     program: &std::ffi::OsStr,
-    config: &[String],
+    config: &[(String, String)],
 ) -> GitEvidence {
     if !repo.is_dir() {
         return GitEvidence::default();
@@ -371,7 +409,7 @@ async fn git_evidence(
 /// | `core.fsmonitor=false` | an fsmonitor hook/daemon is an arbitrary program run by `status`/`diff` |
 /// | `core.hooksPath=/dev/null` | hooks (none run for these commands today; defence in depth) |
 /// | `--no-ext-diff`, `--no-textconv` | `diff.external` and `diff.<driver>.textconv` are programs |
-/// | `filter.<name>.{clean,smudge,process}` | clean filters run when git compares work tree to index; every filter named in the repo's config is replaced with `cat`/empty |
+/// | `filter.<name>.{clean,smudge,process,required}` | clean filters run when git compares work tree to index. Every filter defined in the configuration *as it stands when the observation starts, in any scope* is overridden (`cat` / empty); a filter added *during* the observation is only detected (see `config_scan`) |
 /// | `core.pager=cat`, `GIT_PAGER=cat`, `PAGER=cat` | a pager is a program |
 /// | `core.sshCommand`, `core.gitProxy`, `core.askPass`, `credential.helper`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_TERMINAL_PROMPT=0` | transports and credential helpers (a lazy fetch would run them) |
 /// | `GIT_NO_LAZY_FETCH=1` | a partial clone's promisor remote must not be contacted |
@@ -398,7 +436,7 @@ const GIT_FORCED_CONFIG: &[&str] = &[
 fn git_command(
     repo: &Path,
     args: &[&str],
-    config: &[String],
+    config: &[(String, String)],
     program: &std::ffi::OsStr,
 ) -> Command {
     git_command_with_base(repo, args, config, program, std::env::vars_os())
@@ -409,7 +447,7 @@ fn git_command(
 fn git_command_with_base(
     repo: &Path,
     args: &[&str],
-    config: &[String],
+    config: &[(String, String)],
     program: &std::ffi::OsStr,
     base: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
 ) -> Command {
@@ -442,8 +480,15 @@ fn git_command_with_base(
     for forced in GIT_FORCED_CONFIG {
         command.arg("-c").arg(forced);
     }
-    for extra in config {
-        command.arg("-c").arg(extra);
+    // Key/value pairs go through the environment (`GIT_CONFIG_COUNT`, ...), which has the
+    // same precedence as `-c` but needs no parsing, so a key containing `=` or spaces
+    // cannot be mis-split into a different key.
+    if !config.is_empty() {
+        command.env("GIT_CONFIG_COUNT", config.len().to_string());
+        for (index, (key, value)) in config.iter().enumerate() {
+            command.env(format!("GIT_CONFIG_KEY_{index}"), key);
+            command.env(format!("GIT_CONFIG_VALUE_{index}"), value);
+        }
     }
     command.arg("-C").arg(repo).args(args);
     command.stdin(std::process::Stdio::null());
@@ -454,43 +499,89 @@ fn git_command_with_base(
     command
 }
 
-/// `-c` overrides that neutralize the repository's own `filter.<name>.*` drivers.
+/// What the repository's configuration holds that can run programs, as the hardened
+/// commands will see it.
+struct ConfigScan {
+    /// Forced values for every name-keyed, code-executing entry found (`filter.<n>.*`).
+    overrides: Vec<(String, String)>,
+    /// Every key in the families that can execute code, sorted: compared before and after an
+    /// observation to detect a change made while it ran.
+    exec_keys: Vec<String>,
+}
+
+/// Whether a configuration key belongs to a family that can make git run a program or
+/// change where it reads configuration from. Used to detect change, not to override.
+fn is_exec_key(key: &str) -> bool {
+    key.starts_with("filter.")
+        || key.starts_with("diff.")
+        || key.starts_with("include.")
+        || key.starts_with("includeif.")
+        || key.starts_with("extensions.")
+        || matches!(
+            key,
+            "core.fsmonitor" | "core.hookspath" | "core.attributesfile" | "core.worktree"
+        )
+}
+
+/// Enumerate the configuration and derive the overrides that neutralize the repository's
+/// own `filter.<name>.*` drivers.
 ///
-/// A clean filter named by `.gitattributes` is run by `git status`/`git diff` to compare
-/// the work tree with the index. There is no switch that turns filters off, so each
-/// filter the repository's *local* config defines is overridden: `clean`/`smudge` become
-/// `cat` and `process` becomes empty (an empty command is not run). Reading the config
-/// (`git config --list --local --name-only`) executes nothing.
-async fn repo_config_overrides(
+/// A clean filter named by `.gitattributes` or `.git/info/attributes` is run by `git
+/// status`/`git diff` to compare the work tree with the index. There is no switch that
+/// turns filters off, so each filter the configuration defines is overridden: `clean` and
+/// `smudge` become `cat`, `process` becomes empty (an empty command is not run) and
+/// `required` becomes false.
+///
+/// The list is taken from **exactly what the commands will read**: it is produced by the
+/// same hardened invocation (same environment, same forced `-c` settings), without
+/// `--local` or any scope restriction, with `--includes`, so every scope git consults is
+/// covered: system and global (both `/dev/null` here), local, worktree-scoped
+/// (`config.worktree`, when `extensions.worktreeConfig` is on), anything pulled in by
+/// `include.path` and `includeIf.*.path` from any of them, and the command line. Names may
+/// contain dots, spaces, and upper case; the list is NUL-separated (`-z`) so a name cannot
+/// be split, and the overrides travel through the environment so a name cannot be mis-parsed.
+/// Reading configuration executes nothing.
+async fn config_scan(
     repo: &Path,
     deadline: tokio::time::Instant,
     program: &std::ffi::OsStr,
-) -> Vec<String> {
-    let keys = run_git(
+) -> ConfigScan {
+    let listing = run_git(
         repo,
-        &["config", "--list", "--local", "--name-only"],
+        &["config", "--list", "--includes", "--name-only", "-z"],
         &[],
         deadline,
         program,
     )
     .await
     .unwrap_or_default();
-    let mut overrides = Vec::new();
-    for key in keys.lines() {
+    let mut overrides = std::collections::BTreeMap::new();
+    let mut exec_keys = Vec::new();
+    for key in listing.split('\0').filter(|k| !k.is_empty()) {
+        // `--name-only` prints section and variable lower-cased, subsection verbatim.
+        if is_exec_key(key) {
+            exec_keys.push(key.to_owned());
+        }
         let Some(rest) = key.strip_prefix("filter.") else {
             continue;
         };
-        let Some((name, field)) = rest.rsplit_once('.') else {
+        let Some((_, field)) = rest.rsplit_once('.') else {
             continue;
         };
-        match field {
-            "clean" | "smudge" => overrides.push(format!("filter.{name}.{field}=cat")),
-            "process" => overrides.push(format!("filter.{name}.process=")),
-            "required" => overrides.push(format!("filter.{name}.required=false")),
-            _ => {}
-        }
+        let forced = match field {
+            "clean" | "smudge" => "cat",
+            "process" => "",
+            "required" => "false",
+            _ => continue,
+        };
+        overrides.insert(key.to_owned(), forced.to_owned());
     }
-    overrides
+    exec_keys.sort();
+    exec_keys.dedup();
+    ConfigScan {
+        overrides: overrides.into_iter().collect(),
+        exec_keys,
+    }
 }
 
 /// Kills a git process group when dropped while armed: a timed-out or abandoned git
@@ -517,7 +608,7 @@ impl Drop for KillGroup {
 async fn run_git(
     repo: &Path,
     args: &[&str],
-    config: &[String],
+    config: &[(String, String)],
     deadline: tokio::time::Instant,
     program: &std::ffi::OsStr,
 ) -> Option<String> {
@@ -589,7 +680,7 @@ async fn untracked_excerpts(
     caps: ObsCaps,
     deadline: tokio::time::Instant,
     program: &std::ffi::OsStr,
-    config: &[String],
+    config: &[(String, String)],
 ) -> Vec<UntrackedExcerpt> {
     let status = run_git(
         repo,

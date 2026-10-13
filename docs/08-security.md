@@ -177,7 +177,7 @@ credentials, and be a way out of a `sandboxed` worker. Every such `git` is run w
 | `core.fsmonitor=false` | an fsmonitor hook is an arbitrary program run by `status`/`diff` |
 | `core.hooksPath=/dev/null` | hooks (none run for these commands today; defence in depth) |
 | `--no-ext-diff`, `--no-textconv` | `diff.external` and `diff.<driver>.textconv` are programs |
-| `filter.<name>.clean/smudge/process/required` | clean filters run when git compares work tree and index; every filter the repo's local config defines is overridden (`cat` / empty command) per run |
+| `filter.<name>.clean/smudge/process/required` | clean filters run when git compares work tree and index. Every filter defined in the configuration as it stands when the observation starts, **in any scope** (local, worktree-scoped `config.worktree`, anything reached by `include.path`/`includeIf`), is overridden (`cat` / empty command) for that observation. A filter added *while* the observation runs is detected, not prevented (below) |
 | `core.pager`, `GIT_PAGER`, `PAGER` | a pager is a program |
 | `core.sshCommand`, `core.gitProxy`, `core.askPass`, `credential.helper`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_TERMINAL_PROMPT=0`, `protocol.ext.allow=never` | transports and credential helpers, which a lazy fetch would run |
 | `GIT_NO_LAZY_FETCH=1` | a partial clone's promisor remote is not contacted (git 2.44+; older git has no lazy fetch for these commands that we rely on) |
@@ -189,7 +189,46 @@ Consequences stated plainly: `safe.directory` entries in global config are ignor
 repository owned by another user is "dubious" to git and yields no git evidence (it is never
 trusted by adding `safe.directory=*`); and a repository relying on a clean filter for correct
 `status` output sees the filter replaced by `cat`, which only affects what the supervisor
-*observes*, never the working tree. The same rule covers the other reads: only regular files
+*observes*, never the working tree.
+
+**How the filter list is computed.** From exactly the configuration the hardened commands will
+read: the same invocation (same scrubbed environment, same forced settings) runs `git config
+--list --includes --name-only -z`, with no `--local` or other scope restriction, so system and
+global (both `/dev/null` here), local, worktree-scoped config (`extensions.worktreeConfig`), every
+file pulled in by `include.path` / `includeIf.*.path` from any of those, and the command line are
+all covered. `-z` keeps names with dots, spaces, capitals or `=` intact, and the overrides reach
+git through `GIT_CONFIG_COUNT/KEY_n/VALUE_n`, which has the precedence of `-c` but is not
+parsed, so a name cannot be mis-split into another key. Other name-keyed families: `diff.<d>.command`,
+`.textconv`, `.cachetextconv` and `diff.external` are not run because every `diff` is invoked
+with `--no-ext-diff --no-textconv` and `status` never runs them; `merge.<d>.driver` is only reachable
+from merge, which is never run; `core.fsmonitor` and `core.hooksPath` are forced with `-c`, which
+wins over every file scope including worktree config (tested).
+
+**What is prevented, what is only detected, and why.**
+
+- *Prevented:* any code-executing configuration that is present when the observation starts, in
+  any scope, as above.
+- *Only detected:* configuration that appears *during* the observation. The worker runs
+  concurrently and controls `.git/`, so it can add a filter between the scan and the command
+  that follows; overriding by name cannot close that, because git offers no switch that disables
+  `clean`/`smudge`/`process` filters or `$GIT_DIR/info/attributes`. After the commands the scan is
+  repeated; if the set of code-executing entries (`filter.*`, `diff.*`, `include*`, `extensions.*`,
+  `core.fsmonitor`, `core.hookspath`, `core.attributesfile`, `core.worktree`) changed, that
+  cycle's git and untracked-file evidence is discarded, `observation_note` says so, and a
+  warning is logged. The window during which something can still run is therefore not closed,
+  only made visible; it is bounded by one observation and by what the worker can do anyway as
+  itself.
+- *Not built:* a name-independent design: run the read-only commands against a
+  supervisor-owned `GIT_DIR` shim (its own `config` and `info/attributes`, no hooks;
+  `GIT_OBJECT_DIRECTORY`, `GIT_INDEX_FILE` and `GIT_WORK_TREE` pointing at the real repository), so
+  repository configuration is never read at all. It would break or complicate linked worktrees,
+  split index, alternates, SHA-256 repositories (`extensions.objectFormat` lives in the config the
+  shim replaces) and sparse checkout, and `.gitattributes` in the work tree would still name
+  filters (harmlessly, as the shim defines none). Until it is built, treat a worker that edits
+  `.git/config` mid-observation as able to run one command as the supervisor's user, with no
+  secrets in its environment.
+
+The same rule covers the other reads: only regular files
 are opened, never a FIFO, device or symlink, and never without a byte cap. Regression tests
 plant each of these in a real repository and require that the marker is never created.
 

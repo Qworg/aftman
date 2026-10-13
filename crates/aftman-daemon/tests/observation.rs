@@ -534,3 +534,282 @@ fn the_supervisors_credentials_and_git_variables_are_not_passed_on() {
             .any(|(k, _)| k.starts_with("TYPESAFE_") || k.starts_with("AFTMAN_"))
     );
 }
+
+// ---- every configuration scope ---------------------------------------------------------
+
+/// Like `assert_not_run`, but the plant is written by `setup(repo, evil_script, dir)`, so it
+/// can go in any scope (worktree config, an included file, ...).
+async fn assert_planted_not_run(
+    name: &str,
+    attributes: Option<&str>,
+    control: &[&str],
+    setup: impl Fn(&Path, &Path, &Path),
+) {
+    if !have_git() {
+        return;
+    }
+    let dir = short_tempdir().expect("tempdir");
+    let marker = dir.path().join(format!("marker-{name}"));
+    let evil = script(
+        dir.path(),
+        "evil.sh",
+        &format!("touch {}\ncat", marker.display()),
+    );
+    let repo = make_repo(dir.path());
+    setup(&repo, &evil, dir.path());
+    if let Some(attributes) = attributes {
+        std::fs::write(repo.join(".gitattributes"), attributes).expect("attributes");
+    }
+    dirty(&repo);
+
+    git(&repo, control);
+    assert!(
+        marker.exists(),
+        "{name}: the plant is not live; the test proves nothing"
+    );
+    std::fs::remove_file(&marker).expect("reset");
+
+    let observation = observe(&ObservationBuilder::new(false), &repo).await;
+    assert!(
+        !marker.exists(),
+        "{name}: repository-controlled code ran during observation"
+    );
+    assert!(
+        observation
+            .git
+            .changed_files
+            .iter()
+            .any(|f| f.ends_with("a.txt")),
+        "{name}: the observation still has content: {:?}",
+        observation.git
+    );
+}
+
+const WORKTREE_ON: &str = "[extensions]\n\tworktreeConfig = true\n";
+
+fn worktree_config(repo: &Path, text: &str, evil: &Path) {
+    append(&repo.join(".git/config"), WORKTREE_ON);
+    std::fs::write(
+        repo.join(".git/config.worktree"),
+        text.replace("EVIL", &evil.display().to_string()),
+    )
+    .expect("config.worktree");
+}
+
+#[tokio::test]
+async fn a_clean_filter_in_worktree_scoped_config_is_not_run() {
+    assert_planted_not_run(
+        "wt-clean",
+        Some("*.txt filter=evil\n"),
+        &["status"],
+        |repo, evil, _| {
+            worktree_config(
+                repo,
+                "[filter \"evil\"]\n\tclean = EVIL\n\tsmudge = EVIL\n",
+                evil,
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_process_filter_in_worktree_scoped_config_is_not_run() {
+    assert_planted_not_run(
+        "wt-process",
+        Some("*.txt filter=evil\n"),
+        &["status"],
+        |repo, evil, _| {
+            worktree_config(
+                repo,
+                "[filter \"evil\"]\n\tprocess = EVIL\n\trequired = true\n",
+                evil,
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_filter_pulled_in_by_include_from_worktree_config_is_not_run() {
+    assert_planted_not_run(
+        "wt-include",
+        Some("*.txt filter=evil\n"),
+        &["status"],
+        |repo, evil, dir| {
+            let extra = dir.join("extra.cfg");
+            std::fs::write(
+                &extra,
+                format!("[filter \"evil\"]\n\tclean = {}\n", evil.display()),
+            )
+            .expect("extra");
+            worktree_config(
+                repo,
+                &format!("[include]\n\tpath = {}\n", extra.display()),
+                evil,
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_filter_pulled_in_by_include_if_from_local_config_is_not_run() {
+    assert_planted_not_run(
+        "local-includeif",
+        Some("*.txt filter=evil\n"),
+        &["status"],
+        |repo, evil, dir| {
+            let extra = dir.join("extra.cfg");
+            std::fs::write(
+                &extra,
+                format!("[filter \"evil\"]\n\tclean = {}\n", evil.display()),
+            )
+            .expect("extra");
+            append(
+                &repo.join(".git/config"),
+                &format!(
+                    "[includeIf \"gitdir:/tmp/**\"]\n\tpath = {}\n",
+                    extra.display()
+                ),
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn fsmonitor_set_in_worktree_config_does_not_win_over_the_forced_setting() {
+    assert_planted_not_run("wt-fsmonitor", None, &["status"], |repo, evil, _| {
+        worktree_config(repo, "[core]\n\tfsmonitor = EVIL\n", evil);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn hooks_path_set_in_worktree_config_does_not_win_over_the_forced_setting() {
+    if !have_git() {
+        return;
+    }
+    let dir = short_tempdir().expect("tempdir");
+    let marker = dir.path().join("marker-wt-hooks");
+    let repo = make_repo(dir.path());
+    let hooks = dir.path().join("evil-hooks");
+    std::fs::create_dir_all(&hooks).expect("hooks dir");
+    for hook in [
+        "post-index-change",
+        "fsmonitor-watchman",
+        "pre-commit",
+        "reference-transaction",
+    ] {
+        script(&hooks, hook, &format!("touch {}", marker.display()));
+    }
+    append(&repo.join(".git/config"), WORKTREE_ON);
+    std::fs::write(
+        repo.join(".git/config.worktree"),
+        format!("[core]\n\thooksPath = {}\n", hooks.display()),
+    )
+    .expect("config.worktree");
+    dirty(&repo);
+    let _ = observe(&ObservationBuilder::new(false), &repo).await;
+    assert!(
+        !marker.exists(),
+        "a hook from a worktree-scoped hooksPath ran"
+    );
+}
+
+#[tokio::test]
+async fn a_filter_whose_name_has_dots_spaces_and_capitals_is_neutralized() {
+    // An attribute value cannot contain a space, so the filter the attributes name has dots,
+    // capitals and an `=`; a second one with spaces in its name is defined too, to prove
+    // the scan copes with it.
+    let name = "My.Odd=Filter.V2";
+    let config = format!(
+        "[filter \"{name}\"]\n\tclean = EVIL\n\tsmudge = EVIL\n[filter \"has some spaces\"]\n\tclean = EVIL\n"
+    );
+    // In local config...
+    assert_planted_not_run(
+        "odd-local",
+        Some(&format!("*.txt filter={name}\n")),
+        &["status"],
+        |repo, evil, _| {
+            append(
+                &repo.join(".git/config"),
+                &config.replace("EVIL", &evil.display().to_string()),
+            );
+        },
+    )
+    .await;
+    // ... and in worktree config.
+    assert_planted_not_run(
+        "odd-worktree",
+        Some(&format!("*.txt filter={name}\n")),
+        &["status"],
+        |repo, evil, _| worktree_config(repo, &config, evil),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn diff_drivers_in_worktree_config_are_not_run_by_status_or_diff() {
+    // `--no-ext-diff --no-textconv` cover `diff` and `diff --stat`; `status` never runs
+    // either. `merge.<driver>.driver` is only reachable from merge, which is never run.
+    assert_planted_not_run(
+        "wt-diff-drivers",
+        Some("*.txt diff=evil\n"),
+        &["diff"],
+        |repo, evil, _| {
+            worktree_config(
+                repo,
+                "[diff \"evil\"]\n\ttextconv = EVIL\n\tcommand = EVIL\n[diff]\n\texternal = EVIL\n",
+                evil,
+            );
+        },
+    )
+    .await;
+}
+
+/// A fake git that plants a filter in the repository the first time it is asked to `diff`,
+/// then runs the real git: configuration changing mid-observation, deterministically.
+#[tokio::test]
+async fn configuration_that_changes_during_the_observation_discards_the_git_evidence() {
+    if !have_git() {
+        return;
+    }
+    let dir = short_tempdir().expect("tempdir");
+    let repo = make_repo(dir.path());
+    dirty(&repo);
+    let once = dir.path().join("mutated-once");
+    let fake = script(
+        dir.path(),
+        "mutating-git",
+        &format!(
+            "for a in \"$@\"; do\n  if [ \"$a\" = diff ] && [ ! -e {once} ]; then\n    touch {once}\n    printf '[filter \"late\"]\\n\\tclean = /bin/true\\n' >> {repo}/.git/config\n  fi\ndone\nexec {real} \"$@\"",
+            once = once.display(),
+            repo = repo.display(),
+            real = real_git().display(),
+        ),
+    );
+    let mut builder = ObservationBuilder::new(false);
+    builder.git_program = fake.into_os_string();
+
+    let observation = observe(&builder, &repo).await;
+    assert!(once.exists(), "the fake git mutated the configuration");
+    let note = observation
+        .evidence
+        .get("observation_note")
+        .expect("a note records that the evidence was discarded");
+    assert!(note.contains("changed during the observation"), "{note}");
+    assert!(observation.git.status_short.is_empty() && observation.git.diff_excerpt.is_empty());
+    assert!(observation.untracked.is_empty());
+
+    // The next cycle sees the new configuration from the start, so it is both safe
+    // (overridden) and complete.
+    let next = observe(&builder, &repo).await;
+    assert!(
+        !next.evidence.contains_key("observation_note"),
+        "{:?}",
+        next.evidence
+    );
+    assert!(next.git.changed_files.iter().any(|f| f.ends_with("a.txt")));
+}

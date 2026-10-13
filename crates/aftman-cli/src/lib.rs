@@ -15,6 +15,7 @@
 //! | [`follow`] | the self-recovering event stream |
 //! | [`out`], [`sanitize`] | the only way to the terminal, and what it strips |
 //! | [`statedir`] | private creation of the state directory, log rotation |
+//! | [`tui`] | `aftman watch`: the terminal UI (pure state, view and input; async driver) |
 //! | [`runid`], [`error`] | run-id prefixes, exit codes |
 
 #![forbid(unsafe_code)]
@@ -31,6 +32,7 @@ pub mod render;
 pub mod runid;
 pub mod sanitize;
 pub mod statedir;
+pub mod tui;
 
 use std::process::ExitCode;
 

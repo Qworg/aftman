@@ -196,6 +196,18 @@ impl Follow {
         self.finished
     }
 
+    /// Consecutive failed attempts to re-establish a lost connection; `0` while the
+    /// stream is connected (and during the first, quick retry). For a "reconnecting"
+    /// indication: read-only.
+    #[must_use]
+    pub fn reconnect_failures(&self) -> u32 {
+        if self.conn.is_none() {
+            self.retry.failed
+        } else {
+            0
+        }
+    }
+
     /// True when the daemon is not driving this run, so the stream polls the log
     /// instead of waiting for pushes.
     #[must_use]

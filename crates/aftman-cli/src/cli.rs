@@ -61,6 +61,8 @@ pub enum Command {
         #[arg(long, default_value_t = 50)]
         limit: usize,
     },
+    /// Watch one run live in a terminal UI (a plain event log when stdout is not a terminal).
+    Watch(RunTarget),
     /// Show one run's summary, decision timeline, and open escalations.
     Show(RunTarget),
     /// Show every proposal, suppression, and invariant for a run.

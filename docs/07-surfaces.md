@@ -300,6 +300,158 @@ or usage error (a bad flag, an unknown run id, `invalid_repo`, `invalid_config`,
 distinguish "a person must look" from "it broke"), `130` detached with Ctrl-C (or an embedded run
 cancelled by SIGINT), `143` an embedded run cancelled by SIGTERM.
 
+### `aftman watch` as built (M3)
+
+`aftman watch <run> | --last` is a client like the others (`aftman_cli::tui`): it replays the run
+from `seq 1` through the same self-recovering `Follow` stream the CLI uses, so catching up and
+following live are one code path and a reconnect cannot desynchronise the screen. It sends
+`run.steer`, `run.cancel` and `run.answer` on a connection of its own, and decides nothing: every
+action is a request, and the daemon's answer (`wrong_state`, `steering_unsupported`, a rejected
+steer) is shown in the footer. It has no herdr awareness and works unchanged inside a herdr pane.
+
+**The daemon.** `watch` goes through the same daemon checks as the other commands: it starts a daemon
+if none is running (then, having no such run, says so: `unknown_run`, or "there are no runs" for
+`--last`, exit `2`), refuses a daemon that serves another state directory, and warns on a version
+skew. It needs a daemon: `--no-daemon` is a usage error (exit `2`). A run the daemon is not driving
+(another process owns it, or it is an orphan) is followed by polling its log; the header says so
+("not live in this daemon") and the stream ends when the log does.
+
+**Structure.** A pure state model (`WatchState::apply(&EventEnvelope)`: a fold, idempotent on a
+repeated `seq`, tolerant of unknown or malformed payloads; an event kind this build does not know
+decodes as `EventKind::Unknown`, is counted and shows nothing), a pure view
+(`draw(frame, state, ui)`), pure key handling (`handle_key(ui, state, key) -> Option<Action>`), and an
+async driver generic over the ratatui `Backend` and over a channel of terminal events. Only
+`tui::terminal` touches the real terminal.
+
+**Layout.** Header (status badge, run, elapsed, counters; worker, model, repo with its middle
+elided, job; the launch posture when there is room), a banner only when the run needs a human or has
+ended, three panes, a footer.
+
+```text
+ RUNNING  run 0193a0f1  0:01:14  assessments 3 (+2 skipped)  workers 1  attempts 1  steers 0
+ worker: pi  model: ...  repo: /home/me/.../service  job: ...
++- NEEDS A HUMAN ----------------------------------------+-------------------------------+   only when needed
+| escalation <id>   press a to answer                     |                               |
+| ask: ...                                                |                               |
++- 1 Decisions -----------------------+ +- 3 Worker output ---------------------------+
+| 41 * continue  <reason>             | | ~ -- worker 0193a0f1 --                     |
+|> 44 * finish    <reason>            | | | text the worker printed                   |
+|     why: ...                        | | + a long line continues here                |
+|     proposed: rule -> directive     | |                                             |
+|     suppressed: rule (reason)       | |                                             |
+|     invariants: ...                 | |                                             |
++- 2 Assessment #3 (6 checks) --------+ |                                             |
+| check        p   thr  margin side flags                                             |
+| core.x     0.82 0.70  +0.12 above decisive permitted                                |
++-------------------------------------+---------------------------------------------+
+ message ......................  a ANSWER  q quit  Tab pane  j/k scroll  s steer  c cancel  ? help
+```
+
+- **Decisions** lists every selected directive with its reason, interleaved with the notable events
+  around it (state changes, workers, steers, evidence, escalations, errors). The selected entry is
+  expanded into its "why": the reason, the assessment it came from, every proposal (rule, directive,
+  priority), every suppression with its reason, and the invariants that applied. The newest entry
+  is followed until the user moves the selection.
+- **Assessment** shows every check of the latest real assessment with its value, threshold, and
+  margin computed from the unrounded values (never `-0.00`; a value just under its threshold prints
+  `-<0.001`), the side of the threshold in words (`above` / `below` / `at`), and the `decisive` /
+  `contested` / `unresolved` / `permitted` flags verbatim and uncoloured as good or bad (`decisive`
+  means far enough from the threshold to act on, in either direction). With fewer than 84 columns
+  *in the pane* each check takes two lines. The last model error, rate limit or budget event shows
+  above the checks with its event number and age, and goes when a later assessment gets real answers
+  (a spent budget stays). The header counts `assessment_seq` as the daemon does and counts cycles
+  that found the budget spent separately (`+N budget-exhausted`).
+- **Worker output** is the sanitised `WORKER_OUTPUT` text. Every worker line has a `| ` gutter; a long
+  line wraps (at most six rows, ending in `…`) and its continuation rows start with `+ `; lines the
+  TUI itself adds (worker boundaries, truncation notices) have a `~ ` gutter and a different style.
+  Styling follows the line's kind, never what its text looks like, so nothing a worker prints can pass
+  for the TUI's chrome. Scrolling back anchors to the line being read (new output does not move it),
+  the title says how many newer lines exist, and the pane is never left blank at the top.
+- **Banner.** `needs_human` only: black on yellow, with the words "NEEDS A HUMAN", the escalation id and
+  the ask; `NeedsHuman` is never drawn like `Failed` (white on red, no banner), in colour or without
+  it. Once a run ends a one-line summary replaces it.
+- **Launch posture** (`RUN_CREATED.launch`): shown in the header when there is room. An `auto-approve`
+  run additionally carries a red `AUTO-APPROVE` badge on the first line and, from 14 rows up, a red
+  line saying the agent's approval prompts are suppressed and aftman does not sandbox it.
+- **Link.** If the stream loses its connection and cannot re-establish it at once, the header shows
+  `NO DAEMON (n)` and says the screen is stale and reconnecting. If it cannot be re-established
+  within the client's attempts, the last frame says "lost the daemon", the TUI leaves the alternate
+  screen and prints the error (see exit codes).
+- Three panes at 110+ columns sit in two columns (timeline over assessment on the left, worker
+  output on the right); from 50 columns and 15 body rows they stack; below that only the focused pane
+  shows (`Tab` switches). Under 12 columns or 3 rows the screen is one status line. It does not panic
+  at any size.
+
+**Keys.**
+
+| Keys | |
+| --- | --- |
+| `q`, `Esc`, `Ctrl-C`, `Ctrl-D` | quit the TUI (the run keeps going) |
+| `Tab`, `Shift-Tab`, `1` `2` `3` | focus a pane |
+| `j` `k`, arrows, `PgUp` `PgDn`, `Home` `g`, `End` `G` | scroll the focused pane (`End` follows again) |
+| `s` | steer the worker |
+| `a` | answer the oldest open escalation (refused once the run has ended) |
+| `c` | cancel the run |
+| `?`, `F1` | help |
+
+- **Steer** (`s`) opens a one-line editor (multi-byte aware: cursor by character,
+  `Ctrl-A`/`E`/`U`/`K`/`W`, `Alt-←/→`, bracketed paste). Enter sends. A message that did not go
+  through is back in the editor the next time. The limits are enforced as you type
+  (`MAX_STEER_BYTES` 16 KiB and the runtime's 8,000 characters). Pasted newlines become spaces.
+- **Answer** (`a`) lists the five decisions of `docs/06-ensemble.md` "R3 - Human" with a plain
+  sentence each: `accept`, `recheck`, `stop`, `claim-complete` (it re-measures with fresh evidence
+  and cannot finish the run by itself), and `guidance` (your words go to the worker; required text).
+  Choosing one opens the editor for a note (optional, 2,000 characters; required for guidance).
+- **Destructive actions need a word, not a letter.** `c` (cancel) and an answer of `stop` open a
+  confirmation where you type `cancel` / `stop` and press Enter; anything else backs out, as does
+  Esc. A stream of text (type-ahead, a paste that arrives without bracketed paste) cannot do this by
+  accident: keys closer together than 25 ms are a burst, and a burst cannot issue a command, open or
+  drive a modal, or confirm anything; an Enter inside a burst in the editors is a space, never a
+  submit. Prompts that cannot be shown in full (under 44x9 for the confirmation, 44x10 for the
+  decision list) say "terminal too small" and accept nothing but Esc.
+- Only one steer or answer is in flight at a time: a second is refused before its prompt closes, so
+  nothing typed is lost. A cancel can always be issued. While an action is in flight the screen keeps
+  updating; quitting waits up to two seconds for it (saying so; any key leaves at once).
+
+**Quitting never cancels the run.** When the run ends the TUI stays up on the final state (scroll
+the tail and the timeline) until the user quits. It shows **one run**, chosen by id or `--last`; the
+list of runs is `aftman ls`. The exit code is the CLI's: `0` / `1` / `3` for a run that ended
+finished / failed or cancelled / needing a human, `130` for a detach from a live run, `3` when
+quitting while the run waits for a human, and `1` if the daemon was lost and could not be reached
+again. That last case prints, on the normal screen, that the TUI cannot tell what happened to the
+run (a crashed daemon's runs are marked failed when a daemon next starts) and which commands find
+out. The commands it prints for re-attaching, answering and cancelling carry `--socket` /
+`--data-dir` when they were given.
+
+**Not a terminal.** When stdout or stdin is not a terminal, `watch` draws nothing and emits no escape
+sequence: it prints one line per event through the CLI's sanitising output (the format of
+`aftman run`, one line per event whatever the text contains, plus the launch lines) until the run
+ends, and Ctrl-C detaches (`130`). `needs_human` is printed as it happens but does not end the
+follow.
+
+**Terminal hygiene.** Raw mode, the alternate screen and bracketed paste are entered once and undone
+on every exit path: normal return, error, a panic on the TUI's thread (the hook restores first), and
+SIGINT / SIGQUIT / SIGTERM / SIGHUP. A panic in an action task is reported in the footer and does not
+touch the terminal. Keys are read on a dedicated thread and handed to the async loop through a bounded
+channel; if that thread ends the TUI quits.
+
+**Untrusted text.** Worker output, the job, the repo path, escalation asks, model reasons and daemon
+error messages all pass through the shared `sanitize` (`crates/aftman-cli/src/sanitize.rs`, the same
+function the plain CLI output uses) before they are stored: ESC / CSI / OSC / DCS / APC sequences
+(and their 8-bit C1 forms) are removed whole, other C0/C1 controls are dropped, a lone carriage return
+becomes a line break, bidi controls, zero-width and tag characters, the combining grapheme joiner and
+U+180E are dropped, and at most four zero-width marks are kept per base character. The TUI layers
+tab expansion, one-line folding, field caps (applied after sanitising, so escapes cannot use the cap
+up), and column-aware clipping and wrapping on top. Wide and combining characters are measured by
+terminal column, never split.
+
+**Bounds** (named constants in `tui::state`, oldest-first eviction): 400 timeline entries, 1,000 tail
+lines / 128 KiB, 500 characters per tail line (and 256 K characters taken from one event), 1,000
+characters per reason or ask, 24 proposals / 24 suppressions / 16 invariants per decision, 64 checks,
+32 escalations, 64 workers, 16 launch entries.
+
+Not built: the diff view (the event stream carries none in M3).
+
 ## 5. Surface 2 — herdr
 
 herdr is a terminal workspace manager for coding agents. Aftman works at **three graduated levels
@@ -470,8 +622,8 @@ What each surface can do. Blank means "not applicable", not "not implemented by 
 | Steer a worker | ✅ | ✅ | ✅ | ✅ | ✅ (`agent prompt`) |
 | Cancel a run | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Answer an escalation | ✅ | ✅ | ✅ | ✅ | ✅ (in the pane) |
-| Browse history | ✅ | ✅ | ✅ | — | — |
-| See the diff | ✅ | ✅ | ✅ | — | — |
+| Browse history | ✅ | one run, chosen by id or `--last` (scroll its timeline and output; no run list) | ✅ | — | — |
+| See the diff | ✅ | not yet (M4) | ✅ | — | — |
 | Inspect decisions | ✅ | ✅ | ✅ | — | — |
 | Watch the raw agent | — | — | — | — | ✅ (the pane **is** the agent) |
 | Approve a permission prompt | — | — | — | — | ✅ |

@@ -25,19 +25,38 @@
 //! - **Newline and tab are kept.** `logs` prints worker text, and its line structure and
 //!   indentation are the text. There is no raw mode.
 //!
-//! Printable text, including non-ASCII, is left untouched.
+//! - **Invisible format characters are removed**: zero-width space/joiners, word joiner,
+//!   BOM, soft hyphen, combining grapheme joiner, Mongolian vowel separator, the Unicode
+//!   tag block, interlinear annotation anchors. U+2028/U+2029 become line breaks. The
+//!   next-line control U+0085 is dropped like the rest of C1.
+//! - **Zero-width marks are capped** at four per base character (accents, variation
+//!   selectors): one terminal cell cannot carry hundreds of code points.
+//!
+//! Printable text, including non-ASCII, is left untouched. The TUI's helpers
+//! (`tui::sanitize`: inline form, field caps, clipping, wrapping, tab expansion) are
+//! layered on this function, so the plain CLI output and the TUI strip identically.
+
+use unicode_width::UnicodeWidthChar as _;
+
+/// Zero-width marks kept after one base character. Real text needs two or three (a
+/// letter with stacked accents, an emoji with a variation selector and a skin tone);
+/// "zalgo" text and invisible padding need hundreds, and one terminal cell must not be
+/// able to carry 500 code points.
+pub(crate) const MAX_MARKS_PER_BASE: usize = 4;
 
 /// Remove everything from `input` that could drive a terminal rather than be read.
+/// The result contains printable characters, `\n` and `\t` only.
 #[must_use]
-pub fn sanitize(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
+pub fn sanitize(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    let mut marks = 0usize;
     while let Some(c) = chars.next() {
         match c {
             '\u{1b}' => skip_escape(&mut chars),
-            // C1 introducers behave like their ESC forms.
+            // 8-bit C1 introducers.
             '\u{9b}' => skip_csi(&mut chars),
-            '\u{9d}' | '\u{90}' | '\u{98}' | '\u{9e}' | '\u{9f}' => skip_string(&mut chars),
+            '\u{90}' | '\u{98}' | '\u{9d}' | '\u{9e}' | '\u{9f}' => skip_string(&mut chars),
             '\r' => {
                 if chars.peek() == Some(&'\n') {
                     chars.next();
@@ -45,13 +64,22 @@ pub fn sanitize(input: &str) -> String {
                 out.push('\n');
             }
             '\n' | '\t' => out.push(c),
-            c if c.is_control() => {}
-            '\u{202a}'..='\u{202e}'
-            | '\u{2066}'..='\u{2069}'
-            | '\u{200e}'
-            | '\u{200f}'
-            | '\u{061c}' => {}
-            c => out.push(c),
+            '\u{2028}' | '\u{2029}' => out.push('\n'),
+            c if is_dropped(c) => {}
+            c => {
+                if c.width() == Some(0) {
+                    marks += 1;
+                    if marks > MAX_MARKS_PER_BASE {
+                        continue;
+                    }
+                } else {
+                    marks = 0;
+                }
+                out.push(c);
+            }
+        }
+        if matches!(c, '\n' | '\r' | '\u{85}' | '\u{2028}' | '\u{2029}' | '\t') {
+            marks = 0;
         }
     }
     out
@@ -59,38 +87,72 @@ pub fn sanitize(input: &str) -> String {
 
 type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
 
-/// After an `ESC`: consume the rest of the sequence it introduces.
+/// Characters removed outright.
+fn is_dropped(c: char) -> bool {
+    matches!(
+        c,
+        // C0 (tab, LF and CR are handled before this) and DEL.
+        '\u{0}'..='\u{1f}' | '\u{7f}'
+        // C1.
+        | '\u{80}'..='\u{9f}'
+        // Soft hyphen, Arabic letter mark.
+        | '\u{ad}' | '\u{61c}'
+        // Combining grapheme joiner, Mongolian vowel separator.
+        | '\u{34f}' | '\u{180e}'
+        // Zero-width space/joiners, LRM, RLM.
+        | '\u{200b}'..='\u{200f}'
+        // Bidi embeddings and overrides.
+        | '\u{202a}'..='\u{202e}'
+        // Word joiner, invisible operators, bidi isolates, deprecated format characters.
+        | '\u{2060}'..='\u{206f}'
+        // BOM / zero-width no-break space.
+        | '\u{feff}'
+        // Interlinear annotation anchors, object replacement.
+        | '\u{fff9}'..='\u{fffb}' | '\u{fffc}'
+        // The tag block (invisible "ASCII smuggling").
+        | '\u{e0000}'..='\u{e007f}'
+    )
+}
+
+/// After ESC: consume the rest of the sequence.
 fn skip_escape(chars: &mut Chars<'_>) {
     match chars.peek().copied() {
+        None => {}
         Some('[') => {
             chars.next();
             skip_csi(chars);
         }
-        // OSC, DCS, SOS, PM, APC: a string, ended by BEL or ST.
+        // OSC, DCS, SOS, PM, APC: strings, up to BEL or ST.
         Some(']' | 'P' | 'X' | '^' | '_') => {
             chars.next();
             skip_string(chars);
         }
         Some(c) if ('\u{20}'..='\u{2f}').contains(&c) => {
-            // Intermediates (`ESC ( B`, `ESC # 8`): then one final byte.
+            // nF escape: intermediates, then one final byte (`ESC ( B`, `ESC # 8`).
             while chars
                 .peek()
                 .is_some_and(|c| ('\u{20}'..='\u{2f}').contains(c))
             {
                 chars.next();
             }
+            if chars
+                .peek()
+                .is_some_and(|c| ('\u{30}'..='\u{7e}').contains(c))
+            {
+                chars.next();
+            }
+        }
+        // `ESC c`, `ESC 7`, `ESC =`, ...: one more character. A lone ESC before a
+        // control character (including another ESC) consumes nothing.
+        Some(c) if !c.is_control() => {
             chars.next();
         }
-        Some(_) => {
-            // `ESC c`, `ESC 7`, `ESC =`, ...: one more character.
-            chars.next();
-        }
-        None => {}
+        Some(_) => {}
     }
 }
 
-/// Inside a CSI: parameters, intermediates, one final byte (`@`..`~`). A control
-/// character inside aborts it (terminals do the same); the rest of the input is kept.
+/// CSI body: parameter bytes, intermediate bytes, one final byte `@`..`~`. An
+/// out-of-range byte aborts the sequence (as a terminal does) without consuming it.
 fn skip_csi(chars: &mut Chars<'_>) {
     while let Some(&c) = chars.peek() {
         match c {
@@ -106,19 +168,25 @@ fn skip_csi(chars: &mut Chars<'_>) {
     }
 }
 
-/// Inside OSC / DCS / ...: skip to BEL, ST (`ESC \` or U+009C). Unterminated: to the end.
+/// A string sequence body, ended by BEL, ST (`ESC \` or U+009C), or the end of the text.
+/// An ESC that does not begin ST ends the string and is left for the main loop.
 fn skip_string(chars: &mut Chars<'_>) {
-    while let Some(c) = chars.next() {
+    while let Some(&c) = chars.peek() {
         match c {
-            '\u{7}' | '\u{9c}' => return,
+            '\u{7}' | '\u{9c}' => {
+                chars.next();
+                return;
+            }
             '\u{1b}' => {
+                chars.next();
                 if chars.peek() == Some(&'\\') {
                     chars.next();
                 }
-                // Any ESC ends the string (a new sequence, or ST).
                 return;
             }
-            _ => {}
+            _ => {
+                chars.next();
+            }
         }
     }
 }
@@ -240,5 +308,31 @@ mod tests {
                 c as u32
             );
         }
+    }
+
+    #[test]
+    fn invisible_format_characters_are_removed() {
+        assert_eq!(
+            sanitize("a\u{200b}b\u{200d}c\u{2060}d\u{feff}e\u{ad}f"),
+            "abcdef"
+        );
+        assert_eq!(sanitize("a\u{34f}b\u{180e}c"), "abc");
+        assert_eq!(sanitize("hi\u{e0049}\u{e0067}"), "hi");
+        assert_eq!(sanitize("a\u{2028}b\u{2029}c"), "a\nb\nc");
+    }
+
+    #[test]
+    fn combining_marks_are_capped_per_base_character() {
+        let zalgo = format!("e{}x", "\u{301}".repeat(500));
+        assert_eq!(
+            sanitize(&zalgo).chars().count(),
+            2 + super::MAX_MARKS_PER_BASE
+        );
+        let selectors = format!("a{}b", "\u{fe0f}".repeat(50));
+        assert_eq!(
+            sanitize(&selectors).chars().count(),
+            2 + super::MAX_MARKS_PER_BASE
+        );
+        assert_eq!(sanitize("e\u{301}e\u{301}"), "e\u{301}e\u{301}");
     }
 }

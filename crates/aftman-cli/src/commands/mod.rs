@@ -264,6 +264,7 @@ pub async fn dispatch(cli: Cli) -> Result<u8, CliError> {
         Command::Run(args) => run::run(&ctx, args).await,
         Command::Demo(args) => run::demo(&ctx, args).await,
         Command::Ls { status, limit } => inspect::ls(&ctx, &status, limit).await,
+        Command::Watch(target) => crate::tui::watch(&ctx, target).await,
         Command::Show(target) => inspect::show(&ctx, target).await,
         Command::Decisions(target) => inspect::decisions(&ctx, target).await,
         Command::Logs { target, follow } => inspect::logs(&ctx, target, follow).await,

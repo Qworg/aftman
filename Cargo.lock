@@ -46,6 +46,7 @@ dependencies = [
  "aftman-store",
  "aftman-workers",
  "async-trait",
+ "nix",
  "serde",
  "serde_json",
  "tempfile",
@@ -78,6 +79,7 @@ version = "0.1.0"
 dependencies = [
  "aftman-core",
  "async-trait",
+ "nix",
  "serde",
  "serde_json",
  "tempfile",

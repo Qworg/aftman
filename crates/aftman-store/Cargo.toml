@@ -10,6 +10,7 @@ description = "Append-only run storage for aftman"
 aftman-core.workspace = true
 
 async-trait.workspace = true
+nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -1,27 +1,48 @@
 //! The on-disk run store.
 //!
 //! ```text
-//! <root>/
-//! ├─ runs/<run-id>/
+//! <root>/                      (0700 when aftman creates it)
+//! ├─ runs/<run-id>/            (0700)
 //! │  ├─ meta.json      header written once at creation
 //! │  ├─ state.json     latest snapshot, replaced atomically
-//! │  └─ events.jsonl   append-only, one event per line
+//! │  ├─ events.jsonl   append-only, one event per line
+//! │  └─ run.lock       advisory lock, held by the process driving the run
+//! ├─ runs/.deleted-*   tombstones of runs being purged (ignored, then removed)
 //! └─ index.sqlite      (M-later) run list queries when the directory grows
 //! ```
 //!
 //! `events.jsonl` is the source of truth and `state.json` is a cache, so every load
 //! validates the two against each other. An interrupted append leaves a torn final
 //! line, which is recovered; anything else is corruption and is refused.
+//!
+//! # Writes are serialized per run, on blocking threads
+//!
+//! `append` and `snapshot` run as one `spawn_blocking` closure that holds a per-run
+//! `std` mutex for its whole duration. Dropping (aborting) the calling future does
+//! not stop a closure already running, so the lock is held by the *operation*, not by
+//! the future: a later writer (the daemon recording a failed run) waits for an
+//! in-flight write of an aborted task instead of racing it. Two guards cover what
+//! serialization cannot: an `append` whose `seq` is not greater than the log's last is
+//! refused (`SeqConflict`), and a `snapshot` older than the stored one is dropped, so
+//! a late write from a dead task can neither duplicate a `seq` nor roll the snapshot
+//! back.
 
+use std::collections::HashMap;
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 
 use aftman_core::event::EventEnvelope;
 use aftman_core::ids::{EventSeq, RunId};
+use aftman_core::job::FactoryStatus;
 use aftman_core::run::{RunFilter, RunHeader, RunState, RunSummary};
 
-use crate::{EventLogRead, RunStore, StoreError, io_err, parse_event_log, summarize, write_atomic};
+use crate::{
+    EventLogRead, RunClaim, RunStore, StoreError, io_err, parse_event_log, summarize, write_atomic,
+};
 
 /// Paths inside one run directory.
 #[derive(Debug, Clone)]
@@ -30,6 +51,8 @@ pub struct RunPaths {
     pub meta: PathBuf,
     pub state: PathBuf,
     pub events: PathBuf,
+    /// Held under `flock` by the process driving the run (see `RunStore::claim`).
+    pub lock: PathBuf,
 }
 
 impl RunPaths {
@@ -40,21 +63,200 @@ impl RunPaths {
             meta: dir.join("meta.json"),
             state: dir.join("state.json"),
             events: dir.join("events.jsonl"),
+            lock: dir.join("run.lock"),
             dir,
         }
     }
 }
 
+/// What the store remembers about one run between writes. A cache only: it is
+/// validated against the file (length) before it is trusted.
+#[derive(Debug, Default)]
+struct RunWrites {
+    /// `(file length, last seq)` as of this store's last append.
+    log: Option<(u64, u64)>,
+    /// `last_seq` of the snapshot this store last wrote or read.
+    snapshot_seq: Option<u64>,
+}
+
+type RunLock = Arc<Mutex<RunWrites>>;
+
 /// A run store backed by a directory.
 #[derive(Debug, Clone)]
 pub struct FileRunStore {
     root: PathBuf,
+    writes: Arc<Mutex<HashMap<RunId, RunLock>>>,
+}
+
+/// Create a directory (and any missing parents) `0700`. Existing directories are
+/// left exactly as they are.
+fn mkdir_private(dir: &Path) -> Result<(), StoreError> {
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| io_err(dir.display(), e))
+}
+
+fn lock_writes(lock: &RunLock) -> MutexGuard<'_, RunWrites> {
+    lock.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn join_error(error: tokio::task::JoinError) -> StoreError {
+    io_err("blocking store task", std::io::Error::other(error))
+}
+
+/// `write_atomic`, blocking: temp file, fsync, rename, fsync the directory.
+fn write_atomic_sync(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io_err(path.display(), std::io::Error::other("path has no parent")))?;
+    let temp = path.with_extension("tmp");
+    {
+        let mut file = std::fs::File::create(&temp).map_err(|e| io_err(temp.display(), e))?;
+        file.write_all(bytes)
+            .map_err(|e| io_err(temp.display(), e))?;
+        file.sync_all().map_err(|e| io_err(temp.display(), e))?;
+    }
+    std::fs::rename(&temp, path).map_err(|e| io_err(path.display(), e))?;
+    if let Ok(dir) = std::fs::File::open(parent) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Make the end of a log safe to append to.
+///
+/// A process killed mid-append leaves a final line with no newline. Appending
+/// straight after it would glue the new event onto the fragment and turn a
+/// recoverable torn *final* line into corruption in the *middle* of the log (and
+/// lose the new event). So: a log whose last byte is not a newline either has a
+/// complete last line (add the newline) or a torn one (cut it off, as
+/// `parse_event_log` already treats it as never written).
+fn repair_tail(file: &mut std::fs::File, path: &Path) -> Result<(), StoreError> {
+    let err = |e| io_err(path.display(), e);
+    let len = file.metadata().map_err(err)?.len();
+    if len == 0 {
+        return Ok(());
+    }
+    file.seek(SeekFrom::Start(len - 1)).map_err(err)?;
+    let mut last = [0u8; 1];
+    file.read_exact(&mut last).map_err(err)?;
+    if last[0] == b'\n' {
+        return Ok(());
+    }
+
+    // Slow path, only after an interrupted append.
+    file.seek(SeekFrom::Start(0)).map_err(err)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(err)?;
+    let cut = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+    if serde_json::from_slice::<EventEnvelope>(&bytes[cut..]).is_ok() {
+        file.write_all(b"\n").map_err(err)?;
+    } else {
+        tracing::warn!(
+            path = %path.display(),
+            dropped_bytes = bytes.len() - cut,
+            "dropping a torn final event line before appending"
+        );
+        file.set_len(cut as u64).map_err(err)?;
+    }
+    Ok(())
+}
+
+/// One append, under the run's write lock. Blocking.
+fn append_blocking(
+    run: &RunLock,
+    id: RunId,
+    path: &Path,
+    event: &EventEnvelope,
+    line: &str,
+) -> Result<(), StoreError> {
+    let mut writes = lock_writes(run);
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .open(path)
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                StoreError::NotFound(id)
+            } else {
+                io_err(path.display(), e)
+            }
+        })?;
+    repair_tail(&mut file, path)?;
+    let len = file
+        .metadata()
+        .map_err(|e| io_err(path.display(), e))?
+        .len();
+    let last = match writes.log {
+        Some((cached_len, seq)) if cached_len == len => seq,
+        _ => {
+            let bytes = std::fs::read(path).map_err(|e| io_err(path.display(), e))?;
+            parse_event_log(id, &bytes)?.last_seq().get()
+        }
+    };
+    if event.seq.get() <= last {
+        return Err(StoreError::SeqConflict {
+            run_id: id,
+            seq: event.seq.get(),
+            last,
+        });
+    }
+    let mut record = Vec::with_capacity(line.len() + 1);
+    record.extend_from_slice(line.as_bytes());
+    record.push(b'\n');
+    file.write_all(&record)
+        .map_err(|e| io_err(path.display(), e))?;
+    // Durable before returning: a crash after a directive is applied but before its
+    // event is on disk would leave an unexplainable history.
+    file.sync_data().map_err(|e| io_err(path.display(), e))?;
+    writes.log = Some((len + record.len() as u64, event.seq.get()));
+    Ok(())
+}
+
+/// One snapshot, under the run's write lock. Blocking. An older snapshot than the
+/// stored one is dropped (see the module documentation).
+fn snapshot_blocking(
+    run: &RunLock,
+    id: RunId,
+    paths: &RunPaths,
+    state: &RunState,
+    bytes: &[u8],
+) -> Result<(), StoreError> {
+    let mut writes = lock_writes(run);
+    if !paths.meta.exists() {
+        return Err(StoreError::NotFound(id));
+    }
+    let stored = match writes.snapshot_seq {
+        Some(seq) => Some(seq),
+        None => std::fs::read(&paths.state)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<RunState>(&b).ok())
+            .map(|s| s.last_seq.get()),
+    };
+    if stored.is_some_and(|stored| state.last_seq.get() < stored) {
+        tracing::warn!(
+            run_id = %id,
+            stale = state.last_seq.get(),
+            stored,
+            "dropping a snapshot older than the stored one"
+        );
+        return Ok(());
+    }
+    write_atomic_sync(&paths.state, bytes)?;
+    writes.snapshot_seq = Some(state.last_seq.get());
+    Ok(())
 }
 
 impl FileRunStore {
     #[must_use]
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self {
+            root: root.into(),
+            writes: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     /// The default location, `$XDG_STATE_HOME/aftman` (or `~/.local/state/aftman`).
@@ -79,27 +281,12 @@ impl FileRunStore {
         RunPaths::new(&self.root, id)
     }
 
-    /// Append one line, durably.
-    async fn append_line(&self, path: &Path, line: &str) -> Result<(), StoreError> {
-        use tokio::io::AsyncWriteExt;
-        let mut file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await
-            .map_err(|e| io_err(path.display(), e))?;
-        file.write_all(line.as_bytes())
-            .await
-            .map_err(|e| io_err(path.display(), e))?;
-        file.write_all(b"\n")
-            .await
-            .map_err(|e| io_err(path.display(), e))?;
-        // Durable before returning: a crash after a directive is applied but
-        // before its event is on disk would leave an unexplainable history.
-        file.sync_data()
-            .await
-            .map_err(|e| io_err(path.display(), e))?;
-        Ok(())
+    fn run_lock(&self, id: RunId) -> RunLock {
+        let mut map = self
+            .writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(map.entry(id).or_default())
     }
 
     /// Read a file, mapping a missing file to a clean error.
@@ -115,6 +302,59 @@ impl FileRunStore {
             }
         })
     }
+
+    /// Take the run's lock. `create` is true only for a brand-new run.
+    async fn claim_inner(&self, id: RunId, create: bool) -> Result<Option<RunClaim>, StoreError> {
+        use nix::errno::Errno;
+        use nix::fcntl::{Flock, FlockArg};
+
+        let paths = self.paths(id);
+        // `flock` itself never blocks here (non-blocking mode), but opening files
+        // and creating directories are filesystem calls, so keep them off the
+        // async threads.
+        tokio::task::spawn_blocking(move || {
+            if create {
+                mkdir_private(&paths.dir)?;
+            } else if !paths.dir.is_dir() {
+                return Err(StoreError::NotFound(id));
+            }
+            let file = match std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&paths.lock)
+            {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound && !create => {
+                    return Err(StoreError::NotFound(id));
+                }
+                Err(e) => return Err(io_err(paths.lock.display(), e)),
+            };
+            let opened = file
+                .metadata()
+                .map_err(|e| io_err(paths.lock.display(), e))?;
+            match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => {
+                    // A deleter renames the directory away while holding the lock.
+                    // If that happened between our open and our lock we hold a lock
+                    // on a file nobody can reach: the run is gone.
+                    match std::fs::metadata(&paths.lock) {
+                        Ok(on_disk)
+                            if on_disk.ino() == opened.ino() && on_disk.dev() == opened.dev() =>
+                        {
+                            Ok(Some(RunClaim::new(id, lock)))
+                        }
+                        _ => Err(StoreError::NotFound(id)),
+                    }
+                }
+                Err((_, Errno::EWOULDBLOCK)) => Ok(None),
+                Err((_, errno)) => Err(io_err(paths.lock.display(), errno.into())),
+            }
+        })
+        .await
+        .map_err(join_error)?
+    }
 }
 
 #[async_trait]
@@ -124,9 +364,10 @@ impl RunStore for FileRunStore {
         if paths.meta.exists() {
             return Err(StoreError::AlreadyExists(header.id));
         }
-        tokio::fs::create_dir_all(&paths.dir)
+        let dir = paths.dir.clone();
+        tokio::task::spawn_blocking(move || mkdir_private(&dir))
             .await
-            .map_err(|e| io_err(paths.dir.display(), e))?;
+            .map_err(join_error)??;
 
         let encoded =
             serde_json::to_vec_pretty(header).map_err(|e| StoreError::Encode(e.to_string()))?;
@@ -134,7 +375,7 @@ impl RunStore for FileRunStore {
 
         // Start with an empty log so that readers never have to treat a missing
         // file as an empty one.
-        let empty = RunState::new(header.clone(), aftman_core::job::FactoryStatus::Queued);
+        let empty = RunState::new(header.clone(), FactoryStatus::Queued);
         let encoded =
             serde_json::to_vec_pretty(&empty).map_err(|e| StoreError::Encode(e.to_string()))?;
         write_atomic(&paths.state, &encoded).await?;
@@ -144,21 +385,23 @@ impl RunStore for FileRunStore {
 
     async fn append(&self, event: &EventEnvelope) -> Result<(), StoreError> {
         let paths = self.paths(event.run_id);
-        if !paths.events.exists() {
-            return Err(StoreError::NotFound(event.run_id));
-        }
         let line = serde_json::to_string(event).map_err(|e| StoreError::Encode(e.to_string()))?;
-        self.append_line(&paths.events, &line).await
+        let run = self.run_lock(event.run_id);
+        let (id, event) = (event.run_id, event.clone());
+        tokio::task::spawn_blocking(move || append_blocking(&run, id, &paths.events, &event, &line))
+            .await
+            .map_err(join_error)?
     }
 
     async fn snapshot(&self, state: &RunState) -> Result<(), StoreError> {
         let paths = self.paths(state.header.id);
-        if !paths.meta.exists() {
-            return Err(StoreError::NotFound(state.header.id));
-        }
-        let encoded =
+        let bytes =
             serde_json::to_vec_pretty(state).map_err(|e| StoreError::Encode(e.to_string()))?;
-        write_atomic(&paths.state, &encoded).await
+        let run = self.run_lock(state.header.id);
+        let (id, state) = (state.header.id, state.clone());
+        tokio::task::spawn_blocking(move || snapshot_blocking(&run, id, &paths, &state, &bytes))
+            .await
+            .map_err(join_error)?
     }
 
     async fn load(&self, id: RunId) -> Result<RunState, StoreError> {
@@ -185,6 +428,61 @@ impl RunStore for FileRunStore {
         Ok(state)
     }
 
+    async fn snapshot_status(&self, id: RunId) -> Result<FactoryStatus, StoreError> {
+        let paths = self.paths(id);
+        let bytes = self.read_run_file(&paths.state, id).await?;
+        serde_json::from_slice::<RunState>(&bytes)
+            .map(|s| s.status)
+            .map_err(|e| StoreError::Encode(e.to_string()))
+    }
+
+    async fn ends_with_run_finished(&self, id: RunId) -> Result<bool, StoreError> {
+        let path = self.paths(id).events;
+        let tail = tokio::task::spawn_blocking(move || -> Result<Option<Vec<u8>>, StoreError> {
+            const WINDOW: u64 = 64 * 1024;
+            let mut file = std::fs::File::open(&path).map_err(|e| {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    StoreError::NotFound(id)
+                } else {
+                    io_err(path.display(), e)
+                }
+            })?;
+            let len = file
+                .metadata()
+                .map_err(|e| io_err(path.display(), e))?
+                .len();
+            let start = len.saturating_sub(WINDOW);
+            file.seek(SeekFrom::Start(start))
+                .map_err(|e| io_err(path.display(), e))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|e| io_err(path.display(), e))?;
+            // The last complete line, if the window holds one.
+            while bytes.last() == Some(&b'\n') {
+                bytes.pop();
+            }
+            match bytes.iter().rposition(|b| *b == b'\n') {
+                Some(i) => Ok(Some(bytes[i + 1..].to_vec())),
+                None if start == 0 => Ok(Some(bytes)),
+                None => Ok(None), // a line longer than the window
+            }
+        })
+        .await
+        .map_err(join_error)??;
+        match tail {
+            Some(line) if line.is_empty() => Ok(false),
+            Some(line) => Ok(serde_json::from_slice::<EventEnvelope>(&line)
+                .is_ok_and(|e| e.kind == aftman_core::event::EventKind::RunFinished)),
+            None => {
+                let log = self.read_log(id).await?;
+                Ok(log
+                    .events
+                    .last()
+                    .is_some_and(|e| e.kind == aftman_core::event::EventKind::RunFinished))
+            }
+        }
+    }
+
     async fn events(
         &self,
         id: RunId,
@@ -199,26 +497,8 @@ impl RunStore for FileRunStore {
     }
 
     async fn list(&self, filter: &RunFilter) -> Result<Vec<RunSummary>, StoreError> {
-        let runs_dir = self.root.join("runs");
-        let mut entries = match tokio::fs::read_dir(&runs_dir).await {
-            Ok(entries) => entries,
-            // No runs directory yet is an empty list, not an error.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(io_err(runs_dir.display(), error)),
-        };
-
         let mut summaries: Vec<RunSummary> = Vec::new();
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|e| io_err(runs_dir.display(), e))?
-        {
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let Ok(id) = name.parse::<RunId>() else {
-                // Not a run directory; skip rather than fail a listing over a stray
-                // file someone dropped in the state directory.
-                continue;
-            };
+        for id in self.ids().await? {
             // A missing or unreadable snapshot means the run directory is
             // incomplete. Skipping keeps `aftman ls` usable; the run itself will
             // still fail loudly if someone asks for it by id.
@@ -245,6 +525,65 @@ impl RunStore for FileRunStore {
             Err(error) => return Err(io_err(paths.events.display(), error)),
         };
         parse_event_log(id, &bytes)
+    }
+
+    async fn delete(&self, id: RunId) -> Result<(), StoreError> {
+        // Two steps, so that "the run is gone" is one atomic moment: rename the
+        // directory out of the namespace (after which `claim` reports NotFound and
+        // `ids` cannot see it), then remove the tombstone at leisure.
+        let paths = self.paths(id);
+        let tomb = self.root.join("runs").join(format!(
+            ".deleted-{id}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |d| d.as_nanos())
+        ));
+        match tokio::fs::rename(&paths.dir, &tomb).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(StoreError::NotFound(id));
+            }
+            Err(error) => return Err(io_err(paths.dir.display(), error)),
+        }
+        self.writes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
+        if let Err(error) = tokio::fs::remove_dir_all(&tomb).await {
+            // The run is deleted as far as every reader is concerned; only disk
+            // space is left behind.
+            tracing::warn!(path = %tomb.display(), %error, "could not remove a purged run's files");
+        }
+        Ok(())
+    }
+
+    async fn ids(&self) -> Result<Vec<RunId>, StoreError> {
+        let runs_dir = self.root.join("runs");
+        let mut entries = match tokio::fs::read_dir(&runs_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(io_err(runs_dir.display(), error)),
+        };
+        let mut ids = Vec::new();
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| io_err(runs_dir.display(), e))?
+        {
+            let is_dir = entry.file_type().await.is_ok_and(|t| t.is_dir());
+            if let (true, Ok(id)) = (is_dir, entry.file_name().to_string_lossy().parse::<RunId>()) {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
+    async fn claim(&self, id: RunId) -> Result<Option<RunClaim>, StoreError> {
+        self.claim_inner(id, false).await
+    }
+
+    async fn claim_new(&self, id: RunId) -> Result<Option<RunClaim>, StoreError> {
+        self.claim_inner(id, true).await
     }
 }
 
@@ -344,9 +683,12 @@ mod tests {
         assert_eq!(read.torn_lines.len(), 1);
         assert_eq!(read.torn_lines[0].line_number, 3);
 
-        // And the store stays usable: appending after a torn line works, because
-        // the torn line is the last thing in the file.
+        // And the store stays usable: the torn fragment is cut off before the new
+        // event is appended, so the log is whole again rather than corrupt.
         reopened.append(&event(id, 3)).await?;
+        let read = reopened.read_log(id).await?;
+        assert_eq!(read.events.len(), 3, "the appended event is not lost");
+        assert!(read.torn_lines.is_empty());
         Ok(())
     }
 

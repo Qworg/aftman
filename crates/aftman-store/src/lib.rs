@@ -22,9 +22,10 @@ use async_trait::async_trait;
 
 use aftman_core::event::EventEnvelope;
 use aftman_core::ids::{EventSeq, RunId};
+use aftman_core::job::FactoryStatus;
 use aftman_core::run::{RunFilter, RunHeader, RunState, RunSummary};
 
-pub use file::FileRunStore;
+pub use file::{FileRunStore, RunPaths};
 pub use memory::MemoryRunStore;
 
 /// Errors from the store.
@@ -58,6 +59,12 @@ pub enum StoreError {
 
     #[error("run {0} already exists")]
     AlreadyExists(RunId),
+
+    /// An append whose `seq` is not greater than the log's last. Another writer got
+    /// there first (for example a task that was aborted mid-write); the caller
+    /// re-reads the log and continues from what is really there.
+    #[error("run {run_id}: event seq {seq} does not follow the log's last seq {last}")]
+    SeqConflict { run_id: RunId, seq: u64, last: u64 },
 
     #[error("could not serialize run data: {0}")]
     Encode(String),
@@ -199,6 +206,91 @@ pub trait RunStore: Send + Sync {
 
     /// Read the whole event log, reporting any torn trailing line.
     async fn read_log(&self, id: RunId) -> Result<EventLogRead, StoreError>;
+
+    /// Delete one run's data completely (`aftman purge <run-id>`; no soft delete).
+    ///
+    /// The caller is responsible for not deleting a run somebody is driving:
+    /// take a [`RunStore::claim`] first, as the daemon's `run.purge` does.
+    ///
+    /// # Errors
+    /// [`StoreError::NotFound`] when the run does not exist.
+    async fn delete(&self, id: RunId) -> Result<(), StoreError>;
+
+    /// Every run id the store holds, including runs whose data cannot be loaded.
+    ///
+    /// [`RunStore::list`] skips unreadable runs so that `aftman ls` stays usable;
+    /// recovery and purge need to see them too. Order is unspecified.
+    async fn ids(&self) -> Result<Vec<RunId>, StoreError>;
+
+    /// The status in a run's snapshot, without validating it against the log.
+    /// Cheap (no log read), and only a hint: the snapshot may trail the log.
+    async fn snapshot_status(&self, id: RunId) -> Result<FactoryStatus, StoreError> {
+        self.load(id).await.map(|state| state.status)
+    }
+
+    /// Whether the log's last event is `RUN_FINISHED`. The file store reads only the
+    /// end of the file, so a daemon starting over many large finished runs does not
+    /// have to read all of their logs.
+    async fn ends_with_run_finished(&self, id: RunId) -> Result<bool, StoreError> {
+        let log = self.read_log(id).await?;
+        Ok(log
+            .events
+            .last()
+            .is_some_and(|e| e.kind == aftman_core::event::EventKind::RunFinished))
+    }
+
+    /// Claim the right to write to a run: an exclusive advisory lock held for the
+    /// life of the returned [`RunClaim`].
+    ///
+    /// Exactly one process may drive a run, and two writers appending to one log
+    /// corrupt it. The process that drives a run (`FactoryRuntime::start` through
+    /// `drive`) holds its claim; daemon restart recovery and `run.purge` take the
+    /// claim before touching a run, so a run alive in *another process* sharing the
+    /// state directory is never failed or deleted out from under it. The claim is
+    /// released when the value is dropped, and by the operating system if the
+    /// process dies.
+    ///
+    /// Returns `Ok(None)` when someone else holds the claim, and
+    /// [`StoreError::NotFound`] when the run does not exist (or was deleted while
+    /// the claim was being taken). It never creates anything: only
+    /// [`RunStore::claim_new`] does, so a claim on a run that is being purged cannot
+    /// resurrect it.
+    async fn claim(&self, id: RunId) -> Result<Option<RunClaim>, StoreError>;
+
+    /// Claim a run that does not exist yet, before [`RunStore::create`]. This is how
+    /// the runtime avoids a window in which a run exists but is unowned. For the file
+    /// store it creates the run directory (`0700`).
+    async fn claim_new(&self, id: RunId) -> Result<Option<RunClaim>, StoreError>;
+}
+
+/// Exclusive ownership of one run, released on drop. See [`RunStore::claim`].
+pub struct RunClaim {
+    run_id: RunId,
+    _guard: Box<dyn Send + Sync>,
+}
+
+impl RunClaim {
+    /// Wrap whatever keeps the claim alive. Dropping the guard must release it.
+    #[must_use]
+    pub fn new(run_id: RunId, guard: impl Send + Sync + 'static) -> Self {
+        Self {
+            run_id,
+            _guard: Box::new(guard),
+        }
+    }
+
+    #[must_use]
+    pub fn run_id(&self) -> RunId {
+        self.run_id
+    }
+}
+
+impl std::fmt::Debug for RunClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunClaim")
+            .field("run_id", &self.run_id)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Build a [`RunSummary`] from state. Shared so both stores report the same shape.

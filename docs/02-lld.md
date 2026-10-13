@@ -695,6 +695,7 @@ $XDG_STATE_HOME/aftman/            (default ~/.local/state/aftman)
 │     ├─ meta.json                 # job, repo, config at start (redacted)
 │     ├─ state.json                # latest snapshot, atomic
 │     ├─ events.jsonl              # append-only
+│     ├─ run.lock                  # advisory flock held by the process driving the run
 │     └─ artifacts/                # diffs captured at decision points, evidence blobs
 ├─ index.sqlite                    # optional: run list queries when the dir grows
 └─ jev-usage.jsonl                 # one line per model request
@@ -711,8 +712,52 @@ pub trait RunStore: Send + Sync {
     async fn load(&self, id: RunId) -> Result<RunState>;
     async fn events(&self, id: RunId, from: EventSeq) -> Result<EventStream>;
     async fn list(&self, filter: RunFilter) -> Result<Vec<RunSummary>>;
+    async fn read_log(&self, id: RunId) -> Result<EventLogRead>;   // reports a torn final line
+
+    /// Delete one run's data completely (`aftman purge`). No soft delete.
+    async fn delete(&self, id: RunId) -> Result<()>;
+    /// Every run id held, including runs `list` skips because they cannot be loaded.
+    async fn ids(&self) -> Result<Vec<RunId>>;
+    /// Exclusive ownership of an existing run; `Ok(None)` when someone else holds it,
+    /// `NotFound` when it does not exist (never creates anything).
+    async fn claim(&self, id: RunId) -> Result<Option<RunClaim>>;
+    /// Ownership of a run that does not exist yet, before `create` (creates the directory).
+    async fn claim_new(&self, id: RunId) -> Result<Option<RunClaim>>;
+    /// Hints that avoid reading whole logs (defaults read everything):
+    async fn snapshot_status(&self, id: RunId) -> Result<FactoryStatus>;
+    async fn ends_with_run_finished(&self, id: RunId) -> Result<bool>;
 }
 ```
+
+**Run ownership.** Exactly one process may write to a run's log. The process that drives a run
+holds `claim(id)` for the run's lifetime: an exclusive, non-blocking `flock` on `run.lock` in the
+run directory (`MemoryRunStore`: in-process bookkeeping). The kernel releases it if the process
+dies, so there is no stale-lock cleanup. `FactoryRuntime::start` takes `claim_new` *before*
+`create`, and the `StartedRun` carries it until `drive` returns (or the value is dropped), so a
+`--no-daemon` run and a daemon-driven run are protected identically, and there is no moment at
+which a run directory is visible but unowned. Everything that would write to a run it does not
+drive (daemon restart recovery, `run.purge`) takes the claim first and skips the run if it
+cannot; that is how a daemon never marks `Failed` a run that is alive in another terminal's
+`--no-daemon`. Only `claim_new` creates (the run directory, `0700`); `claim` on a run that does
+not exist, or that was deleted while the lock was being taken (the inode is re-checked after
+locking), is `NotFound`. A failed `start` deletes what it created, so no `Queued` run is left
+that nobody drives.
+
+**Deleting.** `delete` renames the run directory to a `runs/.deleted-*` tombstone (after which
+`claim` and `ids` cannot see the run) and then removes the tombstone, so two concurrent purges
+cannot both own, or both half-delete, a run. Directories aftman creates (`<root>`, `runs/`,
+`runs/<id>/`) are `0700`; a pre-existing root is not chmodded.
+
+**Writes are serialized per run, on blocking threads.** `append` and `snapshot` each run as one
+`spawn_blocking` closure holding a per-run mutex, so a write already in flight when its caller
+is aborted still finishes *before* the next writer starts. Two guards cover the rest: an
+`append` whose `seq` is not greater than the log's last fails with `SeqConflict` (the daemon
+re-reads and continues), and a `snapshot` older than the stored one is dropped.
+
+**Torn tails.** `append` repairs the end of a log before writing: a last byte that is not `\n`
+is either a complete final line (a newline is added) or a fragment from an interrupted append
+(it is truncated, with a warning), so a crash mid-append never turns into corruption in the
+middle of the log.
 
 `FileRunStore` (JSONL, the default):
 - replays the last N events on load to rebuild in-memory state;
@@ -885,6 +930,60 @@ otherwise the reply is an id-less error push.
 
 Framing: one message is exactly one line terminated by a newline; JSON string escaping guarantees
 a payload containing newlines stays on one line.
+
+**Method semantics** (`aftman_daemon::manager::RunManager`, one method each; transports add
+framing only):
+
+- `run.start` validates, asks the injected `RuntimeFactory` to build a `FactoryRuntime` and `Job`
+  (the factory can answer `invalid_repo`, `invalid_config`, `model_unavailable`), calls
+  `FactoryRuntime::start` (so the run is persisted and its id known), spawns `drive`, and replies
+  with the id. More than `ManagerConfig::max_live_runs` (default 16) live runs is `rate_limited`
+  (retryable). The work runs in its own task, so a client that hangs up, or a panic in the
+  factory, cannot strand a half-started run or leak a slot. A run that is not live is never left
+  non-terminal: if `drive` errors, panics, or is aborted, the manager's supervisor records
+  `StateChanged` + `RunFinished` (`status: failed`, reason `run failed: ...`, `run task
+  panicked`, `run task aborted`) and a snapshot, and workers still recorded `Running` are closed
+  out first (a worker is aborted by `Drop` when its run task ends by any route). Recording is
+  retried with backoff a bounded number of times; if the store keeps failing it is logged loudly
+  and the next start's recovery is the last resort, so the guarantee is "never left non-terminal
+  while the store works, and repaired at the next start otherwise". Events that reached the log
+  but not the hub are replayed to the hub before the manager appends its own, so subscribers
+  never see a gap.
+- `run.steer`, `run.cancel`, `run.answer` act only on a run that is live in this daemon. An id
+  the store has never seen is `unknown_run`; a known run that is not live, or is in the wrong state
+  (no active worker, no open escalation), is `wrong_state`; a malformed message is
+  `invalid_request`. A steer to a backend with no input channel is `steering_unsupported`; a
+  backend that *rejects* the message is a normal result (`{"outcome":"rejected",...}`). The surface
+  recorded with an answer comes from the transport; the socket server records `"cli"`.
+- `run.purge` deletes ended runs (`all: true` skips live ones and reports how many it deleted;
+  one run failing does not stop the rest). A run that is live here, or whose ownership claim
+  another process holds, is refused with `wrong_state`. A run whose `RUN_FINISHED` has been
+  emitted (or whose snapshot is already terminal) is over: purge waits, bounded, for its task to
+  return instead of refusing. The claim is held across the delete.
+- **`RUN_FINISHED` means over.** The runtime writes the final event as append, then final
+  snapshot, then emit, so a subscriber that reacts to `RUN_FINISHED` with `run.get` sees the
+  terminal status; `runs_active` no longer counts the run. Every manager method validates its
+  own parameters (a direct caller such as the HTTP transport cannot bypass a bound).
+- `daemon.status`: `runs_total` counts every run directory, `runs_active` the runs this process
+  is supervising; `uptime_secs` is monotonic.
+
+**Socket server** (`aftman_daemon::server`). Per connection: a bounded line reader (never more than
+`MAX_REQUEST_LINE_BYTES` of an unfinished line is buffered; a longer line gets an `invalid_request`
+push and the connection is closed), one task per in-flight request (at most
+`ServerConfig::max_in_flight`, 32), the subscription forwarder, and a single writer task fed by a
+bounded queue (`outbound_queue`, 256) with a per-write timeout (`write_timeout`, 5 s). Responses
+echo `id` and may arrive out of order; `subscription.open`/`close` and `daemon.stop` are handled
+in request order. A client that stops reading fills its kernel buffer, then its queue, then its hub
+channel (it is marked lagged; the run never waits), and the write timeout then closes the
+connection. Over `max_connections` (64) a new connection receives a `rate_limited` push and is
+closed. A connection with no subscription and no request in flight is closed after
+`idle_timeout` (60 s), so idle clients cannot occupy every slot and lock out `aftman stop`.
+`max_in_flight` bounds the requests *executing* on one connection (the reader stops reading it
+until one finishes); it does not bound the total across connections (`max_connections` times
+it) or the responses queued for a slow reader (that is `outbound_queue` and `write_timeout`).
+A client that half-closes its write side (`nc -N`, `socat`) still receives its in-flight
+responses and keeps an open subscription until it, or the writer, ends. `daemon.stop` replies
+`{"ok":true}` and then starts the graceful shutdown in [07-surfaces.md section 1](07-surfaces.md).
 
 HTTP mirror (used by the web UI and any remote client):
 

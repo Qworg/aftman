@@ -454,6 +454,18 @@ impl RunStore for TestStore {
     async fn read_log(&self, id: RunId) -> Result<EventLogRead, StoreError> {
         self.inner.read_log(id).await
     }
+    async fn delete(&self, id: RunId) -> Result<(), StoreError> {
+        self.inner.delete(id).await
+    }
+    async fn ids(&self) -> Result<Vec<RunId>, StoreError> {
+        self.inner.ids().await
+    }
+    async fn claim(&self, id: RunId) -> Result<Option<aftman_store::RunClaim>, StoreError> {
+        self.inner.claim(id).await
+    }
+    async fn claim_new(&self, id: RunId) -> Result<Option<aftman_store::RunClaim>, StoreError> {
+        self.inner.claim_new(id).await
+    }
 }
 
 fn cfg(replay: usize, cap: usize) -> HubConfig {

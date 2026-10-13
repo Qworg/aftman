@@ -159,7 +159,8 @@ Implementation details:
 - Any process running as the user can speak to the socket. This is intentional: on a single-user
   machine, "can run as you" is already game over, and a socket-level auth layer would add no
   security while breaking `nc` debugging.
-- Stale sockets are replaced only after a connect attempt fails.
+- Stale sockets are replaced only after a connect attempt fails, and only by the process holding
+  the daemon's pid lock; a live socket is never stolen ([07-surfaces.md section 9](07-surfaces.md)).
 
 ## 6. Evidence, injection, and untrusted text
 
@@ -199,14 +200,20 @@ $XDG_STATE_HOME/aftman/            0700
 └─ index.sqlite
 ```
 
-- Nothing is written outside this directory and the run's own temp dirs.
+- Nothing is written outside this directory and the run's own temp dirs. The directories aftman
+  creates (the state root if missing, `runs/`, and each `runs/<id>/`) are created `0700`; a state
+  root that already exists is left as the user made it.
+- Writes to a run's files are serialized per run, and a purge renames the run away before
+  deleting it, so concurrent purges and a late write from a dead task cannot corrupt or resurrect
+  a run.
 - Logs contain: job text, diffs, model probabilities, decisions, and command evidence output. They
   do **not** contain: the API key, `AGENTS.md` contents, untracked file contents, or full model
   prompts.
 - A diff is a copy of source code. The state directory is as sensitive as the repository, and the
   docs say so in the README rather than hiding it.
 - `aftman purge <run-id>` deletes a run's directory; `aftman purge --all` clears the store. No
-  soft-delete, no hidden backups.
+  soft-delete, no hidden backups. A run that is being driven, by this daemon or by another process
+  holding its ownership claim, is never purged; `purge --all` skips it.
 
 ## 8. Supply chain
 

@@ -43,7 +43,7 @@ use aftman_core::worker::{
     SteerOutcome, SteerRecord, SteerSource, TerminateReason, Worker, WorkerCtx, WorkerError,
     WorkerEventSink, WorkerOutcome, WorkerRecord, WorkerSignal,
 };
-use aftman_store::{RunStore, StoreError};
+use aftman_store::{RunClaim, RunStore, StoreError};
 
 use crate::control::{ControlError, ControlMessage, ControlReceiver};
 use crate::obs::ObservationBuilder;
@@ -81,6 +81,12 @@ pub enum RuntimeError {
     #[error("storage error: {0}")]
     Store(#[from] StoreError),
 
+    /// Another process holds this run's ownership claim. Cannot happen for a
+    /// fresh run id; reported rather than ignored because it would mean two
+    /// writers on one log.
+    #[error("run {0} is claimed by another process")]
+    Claimed(RunId),
+
     #[error("model error: {0}")]
     Model(#[from] ModelError),
 
@@ -116,6 +122,11 @@ pub struct RunOutcome {
 pub struct StartedRun {
     job: Job,
     state: RunState,
+    /// The run's ownership claim (`RunStore::claim`), held until `drive` returns
+    /// and the value is dropped, or until the caller drops an undriven run. It is
+    /// what keeps a restarting daemon, or a purge, in another process from
+    /// treating a live run as an orphan.
+    _claim: RunClaim,
 }
 
 impl StartedRun {
@@ -266,6 +277,17 @@ struct WorkerHandle {
     task: tokio::task::JoinHandle<()>,
 }
 
+impl Drop for WorkerHandle {
+    /// No way of ending a run task (return, error, panic, abort) may leave its
+    /// worker running. A dropped `JoinHandle` only *detaches* the task, so abort it
+    /// explicitly: the backends kill their process group when their `run` future is
+    /// dropped. A normal stop has already reaped the task, and aborting a finished
+    /// task is a no-op.
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
 /// Why a worker is being ended; decides the termination reason and the
 /// `WorkerTerminated` payload.
 enum StopWhy<'a> {
@@ -359,6 +381,11 @@ impl FactoryRuntime {
         }
 
         let run_id = RunId::new();
+        // Claim before the run exists, so there is no moment at which a run
+        // directory is visible to another process and unowned.
+        let Some(claim) = self.deps.store.claim_new(run_id).await? else {
+            return Err(RuntimeError::Claimed(run_id));
+        };
         let header = RunHeader {
             id: run_id,
             created_at: self.now(),
@@ -368,17 +395,38 @@ impl FactoryRuntime {
             worker_versions: BTreeMap::new(),
             granted_key_names: Vec::new(),
         };
-        self.deps.store.create(&header).await?;
-        let mut state = RunState::new(header, FactoryStatus::Queued);
-        self.emit(
-            &mut state,
-            EventKind::RunCreated,
-            json!({ "repo": job.repo.display().to_string() }),
-        )
-        .await?;
-        // A snapshot now, so the run is loadable (`run.get`) while it is still routing.
-        self.snapshot(&mut state).await?;
-        Ok(StartedRun { job, state })
+        // From here on a failure must not leave a half-made run that nobody drives
+        // (it would sit `Queued` until the next restart): delete it. We hold its
+        // claim, so nobody else can be using it.
+        let result = async {
+            self.deps.store.create(&header).await?;
+            let mut state = RunState::new(header, FactoryStatus::Queued);
+            self.emit(
+                &mut state,
+                EventKind::RunCreated,
+                json!({ "repo": job.repo.display().to_string() }),
+            )
+            .await?;
+            // A snapshot now, so the run is loadable (`run.get`) while it is still
+            // routing.
+            self.snapshot(&mut state).await?;
+            Ok::<_, RuntimeError>(state)
+        }
+        .await;
+        let state = match result {
+            Ok(state) => state,
+            Err(error) => {
+                if let Err(cleanup) = self.deps.store.delete(run_id).await {
+                    tracing::warn!(%run_id, %cleanup, "could not remove a run that failed to start");
+                }
+                return Err(error);
+            }
+        };
+        Ok(StartedRun {
+            job,
+            state,
+            _claim: claim,
+        })
     }
 
     /// Supervise a started run to the end.
@@ -401,7 +449,11 @@ impl FactoryRuntime {
         started: StartedRun,
         control: Option<ControlReceiver>,
     ) -> Result<RunOutcome, RuntimeError> {
-        let StartedRun { job, mut state } = started;
+        let StartedRun {
+            job,
+            mut state,
+            _claim,
+        } = started;
         let mut ls = Loop::new(self.instant(), &self.deps.config);
         let result = self.drive_inner(job, &mut state, &mut ls, control).await;
         if result.is_err() {
@@ -508,8 +560,7 @@ impl FactoryRuntime {
                 if let Some(reason) = &ls.finish_reason {
                     payload["reason"] = json!(reason);
                 }
-                self.emit(state, EventKind::RunFinished, payload).await?;
-                self.snapshot(state).await?;
+                self.emit_final(state, payload).await?;
                 return Ok(outcome);
             }
 
@@ -1581,6 +1632,30 @@ impl FactoryRuntime {
 
     async fn snapshot(&self, state: &mut RunState) -> Result<(), RuntimeError> {
         self.deps.store.snapshot(state).await?;
+        Ok(())
+    }
+
+    /// The last event of a run. Ordering matters to every observer: append to the
+    /// log, then write the final snapshot, and only then tell the sink, so a
+    /// subscriber that reacts to `RUN_FINISHED` by calling `run.get` always sees the
+    /// terminal status.
+    async fn emit_final(
+        &self,
+        state: &mut RunState,
+        payload: serde_json::Value,
+    ) -> Result<(), RuntimeError> {
+        let seq = state.last_seq.next();
+        let event = EventEnvelope::new(
+            seq,
+            state.header.id,
+            self.now(),
+            EventKind::RunFinished,
+            payload,
+        );
+        self.deps.store.append(&event).await?;
+        state.last_seq = seq;
+        self.deps.store.snapshot(state).await?;
+        self.deps.sink.emit(&event);
         Ok(())
     }
 

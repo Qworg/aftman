@@ -38,12 +38,26 @@ aftman serve [--socket <path>] [--bind <addr>] [--print-url]
   socket is absent, waits for readiness (500 ms poll, 5 s timeout), and then speaks to it. The
   daemon is a child of nothing: it double-forks on Unix and writes its pid to
   `$XDG_RUNTIME_DIR/aftman/aftman.pid`, so closing the terminal does not kill a running job.
-- **Single instance:** a lock on the pid file. A second `serve` prints the existing pid and exits 0.
+- **Single instance:** an exclusive `flock` on the pid file, with the pid written into it. A
+  second `serve` gets `AlreadyRunning { pid }`, prints that pid, and exits 0. The lock, not the pid
+  number, is the arbiter, so a stale pid file left by a crash is harmless. It is taken before
+  recovery and before the socket is touched, so two daemons starting at once cannot both win.
 - **One-shot:** `--no-daemon` embeds the runtime in the CLI process, streams events to the
   terminal, and exits with the run's status. For CI and scripts. No socket, no web, no herdr.
-- **Shutdown:** `aftman stop` (or SIGTERM) cancels live workers via the normal termination path,
-  persists each run as `Cancelled` with reason `daemon shutdown`, flushes the store, then closes
-  the socket.
+- **Shutdown:** `aftman stop` (`daemon.stop`) or SIGTERM/SIGINT. In order: stop accepting
+  connections; cancel every live run with reason `daemon shutdown` (workers are terminated via the
+  normal path and each run is persisted `Cancelled`), waiting at most `shutdown_grace` (60 s), after
+  which stragglers are aborted and recorded `Failed`; close every subscription (each subscriber is
+  first sent what it was owed, including the final `RUN_FINISHED`); let connections flush and finish
+  (bounded, 5 s); remove the socket file and the pid file, but only if they are still the files
+  this daemon created (a path that now names something else belongs to someone else). A
+  `daemon.stop` caller gets its `ok` reply before any of this starts.
+  Outcomes worth stating: a `run.start` that began before the stop is allowed to finish (shutdown
+  waits for it, bounded by the grace) and the run it creates is then cancelled like any other,
+  with its events delivered; a `run.start` that begins after is refused with `wrong_state` before
+  anything is created. If a factory outlasts the whole wait, the run it finally creates is
+  recorded `Failed` (`daemon shutdown`) without being announced (the hub is closed), and the
+  caller gets `wrong_state`. A run aborted at the end of the grace has its worker aborted with it.
 
 The daemon is deliberately small: it owns the runtime and the transports, and it holds no
 surface-specific logic.
@@ -309,13 +323,45 @@ What each surface can do. Blank means "not applicable", not "not implemented by 
 ## 9. Daemon lifecycle and resilience
 
 - **Socket permissions:** `0600`, inside `$XDG_RUNTIME_DIR` where the OS already isolates per-user
-  state. A stale socket is detected by connect-and-fail, removed, and recreated.
+  state. The daemon's own directory is created `0700`; an existing one owned by someone else is
+  refused, and one with group/other bits is tightened to `0700` (logged). For an explicit
+  `--socket` path only missing parents are created (`0700`); an existing parent is left alone. A
+  path too long for `sun_path` is a clear error up front. The limit applies to the path that is
+  actually bound, which is the final path plus the staging directory `/.st<pid>` (103 bytes in
+  all; `lifecycle::max_socket_path_bytes()`). The socket is bound inside that private `0700`
+  staging directory, made `0600`, and renamed into place, so it is never visible at its final
+  path with a wider mode. The directory policy follows where the socket lives: moving only the
+  pid file does not switch it off.
+- **Stale sockets:** examined only while holding the pid lock. A socket file is replaced only after a
+  connect attempt is refused; one that answers is never stolen (`SocketInUse`), and a path that is
+  not a socket is never removed (`NotASocket`). A client distinguishes the cases by trying to
+  connect: success means a daemon is running; refusal on an existing socket file means stale.
 - **Client reconnect:** any client can reconnect and resume from its last `seq`. The daemon keeps a
   bounded replay buffer (default 10,000 events in total, oldest evicted first) plus the on-disk
   log, so resume works for old runs too. Each connection holds one subscription.
-- **Daemon restart:** on start, runs with no terminal event are loaded, their state is
-  reconstructed, and each is either resumed (if configured) or marked `Failed` with reason
-  `daemon restarted`. There is no silent zombie run.
+- **Daemon restart:** after taking the pid lock and before binding the socket, recovery examines
+  every run. A run is *orphaned* if its log has no `RunFinished`, its status (the last
+  `STATE_CHANGED` in the log; the snapshot may trail it) is not terminal, and its ownership claim
+  ([02-lld.md section 8](02-lld.md)) can be taken, i.e. nobody is driving it. A run whose snapshot
+  is terminal and whose log ends with `RUN_FINISHED` (read from the end of the file) is skipped
+  without reading its log, so startup cost does not grow with the size of finished logs. Each orphan is marked
+  `Failed` with reason `daemon restarted`: a `STATE_CHANGED` and a `RUN_FINISHED` continuing the
+  run's `seq`, plus a snapshot. **Resuming a run is not implemented in M3**; the only outcomes are
+  "driven by someone" and `Failed`, so there is no silent zombie. Left alone: runs whose log already
+  has `RunFinished` (including a `--no-daemon` run that ended in `NeedsHuman`), runs with a terminal
+  status, and runs claimed by another process (an `aftman run --no-daemon` in a second terminal
+  sharing the state directory: appending to its log from here would corrupt it). A damaged run
+  directory is logged and skipped and does not stop the daemon from starting. Runs that are
+  already over in the log but whose files disagree are *repaired*: a snapshot trailing a terminal
+  log is rewritten from the log, and a terminal status with no `RUN_FINISHED` gets one appended
+  (a client waiting for it would otherwise wait forever). A run directory holding nothing but a
+  lock file is removed. A log with a torn final line is cut back before anything is appended.
+- **Connection bounds:** at most 64 clients, each with a 256-line outbound queue, a 5 s write
+  timeout, 32 in-flight requests (the reader stops reading a connection that has that many
+  executing; the figure does not multiply across connections or bound queued responses), a 1 MiB
+  request-line cap, and a 60 s idle timeout for connections with no subscription and nothing in
+  flight. A client that exceeds a bound is dropped; nothing a client does can stall a run, the
+  accept loop, or another client.
 - **Backpressure:** a slow client cannot stall a run. Each subscriber has a bounded channel; on
   overflow the client is dropped with a `subscriber_lagged` error push (carrying `resume_from`) and
   must resume by `seq`; what it already received is a correct gap-free prefix. Runs never block on

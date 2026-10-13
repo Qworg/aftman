@@ -368,7 +368,12 @@ interrupt → wait terminate_grace (5s) → kill process group
   and in a `WorkerTerminated` event with the number of signals sent and the elapsed grace.
 - Termination is idempotent; calling it twice is not an error.
 - On daemon shutdown, every live worker is terminated with the same path, and the run is
-  persisted as `Cancelled` with a `daemon shutdown` reason.
+  persisted as `Cancelled` with a `daemon shutdown` reason. A run that does not stop within
+  the shutdown grace is aborted: dropping the run's task drops its worker handle, which aborts
+  the worker task (the backend then kills its process group when its `run` future is dropped),
+  and the run is recorded `Failed` (`run task aborted`) with its worker records closed out. The
+  same holds when a run task panics or errors: no way of ending a run task leaves a worker
+  alive.
 
 ## 12. Adding a backend
 

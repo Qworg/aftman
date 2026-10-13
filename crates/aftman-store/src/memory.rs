@@ -5,8 +5,8 @@
 //! agreement check — so that a test which passes here is not passing because the
 //! in-memory backend was more forgiving.
 
-use std::collections::BTreeMap;
-use std::sync::{Mutex, MutexGuard};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use async_trait::async_trait;
 
@@ -14,7 +14,7 @@ use aftman_core::event::EventEnvelope;
 use aftman_core::ids::{EventSeq, RunId};
 use aftman_core::run::{RunFilter, RunHeader, RunState, RunSummary};
 
-use crate::{EventLogRead, RunStore, StoreError, summarize};
+use crate::{EventLogRead, RunClaim, RunStore, StoreError, summarize};
 
 #[derive(Debug, Default)]
 struct Inner {
@@ -27,6 +27,24 @@ struct Inner {
 #[derive(Debug, Default)]
 pub struct MemoryRunStore {
     inner: Mutex<Inner>,
+    /// Runs currently claimed. Shared with each [`RunClaim`] guard so that
+    /// dropping the claim releases it.
+    claims: Arc<Mutex<BTreeSet<RunId>>>,
+}
+
+/// Releases a memory claim on drop.
+struct MemoryClaim {
+    id: RunId,
+    claims: Arc<Mutex<BTreeSet<RunId>>>,
+}
+
+impl Drop for MemoryClaim {
+    fn drop(&mut self) {
+        self.claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.id);
+    }
 }
 
 impl MemoryRunStore {
@@ -73,13 +91,10 @@ impl RunStore for MemoryRunStore {
         // silently accepting an out-of-order history.
         if let Some(last) = log.last() {
             if event.seq <= last.seq {
-                return Err(StoreError::CorruptLog {
+                return Err(StoreError::SeqConflict {
                     run_id: event.run_id,
-                    line: log.len() + 1,
-                    detail: format!(
-                        "event sequence {} is not greater than the previous {}",
-                        event.seq, last.seq
-                    ),
+                    seq: event.seq.get(),
+                    last: last.seq.get(),
                 });
             }
         }
@@ -143,6 +158,17 @@ impl RunStore for MemoryRunStore {
         Ok(summaries)
     }
 
+    async fn snapshot_status(
+        &self,
+        id: RunId,
+    ) -> Result<aftman_core::job::FactoryStatus, StoreError> {
+        self.lock()
+            .snapshots
+            .get(&id)
+            .map(|s| s.status)
+            .ok_or(StoreError::NotFound(id))
+    }
+
     async fn read_log(&self, id: RunId) -> Result<EventLogRead, StoreError> {
         let inner = self.lock();
         let log = inner.events.get(&id).ok_or(StoreError::NotFound(id))?;
@@ -150,6 +176,44 @@ impl RunStore for MemoryRunStore {
             events: log.clone(),
             torn_lines: Vec::new(),
         })
+    }
+
+    async fn delete(&self, id: RunId) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        if inner.headers.remove(&id).is_none() {
+            return Err(StoreError::NotFound(id));
+        }
+        inner.events.remove(&id);
+        inner.snapshots.remove(&id);
+        Ok(())
+    }
+
+    async fn ids(&self) -> Result<Vec<RunId>, StoreError> {
+        Ok(self.lock().headers.keys().copied().collect())
+    }
+
+    async fn claim(&self, id: RunId) -> Result<Option<RunClaim>, StoreError> {
+        if !self.lock().headers.contains_key(&id) {
+            return Err(StoreError::NotFound(id));
+        }
+        self.claim_new(id).await
+    }
+
+    async fn claim_new(&self, id: RunId) -> Result<Option<RunClaim>, StoreError> {
+        let mut claims = self
+            .claims
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !claims.insert(id) {
+            return Ok(None);
+        }
+        Ok(Some(RunClaim::new(
+            id,
+            MemoryClaim {
+                id,
+                claims: Arc::clone(&self.claims),
+            },
+        )))
     }
 }
 
@@ -221,7 +285,7 @@ mod tests {
             .append(&event(id, 1))
             .await
             .expect_err("a repeated sequence must be refused");
-        assert!(matches!(error, crate::StoreError::CorruptLog { .. }));
+        assert!(matches!(error, crate::StoreError::SeqConflict { .. }));
         Ok(())
     }
 

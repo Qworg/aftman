@@ -171,6 +171,45 @@ pub struct WorkerCtx {
     /// supervisor can react long before the process exits. The lock is held only
     /// for the duration of one push.
     pub output: Arc<Mutex<BoundedLog>>,
+    /// Where a backend that launches a process records it, so that a supervisor that
+    /// dies abruptly cannot leave an agent running unaccounted for (see
+    /// [`ProcessLedger`]). `None` for backends that launch nothing, and in tests.
+    pub ledger: Option<Arc<dyn ProcessLedger>>,
+}
+
+/// Enough to find, and to be *sure* of, a worker's process group later.
+///
+/// Written to the run directory when a subprocess worker starts and cleared when it is
+/// reaped. If the supervisor dies in between, restart recovery reads it, checks that
+/// the process now at `pgid` is still the same one (`start_token`, `boot_id`), and only
+/// then ends the group. A pid number alone proves nothing: pids are reused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProcessIdentity {
+    /// The process group (and, since the worker leads it, the leader's pid).
+    pub pgid: i32,
+    /// The leader's start time as the OS reports it: `/proc/<pid>/stat` field 22 on
+    /// Linux, `ps -o lstart=` elsewhere. `None` when it could not be read, in which case
+    /// the process can never be positively identified and will not be signalled.
+    pub start_token: Option<String>,
+    /// The boot the process belongs to (`/proc/sys/kernel/random/boot_id` on Linux).
+    pub boot_id: Option<String>,
+    /// The mission file this worker was given, to be removed with the run.
+    pub mission_file: Option<PathBuf>,
+}
+
+/// Where a process-launching worker records the process it started.
+///
+/// Implemented by the runtime over the run store. Both methods are best-effort and
+/// never fail the worker: a ledger that cannot be written is logged by the
+/// implementation, because refusing to run an agent over bookkeeping would be worse
+/// than the (small) orphan risk it exists to cover.
+#[async_trait]
+pub trait ProcessLedger: Send + Sync + std::fmt::Debug {
+    /// The worker's process is up.
+    async fn record(&self, identity: ProcessIdentity);
+    /// The worker's process has been reaped (or never started).
+    async fn clear(&self);
 }
 
 /// A signal from a worker to the runtime.

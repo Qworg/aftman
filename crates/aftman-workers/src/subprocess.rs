@@ -51,8 +51,10 @@ pub struct CommandSpec {
     pub env: Vec<(String, String)>,
     /// How the mission reaches the agent, and whether it can be steered.
     pub steer: SteerProtocol,
-    /// A non-zero exit is still a normal supervised outcome, so this only affects
-    /// whether the worker can be steered.
+    /// Retained for compatibility; it no longer has any effect. **Every** worker runs
+    /// with its working directory set to the run's repository, whatever backend
+    /// built the command. (A worker that inherited the daemon's cwd would edit
+    /// whatever directory the first CLI happened to auto-start the daemon from.)
     pub working_dir_is_repo: bool,
 }
 
@@ -115,6 +117,17 @@ pub struct SubprocessWorker {
     /// that exits on `SIGINT` can leave a grandchild that ignored it.
     terminating: std::sync::atomic::AtomicBool,
     stdin: tokio::sync::Mutex<Option<ChildStdin>>,
+}
+
+/// A mission file that is removed when this goes out of scope: when the worker ends by any
+/// route, including the `run` future being dropped. (If the whole process is killed
+/// instead, restart recovery removes the file named in the worker's recorded identity.)
+struct MissionFile(std::path::PathBuf);
+
+impl Drop for MissionFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 /// Kills the process group if the `run` future is dropped (aborted) while the
@@ -193,21 +206,26 @@ impl SubprocessWorker {
         }
     }
 
-    /// The argv for this run.
-    fn resolve_spec(&self, ctx: &WorkerCtx) -> Result<CommandSpec, WorkerError> {
+    /// The argv for this run, and the guard for any mission file written for it. The
+    /// guard exists *before* the file does, so a failed build cannot leave one behind.
+    fn resolve_spec(
+        &self,
+        ctx: &WorkerCtx,
+    ) -> Result<(CommandSpec, Option<MissionFile>), WorkerError> {
         match &self.source {
-            SpecSource::Fixed(spec) => Ok(spec.clone()),
+            SpecSource::Fixed(spec) => Ok((spec.clone(), None)),
             SpecSource::Backend {
                 options,
                 mission_dir,
             } => {
                 let mission_file = mission_dir.join(format!("mission-{}.md", ctx.id));
-                build(self.kind, &ctx.mission, options, &mission_file, &ctx.repo).map_err(|error| {
-                    WorkerError::Launch {
+                let guard = MissionFile(mission_file.clone());
+                let spec = build(self.kind, &ctx.mission, options, &mission_file, &ctx.repo)
+                    .map_err(|error| WorkerError::Launch {
                         kind: self.kind.as_str().to_owned(),
                         message: error.to_string(),
-                    }
-                })
+                    })?;
+                Ok((spec, Some(guard)))
             }
         }
     }
@@ -235,9 +253,8 @@ impl SubprocessWorker {
     fn spawn(&self, ctx: &WorkerCtx, spec: &CommandSpec) -> Result<(Child, i32), WorkerError> {
         let mut command = Command::new(&spec.program);
         command.args(&spec.args);
-        if spec.working_dir_is_repo {
-            command.current_dir(&ctx.repo);
-        }
+        // Always the run's repository, for every backend including `generic`.
+        command.current_dir(&ctx.repo);
         // Scrubbed, then the caller's extras, then the backend's own.
         command.env_clear();
         command.envs(crate::worker_environment(&ctx.env));
@@ -383,13 +400,21 @@ impl Worker for SubprocessWorker {
         ctx: WorkerCtx,
         sink: WorkerEventSink,
     ) -> Result<WorkerOutcome, WorkerError> {
-        let spec = self.resolve_spec(&ctx)?;
+        let (spec, mission_file) = self.resolve_spec(&ctx)?;
         let (mut child, pgid) = self.spawn(&ctx, &spec)?;
         let mut guard = GroupGuard {
             pgid,
             slot: &self.pgid,
             armed: true,
         };
+        // Leave a trail in the run directory so that, if the supervisor dies before it
+        // reaps this process, recovery can find and end it.
+        if let Some(ledger) = &ctx.ledger {
+            let mission_path = mission_file.as_ref().map(|m| m.0.clone());
+            ledger
+                .record(crate::process::identify(pgid, mission_path))
+                .await;
+        }
 
         // For an RPC backend the mission is the first line of input, not an argument.
         if let Some(initial) = spec.steer.initial_prompt(&ctx.mission) {
@@ -431,6 +456,9 @@ impl Worker for SubprocessWorker {
             Ok(Err(error)) => {
                 guard.armed = false;
                 self.clear_live(pgid);
+                if let Some(ledger) = &ctx.ledger {
+                    ledger.clear().await;
+                }
                 return Err(WorkerError::Io(error.to_string()));
             }
             Err(_elapsed) => {
@@ -447,6 +475,9 @@ impl Worker for SubprocessWorker {
         }
         guard.armed = false;
         self.clear_live(pgid);
+        if let Some(ledger) = &ctx.ledger {
+            ledger.clear().await;
+        }
         sink.finished();
         Ok(outcome)
     }
@@ -551,6 +582,7 @@ mod tests {
             timeout,
             env: Vec::new(),
             output,
+            ledger: None,
         }
     }
 
@@ -756,5 +788,198 @@ mod tests {
             !rendered.contains("hunter2"),
             "the environment is never part of the argv display"
         );
+    }
+
+    // ---- cwd, mission file, and the process ledger --------------------------------
+
+    use crate::backends::{BackendOptions, PermissionMode};
+    use aftman_core::worker::{ProcessIdentity, ProcessLedger};
+
+    #[derive(Debug, Default)]
+    struct TestLedger {
+        events: Mutex<Vec<String>>,
+        recorded: Mutex<Option<ProcessIdentity>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ProcessLedger for TestLedger {
+        async fn record(&self, identity: ProcessIdentity) {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push("record".into());
+            *self
+                .recorded
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity);
+        }
+        async fn clear(&self) {
+            self.events
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push("clear".into());
+        }
+    }
+
+    fn generic_worker(template: &str, mission_dir: &std::path::Path) -> SubprocessWorker {
+        SubprocessWorker::backend(
+            WorkerKind::Generic,
+            BackendOptions {
+                command_template: Some(template.to_owned()),
+                permissions: PermissionMode::AutoApprove,
+                ..BackendOptions::default()
+            },
+            mission_dir.to_path_buf(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_generic_worker_runs_in_the_repository_not_the_daemons_directory() -> TestResult {
+        let repo = tempfile::tempdir()?;
+        let missions = tempfile::tempdir()?;
+        // A relative write: lands wherever the worker's cwd is.
+        let worker = generic_worker(
+            "/bin/sh -c 'pwd -P > cwd-out; touch created-by-agent'",
+            missions.path(),
+        );
+        let mut context = ctx(fresh_log(), Duration::from_secs(10));
+        context.repo = repo.path().to_path_buf();
+        let (outcome, _) = drive_quiet(&worker, context).await?;
+        assert_eq!(outcome, WorkerOutcome::Completed);
+        assert!(
+            repo.path().join("created-by-agent").exists(),
+            "created in the repo"
+        );
+        let cwd = std::fs::read_to_string(repo.path().join("cwd-out"))?;
+        assert_eq!(
+            std::path::Path::new(cwd.trim()),
+            std::fs::canonicalize(repo.path())?,
+            "the worker's cwd is the run's repository"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_mission_file_is_private_while_it_exists_and_gone_when_the_worker_ends()
+    -> TestResult {
+        use std::os::unix::fs::PermissionsExt as _;
+        let repo = tempfile::tempdir()?;
+        let base = tempfile::tempdir()?;
+        let missions = base.path().join("missions");
+        let worker = generic_worker(
+            "/bin/sh -c 'stat -c %a {mission_file} > file-mode; stat -c %a $(dirname {mission_file}) > dir-mode; cp {mission_file} copy'",
+            &missions,
+        );
+        let mut context = ctx(fresh_log(), Duration::from_secs(10));
+        context.repo = repo.path().to_path_buf();
+        context.mission = "SECRET JOB TEXT".to_owned();
+        let (outcome, _) = drive_quiet(&worker, context).await?;
+        assert_eq!(outcome, WorkerOutcome::Completed);
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("file-mode"))?.trim(),
+            "600"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("dir-mode"))?.trim(),
+            "700"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("copy"))?,
+            "SECRET JOB TEXT"
+        );
+        let left: Vec<_> = std::fs::read_dir(&missions)?.collect();
+        assert!(left.is_empty(), "the mission file was removed: {left:?}");
+        assert_eq!(
+            std::fs::metadata(&missions)?.permissions().mode() & 0o777,
+            0o700
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_mission_file_is_removed_when_the_worker_is_dropped_mid_run() -> TestResult {
+        let repo = tempfile::tempdir()?;
+        let missions = tempfile::tempdir()?;
+        let worker = Arc::new(generic_worker(
+            "/bin/sh -c 'sleep 60' {mission_file}",
+            missions.path(),
+        ));
+        let mut context = ctx(fresh_log(), Duration::from_secs(60));
+        context.repo = repo.path().to_path_buf();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let task = tokio::spawn({
+            let worker = Arc::clone(&worker);
+            async move { worker.run(context, WorkerEventSink::new(tx)).await }
+        });
+        // Wait until the file exists, i.e. the worker is up.
+        for _ in 0..200 {
+            if std::fs::read_dir(missions.path())?.next().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(std::fs::read_dir(missions.path())?.next().is_some());
+        task.abort();
+        let _ = task.await;
+        assert!(
+            std::fs::read_dir(missions.path())?.next().is_none(),
+            "removed on the abort path too"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_launch_leaves_no_mission_file() -> TestResult {
+        let repo = tempfile::tempdir()?;
+        let missions = tempfile::tempdir()?;
+        let worker = generic_worker("/definitely/not/a/binary {mission_file}", missions.path());
+        let mut context = ctx(fresh_log(), Duration::from_secs(5));
+        context.repo = repo.path().to_path_buf();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let result = worker.run(context, WorkerEventSink::new(tx)).await;
+        assert!(matches!(result, Err(WorkerError::Launch { .. })));
+        assert!(std::fs::read_dir(missions.path())?.next().is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_process_is_recorded_while_it_runs_and_cleared_when_reaped() -> TestResult {
+        let ledger = Arc::new(TestLedger::default());
+        let worker = SubprocessWorker::new(WorkerKind::Generic, spec("echo hi"));
+        let mut context = ctx(fresh_log(), Duration::from_secs(10));
+        context.ledger = Some(ledger.clone());
+        let (outcome, _) = drive_quiet(&worker, context).await?;
+        assert_eq!(outcome, WorkerOutcome::Completed);
+        let events = ledger
+            .events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert_eq!(events, vec!["record", "clear"]);
+        let identity = ledger
+            .recorded
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or("recorded")?;
+        assert!(identity.pgid > 1);
+        Ok(())
+    }
+
+    /// Like `drive`, without requiring any output.
+    async fn drive_quiet(
+        worker: &SubprocessWorker,
+        context: WorkerCtx,
+    ) -> Result<(WorkerOutcome, String), WorkerError> {
+        let log = Arc::clone(&context.output);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let outcome = worker.run(context, WorkerEventSink::new(tx)).await?;
+        let text = log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .tail(64 * 1024)
+            .to_owned();
+        Ok((outcome, text))
     }
 }

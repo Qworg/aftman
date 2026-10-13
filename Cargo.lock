@@ -11,9 +11,13 @@ dependencies = [
  "aftman-jev",
  "aftman-store",
  "aftman-workers",
- "anyhow",
+ "async-trait",
  "clap",
+ "nix",
+ "serde",
  "serde_json",
+ "tempfile",
+ "thiserror",
  "time",
  "tokio",
  "tracing",
@@ -165,12 +169,6 @@ dependencies = [
  "once_cell_polyfill",
  "windows-sys 0.61.2",
 ]
-
-[[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "arrayvec"

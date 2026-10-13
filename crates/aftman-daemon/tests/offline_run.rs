@@ -177,6 +177,7 @@ fn runtime(
         ensemble_enabled: false,
         uncertainty_margin: 0.15,
         steering_grace: Duration::from_secs(30),
+        launch: Default::default(),
     })
 }
 
@@ -441,6 +442,7 @@ async fn an_ensemble_enabled_run_still_reaches_the_same_verdict()
         ensemble_enabled: true,
         uncertainty_margin: 0.15,
         steering_grace: Duration::from_secs(30),
+        launch: Default::default(),
     });
     let outcome = rt.run(job(&h.repo)).await?;
     assert_eq!(outcome.status, FactoryStatus::Finished);
@@ -560,6 +562,7 @@ async fn skipped_cycles_do_not_reach_the_model() -> Result<(), Box<dyn std::erro
         ensemble_enabled: false,
         uncertainty_margin: 0.15,
         steering_grace: Duration::from_secs(30),
+        launch: Default::default(),
     });
     let outcome = rt.run(job(&h.repo)).await?;
 
@@ -638,6 +641,7 @@ fn runtime_with(
         ensemble_enabled: false,
         uncertainty_margin: 0.15,
         steering_grace: Duration::from_secs(30),
+        launch: Default::default(),
     })
 }
 

@@ -21,6 +21,8 @@ struct Inner {
     headers: BTreeMap<RunId, RunHeader>,
     events: BTreeMap<RunId, Vec<EventEnvelope>>,
     snapshots: BTreeMap<RunId, RunState>,
+    processes:
+        BTreeMap<RunId, BTreeMap<aftman_core::ids::WorkerId, aftman_core::worker::ProcessIdentity>>,
 }
 
 /// A run store held entirely in memory.
@@ -185,11 +187,55 @@ impl RunStore for MemoryRunStore {
         }
         inner.events.remove(&id);
         inner.snapshots.remove(&id);
+        inner.processes.remove(&id);
         Ok(())
     }
 
     async fn ids(&self) -> Result<Vec<RunId>, StoreError> {
         Ok(self.lock().headers.keys().copied().collect())
+    }
+
+    async fn set_worker_process(
+        &self,
+        run: RunId,
+        worker: aftman_core::ids::WorkerId,
+        identity: Option<aftman_core::worker::ProcessIdentity>,
+    ) -> Result<(), StoreError> {
+        let mut inner = self.lock();
+        if !inner.headers.contains_key(&run) {
+            return Err(StoreError::NotFound(run));
+        }
+        let map = inner.processes.entry(run).or_default();
+        match identity {
+            Some(identity) => {
+                map.insert(worker, identity);
+            }
+            None => {
+                map.remove(&worker);
+            }
+        }
+        Ok(())
+    }
+
+    async fn worker_processes(
+        &self,
+        run: RunId,
+    ) -> Result<
+        Vec<(
+            aftman_core::ids::WorkerId,
+            aftman_core::worker::ProcessIdentity,
+        )>,
+        StoreError,
+    > {
+        let inner = self.lock();
+        if !inner.headers.contains_key(&run) {
+            return Err(StoreError::NotFound(run));
+        }
+        Ok(inner
+            .processes
+            .get(&run)
+            .map(|m| m.iter().map(|(w, i)| (*w, i.clone())).collect())
+            .unwrap_or_default())
     }
 
     async fn claim(&self, id: RunId) -> Result<Option<RunClaim>, StoreError> {

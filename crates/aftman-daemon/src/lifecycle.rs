@@ -87,6 +87,15 @@ pub enum LifecycleError {
 
     /// The socket path answers connections but nobody holds the pid lock: a daemon
     /// using a different pid file, or a foreign server. Never stolen.
+    /// Another daemon is serving this state directory (a different socket, the same
+    /// runs). `pid` is its pid, or `0` when it had not written one yet.
+    #[error(
+        "an aftman daemon (pid {pid}) is already serving the state directory {}; \
+         stop it first or use its socket",
+        state_dir.display()
+    )]
+    StateDirInUse { pid: u32, state_dir: PathBuf },
+
     #[error("{0} is in use by a live server; refusing to replace it")]
     SocketInUse(PathBuf),
 
@@ -299,7 +308,11 @@ impl PidLock {
         // A previous daemon removes the pid file while holding the lock. Someone
         // who opened the old file before that holds a lock on an unlinked inode, so
         // after locking, confirm the path still names the inode we locked.
-        for _ in 0..5 {
+        // A probe (`lock_holder`) takes the lock shared for an instant; a starter that
+        // collides with one retries briefly instead of reporting a daemon that is not
+        // there.
+        let mut contended = 0;
+        for _ in 0..12 {
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
@@ -327,6 +340,11 @@ impl PidLock {
                     });
                 }
                 Err((_, Errno::EWOULDBLOCK)) => {
+                    contended += 1;
+                    if contended < 4 {
+                        std::thread::sleep(Duration::from_millis(15));
+                        continue;
+                    }
                     return Err(LifecycleError::AlreadyRunning {
                         pid: read_pid(path),
                     });
@@ -370,6 +388,71 @@ fn read_pid(path: &Path) -> u32 {
         std::thread::sleep(Duration::from_millis(10));
     }
     0
+}
+
+/// Who holds the lock on `path`, without taking or creating it.
+///
+/// Opens the file read-only (never creating it) and tries a **shared** non-blocking
+/// lock: if that succeeds nobody holds the exclusive one, and it is released at once.
+/// A daemon starting at that instant retries briefly (see [`PidLock::acquire_with`]),
+/// so a probe never makes it fail. `Some(pid)` when held (`0` if no pid was readable).
+fn lock_holder(path: &Path) -> Option<u32> {
+    let file = std::fs::File::open(path).ok()?;
+    match Flock::lock(file, FlockArg::LockSharedNonblock) {
+        Ok(_released_on_drop) => None,
+        Err((_, Errno::EWOULDBLOCK)) => Some(read_pid(path)),
+        Err(_) => None,
+    }
+}
+
+/// What [`probe`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DaemonPresence {
+    /// No daemon holds the pid lock and nothing answers on the socket.
+    NotRunning,
+    /// A daemon is up and answering on its socket. `pid` is `0` if the socket answers
+    /// but no pid lock is held (a server this crate does not manage).
+    Running { pid: u32 },
+    /// A daemon holds the pid lock but the socket does not answer: it is starting up
+    /// (recovery, binding) or shutting down (it stops listening first and then waits,
+    /// up to the shutdown grace, for runs to be cancelled). Retry, or wait.
+    Busy { pid: u32 },
+}
+
+/// Is a daemon using `paths`? Takes no lock, creates nothing, and disturbs nothing: it
+/// reads the pid lock's state (see [`lock_holder`]) and makes one connection that it
+/// drops at once.
+pub async fn probe(paths: &DaemonPaths) -> DaemonPresence {
+    let pid_file = paths.pid_file.clone();
+    let holder = tokio::task::spawn_blocking(move || lock_holder(&pid_file))
+        .await
+        .ok()
+        .flatten();
+    let answers = matches!(
+        tokio::time::timeout(PROBE_TIMEOUT, UnixStream::connect(&paths.socket)).await,
+        Ok(Ok(_))
+    );
+    match (holder, answers) {
+        (Some(pid), true) => DaemonPresence::Running { pid },
+        (Some(pid), false) => DaemonPresence::Busy { pid },
+        (None, true) => DaemonPresence::Running { pid: 0 },
+        (None, false) => DaemonPresence::NotRunning,
+    }
+}
+
+/// File name of the per-state-directory daemon lock.
+pub const STATE_LOCK_FILE_NAME: &str = "daemon.lock";
+
+/// Is a daemon serving the state directory `state_dir`? `Some(pid)` if so (`0` when its
+/// pid is not readable yet). Non-destructive, like [`probe`]. `aftman --no-daemon purge`
+/// must refuse (or defer to the daemon) while this is `Some`: deleting run files from
+/// under a daemon leaves its replay ring serving a run that no longer exists.
+pub async fn probe_state_dir(state_dir: &Path) -> Option<u32> {
+    let lock_file = state_dir.join(STATE_LOCK_FILE_NAME);
+    tokio::task::spawn_blocking(move || lock_holder(&lock_file))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// Bind the daemon socket at `paths.socket`, replacing a stale one. Returns the
@@ -447,6 +530,8 @@ pub struct Claimed {
 #[derive(Debug)]
 pub struct ClaimGuard {
     pid_lock: PidLock,
+    /// The lock on the state directory, when the daemon was started with one.
+    state_lock: Option<PidLock>,
     paths: DaemonPaths,
     /// `(dev, ino)` of the socket file this daemon bound.
     socket_id: (u64, u64),
@@ -464,6 +549,7 @@ impl ClaimGuard {
     pub async fn cleanup(self) {
         let Self {
             pid_lock,
+            state_lock,
             paths,
             socket_id,
         } = self;
@@ -480,7 +566,13 @@ impl ClaimGuard {
             }
         }
         // `release` removes a file and drops the lock: quick, but still I/O.
-        let _ = tokio::task::spawn_blocking(move || pid_lock.release()).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            pid_lock.release();
+            if let Some(state_lock) = state_lock {
+                state_lock.release();
+            }
+        })
+        .await;
     }
 }
 
@@ -511,6 +603,7 @@ pub async fn lock(paths: &DaemonPaths) -> Result<PidLockGuard, LifecycleError> {
     .map_err(|e| io(&paths.pid_file, std::io::Error::other(e)))??;
     Ok(PidLockGuard {
         lock,
+        state_lock: None,
         paths: paths.clone(),
     })
 }
@@ -519,10 +612,38 @@ pub async fn lock(paths: &DaemonPaths) -> Result<PidLockGuard, LifecycleError> {
 #[derive(Debug)]
 pub struct PidLockGuard {
     lock: PidLock,
+    state_lock: Option<PidLock>,
     paths: DaemonPaths,
 }
 
 impl PidLockGuard {
+    /// Also take the lock on the state directory: one daemon per state directory, whatever
+    /// socket it listens on. The file is `<state_dir>/daemon.lock`, with the same
+    /// discipline as the pid lock (exclusive `flock`, pid written in, inode re-checked).
+    /// The directory is created `0700` if missing.
+    ///
+    /// # Errors
+    /// [`LifecycleError::StateDirInUse`] naming the holder's pid, or an I/O error.
+    pub async fn with_state_dir(mut self, state_dir: &Path) -> Result<Self, LifecycleError> {
+        let state_dir = state_dir.to_owned();
+        let lock = tokio::task::spawn_blocking({
+            let state_dir = state_dir.clone();
+            move || {
+                prepare_dir(&state_dir, DirPolicy::UserChosen)?;
+                PidLock::acquire(&state_dir.join(STATE_LOCK_FILE_NAME)).map_err(|e| match e {
+                    LifecycleError::AlreadyRunning { pid } => {
+                        LifecycleError::StateDirInUse { pid, state_dir }
+                    }
+                    other => other,
+                })
+            }
+        })
+        .await
+        .map_err(|e| io(&self.paths.pid_file, std::io::Error::other(e)))??;
+        self.state_lock = Some(lock);
+        Ok(self)
+    }
+
     /// Bind the socket (replacing a stale one) while holding the lock.
     ///
     /// # Errors
@@ -533,6 +654,7 @@ impl PidLockGuard {
             listener,
             guard: ClaimGuard {
                 pid_lock: self.lock,
+                state_lock: self.state_lock,
                 paths: self.paths,
                 socket_id,
             },

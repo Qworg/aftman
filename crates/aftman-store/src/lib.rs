@@ -257,6 +257,34 @@ pub trait RunStore: Send + Sync {
     /// resurrect it.
     async fn claim(&self, id: RunId) -> Result<Option<RunClaim>, StoreError>;
 
+    /// Record (or, with `None`, clear) the process a worker of this run launched, so
+    /// recovery can end it if the supervisor dies. Never creates the run directory.
+    /// The default does nothing, for stores that cannot persist it.
+    async fn set_worker_process(
+        &self,
+        run: RunId,
+        worker: aftman_core::ids::WorkerId,
+        identity: Option<aftman_core::worker::ProcessIdentity>,
+    ) -> Result<(), StoreError> {
+        let _ = (run, worker, identity);
+        Ok(())
+    }
+
+    /// The processes recorded and not yet cleared for this run.
+    async fn worker_processes(
+        &self,
+        run: RunId,
+    ) -> Result<
+        Vec<(
+            aftman_core::ids::WorkerId,
+            aftman_core::worker::ProcessIdentity,
+        )>,
+        StoreError,
+    > {
+        let _ = run;
+        Ok(Vec::new())
+    }
+
     /// Claim a run that does not exist yet, before [`RunStore::create`]. This is how
     /// the runtime avoids a window in which a run exists but is unowned. For the file
     /// store it creates the run directory (`0700`).

@@ -28,23 +28,93 @@ are *clients* of aftman (via the CLI, the web UI, or by watching panes).
 ## 1. The daemon
 
 ```bash
-aftman serve [--socket <path>] [--bind <addr>] [--print-url]
+aftman serve [--socket <path>]          # foreground; --bind / --print-url arrive with HTTP in M4
 ```
 
-- **Socket:** `$XDG_RUNTIME_DIR/aftman/aftman.sock` (fallback `~/.aftman/aftman.sock`), created
-  with mode `0600`. This is the real API.
+- **Socket:** `--socket <path>` (env `AFTMAN_SOCKET`), else `$XDG_RUNTIME_DIR/aftman/aftman.sock`
+  (fallback `~/.aftman/aftman.sock`), created with mode `0600`. This is the real API. The pid file
+  is the socket path with a `.pid` extension. `serve` prints the socket path and what restart
+  recovery did (which orphaned runs it marked `Failed`).
 - **HTTP:** disabled unless `--bind` or `web.enabled = true`. Default bind `127.0.0.1:8787`.
-- **Auto-start:** the first `aftman` subcommand that needs run state starts the daemon if the
-  socket is absent, waits for readiness (500 ms poll, 5 s timeout), and then speaks to it. The
-  daemon is a child of nothing: it double-forks on Unix and writes its pid to
-  `$XDG_RUNTIME_DIR/aftman/aftman.pid`, so closing the terminal does not kill a running job.
+  (Not built yet: M4.)
+- **Auto-start:** the first `aftman` subcommand that needs run state (`run`, `ls`, `show`,
+  `decisions`, `logs`, `steer`, `cancel`, `answer`, `purge`) connects to the socket; if it is absent
+  or stale (`ENOENT`, `ECONNREFUSED`) it starts the daemon, polls `connect` until it succeeds
+  (15 ms first, growing to 150 ms; **5 s total** timeout), and then speaks to it. `status`, `stop`,
+  `usage`, `doctor`, `responsibilities` and `demo` never start a daemon.
+  - **How it detaches.** A classic daemon double-forks, but `fork` is `unsafe` and this workspace
+    forbids `unsafe`. Instead the CLI spawns `current_exe() serve --detached` (a hidden flag) with
+    stdin closed and stdout/stderr appended to **`<state dir>/daemon.log`**, and does not wait for
+    it. The child, as the first thing `main` does and **before any tokio runtime or thread
+    exists**, calls `setsid()` (the safe `nix` wrapper) to leave the terminal's session, so
+    closing the terminal sends it no SIGHUP and a running job survives. `main` therefore builds
+    the tokio runtime by hand instead of using `#[tokio::main]`. The daemon also ignores SIGHUP
+    (foreground or detached) and writes its pid to the pid file as below. The spawn passes the
+    user's `--socket` / `--data-dir` through and inherits the environment whole: this is the
+    supervisor re-executing itself, not a worker, so it needs the provider credentials
+    ([08-security.md section 2.2](08-security.md) records the exception to the worker-environment
+    rule).
+  - **Paths are made absolute by the client.** The detached daemon does `chdir("/")` after
+    `setsid()`, so it never keeps the first CLI's working directory (it would otherwise give
+    that directory to every later job). `--socket`, `--data-dir`, the repository and a job file
+    are therefore resolved to absolute paths in the client before anything is sent or passed on.
+    A worker runs with its working directory set to the repository (every backend, `generic`
+    included).
+  - **The daemon freezes its environment.** An auto-started daemon inherits the environment of
+    the CLI that started it, and every later run through it - its workers, its evidence
+    commands, its provider key - uses *that* environment, not the caller's. A key exported in a
+    later shell does not reach it. To change it: `aftman stop`, and the next command starts a
+    daemon with the new environment. Provider settings are the exception: the provider `.env`
+    file is re-read on every run, so putting the key there needs no restart. `aftman status` and
+    `aftman doctor` print the daemon's view (provider configured or not, model, base URL without
+    credentials, state directory, version) next to the caller's, and flag any disagreement; a
+    `model_unavailable` from a daemon says it was started without a provider and how to fix it.
+    Forwarding the caller's environment per run is a protocol and security decision that has not
+    been made.
+  - **One daemon per state directory.** The daemon takes a lock in the state directory
+    (`daemon.lock`) as well as its pid-file lock, so two daemons on different sockets cannot
+    share runs. Auto-start reports which pid owns the directory instead of looping. A client
+    refuses (exit `2`) to use a daemon that serves a *different* state directory than its
+    `--data-dir`, and warns when the daemon's version differs from its own.
+  - **A daemon that is starting or shutting down** holds its lock without answering on the
+    socket. `status` says so (with the pid, exit `1`); `stop` waits for it to be gone (up to 75 s)
+    instead of saying "not running"; auto-start waits for it (up to 75 s) rather than racing it.
+  - **Files.** The state directory, `runs/`, `missions/` and `evidence-tmp/` are created `0700`
+    and `daemon.log` `0600` on every path (embedded, foreground `serve`, auto-start); a directory
+    the user already made is never chmodded (what aftman puts inside it is still private). The
+    log is rotated to `daemon.log.old` (one generation) when a daemon is auto-started and it
+    exceeds 4 MiB.
+  - **Racing starts.** Two CLIs auto-starting at once each spawn a `serve --detached`; the pid-file
+    lock lets exactly one win, the other gets `AlreadyRunning`, prints the winner's pid to the log
+    and exits `0`, and both CLIs connect to the winner. A child that exits non-zero before the
+    socket appears is reported (with the log path) instead of waiting out the timeout.
+  - **Data directory.** `--data-dir` (env `AFTMAN_DATA_DIR`, default `$XDG_STATE_HOME/aftman`) is a
+    property of the *daemon*: a client talking to a running daemon uses that daemon's store. It is
+    what an auto-started daemon is given, and what `--no-daemon`, `usage` and `doctor` read.
 - **Single instance:** an exclusive `flock` on the pid file, with the pid written into it. A
   second `serve` gets `AlreadyRunning { pid }`, prints that pid, and exits 0. The lock, not the pid
   number, is the arbiter, so a stale pid file left by a crash is harmless. It is taken before
   recovery and before the socket is touched, so two daemons starting at once cannot both win.
+- **One daemon per state directory:** a second exclusive lock, `<state-dir>/daemon.lock`, with the
+  same discipline (pid written in, inode re-checked), is taken right after the pid lock when the
+  daemon is configured with a state directory. A second daemon on a different socket but the same
+  state directory gets `StateDirInUse { pid, state_dir }`. `lifecycle::probe_state_dir` is the
+  non-destructive check a `--no-daemon` command uses (it takes the lock shared for an instant,
+  creates nothing, and a daemon starting at that moment retries rather than failing): `aftman
+  --no-daemon purge` must refuse while it reports a holder, because deleting run files under a
+  live daemon leaves its replay ring serving a run that no longer exists.
+- **Presence probe:** `lifecycle::probe(&DaemonPaths)` returns `NotRunning`, `Running { pid }`
+  (the pid lock is held and the socket answers) or `Busy { pid }` (lock held, socket not
+  answering). Graceful shutdown stops listening first and then holds the lock for up to the
+  grace period while runs are cancelled, so a CLI that only tries to connect sees "refused" and
+  wrongly concludes "not running"; `Busy` is how it knows to wait instead of auto-starting a
+  second daemon or misreporting. The probe takes no lock for longer than an instant, creates
+  nothing, and makes one connection that it drops at once.
 - **One-shot:** `--no-daemon` embeds the runtime in the CLI process, streams events to the
-  terminal, and exits with the run's status. For CI and scripts. No socket, no web, no herdr.
-- **Shutdown:** `aftman stop` (`daemon.stop`) or SIGTERM/SIGINT. In order: stop accepting
+  terminal, and exits with the run's status. For CI and scripts. No socket, no web, no herdr. It
+  builds the run through the same `CliFactory` the daemon uses, so the two cannot drift.
+- **Shutdown:** `aftman stop` (`daemon.stop`, then waits until the socket and pid file are gone,
+  up to 75 s) or SIGTERM/SIGINT. In order: stop accepting
   connections; cancel every live run with reason `daemon shutdown` (workers are terminated via the
   normal path and each run is persisted `Cancelled`), waiting at most `shutdown_grace` (60 s), after
   which stragglers are aborted and recorded `Failed`; close every subscription (each subscriber is
@@ -108,38 +178,127 @@ aftman run --repo . --job "..." --worker pi
 aftman run --repo . --job "..." --worker agy  --model <m> --effort high
 aftman run --repo . --job "..." --worker claude
 aftman run --repo . --job "..." --worker generic --cmd 'mytool --prompt {mission_file}'
-aftman run --repo . --job "..." --worker herdr:pane --kind claude
+aftman run --repo . --job "..." --worker herdr:pane --kind claude   # not built: herdr surface, M6
 
 # Watch one run live (TUI dashboard)
 aftman watch <run-id>
 aftman watch --last
 
 # Inspect
-aftman ls [--status running|finished|needs-human]
-aftman show <run-id>          # summary, decision timeline, final diff
-aftman logs <run-id> -f
-aftman decisions <run-id>     # every proposal, every suppression, every opinion
+aftman ls [--status running,needs-human] [--limit N]
+aftman show <run>             # summary, decision timeline, open escalations (with ids)
+aftman logs <run> [-f]        # the worker's output; -f follows until the run ends
+aftman decisions <run>        # every proposal, every suppression, every opinion
 
 # Intervene
-aftman steer <run-id> "the migration should not touch the public API"
-aftman answer <run-id> <escalation-id> "yes, use the staging credentials"
-aftman cancel <run-id>
+aftman steer <run> "the migration should not touch the public API"
+aftman answer <run> <escalation-id> "yes, use the staging credentials"   # guidance
+aftman answer <run> <escalation-id> --accept|--recheck|--stop|--claim-complete ["note"]
+aftman cancel <run>
+aftman purge <run> | --all    # delete a run's data (docs/08 section 7)
 
 # Operate
 aftman responsibilities list
 aftman responsibilities show core.completion
-aftman usage [--since 7d]
+aftman usage [--since 7d] [--run-id <id>]
 aftman doctor [--probe]
 aftman serve | stop | status
 aftman demo                    # simulated worker + simulated model, no network
 ```
 
+Global flags: `--data-dir`, `--socket` (env `AFTMAN_SOCKET`), `--quiet`, `--no-daemon`.
+
 `aftman watch` is the TUI: a decision timeline, the live worker tail, the current assessment, and
 a key binding for steer and for answering escalations. It renders correctly in any terminal,
 including inside a herdr pane, with no herdr awareness at all.
 
-Exit codes: `0` finished, `1` failed/stopped, `2` configuration or credential error, `3`
-`NeedsHuman` (so a script can distinguish "a person must look" from "it broke").
+### As built (M3)
+
+`aftman serve` runs the daemon; every other subcommand is a client of it (a typed NDJSON client,
+`aftman_cli::client`) or, under `--no-daemon`, of the embedded runtime.
+
+- **`<run>`** is a full id or an unambiguous prefix (at least 4 hex characters; an ambiguous prefix
+  lists the candidates). `show`, `decisions`, `logs` and `cancel` also take `--last` (the newest
+  run).
+- **`run`** goes through the daemon: `run.start`, then it follows the run's events from `seq 1`
+  (a dedicated connection that re-opens itself after a `subscriber_lagged` push or a dropped
+  connection, resuming from the last `seq` seen, and treats any gap or duplicate as an error) and
+  prints them as the embedded runtime does. It exits with the run's code when `RUN_FINISHED`
+  arrives. The client, not the daemon, canonicalizes `--repo` and reads `--job-file`: the daemon's
+  working directory and terminal are not the user's.
+  - **`NeedsHuman`:** when the run enters `needs_human`, `run` prints the escalation id, the ask and
+    the exact `aftman answer ...` command (repeating any `--socket` / `--data-dir` the user gave),
+    and exits `3`. The run keeps waiting in the daemon.
+  - **Ctrl-C detaches**: the run continues in the daemon, `run` prints how to watch
+    (`logs <id> -f`) and cancel (`cancel <id>`) it, and exits `130`. It never cancels.
+  - **Permissions.** `--permissions interactive` is refused (no human is attached to a worker the
+    daemon starts; it exists only on the herdr surface). `auto-approve` requires
+    `AFTMAN_ACK_UNSANDBOXED` in the **client's** environment, checked before anything is sent: the
+    daemon's environment is whichever shell happened to start it. The socket is same-user-only
+    ([08-security.md section 5](08-security.md)), so this is a guard against a slip, not a defence
+    against another principal.
+  - **`--no-daemon`** embeds the runtime in this process: no socket, no auto-start. It is the CI /
+    script mode and is unchanged from M0.
+- **Read-only commands** (`ls`, `show`, `decisions`, `logs`) go through the daemon, starting it if
+  needed. With `--no-daemon` they read the store directly and never start anything; `logs -f` is an
+  error there (a `--no-daemon` run's own terminal is its live view).
+- **`steer`, `cancel`, `answer`** act on runs a daemon supervises; with `--no-daemon` they are a
+  clear usage error. Outcomes are reported truthfully: a steer the backend *rejects*, or a worker with
+  no input channel (`steering_unsupported`), prints that and exits `1`; `queued` is reported as
+  "accepted; delivery not confirmed". `answer` text alone is guidance for the worker
+  (`HumanDecision::Guidance`); with a decision flag the text is a note recorded with that decision.
+  At most one of the four flags may be given.
+- **`purge`** deletes through the daemon, or directly from the store under `--no-daemon`; a run
+  being driven by anyone is never purged (`purge --all` skips it, a named one is `wrong_state`). A
+  purge fired the instant `run` returned is retried briefly, because the daemon announces
+  `RUN_FINISHED` slightly before it drops the run from its live table.
+- **`status`** prints the daemon's pid, version, uptime and run counts and exits `0`; when no daemon
+  answers it prints "not running" and exits **`1`**, so `aftman status && ...` reads naturally.
+  **`stop`** asks the daemon to stop and waits until its socket and pid file are gone; when none is
+  running it says so and exits **`0`** (stopping is idempotent). Neither starts a daemon.
+- **`usage`, `responsibilities`, `doctor`, `demo`** never need or start a daemon. `usage --since`
+  takes a duration (`90s`, `30m`, `12h`, `7d`, `2w`) or an RFC 3339 time. `doctor` also reports
+  whether the daemon is reachable, and the socket path and permissions; it exits `2` when no
+  provider is configured, as before.
+- **Errors from the daemon** print with their code and message (`error: invalid_repo: ...`).
+- **Untrusted text is sanitised.** Everything printed - worker output, reasons, asks, job text,
+  daemon error messages - passes through `sanitize` first: escape sequences (CSI, OSC, DCS, APC,
+  PM, SOS, and the short forms; an unterminated one swallows the rest), C1 controls, bidi
+  overrides and isolates, NUL, DEL, backspace and other C0 controls are removed, and CR becomes
+  LF (so a progress bar cannot overwrite a line you read). Tabs and newlines are kept, since
+  they are the structure of worker output. There is no raw mode: a worker can emit OSC 0, OSC 52
+  and `ESC[2J` and none of it reaches your terminal.
+- **Validation is shared.** `--no-daemon` and the daemon path apply the same request validation
+  (an empty job, a job over 256 KiB, a job file read past its limit, are `invalid_request`,
+  exit `2`); a job file is read at most the limit plus one byte.
+- **`--no-daemon` runs are cleaned up.** A worker that cannot launch records the run `failed`
+  (exit `1`), not `running`. SIGINT or SIGTERM cancels the run through its control channel,
+  waits for the worker to be terminated and the run recorded `cancelled`, and exits `130` or
+  `143`.
+- **`logs -f` on a run the daemon is not driving** (it ended, belongs to a `--no-daemon`
+  process, or is an orphan) says so and follows by polling the run's log until `RUN_FINISHED`
+  or a terminal status; the polling lives in the client's `Follow` stream, so the TUI gets it.
+- **`purge --no-daemon` refuses while a daemon serves the state directory** (deleting files from
+  under it would leave its replay ring serving a purged run). `purge` also removes the mission
+  files; after `purge --all` the job text is nowhere under the state directory.
+- **`show` reconciles with the log**: the snapshot trails the event log, so when the log is
+  ahead the last `STATE_CHANGED` decides the status, and open escalations are read from the log.
+  It prints how the run was launched (permissions, external sandbox, steering). The
+  `aftman answer ...` hint is printed only for a daemon-backed run that is waiting, with the
+  user's `--socket` / `--data-dir` repeated.
+- **Output.** All output goes through one writer: a closed pipe (`aftman ls | head`) ends the
+  process quietly with exit `0`.
+- **Ctrl-C while `run.start` is pending** is effective at once; it (and a `run.start` timeout)
+  says the run may have started and to look with `aftman ls`.
+- **After `RUN_FINISHED` the event decides** the summary and the exit code; the final `run.get`
+  is best effort, on a fresh connection (the daemon closes idle connections after 60 s).
+
+Exit codes: `0` finished, `1` failed/stopped/cancelled (or an operation that did not take effect:
+a refused steer, a cancel of an ended run, `status` with no daemon), `2` configuration, credential
+or usage error (a bad flag, an unknown run id, `invalid_repo`, `invalid_config`,
+`model_unavailable`, a daemon that cannot be reached or started), `3` `NeedsHuman` (so a script can
+distinguish "a person must look" from "it broke"), `130` detached with Ctrl-C (or an embedded run
+cancelled by SIGINT), `143` an embedded run cancelled by SIGTERM.
 
 ## 5. Surface 2 — herdr
 

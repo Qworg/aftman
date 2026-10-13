@@ -35,7 +35,9 @@ pub mod wire;
 pub use budget::{BudgetFit, fit};
 pub use client::{ProbeResult, SystemOneClient};
 pub use config::{
-    JevSettings, SettingsError, default_env_file, load_env_file, parse_env_file, resolve,
+    CredentialSource, ENV_KEYS, JevSettings, SettingsError, SettingsView, default_env_file,
+    default_env_file_with, describe, load_env_file, parse_env_file, redact_url, resolve,
+    resolve_with, snapshot_env,
 };
 pub use retry::{RetryAfter, RetryPolicy, retry_after};
 pub use transport::{

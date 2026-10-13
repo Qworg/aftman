@@ -51,6 +51,11 @@ pub enum EventKind {
     /// An internal fault. Not a model or provider condition.
     Error,
     Notification,
+    /// A kind this build does not know: an event written by a newer aftman. It decodes
+    /// instead of failing the stream or the log; the original name is not preserved
+    /// (serde cannot keep it), so it renders as `UNKNOWN`. Never emitted by this build.
+    #[serde(other)]
+    Unknown,
 }
 
 impl EventKind {
@@ -83,6 +88,7 @@ impl EventKind {
             Self::RunFinished => "RUN_FINISHED",
             Self::Error => "ERROR",
             Self::Notification => "NOTIFICATION",
+            Self::Unknown => "UNKNOWN",
         }
     }
 }
@@ -198,6 +204,16 @@ mod tests {
             let encoded = serde_json::to_string(&kind)?;
             assert_eq!(encoded.trim_matches('"'), kind.as_str());
         }
+        Ok(())
+    }
+
+    #[test]
+    fn an_event_kind_from_a_newer_build_decodes_as_unknown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let line = r#"{"seq":3,"run_id":"0193a000-0000-7000-8000-000000000001","kind":"BRAND_NEW_THING","at":"2026-01-01T00:00:00Z","payload":{}}"#;
+        let event: EventEnvelope = serde_json::from_str(line)?;
+        assert_eq!(event.kind, EventKind::Unknown);
+        assert_eq!(event.seq.get(), 3);
         Ok(())
     }
 

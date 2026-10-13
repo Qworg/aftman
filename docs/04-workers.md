@@ -310,7 +310,10 @@ aftman run --repo . --job "..." --worker generic \
 
 Placeholders: `{mission_file}` (a temp file containing the mission — preferred over `{mission}`
 so a long prompt never hits argv limits), `{mission}`, `{repo}`, `{model}`. The command runs with
-the scrubbed environment, in a fresh process group, with the same streaming and termination rules.
+**its working directory set to the repository** (like every other backend; `{repo}` is the same
+path, for tools that want it explicitly), with the scrubbed environment, in a fresh process
+group, with the same streaming and termination rules. The mission file is created `0600` in a
+`0700` directory and removed when the worker ends (see section 11); it never outlives the run.
 
 This is the escape hatch for any agent aftman does not ship a backend for.
 
@@ -367,6 +370,32 @@ interrupt → wait terminate_grace (5s) → kill process group
 - `TerminateReason::Timeout | Cancelled | Stopped | Superseded` is recorded on the worker record
   and in a `WorkerTerminated` event with the number of signals sent and the elapsed grace.
 - Termination is idempotent; calling it twice is not an error.
+- **Every worker runs with its working directory set to the run's repository** (the daemon's own
+  working directory is whatever a client happened to start it from and is never inherited), and
+  the repository path the daemon accepts must be absolute.
+- **The mission file** (`generic`) is created `0600` in a `0700` directory and removed when the
+  worker ends by any route: completion, failure, timeout, termination, the `run` future being
+  dropped, a failed launch.
+- **Orphans.** A worker is its own process group, so it survives a supervisor that dies abruptly
+  (`kill -9` of the daemon). When a subprocess worker starts, its process identity is written to
+  `runs/<id>/processes.json` (process-group id, the leader's start time, the boot id, the
+  mission-file path) and cleared when the worker is reaped. Restart recovery, for a run whose
+  claim it holds, reads those records and ends each group (`SIGINT`, 5 s grace, `SIGKILL`) **only
+  if it positively identifies the process**: the process now at that pid must have the recorded
+  start time and the recorded process group, on the same boot. It then records `WORKER_TERMINATED`
+  with cause `orphaned` and result `killed`, `already_gone` or `unverified`, removes the record and
+  the mission file, and lists the outcome in the recovery report. Anything it cannot identify is
+  **not signalled**, and the event/report say so.
+  - Linux: start time is `/proc/<pid>/stat` field 22, the group is field 5, the boot id is
+    `/proc/sys/kernel/random/boot_id`.
+  - macOS and other Unix: no `/proc`; the start token is `ps -o lstart=` and the group is
+    `ps -o pgid=` (second resolution, no boot id), shelling out to `ps`. This path is not
+    exercised by the test suite.
+  - Limits that cannot be removed: if the group leader has already exited while other members
+    live on, those members cannot be told from an unrelated new group and are reported
+    `unverified`; a worker spawned and killed between `spawn` and the record being written (a few
+    microseconds to milliseconds) is not recorded; a crash of the *whole machine* needs no cleanup.
+  - The same primitive serves the embedded (`--no-daemon`) path through `mark_run_failed`.
 - On daemon shutdown, every live worker is terminated with the same path, and the run is
   persisted as `Cancelled` with a `daemon shutdown` reason. A run that does not stop within
   the shutdown grace is aborted: dropping the run's task drops its worker handle, which aborts

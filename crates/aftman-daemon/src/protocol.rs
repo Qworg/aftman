@@ -201,6 +201,16 @@ pub struct DaemonStatusResult {
     pub pid: u32,
     pub runs_total: u64,
     pub runs_active: u64,
+    /// The state directory this daemon serves.
+    #[serde(default)]
+    pub state_dir: Option<PathBuf>,
+    /// When the daemon started (RFC 3339, from the injected clock).
+    #[serde(default)]
+    pub started_at: Option<String>,
+    /// Free-form facts supplied by the composition root. Bounded: at most 32 entries,
+    /// keys of at most 64 bytes, values of at most 256.
+    #[serde(default)]
+    pub info: std::collections::BTreeMap<String, String>,
 }
 
 /// Everything `aftman run` can express. Only `repo` and `job` are required.
@@ -322,6 +332,12 @@ pub struct SubscriptionOpenResult {
     pub from_seq: Option<EventSeq>,
     /// True when this replaced an earlier subscription on the connection.
     pub replaced: bool,
+    /// Whether this daemon is driving the run, so events will keep arriving. False for
+    /// a run that has ended, is alive in another process (`--no-daemon`), or is
+    /// non-terminal but orphaned; then a client follows it by polling `run.events`.
+    /// Always true for an all-runs stream. Absent from an older daemon (decodes false).
+    #[serde(default)]
+    pub live: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -619,6 +635,14 @@ impl Request {
                     ProtocolError::new(ErrorCode::InvalidRepo, "repo path is not valid UTF-8")
                 })?;
                 check_len("repo", repo, MAX_FIELD_BYTES)?;
+                // Resolved against the daemon's cwd otherwise, which is whatever
+                // directory the first client happened to start it from.
+                if !p.repo.is_absolute() {
+                    return Err(ProtocolError::new(
+                        ErrorCode::InvalidRepo,
+                        "repo must be an absolute path (the daemon's working directory is not the client's)",
+                    ));
+                }
                 check_opt("worker", p.worker.as_ref())?;
                 check_opt("cmd", p.cmd.as_ref())?;
                 check_opt("permissions", p.permissions.as_ref())?;
@@ -1006,8 +1030,19 @@ mod tests {
             pid: 7,
             runs_total: 3,
             runs_active: 1,
+            state_dir: Some("/state".into()),
+            started_at: Some("2026-01-01T00:00:00Z".into()),
+            info: [("provider".to_owned(), "yes".to_owned())].into(),
         };
         let r = Response::ok(1, &status)?;
+        // An older daemon's reply (no new fields) still decodes.
+        let old: DaemonStatusResult = serde_json::from_value(json!({
+            "version": "0", "uptime_secs": 1, "pid": 1, "runs_total": 0, "runs_active": 0
+        }))?;
+        assert_eq!(old.state_dir, None);
+        let open: SubscriptionOpenResult =
+            serde_json::from_value(json!({ "run_id": null, "from_seq": null, "replaced": false }))?;
+        assert!(!open.live);
         let back: DaemonStatusResult = ServerMessage::decode(&encode_line(&r)?)?
             .into_response()?
             .into_result()?;

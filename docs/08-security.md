@@ -55,6 +55,22 @@ AFTMAN_JEV_API_KEY, AFTMAN_WEB_TOKEN, AFTMAN_* (prefix)
 OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY     # unless explicitly granted
 ```
 
+**The one exception, and it is not a worker.** Auto-starting the daemon makes the CLI spawn
+`current_exe() serve --detached` ([07-surfaces.md section 1](07-surfaces.md)). That is the
+supervisor re-executing itself, and it must inherit its environment whole because it needs the
+provider credentials the user set; routing it through `worker_environment()` would start a daemon
+that can never reach Jev. Nothing the daemon later spawns as a *worker* is affected: every such
+subprocess still gets `worker_environment()`. The spawn site in `aftman-cli/src/autostart.rs` says
+so in a comment.
+
+**The daemon's environment is frozen at its start.** The auto-started daemon inherits the
+starting shell's environment, and all of that environment (minus the stripped names above) is
+what its workers and evidence commands see for every later run, whoever asks for it. Nothing
+forwards a later caller's environment. This is stated, not hidden: `aftman status` and `doctor`
+print what the daemon holds (provider yes/no, model, base URL with credentials removed, never a
+key), and `aftman stop` replaces it. Whether to forward a per-run environment is a protocol
+decision not taken in M3.
+
 Rationale: a coding agent is a general-purpose program with shell access that reads files. If it
 can read the supervisor's key, then any prompt injection that reaches it can exfiltrate the key,
 and the key is billable. The agent's own authentication comes from its own CLI login and is
@@ -73,6 +89,10 @@ opts in for backends that need an API key instead of a login, and every run that
 which keys were granted in `meta.json` (names only) and prints a warning.
 
 ### 2.3 Redaction
+
+- A base URL carrying `user:password@` is redacted wherever it is shown (`doctor`, `status`,
+  the `launch` record, `invalid_config` messages sent to socket clients), and the userinfo is
+  never mistaken for the host (`http://localhost@evil.example` is not loopback).
 
 - A `tracing` layer redacts any field whose key matches
   `(?i)(api[_-]?key|authorization|token|secret|password|cookie)`.
@@ -105,11 +125,22 @@ mode = "sandboxed"   # sandboxed | auto-approve | interactive
 
 - `sandboxed` (default) passes the backend's own sandbox flag where one exists.
 - `auto-approve` passes the backend's skip-permissions flag. Requires
-  `AFTMAN_ACK_UNSANDBOXED=1`, prints a warning on every run, and is recorded in the run metadata.
+  `AFTMAN_ACK_UNSANDBOXED=1` **in the environment of the client that starts the run** (the CLI
+  checks it before sending `run.start`; the daemon's environment is whichever shell happened to
+  start it, so checking there would test the wrong person's intent). Every run with this posture
+  prints a prominent warning (in both daemon and `--no-daemon` mode), and the posture is recorded
+  in the run: the `RUN_CREATED` event carries a `launch` map (`permissions`, `external_sandbox`,
+  `steering`) that the composition root fills in ([02-lld.md section 11](02-lld.md)), and `aftman
+  show` prints it. Because the socket accepts any process of the same user (section 5), a raw
+  socket client can request `auto-approve` **without** the acknowledgement; the acknowledgement is
+  a guard against a slip, not an access control, and the record in the run is what makes such a
+  run visible afterwards.
   It exists because a headless agent that blocks on a prompt is useless, and pretending otherwise
   would push operators to bypass aftman instead.
 - `interactive` is allowed **only** on the herdr surface, where a `blocked` agent becomes an
-  escalation a human can answer. It is refused at startup elsewhere, with a message naming herdr.
+  escalation a human can answer. It is refused at startup elsewhere, with a message naming herdr:
+  by the CLI before it sends anything, and by the daemon's factory (`invalid_config`) for any other
+  client.
 
 **Aftman is not a sandbox.** It does not confine the filesystem, network, or syscalls of a worker.
 The correct controls are the agent's own sandbox, a container, or a throwaway checkout, and
@@ -203,6 +234,12 @@ $XDG_STATE_HOME/aftman/            0700
 - Nothing is written outside this directory and the run's own temp dirs. The directories aftman
   creates (the state root if missing, `runs/`, and each `runs/<id>/`) are created `0700`; a state
   root that already exists is left as the user made it.
+- A `generic` worker's mission file (the job text) is `0600` in a `0700` directory and is removed
+  when the worker ends; after a hard kill, recovery removes it with the orphaned worker. Nothing
+  of a run's job text outlives the run outside its run directory.
+- A worker orphaned by a dead supervisor is ended by recovery only if it can be positively
+  identified (start time, process group, boot id); otherwise it is left alone and the event says
+  so ([04-workers.md section 11](04-workers.md)).
 - Writes to a run's files are serialized per run, and a purge renames the run away before
   deleting it, so concurrent purges and a late write from a dead task cannot corrupt or resurrect
   a run.
@@ -211,6 +248,12 @@ $XDG_STATE_HOME/aftman/            0700
   prompts.
 - A diff is a copy of source code. The state directory is as sensitive as the repository, and the
   docs say so in the README rather than hiding it.
+- Everything aftman creates here is `0700` (directories) or `0600` (files, including
+  `daemon.log` and mission files), on every path, and a directory the user made is not chmodded.
+  The daemon log is rotated at 4 MiB.
+- Anything printed to a terminal is sanitised first (escape sequences, control characters, bidi
+  overrides removed), because worker output, model reasons and job text are untrusted text and a
+  terminal obeys what it is sent ([07-surfaces.md section 4](07-surfaces.md)).
 - `aftman purge <run-id>` deletes a run's directory; `aftman purge --all` clears the store. No
   soft-delete, no hidden backups. A run that is being driven, by this daemon or by another process
   holding its ownership claim, is never purged; `purge --all` skips it.

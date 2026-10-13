@@ -583,6 +583,12 @@ pub enum EventKind {
 
 Variant notes, because three of these were previously cited in prose without existing here:
 
+- `RunCreated` — payload `{repo, launch?}`. `launch` is the opaque, bounded
+  `RuntimeDeps::launch` map (how the worker was launched: `permissions`, `external_sandbox`,
+  `steering`); see §11. Core never reads it.
+- `WorkerTerminated` — payload `{worker_id, cause, reason, ...}`. `cause: "orphaned"` (written by
+  restart recovery for a worker its dead supervisor left behind) adds `pgid`, `result`
+  (`killed` | `already_gone` | `unverified`) and `detail`.
 - `JobRouted` — the routing decision, with each conditional responsibility's probability and
   threshold. Replaces the earlier `RESPONSIBILITIES_ACTIVATED` label
   ([05-responsibilities.md §5](05-responsibilities.md)).
@@ -873,6 +879,23 @@ Methods (every params struct rejects unknown fields; a method with no params acc
 | `run.purge` | exactly one of `run_id` or `all: true` | `{purged}` |
 | `responsibility.list` | none | `{responsibilities: [{id, description, checks[]}]}` |
 | `jev.usage` | `since?` (RFC 3339), `run_id?` | aggregated token usage (opaque to the protocol crate) |
+
+Additive fields (all `#[serde(default)]`, so mixed versions decode): `subscription.open` also
+returns **`live`**, whether *this daemon is driving the run*, so events will keep arriving. It is
+false for a run that has ended, one that is alive in another process (`aftman run --no-daemon`),
+or one that is non-terminal but orphaned; the history is still served, but a client that wants to
+follow such a run polls `run.events`. It is always true for an all-runs stream. `daemon.status`
+also returns **`state_dir`** (the directory the daemon serves, so a client can notice its own
+`--data-dir` differs), **`started_at`** (RFC 3339, from the injected clock) and **`info`** (free-form
+strings from the composition root, at most 32 entries, keys at most 64 bytes, values at most 256).
+`run.start` requires an absolute `repo` (`invalid_repo` otherwise): a relative path would be
+resolved against the daemon's working directory, not the client's.
+
+**`RUN_CREATED` payload.** `{repo, launch?}`. `launch` is an opaque, bounded map (at most 32
+entries, keys 64 chars, values 256) that the composition root supplies in `RuntimeDeps::launch`:
+how the worker was launched, for example `permissions`, `external_sandbox`, `steering`. It is a
+description for the record, never an input to a decision, and core knows nothing about launch flags;
+it exists so an `auto-approve` run is distinguishable from a sandboxed one in the log.
 
 `decision` is `aftman_core::assessment::HumanDecision` (`{"decision":"accept"}`,
 `{"decision":"guidance","text":"..."}`, ...). `run.purge` backs `aftman purge <run-id>` and

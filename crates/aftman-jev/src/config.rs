@@ -147,23 +147,121 @@ pub fn load_env_file(path: &Path) -> BTreeMap<String, String> {
 /// The `$XDG_CONFIG_HOME/aftman/.env` path, if a home directory can be determined.
 #[must_use]
 pub fn default_env_file() -> Option<std::path::PathBuf> {
-    if let Some(config) = std::env::var_os("XDG_CONFIG_HOME") {
+    default_env_file_with(&|key| std::env::var(key).ok())
+}
+
+/// [`default_env_file`] with an explicit environment.
+#[must_use]
+pub fn default_env_file_with(env: &dyn Fn(&str) -> Option<String>) -> Option<std::path::PathBuf> {
+    if let Some(config) = env("XDG_CONFIG_HOME") {
         return Some(std::path::PathBuf::from(config).join("aftman/.env"));
     }
-    std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config/aftman/.env"))
+    env("HOME").map(|home| std::path::PathBuf::from(home).join(".config/aftman/.env"))
 }
 
 /// Resolve settings from the process environment, with `file` as a fallback.
 ///
 /// The process environment wins over the file, always.
 pub fn resolve(file: Option<&BTreeMap<String, String>>) -> Result<JevSettings, SettingsError> {
+    resolve_with(&|key| std::env::var(key).ok(), file)
+}
+
+/// Every environment variable provider resolution reads. The composition root takes a
+/// [`snapshot_env`] of exactly these, once, so the rest of the program never needs to
+/// know their names (hard rule 2) and tests can supply their own.
+pub const ENV_KEYS: &[&str] = &[
+    "TYPESAFE_API_KEY",
+    "TYPESAFE_BASE_URL",
+    "TYPESAFE_DEFAULT_MODEL",
+    "AFTMAN_JEV_API_KEY",
+    "AFTMAN_JEV_MODEL",
+    "AFTMAN_JEV_TIMEOUT_SECONDS",
+    "AFTMAN_JEV_MAX_RETRIES",
+    "AFTMAN_JEV_MAX_RETRY_AFTER_SECONDS",
+    "AFTMAN_JEV_PAIR_BUDGET_BYTES",
+    "AFTMAN_JEV_REQUEST_BUDGET_BYTES",
+];
+
+/// The values of [`ENV_KEYS`] that `env` has.
+#[must_use]
+pub fn snapshot_env(env: &dyn Fn(&str) -> Option<String>) -> BTreeMap<String, String> {
+    ENV_KEYS
+        .iter()
+        .filter_map(|key| env(key).map(|value| ((*key).to_owned(), value)))
+        .collect()
+}
+
+/// Where the credential came from. Never the credential itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialSource {
+    Missing,
+    Environment,
+    ConfigFile,
+}
+
+/// A redacted description of what was resolved: safe to print, log, or send to a
+/// client. Holds no key, no key prefix, no key length, and no URL userinfo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsView {
+    pub configured: bool,
+    pub credential: CredentialSource,
+    pub model: String,
+    pub base_url: String,
+    pub loopback: bool,
+}
+
+impl JevSettings {
+    /// The redacted description of these settings. `credential` says where the key
+    /// came from, as found by [`describe`].
+    #[must_use]
+    pub fn view(&self, credential: CredentialSource) -> SettingsView {
+        SettingsView {
+            configured: self.is_configured(),
+            credential: if self.is_configured() {
+                credential
+            } else {
+                CredentialSource::Missing
+            },
+            model: self.model.clone(),
+            base_url: redact_url(&self.base_url),
+            loopback: self.is_loopback(),
+        }
+    }
+}
+
+/// Resolve with `env` and `file`, and describe the result without exposing it.
+///
+/// # Errors
+/// As [`resolve_with`].
+pub fn describe(
+    env: &dyn Fn(&str) -> Option<String>,
+    file: Option<&BTreeMap<String, String>>,
+) -> Result<SettingsView, SettingsError> {
+    let settings = resolve_with(env, file)?;
+    let from_env = ["TYPESAFE_API_KEY", "AFTMAN_JEV_API_KEY"]
+        .iter()
+        .any(|k| env(k).is_some_and(|v| !v.trim().is_empty()));
+    Ok(settings.view(if from_env {
+        CredentialSource::Environment
+    } else {
+        CredentialSource::ConfigFile
+    }))
+}
+
+/// [`resolve`] with an explicit environment, so a test or a composition root can say
+/// exactly what the environment is.
+pub fn resolve_with(
+    env: &dyn Fn(&str) -> Option<String>,
+    file: Option<&BTreeMap<String, String>>,
+) -> Result<JevSettings, SettingsError> {
     let mut settings = JevSettings::default();
 
     let lookup = |key: &str| -> Option<String> {
-        std::env::var(key)
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .or_else(|| file.and_then(|f| f.get(key)).cloned())
+        env(key).filter(|v| !v.trim().is_empty()).or_else(|| {
+            file.and_then(|f| f.get(key))
+                .filter(|v| !v.trim().is_empty())
+                .cloned()
+        })
     };
 
     settings.api_key = lookup("TYPESAFE_API_KEY").or_else(|| lookup("AFTMAN_JEV_API_KEY"));
@@ -214,6 +312,9 @@ fn parse_u64(key: &str, raw: &str) -> Result<u64, SettingsError> {
 /// to be everything after the scheme.
 fn host_of(rest: &str) -> &str {
     let authority = rest.split('/').next().unwrap_or("");
+    // `user:pass@host`: the host is what follows the last `@`. Getting this wrong would
+    // let `http://localhost@evil.example` pass as loopback.
+    let authority = authority.rsplit('@').next().unwrap_or("");
     if let Some(inner) = authority.strip_prefix('[') {
         return inner.split(']').next().unwrap_or("");
     }
@@ -225,6 +326,30 @@ fn host_of(rest: &str) -> &str {
 /// A path is allowed (some providers mount the API under one); a `/v1` prefix is not,
 /// because the client appends `/v1/systemone` and the result would be `/v1/v1/...`.
 fn validate_base_url(raw: &str) -> Result<String, SettingsError> {
+    validate_base_url_inner(raw).map_err(|error| match error {
+        SettingsError::InvalidBaseUrl(u) => SettingsError::InvalidBaseUrl(redact_url(&u)),
+        SettingsError::InsecureBaseUrl(u) => SettingsError::InsecureBaseUrl(redact_url(&u)),
+        SettingsError::BaseUrlHasPath(u) => SettingsError::BaseUrlHasPath(redact_url(&u)),
+        other => other,
+    })
+}
+
+/// `raw` with any `user:password@` removed from its authority, for display and for
+/// error messages that cross a trust boundary (a socket client, a log).
+#[must_use]
+pub fn redact_url(raw: &str) -> String {
+    let Some((scheme, rest)) = raw.trim().split_once("://") else {
+        return raw.trim().to_owned();
+    };
+    let (authority, tail) = match rest.find('/') {
+        Some(i) => rest.split_at(i),
+        None => (rest, ""),
+    };
+    let authority = authority.rsplit('@').next().unwrap_or(authority);
+    format!("{scheme}://{authority}{tail}")
+}
+
+fn validate_base_url_inner(raw: &str) -> Result<String, SettingsError> {
     let trimmed = raw.trim().trim_end_matches('/');
     let Some((scheme, rest)) = trimmed.split_once("://") else {
         return Err(SettingsError::InvalidBaseUrl(raw.to_owned()));
@@ -251,8 +376,48 @@ fn validate_base_url(raw: &str) -> Result<String, SettingsError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{JevSettings, SettingsError, parse_env_file, resolve, validate_base_url};
+    use super::{
+        CredentialSource, JevSettings, SettingsError, describe, parse_env_file, redact_url,
+        resolve, validate_base_url,
+    };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn userinfo_is_redacted_and_cannot_spoof_loopback() {
+        assert_eq!(
+            redact_url("https://user:secret@api.example.com/api"),
+            "https://api.example.com/api"
+        );
+        assert_eq!(
+            redact_url("https://api.example.com"),
+            "https://api.example.com"
+        );
+        let error = validate_base_url("http://localhost@evil.example").expect_err("not loopback");
+        assert!(matches!(error, SettingsError::InsecureBaseUrl(_)));
+        let error = validate_base_url("ftp://u:pw@h").expect_err("bad scheme");
+        assert!(!error.to_string().contains("pw"), "{error}");
+    }
+
+    #[test]
+    fn the_view_names_the_source_and_never_the_key() {
+        let env = |k: &str| (k == "TYPESAFE_API_KEY").then(|| "sk-secret".to_owned());
+        let view = describe(&env, None).expect("resolves");
+        assert!(view.configured);
+        assert_eq!(view.credential, CredentialSource::Environment);
+        assert!(!format!("{view:?}").contains("sk-secret"));
+        let none = |_: &str| None;
+        assert_eq!(
+            describe(&none, None).expect("resolves").credential,
+            CredentialSource::Missing
+        );
+        let file = BTreeMap::from([("AFTMAN_JEV_API_KEY".to_owned(), "k".to_owned())]);
+        assert_eq!(
+            describe(&none, Some(&file)).expect("resolves").credential,
+            CredentialSource::ConfigFile
+        );
+        let blank = |k: &str| (k == "TYPESAFE_API_KEY").then(String::new);
+        assert!(!describe(&blank, None).expect("resolves").configured);
+    }
 
     #[test]
     fn https_and_loopback_are_accepted() {

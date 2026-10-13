@@ -53,6 +53,8 @@ pub struct RunPaths {
     pub events: PathBuf,
     /// Held under `flock` by the process driving the run (see `RunStore::claim`).
     pub lock: PathBuf,
+    /// Processes launched by this run's workers and not yet reaped.
+    pub processes: PathBuf,
 }
 
 impl RunPaths {
@@ -64,6 +66,7 @@ impl RunPaths {
             state: dir.join("state.json"),
             events: dir.join("events.jsonl"),
             lock: dir.join("run.lock"),
+            processes: dir.join("processes.json"),
             dir,
         }
     }
@@ -96,6 +99,16 @@ fn mkdir_private(dir: &Path) -> Result<(), StoreError> {
         .mode(0o700)
         .create(dir)
         .map_err(|e| io_err(dir.display(), e))
+}
+
+/// The recorded worker processes; unreadable or absent means none.
+fn read_processes(
+    path: &Path,
+) -> std::collections::BTreeMap<String, aftman_core::worker::ProcessIdentity> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
 }
 
 fn lock_writes(lock: &RunLock) -> MutexGuard<'_, RunWrites> {
@@ -576,6 +589,67 @@ impl RunStore for FileRunStore {
             }
         }
         Ok(ids)
+    }
+
+    async fn set_worker_process(
+        &self,
+        run: RunId,
+        worker: aftman_core::ids::WorkerId,
+        identity: Option<aftman_core::worker::ProcessIdentity>,
+    ) -> Result<(), StoreError> {
+        let paths = self.paths(run);
+        let lock = self.run_lock(run);
+        tokio::task::spawn_blocking(move || {
+            let _guard = lock_writes(&lock);
+            if !paths.meta.exists() {
+                return Err(StoreError::NotFound(run));
+            }
+            let mut map = read_processes(&paths.processes);
+            match identity {
+                Some(identity) => {
+                    map.insert(worker.to_string(), identity);
+                }
+                None => {
+                    map.remove(&worker.to_string());
+                }
+            }
+            if map.is_empty() {
+                match std::fs::remove_file(&paths.processes) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(io_err(paths.processes.display(), e)),
+                }
+            } else {
+                let bytes = serde_json::to_vec_pretty(&map)
+                    .map_err(|e| StoreError::Encode(e.to_string()))?;
+                write_atomic_sync(&paths.processes, &bytes)
+            }
+        })
+        .await
+        .map_err(join_error)?
+    }
+
+    async fn worker_processes(
+        &self,
+        run: RunId,
+    ) -> Result<
+        Vec<(
+            aftman_core::ids::WorkerId,
+            aftman_core::worker::ProcessIdentity,
+        )>,
+        StoreError,
+    > {
+        let paths = self.paths(run);
+        if !paths.dir.is_dir() {
+            return Err(StoreError::NotFound(run));
+        }
+        let map = tokio::task::spawn_blocking(move || read_processes(&paths.processes))
+            .await
+            .map_err(join_error)?;
+        Ok(map
+            .into_iter()
+            .filter_map(|(worker, identity)| Some((worker.parse().ok()?, identity)))
+            .collect())
     }
 
     async fn claim(&self, id: RunId) -> Result<Option<RunClaim>, StoreError> {

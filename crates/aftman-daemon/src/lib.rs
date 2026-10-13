@@ -26,9 +26,12 @@ pub mod sink;
 pub use control::{ControlError, ControlReceiver, RunControl};
 pub use daemon::{Daemon, DaemonConfig, shutdown_signal};
 pub use hub::{EventHub, HubConfig, Lagged, SubscribeError, Subscription};
-pub use lifecycle::{DaemonPaths, LifecycleError, PathInputs, resolve_paths};
+pub use lifecycle::{
+    DaemonPaths, DaemonPresence, LifecycleError, PathInputs, probe, probe_state_dir, resolve_paths,
+};
 pub use manager::{
-    BuiltRun, ManagerConfig, RecoveryReport, RunManager, RuntimeContext, RuntimeFactory,
+    BuiltRun, DaemonInfo, FailOutcome, FailReport, ManagerConfig, OrphanReport, RecoveryReport,
+    RunManager, RuntimeContext, RuntimeFactory, fail_run, fail_run_detailed, mark_run_failed,
 };
 pub use obs::{ObsCaps, ObservationBuilder, parse_test_summaries};
 pub use runtime::{

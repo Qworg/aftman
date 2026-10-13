@@ -553,6 +553,21 @@ impl RuntimeFactory for TestFactory {
             ensemble_enabled: false,
             uncertainty_margin: 0.15,
             steering_grace: Duration::from_secs(30),
+            launch: [
+                (
+                    "permissions".to_owned(),
+                    params
+                        .permissions
+                        .clone()
+                        .unwrap_or_else(|| "sandboxed".to_owned()),
+                ),
+                (
+                    "external_sandbox".to_owned(),
+                    params.external_sandbox.to_string(),
+                ),
+                ("steering".to_owned(), params.steer.to_string()),
+            ]
+            .into(),
         });
         Ok(BuiltRun {
             runtime: Arc::new(runtime),
@@ -625,6 +640,7 @@ impl Harness {
         config.server.write_timeout = Duration::from_millis(500);
         config.server.drain_timeout = Duration::from_secs(5);
         config.manager.shutdown_grace = Duration::from_secs(10);
+        config.state_dir = Some(state.clone());
         tweak(&mut config);
         let daemon = Daemon::start(
             config,

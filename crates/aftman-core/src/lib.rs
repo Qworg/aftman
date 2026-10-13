@@ -75,8 +75,8 @@ pub use responsibility::{
 };
 pub use run::{Escalation, EscalationKind, RunFilter, RunHeader, RunState, RunSummary};
 pub use worker::{
-    SteerOutcome, SteerRecord, TerminateReason, Worker, WorkerCtx, WorkerEventSink, WorkerOutcome,
-    WorkerRecord, WorkerSignal,
+    ProcessIdentity, ProcessLedger, SteerOutcome, SteerRecord, TerminateReason, Worker, WorkerCtx,
+    WorkerEventSink, WorkerOutcome, WorkerRecord, WorkerSignal,
 };
 
 pub mod job;

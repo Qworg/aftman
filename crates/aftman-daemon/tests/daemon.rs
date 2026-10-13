@@ -969,7 +969,7 @@ async fn subscriptions_open_replace_and_close() -> TestResult {
         .await?;
     assert_eq!(
         opened,
-        json!({ "run_id": first, "from_seq": 1, "replaced": false })
+        json!({ "run_id": first, "from_seq": 1, "replaced": false, "live": true })
     );
 
     // A second open replaces the first: only the new run's events arrive.
@@ -978,7 +978,7 @@ async fn subscriptions_open_replace_and_close() -> TestResult {
         .await?;
     assert_eq!(
         replaced,
-        json!({ "run_id": second, "from_seq": 1, "replaced": true })
+        json!({ "run_id": second, "from_seq": 1, "replaced": true, "live": true })
     );
     // Whatever the old stream delivered was queued before the reply; from here on
     // only the replacement may speak.
@@ -1008,7 +1008,7 @@ async fn subscriptions_open_replace_and_close() -> TestResult {
     let all = s.result("subscription.open", json!({})).await?;
     assert_eq!(
         all,
-        json!({ "run_id": null, "from_seq": null, "replaced": false })
+        json!({ "run_id": null, "from_seq": null, "replaced": false, "live": true })
     );
     let live = s.take_events(2).await?;
     assert!(

@@ -322,6 +322,29 @@ pub fn claude(mission: &str, options: &BackendOptions) -> Result<CommandSpec, Sp
     })
 }
 
+/// Write a mission file readable by this user only, in a directory only this user can
+/// enter. The mission is the job text, which is as sensitive as the run's own directory
+/// and must not outlive the run (the worker removes the file when it ends).
+fn write_mission_file(path: &std::path::Path, mission: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
+    if let Some(parent) = path.parent() {
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(parent)?;
+        // A directory left by an older version may be wider; tighten what is ours.
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    file.write_all(mission.as_bytes())
+}
+
 /// An operator-supplied command, with the mission written to a file.
 ///
 /// The mission goes to a file rather than into the command line so that a long prompt
@@ -337,7 +360,7 @@ pub fn generic(
     if template.trim().is_empty() {
         return Err(SpecError::EmptyTemplate);
     }
-    std::fs::write(mission_file, mission).map_err(|error| SpecError::MissionFile {
+    write_mission_file(mission_file, mission).map_err(|error| SpecError::MissionFile {
         path: mission_file.display().to_string(),
         message: error.to_string(),
     })?;
@@ -364,7 +387,7 @@ pub fn generic(
         args: args.into_iter().skip(1).collect(),
         env: Vec::new(),
         steer: SteerProtocol::None,
-        working_dir_is_repo: false,
+        working_dir_is_repo: true,
     })
 }
 

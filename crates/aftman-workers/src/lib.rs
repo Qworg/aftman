@@ -21,6 +21,7 @@
 
 pub mod backends;
 pub mod evidence;
+pub mod process;
 pub mod simulated;
 pub mod subprocess;
 

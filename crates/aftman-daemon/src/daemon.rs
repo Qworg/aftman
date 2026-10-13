@@ -18,7 +18,7 @@ use aftman_store::RunStore;
 
 use crate::hub::{EventHub, HubConfig};
 use crate::lifecycle::{self, ClaimGuard, DaemonPaths, LifecycleError};
-use crate::manager::{ManagerConfig, RecoveryReport, RunManager, RuntimeFactory};
+use crate::manager::{DaemonInfo, ManagerConfig, RecoveryReport, RunManager, RuntimeFactory};
 use crate::server::{ProtocolServer, ServerConfig};
 
 /// Everything tunable about a daemon.
@@ -28,6 +28,12 @@ pub struct DaemonConfig {
     pub manager: ManagerConfig,
     pub server: ServerConfig,
     pub hub: HubConfig,
+    /// The state directory this daemon serves. When set, `Daemon::start` takes a lock
+    /// in it (one daemon per state directory, whatever the socket) and reports it in
+    /// `daemon.status`.
+    pub state_dir: Option<std::path::PathBuf>,
+    /// Free-form facts for `daemon.status` (bounded; see [`DaemonInfo`]).
+    pub info: std::collections::BTreeMap<String, String>,
 }
 
 impl DaemonConfig {
@@ -39,6 +45,8 @@ impl DaemonConfig {
             manager: ManagerConfig::default(),
             server: ServerConfig::default(),
             hub: HubConfig::default(),
+            state_dir: None,
+            info: std::collections::BTreeMap::new(),
         }
     }
 }
@@ -65,9 +73,16 @@ impl Daemon {
         factory: Arc<dyn RuntimeFactory>,
         clock: Arc<dyn Clock>,
     ) -> Result<Self, LifecycleError> {
-        let lock = lifecycle::lock(&config.paths).await?;
+        let mut lock = lifecycle::lock(&config.paths).await?;
+        if let Some(state_dir) = &config.state_dir {
+            lock = lock.with_state_dir(state_dir).await?;
+        }
         let hub = EventHub::new(Arc::clone(&store), config.hub);
         let manager = RunManager::new(store, hub, factory, clock, config.manager);
+        manager.set_info(DaemonInfo {
+            state_dir: config.state_dir.clone(),
+            info: config.info.clone(),
+        });
         let recovery = manager.recover().await;
         let claimed = lock.bind().await?;
         tracing::info!(

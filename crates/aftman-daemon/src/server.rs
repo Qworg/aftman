@@ -442,8 +442,10 @@ impl Connection {
                             // Retire the old stream completely before answering, so
                             // none of its events can follow the reply.
                             let replaced = Self::retire(&mut subscription).await;
-                            let reply =
-                                respond(id, Ok(RunManager::subscription_result(&params, replaced)));
+                            let reply = respond(
+                                id,
+                                Ok(self.manager.subscription_result(&params, replaced)),
+                            );
                             let alive = send_response(&out, reply).await;
                             subscription = Some(tokio::spawn(forward(opened, out.clone())));
                             alive

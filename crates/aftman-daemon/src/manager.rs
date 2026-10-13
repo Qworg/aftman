@@ -55,6 +55,7 @@ use aftman_core::job::{FactoryStatus, Job, WorkerExit, WorkerStatus};
 use aftman_core::run::{RunFilter, RunState};
 use aftman_core::worker::SteerOutcome;
 use aftman_store::{RunStore, StoreError};
+use aftman_workers::process::{ORPHAN_GRACE, OrphanOutcome, end_orphan};
 
 use crate::control::{ControlError, RunControl};
 use crate::hub::{EventHub, SubscribeError, Subscription};
@@ -199,7 +200,21 @@ impl ManagedSink {
         state.finishing.remove(&id);
         state.emitted.remove(&id);
     }
+}
 
+/// Where [`fail_run`] publishes what it appends.
+///
+/// Everything it appends goes to the store first and then to [`EventSink::emit`]. A sink
+/// that tracks what it has already forwarded (the daemon's [`ManagedSink`]) also gets the
+/// chance to bridge a gap before new events are published.
+pub trait FailSink: EventSink {
+    /// Called with the run's log before anything new is appended. A sink that has been
+    /// forwarding this run's events and missed some replays them here, so subscribers
+    /// see a contiguous stream. The default does nothing.
+    fn catch_up(&self, _id: RunId, _log: &[EventEnvelope]) {}
+}
+
+impl FailSink for ManagedSink {
     /// Forward events that are in the log but were never emitted for a run this
     /// process has been emitting for. A run with no history here (an old run seen
     /// by recovery) needs nothing: no subscriber can have seen a prefix of it.
@@ -212,6 +227,17 @@ impl ManagedSink {
         }
     }
 }
+
+/// An arbitrary sink, with no gap bridging: for the embedded (`--no-daemon`) path.
+pub struct PlainSink<'a>(pub &'a dyn EventSink);
+
+impl EventSink for PlainSink<'_> {
+    fn emit(&self, event: &EventEnvelope) {
+        self.0.emit(event);
+    }
+}
+
+impl FailSink for PlainSink<'_> {}
 
 impl EventSink for ManagedSink {
     fn emit(&self, event: &EventEnvelope) {
@@ -263,7 +289,7 @@ pub enum FailOutcome {
 
 struct Emitter<'a> {
     store: &'a dyn RunStore,
-    sink: &'a ManagedSink,
+    sink: &'a dyn FailSink,
     clock: &'a dyn Clock,
 }
 
@@ -341,38 +367,136 @@ fn close_workers(
 /// A store failure (including a corrupt log), or an illegal transition.
 pub async fn fail_run(
     store: &dyn RunStore,
-    sink: &ManagedSink,
+    sink: &dyn FailSink,
     clock: &dyn Clock,
     id: RunId,
     reason: &str,
 ) -> Result<FailOutcome, FailRunError> {
+    fail_run_detailed(store, sink, clock, id, reason)
+        .await
+        .map(|report| report.outcome)
+}
+
+/// [`fail_run`] for a caller that has just a store, a clock and an [`EventSink`]: the
+/// embedded `aftman run --no-daemon` path, when `drive` returned an error and left the
+/// run non-terminal. Same guarantees (the log's status wins, worker records closed out,
+/// contiguous `seq`, an orphaned worker process ended if it can be identified); it only
+/// lacks the daemon's bridging of events that reached the log but not the sink, because
+/// a plain sink keeps no such record.
+///
+/// # Errors
+/// As [`fail_run`].
+pub async fn mark_run_failed(
+    store: &dyn RunStore,
+    sink: &dyn EventSink,
+    clock: &dyn Clock,
+    id: RunId,
+    reason: &str,
+) -> Result<FailOutcome, FailRunError> {
+    fail_run(store, &PlainSink(sink), clock, id, reason).await
+}
+
+/// A worker process found recorded for a run nobody is driving, and what became of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrphanReport {
+    pub worker: aftman_core::ids::WorkerId,
+    pub pgid: i32,
+    pub outcome: OrphanOutcome,
+}
+
+/// [`fail_run`]'s outcome plus the orphaned worker processes it dealt with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FailReport {
+    pub outcome: FailOutcome,
+    pub orphans: Vec<OrphanReport>,
+}
+
+/// [`fail_run`], reporting orphaned workers too.
+///
+/// With the run's claim held (so nothing is driving it), any worker process recorded in
+/// its directory is ended if, and only if, it can be positively identified as that worker
+/// ([`aftman_workers::process::end_orphan`]); otherwise it is left alone and reported as
+/// [`OrphanOutcome::Unverified`]. The records and the workers' mission files are removed.
+/// Orphans are named in the `WORKER_TERMINATED` events of a run that is being failed.
+///
+/// # Errors
+/// As [`fail_run`].
+pub async fn fail_run_detailed(
+    store: &dyn RunStore,
+    sink: &dyn FailSink,
+    clock: &dyn Clock,
+    id: RunId,
+    reason: &str,
+) -> Result<FailReport, FailRunError> {
     let _claim = match store.claim(id).await {
         Ok(Some(claim)) => claim,
-        Ok(None) => return Ok(FailOutcome::Claimed),
-        Err(StoreError::NotFound(_)) => return Ok(FailOutcome::Gone),
+        Ok(None) => {
+            return Ok(FailReport {
+                outcome: FailOutcome::Claimed,
+                orphans: Vec::new(),
+            });
+        }
+        Err(StoreError::NotFound(_)) => {
+            return Ok(FailReport {
+                outcome: FailOutcome::Gone,
+                orphans: Vec::new(),
+            });
+        }
         Err(error) => return Err(error.into()),
     };
+    let orphans = reap_orphans(store, id).await;
     // A write from a task that was aborted may still be in flight; the store
     // serializes it and refuses a duplicate `seq`, so re-read and go on.
     let mut attempts = 0;
     loop {
-        match fail_attempt(store, sink, clock, id, reason).await {
+        match fail_attempt(store, sink, clock, id, reason, &orphans).await {
             Err(FailRunError::Store(StoreError::SeqConflict { .. }))
                 if attempts < CONFLICT_RETRIES =>
             {
                 attempts += 1;
             }
-            other => return other,
+            Ok(outcome) => return Ok(FailReport { outcome, orphans }),
+            Err(error) => return Err(error),
         }
     }
 }
 
+/// End the worker processes recorded for `id`, and forget them. The caller holds the
+/// run's claim.
+async fn reap_orphans(store: &dyn RunStore, id: RunId) -> Vec<OrphanReport> {
+    let recorded = store.worker_processes(id).await.unwrap_or_default();
+    let mut reports = Vec::new();
+    for (worker, identity) in recorded {
+        let outcome = end_orphan(&identity, ORPHAN_GRACE).await;
+        match &outcome {
+            OrphanOutcome::Killed => {
+                tracing::warn!(run_id = %id, %worker, pgid = identity.pgid, "ended a worker orphaned by a dead supervisor");
+            }
+            OrphanOutcome::AlreadyGone => {}
+            OrphanOutcome::Unverified(why) => {
+                tracing::error!(run_id = %id, %worker, pgid = identity.pgid, why, "a worker may still be running, but could not be identified; NOT signalled");
+            }
+        }
+        if let Some(file) = &identity.mission_file {
+            let _ = tokio::fs::remove_file(file).await;
+        }
+        let _ = store.set_worker_process(id, worker, None).await;
+        reports.push(OrphanReport {
+            worker,
+            pgid: identity.pgid,
+            outcome,
+        });
+    }
+    reports
+}
+
 async fn fail_attempt(
     store: &dyn RunStore,
-    sink: &ManagedSink,
+    sink: &dyn FailSink,
     clock: &dyn Clock,
     id: RunId,
     reason: &str,
+    orphans: &[OrphanReport],
 ) -> Result<FailOutcome, FailRunError> {
     let log = match store.read_log(id).await {
         Ok(log) => log,
@@ -431,17 +555,40 @@ async fn fail_attempt(
 
     let to = status.transition(FactoryStatus::Failed)?;
     state.status = to;
-    for worker in &closed {
-        emitter
-            .emit(
-                &mut state,
-                EventKind::WorkerTerminated,
+    // Every worker still recorded Running, plus every orphaned process found, gets one
+    // WORKER_TERMINATED event: `orphaned` (with what became of the process) if a process
+    // was left behind, `run_aborted` otherwise.
+    let mut announced: Vec<aftman_core::ids::WorkerId> = closed.clone();
+    for orphan in orphans {
+        if !announced.contains(&orphan.worker) {
+            announced.push(orphan.worker);
+        }
+    }
+    for worker in &announced {
+        let payload = match orphans.iter().find(|o| o.worker == *worker) {
+            Some(orphan) => {
+                let (result, detail) = match &orphan.outcome {
+                    OrphanOutcome::Killed => ("killed", String::new()),
+                    OrphanOutcome::AlreadyGone => ("already_gone", String::new()),
+                    OrphanOutcome::Unverified(why) => ("unverified", why.clone()),
+                };
                 json!({
                     "worker_id": worker.to_string(),
-                    "cause": "run_aborted",
+                    "cause": "orphaned",
                     "reason": reason,
-                }),
-            )
+                    "pgid": orphan.pgid,
+                    "result": result,
+                    "detail": detail,
+                })
+            }
+            None => json!({
+                "worker_id": worker.to_string(),
+                "cause": "run_aborted",
+                "reason": reason,
+            }),
+        };
+        emitter
+            .emit(&mut state, EventKind::WorkerTerminated, payload)
             .await?;
     }
     emitter
@@ -479,6 +626,10 @@ pub struct RecoveryReport {
     pub claimed_elsewhere: Vec<RunId>,
     /// Runs that could not be read or updated. Logged; never fatal.
     pub unreadable: Vec<(RunId, String)>,
+    /// Worker processes found still recorded for a run recovery handled: ended,
+    /// already gone, or **left alone because they could not be identified** (see
+    /// [`OrphanOutcome`]).
+    pub orphans: Vec<(RunId, OrphanReport)>,
 }
 
 struct LiveRun {
@@ -509,8 +660,59 @@ impl Drop for Reservation {
     }
 }
 
+/// Most entries of [`DaemonInfo::info`] reported by `daemon.status`.
+pub const MAX_INFO_ENTRIES: usize = 32;
+/// Longest info key, in bytes.
+pub const MAX_INFO_KEY_BYTES: usize = 64;
+/// Longest info value, in bytes.
+pub const MAX_INFO_VALUE_BYTES: usize = 256;
+
+/// What the composition root tells `daemon.status` about this daemon.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DaemonInfo {
+    /// The state directory this daemon serves, so a client can notice that its own
+    /// `--data-dir` differs.
+    pub state_dir: Option<std::path::PathBuf>,
+    /// Free-form facts (for example whether a model provider is configured). Bounded by
+    /// [`MAX_INFO_ENTRIES`], [`MAX_INFO_KEY_BYTES`] and [`MAX_INFO_VALUE_BYTES`]: excess
+    /// entries are dropped and long strings truncated when the info is set.
+    pub info: std::collections::BTreeMap<String, String>,
+}
+
+fn truncate_bytes(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    for c in text.chars() {
+        if out.len() + c.len_utf8() > max {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+impl DaemonInfo {
+    fn bounded(self) -> Self {
+        Self {
+            state_dir: self.state_dir,
+            info: self
+                .info
+                .into_iter()
+                .take(MAX_INFO_ENTRIES)
+                .map(|(k, v)| {
+                    (
+                        truncate_bytes(&k, MAX_INFO_KEY_BYTES),
+                        truncate_bytes(&v, MAX_INFO_VALUE_BYTES),
+                    )
+                })
+                .collect(),
+        }
+    }
+}
+
 /// See the module documentation.
 pub struct RunManager {
+    info: Mutex<DaemonInfo>,
+    started_at: time::OffsetDateTime,
     store: Arc<dyn RunStore>,
     sink: Arc<ManagedSink>,
     factory: Arc<dyn RuntimeFactory>,
@@ -575,7 +777,10 @@ impl RunManager {
         config: ManagerConfig,
     ) -> Arc<Self> {
         let started = clock.instant();
+        let started_at = clock.now();
         Arc::new(Self {
+            info: Mutex::new(DaemonInfo::default()),
+            started_at,
             store,
             sink: Arc::new(ManagedSink::new(hub)),
             factory,
@@ -593,6 +798,22 @@ impl RunManager {
         self.live
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Set what `daemon.status` reports about this daemon (bounded; see [`DaemonInfo`]).
+    pub fn set_info(&self, info: DaemonInfo) {
+        *self
+            .info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = info.bounded();
+    }
+
+    /// Whether this daemon is driving `run_id` right now, so that a subscription to it
+    /// will keep receiving events. False for a run that has ended, that is alive in
+    /// another process (a `--no-daemon` run), or that is non-terminal but orphaned.
+    #[must_use]
+    pub fn is_live(&self, run_id: RunId) -> bool {
+        self.live().runs.contains_key(&run_id) && !self.sink.is_finishing(run_id)
     }
 
     /// The hub this manager publishes through.
@@ -646,15 +867,21 @@ impl RunManager {
                 report.untouched.push(id);
                 continue;
             }
-            let outcome = fail_run(
+            let detailed = fail_run_detailed(
                 self.store.as_ref(),
-                &self.sink,
+                self.sink.as_ref(),
                 self.clock.as_ref(),
                 id,
                 RESTART_REASON,
             )
             .await;
             self.sink.release(id);
+            let outcome = detailed.map(|found| {
+                report
+                    .orphans
+                    .extend(found.orphans.into_iter().map(|orphan| (id, orphan)));
+                found.outcome
+            });
             match outcome {
                 Ok(FailOutcome::Failed) => {
                     tracing::warn!(run_id = %id, "marked an unfinished run Failed: {RESTART_REASON}");
@@ -689,6 +916,11 @@ impl RunManager {
     /// `internal` when the store cannot be listed.
     pub async fn status(&self) -> Result<DaemonStatusResult, ProtocolError> {
         let total = self.store.ids().await.map_err(|e| store_error(&e))?.len();
+        let info = self
+            .info
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         let active = self
             .live()
             .runs
@@ -705,6 +937,12 @@ impl RunManager {
             pid: std::process::id(),
             runs_total: total as u64,
             runs_active: active as u64,
+            state_dir: info.state_dir,
+            started_at: self
+                .started_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .ok(),
+            info: info.info,
         })
     }
 
@@ -854,7 +1092,7 @@ impl RunManager {
         for attempt in 1..=FAIL_ATTEMPTS {
             match fail_run(
                 self.store.as_ref(),
-                &self.sink,
+                self.sink.as_ref(),
                 self.clock.as_ref(),
                 run_id,
                 reason,
@@ -987,12 +1225,18 @@ impl RunManager {
     }
 
     /// The `subscription.open` result for `params`.
+    ///
+    /// `live` says whether this daemon is driving the run (always true for an all-runs
+    /// stream); when it is false a client that wants to follow the run must poll
+    /// `run.events`, because this daemon's hub will never see further events.
     #[must_use]
     pub fn subscription_result(
+        &self,
         params: &SubscriptionOpenParams,
         replaced: bool,
     ) -> SubscriptionOpenResult {
         SubscriptionOpenResult {
+            live: params.run_id.is_none_or(|id| self.is_live(id)),
             run_id: params.run_id,
             from_seq: params
                 .run_id

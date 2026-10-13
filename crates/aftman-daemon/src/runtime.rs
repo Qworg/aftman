@@ -70,6 +70,75 @@ pub struct RuntimeDeps {
     pub ensemble_enabled: bool,
     pub uncertainty_margin: f32,
     pub steering_grace: Duration,
+    /// How the worker is launched, as the composition root describes it: opaque
+    /// key/value pairs such as `permissions`, `external_sandbox`, `steering`. Written
+    /// into the `RUN_CREATED` payload under `launch`, so a run launched with approvals
+    /// off is distinguishable in the record from a sandboxed one. Core stays ignorant
+    /// of launch flags; this is a description, never an input to a decision. Bounded
+    /// by [`MAX_LAUNCH_ENTRIES`], [`MAX_LAUNCH_KEY_CHARS`] and [`MAX_LAUNCH_VALUE_CHARS`]
+    /// (excess is dropped or truncated).
+    pub launch: BTreeMap<String, String>,
+}
+
+/// Most `launch` entries recorded in `RUN_CREATED`.
+pub const MAX_LAUNCH_ENTRIES: usize = 32;
+/// Longest `launch` key, in characters.
+pub const MAX_LAUNCH_KEY_CHARS: usize = 64;
+/// Longest `launch` value, in characters.
+pub const MAX_LAUNCH_VALUE_CHARS: usize = 256;
+
+/// The `launch` map as it is recorded: bounded.
+fn bounded_launch(launch: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    launch
+        .iter()
+        .take(MAX_LAUNCH_ENTRIES)
+        .map(|(k, v)| {
+            (
+                k.chars().take(MAX_LAUNCH_KEY_CHARS).collect(),
+                v.chars().take(MAX_LAUNCH_VALUE_CHARS).collect(),
+            )
+        })
+        .collect()
+}
+
+/// Records a worker's process in the run directory through the store, so recovery can
+/// end it if this process dies before reaping it.
+struct StoreLedger {
+    store: Arc<dyn RunStore>,
+    run_id: RunId,
+    worker_id: WorkerId,
+}
+
+impl std::fmt::Debug for StoreLedger {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StoreLedger")
+            .field("run_id", &self.run_id)
+            .field("worker_id", &self.worker_id)
+            .finish_non_exhaustive()
+    }
+}
+
+#[async_trait::async_trait]
+impl aftman_core::worker::ProcessLedger for StoreLedger {
+    async fn record(&self, identity: aftman_core::worker::ProcessIdentity) {
+        if let Err(error) = self
+            .store
+            .set_worker_process(self.run_id, self.worker_id, Some(identity))
+            .await
+        {
+            tracing::warn!(run_id = %self.run_id, %error, "could not record the worker's process");
+        }
+    }
+
+    async fn clear(&self) {
+        if let Err(error) = self
+            .store
+            .set_worker_process(self.run_id, self.worker_id, None)
+            .await
+        {
+            tracing::debug!(run_id = %self.run_id, %error, "could not clear the worker's process record");
+        }
+    }
 }
 
 /// Errors that stop a run for a reason operability can act on.
@@ -401,11 +470,14 @@ impl FactoryRuntime {
         let result = async {
             self.deps.store.create(&header).await?;
             let mut state = RunState::new(header, FactoryStatus::Queued);
-            self.emit(
-                &mut state,
-                EventKind::RunCreated,
-                json!({ "repo": job.repo.display().to_string() }),
-            )
+            self.emit(&mut state, EventKind::RunCreated, {
+                let mut payload = json!({ "repo": job.repo.display().to_string() });
+                let launch = bounded_launch(&self.deps.launch);
+                if !launch.is_empty() {
+                    payload["launch"] = json!(launch);
+                }
+                payload
+            })
             .await?;
             // A snapshot now, so the run is loadable (`run.get`) while it is still
             // routing.
@@ -1852,6 +1924,11 @@ impl FactoryRuntime {
             timeout: self.deps.config.worker_timeout,
             env: Vec::new(),
             output: Arc::clone(&output),
+            ledger: Some(Arc::new(StoreLedger {
+                store: Arc::clone(&self.deps.store),
+                run_id: state.header.id,
+                worker_id: id,
+            })),
         };
 
         let worker = Arc::clone(&self.deps.worker);
@@ -2113,6 +2190,23 @@ pub fn default_margin() -> f32 {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn the_recorded_launch_posture_is_bounded() {
+        let mut launch = std::collections::BTreeMap::new();
+        for i in 0..100 {
+            launch.insert(format!("k{i:03}"), "v".repeat(1_000));
+        }
+        launch.insert("k".repeat(500), "x".into());
+        let bounded = super::bounded_launch(&launch);
+        assert_eq!(bounded.len(), super::MAX_LAUNCH_ENTRIES);
+        assert!(
+            bounded
+                .iter()
+                .all(|(k, v)| k.chars().count() <= super::MAX_LAUNCH_KEY_CHARS
+                    && v.chars().count() <= super::MAX_LAUNCH_VALUE_CHARS)
+        );
+    }
     use super::{code_mission, verify_mission};
     use aftman_core::job::{Job, JobSource, JobSummary};
     use aftman_core::observation::{

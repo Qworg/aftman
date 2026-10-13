@@ -311,14 +311,15 @@ What each surface can do. Blank means "not applicable", not "not implemented by 
 - **Socket permissions:** `0600`, inside `$XDG_RUNTIME_DIR` where the OS already isolates per-user
   state. A stale socket is detected by connect-and-fail, removed, and recreated.
 - **Client reconnect:** any client can reconnect and resume from its last `seq`. The daemon keeps a
-  bounded replay buffer (default 10,000 events) plus the on-disk log, so resume works for old runs
-  too.
+  bounded replay buffer (default 10,000 events in total, oldest evicted first) plus the on-disk
+  log, so resume works for old runs too. Each connection holds one subscription.
 - **Daemon restart:** on start, runs with no terminal event are loaded, their state is
   reconstructed, and each is either resumed (if configured) or marked `Failed` with reason
   `daemon restarted`. There is no silent zombie run.
 - **Backpressure:** a slow client cannot stall a run. Each subscriber has a bounded channel; on
-  overflow the client is dropped with an `error` message and must resume by `seq`. Runs never block
-  on a slow UI.
+  overflow the client is dropped with a `subscriber_lagged` error push (carrying `resume_from`) and
+  must resume by `seq`; what it already received is a correct gap-free prefix. Runs never block on
+  a slow UI. See [02-lld.md section 11](02-lld.md).
 - **Multiple clients:** any number, of any kind, simultaneously. The daemon fans out; it does not
   arbitrate between surfaces, because there is only one run state to read.
 

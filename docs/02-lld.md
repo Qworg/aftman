@@ -699,45 +699,113 @@ pub fn worker_environment(extra: &[(String, String)]) -> Vec<(String, String)>;
 
 ## 11. Daemon protocol
 
-One message schema, two transports. NDJSON over a Unix socket; the same messages over HTTP.
+One message schema, two transports. NDJSON over a Unix socket; the same messages over HTTP. The
+schema is `aftman_daemon::protocol` (types and pure encode/decode only); event fan-out is
+`aftman_daemon::hub`. Neither knows about sockets.
 
-Request/response (NDJSON, one JSON object per line, `id` echoes):
+Request/response (NDJSON, one JSON object per line, `id` echoes). `error` is `null` on success;
+on failure `result` is omitted:
 
 ```jsonc
 {"id":1,"method":"run.start","params":{"repo":"/abs/path","job":"...","worker":"pi"}}
 {"id":1,"result":{"run_id":"0193..."},"error":null}
 ```
 
-Event push (server → client, no `id`):
+Event push (server -> client, no `id`):
 
 ```jsonc
-{"event":{"seq":42,"run_id":"0193...","kind":"DirectiveSelected","at":"...","payload":{...}}}
+{"event":{"seq":42,"run_id":"0193...","kind":"DIRECTIVE_SELECTED","at":"...","payload":{...}}}
 ```
 
-Methods:
+Out-of-band error push (server -> client, no `id`; also the reply to a line whose `id` could not
+be parsed). A slow subscriber is dropped with this, after receiving a correct gap-free prefix:
+
+```jsonc
+{"error":{"code":"subscriber_lagged","message":"...resume from seq 9","retryable":true,
+          "data":{"run_id":"0193...","resume_from":9}}}
+```
+
+`params` must be a JSON object (or `null`/absent for "none"); an array or scalar is
+`invalid_request`. A client must tolerate an error `code` it does not know (it decodes as
+`unknown`). The `decision` of `run.answer` is decoded strictly (unknown fields are rejected;
+guidance text must be non-empty).
+
+Methods (every params struct rejects unknown fields; a method with no params accepts `{}`,
+`null`, or no `params`):
 
 | Method | Params | Result |
 | --- | --- | --- |
-| `daemon.status` | — | version, uptime, pid, run count |
-| `run.start` | `repo, job, worker?, model?, verify?, ...` | `run_id` |
-| `run.list` | `status?, limit?, cursor?` | `RunSummary[]` |
+| `daemon.status` | none | `{version, uptime_secs, pid, runs_total, runs_active}` |
+| `daemon.stop` | none | `{ok}` (graceful shutdown) |
+| `run.start` | `repo, job` + optional `worker, cmd, permissions, effort, steer, external_sandbox, model, verify, ensemble, simulate_model` (the flags of `aftman run`) | `{run_id}` |
+| `run.list` | `status?[], limit?, cursor?` | `{runs: RunSummary[], next_cursor}` |
 | `run.get` | `run_id` | `RunState` |
-| `run.events` | `run_id, from_seq, limit?` | `EventEnvelope[]` |
-| `subscription.open` | `run_id?, from_seq?` | streamed `event` messages |
+| `run.events` | `run_id, from_seq?, limit?` | `{events: EventEnvelope[], has_more}` |
+| `subscription.open` | `run_id?, from_seq?` | `{run_id, from_seq, replaced}`, then streamed `event` pushes |
+| `subscription.close` | none | `{closed}` |
 | `run.steer` | `run_id, message` | `SteerOutcome` |
-| `run.cancel` | `run_id` | `ok` |
-| `run.answer` | `run_id, escalation_id, answer` | `ok` |
-| `responsibility.list` | — | active responsibilities + checks |
-| `jev.usage` | `since?, run_id?` | aggregated token usage |
+| `run.cancel` | `run_id` | `{ok}` |
+| `run.answer` | `run_id, escalation_id, decision, note?` | `{ok}` |
+| `run.purge` | exactly one of `run_id` or `all: true` | `{purged}` |
+| `responsibility.list` | none | `{responsibilities: [{id, description, checks[]}]}` |
+| `jev.usage` | `since?` (RFC 3339), `run_id?` | aggregated token usage (opaque to the protocol crate) |
 
-Errors are structured:
+`decision` is `aftman_core::assessment::HumanDecision` (`{"decision":"accept"}`,
+`{"decision":"guidance","text":"..."}`, ...). `run.purge` backs `aftman purge <run-id>` and
+`aftman purge --all` ([08-security.md](08-security.md)). List-style results are objects, not bare
+arrays, so a cursor or flag can be added without a breaking change.
+
+**Subscriptions.** `subscription.open` with `run_id` delivers every event of that run with
+`seq >= from_seq` (default: the first) exactly once, in order, whether the run is live, finished,
+or has not emitted yet. Without `run_id` it is a live-only stream of all runs; `from_seq` without
+`run_id` is `invalid_request` (sequence numbers are per run). **One subscription per
+connection:** event pushes carry no subscription id, so overlapping subscriptions would be
+indistinguishable duplicates. A second `subscription.open` replaces the first
+(`replaced: true`); a client that wants two streams opens two connections.
+
+**Backpressure.** Each subscriber has a bounded queue (`HubConfig::subscriber_capacity`, default
+1,024). `emit` never blocks. If the queue is full the subscriber is removed, it still receives
+what was already queued, and then gets the `subscriber_lagged` push. For a single-run subscription
+`data.resume_from` is the next `seq` it has not seen and the client reconnects and resumes from
+there; for an all-runs subscription (live-only, no replay) `data.run_id` and `data.resume_from`
+are both `null` and the client simply re-subscribes.
+
+**Replay.** The hub keeps a bounded ring (`HubConfig::replay_capacity`, default 10,000 events
+across all runs, oldest evicted first) and falls back to `RunStore::events` when the ring does not
+reach back to `from_seq`. Correctness depends on the runtime appending to the store *before* it
+emits, and emitting one run's events in `seq` order; the argument is in the `hub` module docs.
+If the ring does not cover `from_seq` and the store does not have the run, the subscribe fails
+with `unknown_run` rather than returning a silent gap. `EventHub::forget(run_id)` (used by
+`run.purge`) drops a run's ring contents and cleanly ends its run-scoped subscribers. Shutdown
+(`close_all`, or dropping the last hub handle) is sticky: streams end cleanly and later
+subscribes fail. See §15 for the cost of the store fallback.
+
+Errors are structured (`data` is optional and omitted when absent):
 
 ```jsonc
 {"id":7,"error":{"code":"invalid_repo","message":"not a directory: /x","retryable":false}}
 ```
 
 Codes: `invalid_repo`, `invalid_config`, `unknown_run`, `wrong_state`, `steering_unsupported`,
-`model_unavailable`, `rate_limited`, `internal`.
+`model_unavailable`, `rate_limited`, `internal`, plus `invalid_request` (malformed JSON, bad
+envelope, unknown or missing params, oversize field), `unknown_method`, and `subscriber_lagged`.
+A request that fails to decode still gets a response echoing its `id` when one could be parsed;
+otherwise the reply is an id-less error push.
+
+**Bounds** (named constants in `protocol`; exceeding one is `invalid_request`):
+
+| Constant | Value |
+| --- | --- |
+| `MAX_REQUEST_LINE_BYTES` | 1 MiB |
+| `MAX_JOB_BYTES` | 256 KiB |
+| `MAX_STEER_BYTES` | 16 KiB |
+| `MAX_ANSWER_BYTES` (note, guidance text) | 16 KiB |
+| `MAX_FIELD_BYTES` (worker, model, cmd, repo, ...) | 4 KiB |
+| `run.events` `limit` | default 500, max 5,000 (larger is clamped, 0 is an error) |
+| `run.list` `limit` | default 50, max 500 (larger is clamped, 0 is an error) |
+
+Framing: one message is exactly one line terminated by a newline; JSON string escaping guarantees
+a payload containing newlines stays on one line.
 
 HTTP mirror (used by the web UI and any remote client):
 
@@ -885,6 +953,12 @@ network access**.
   the cycle.
 - The daemon holds at most one `WorkerRecord::output` ring per run; ended runs drop their logs to
   disk and keep only summaries in memory. Default in-memory budget: 50 MB, configurable.
+
+- **Known limit, event replay from disk.** When a subscriber's `from_seq` is older than the
+  in-memory ring, `RunStore::events` returns the whole remaining log as one `Vec`. Memory per such
+  subscriber is proportional to the remainder of the run's log, and N simultaneous deep resumes
+  cost N copies. The read is off the hub lock, so a run is never delayed by it. Bounding this
+  needs a paged `RunStore::events`; deferred.
 
 ## 16. Extension points (deliberately small)
 

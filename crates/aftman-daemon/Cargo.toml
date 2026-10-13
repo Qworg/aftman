@@ -12,6 +12,7 @@ aftman-store.workspace = true
 aftman-workers.workspace = true
 
 async-trait.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 time.workspace = true

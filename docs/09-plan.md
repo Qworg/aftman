@@ -13,15 +13,16 @@ agent appear. Every milestone ends with the full offline suite green.
 | M0 — skeleton, core types, offline run | **complete** | `aaf9cc9` |
 | M1 — real Jev | **complete** | `b826530` |
 | M2 — responsibilities, policy, a real worker | **complete** | `d3730f5`, `6d4b2a9`, `450b1a6` |
-| M3 — daemon, protocol, CLI, TUI | not started | — |
+| M3 — daemon, protocol, CLI, TUI | **complete** | `cdb5b0c`, `eab59ac`, `d673a67`, `76810fe`, `160ebdc`, `d74327f`, `1169b5c` |
 | M4 — web UI | not started | — |
 | M5 — ensemble S1 and S2 | not started | — |
 | M6 — herdr | not started | — |
 | M7 — ensemble S3 and S4 | not started | — |
 | M8 — backend hardening and verifier missions | not started | — |
 
-As of the M2 commits: **394 tests passing**, `cargo clippy --all-targets --all-features -- -D
+As of the M3 commits: **920 tests passing**, `cargo clippy --all-targets --all-features -- -D
 warnings` clean, `cargo fmt --check` clean, and the whole suite green with an empty environment.
+(394 as of M2.)
 
 ### Where the record lives
 
@@ -38,11 +39,17 @@ git log --oneline          # the milestone commits, in order
 git show <sha>             # the reasoning behind one of them
 ```
 
-Two milestone findings changed `docs/` as well as code, and are noted in place:
+Milestone findings that changed `docs/` as well as code are noted in place:
 
 - the watcher must drain worker completion independently of the trigger that woke it
   ([02-lld.md §7.1](02-lld.md));
-- `Condition` must not derive `serde` ([02-lld.md](02-lld.md), and the type's own documentation).
+- `Condition` must not derive `serde` ([02-lld.md](02-lld.md), and the type's own documentation);
+- every writer of a run's events appends to the store before it emits, in `seq` order — the
+  precondition the hub's gap-free resume rests on ([02-lld.md §11](02-lld.md));
+- hard rule 3 covers the supervisor's own subprocesses, `git` included; every spawn site is listed
+  with the environment it gets ([08-security.md §2.2](08-security.md)), and the supervisor's
+  `git` is hardened against repository-controlled configuration
+  ([08-security.md §3.2](08-security.md)).
 
 ## M0 — Skeleton, core types, offline run
 
@@ -208,13 +215,108 @@ no credentials (`AGENTS.md` hard rule 4).
 
 ## M3 — Daemon, protocol, CLI, TUI
 
+**Status: complete.** What landed, in the order it was built:
+
+- **Event hub and wire protocol** (`aftman-daemon::hub`, `::protocol`). One fan-out shared by
+  the socket server and, in M4, SSE. Resume is gap-free by construction: a subscriber is
+  registered and the replay ring snapshotted in one critical section, the on-disk log is read
+  only afterwards, and the overlap is dropped by `seq`. That depends on the runtime appending to
+  the store before it emits, which is now a stated precondition of every writer.
+- **Run control plane** (`aftman-daemon::control`, `FactoryRuntime::start` / `drive`). Cancel,
+  human steer and escalation answers on a live run. `NeedsHuman` is a quiet wait when a human
+  channel is attached and ends the run when one is not.
+- **The daemon** (`manager`, `server`, `lifecycle`). `RunManager` has one method per protocol
+  method and no socket knowledge; building a run is injected through `RuntimeFactory`, so the
+  daemon crate still cannot name the provider. Restart recovery marks an undriven, unfinished
+  run `Failed` with reason `daemon restarted`.
+- **The CLI as a client** (`aftman-cli` is now a library with a thin `main`), with one factory
+  shared by the daemon and `--no-daemon` so the two cannot drift.
+- **The TUI** (`aftman watch`): a pure fold over the event stream, a pure view, pure input
+  handling, and a driver generic over the backend, so all of it is tested without a terminal.
+
+Exit criteria, each checked by driving the real binary as well as by the offline suite: two
+clients observe the same run; a killed client resumes with no gap and no duplicate; a stalled
+subscriber is dropped without stalling the run; `aftman run --no-daemon` works for every outcome
+including an escalation; and after `kill -9` of the daemon the run is `Failed` exactly once with
+its orphaned worker ended. The first pass of that check found `--no-daemon` hanging on an
+escalation and the first command after a daemon crash failing; both were fixed and re-checked.
+
+How it was built: each stage was implemented, then reviewed adversarially by a separate reviewer
+that was given the code and the contract but not the implementer's reasoning, then fixed; the
+integrated milestone was reviewed once more against these criteria, and the fixes from that review
+were themselves verified. Not everything those reviews listed was reached. Known unverified
+ground: recovery with many orphans at once, very large untracked trees, a state directory on
+read-only or network storage, panics inside TUI tasks, and any terminal emulator other than tmux.
+
+Scope decisions, stated rather than assumed:
+
+- **No double fork.** `fork` is `unsafe` and `unsafe` is forbidden workspace-wide. The CLI spawns
+  `serve --detached`, and the child calls `setsid()` and `chdir("/")` before any thread exists.
+  The outcome the plan wanted — closing the terminal does not kill a running job — holds.
+- **Resume after a daemon restart is not implemented.** The plan allowed "resumed or `Failed`";
+  M3 does `Failed`. Resuming needs the worker's process to be adoptable, which is M6 territory.
+- **A human `Stop` ends the run as `Cancelled`, not `Stopped`.** `Stopped` is non-terminal and
+  `core.completion:retry-stopped` would restart work a person had just stopped.
+- **The daemon keeps the environment it was started with, and workers inherit it.** Forwarding a
+  client's environment per run is a protocol and security decision, not a default to slip in.
+  It is documented in [07-surfaces.md §1](07-surfaces.md) and [08-security.md](08-security.md),
+  and `status` and `doctor` show the daemon's view beside the caller's. **Open for a decision.**
+- **One daemon per state directory**, and a per-run ownership claim (`runs/<id>/run.lock`) held
+  by whichever process drives the run. Without the claim, a daemon auto-started by `aftman ls`
+  would mark a live `aftman run --no-daemon` in another terminal as `Failed`.
+- **An orphaned worker is signalled only when it can be positively identified** (pid, start time,
+  process group and boot id all match the record). Otherwise recovery says `unverified` and does
+  not signal. The non-Linux identity path uses `ps` and is not exercised by any test.
+
+Findings that changed code written in earlier milestones, because the daemon made them reachable
+or the reviews tripped over them:
+
+- **Hard rule 3 was violated by the supervisor's own `git`** (M0 code). The observation ran
+  `git status` / `git diff` with the daemon's environment, so a worker that set `core.fsmonitor`
+  in `.git/config` had its script run with the provider key. Supervisor git is now scrubbed, so
+  no git child sees a supervisor secret, and hardened against code-executing configuration in
+  every config scope ([08-security.md §3.2](08-security.md)). The first version of the hardening
+  scanned only repository-local config and was bypassed through worktree-scoped config; a
+  verification pass over the fix caught that before the milestone closed.
+- **Observation assembly blocked the run loop** with no timeout, though the LLD said it ran in
+  `spawn_blocking` under 8 s. It now does what the document says.
+- **`WorkerOutput` was specified in the LLD and never emitted.** It is now, once per cycle.
+- **Policy's overall-timeout invariant never fired**: it read `counters.elapsed_secs`, which
+  nothing set.
+- **`FileRunStore::append` glued a new event onto a torn final line**, losing the event and
+  corrupting the log mid-file.
+- **The loopback check in `aftman-jev` took URL userinfo for the host**, so
+  `http://localhost@evil.example` was allowed as a cleartext base URL.
+
+Left open, deliberately visible:
+
+- The model-facing observation still sends empty `output_head` / `output_tail` for the active
+  worker (`aftman-core::observation`, since M2). Filling them changes what is sent to a billable
+  model and the byte-exact snapshot tests, so it was not folded into this milestone.
+  **Open for a decision.**
+- The supervisor's `git` cannot be fully isolated from a worker that edits `.git/` *while an
+  observation is running*: git has no switch that disables clean, smudge or process filters.
+  Configuration present when the observation starts is neutralised; configuration that appears
+  during it is detected, and that cycle's git evidence is discarded with a note. A stronger design
+  — running the read-only commands against a supervisor-owned `GIT_DIR` so repository config is
+  never read — is described in [08-security.md §3.2](08-security.md) with what it would break.
+  **Open for a decision**; it fits M8's hardening work.
+- Recovery binds the socket only after orphans are reaped, so the first command after a daemon
+  crash waits about one termination grace and says why.
+- An all-runs subscriber gets no marker when a run is abandoned; a run-scoped one does.
+- The TUI does not show the diff ([07-surfaces.md §8](07-surfaces.md) says so); that arrives
+  with the web UI's diff view in M4.
+
+**920 tests**, `cargo clippy --all-targets --all-features -- -D warnings` clean, `cargo fmt
+--check` clean, and the suite green with an empty environment.
+
 *Deliverable:* `aftman serve` + `aftman watch` with a second client attaching mid-run without
 losing events.
 
 | Work | Crate |
 | --- | --- |
 | `ProtocolServer`: NDJSON framing, request/response, subscriptions, bounded per-client channels | `aftman-daemon` |
-| Unix socket, `0600`, stale-socket handling, pid lock, double-fork, `stop`/`status` | `aftman-daemon` |
+| Unix socket, `0600`, stale-socket handling, pid lock, detach (spawn + `setsid`, not a double fork — see Status), `stop`/`status` | `aftman-daemon`, `aftman-cli` |
 | Auto-start on first client command | `aftman-cli` |
 | Full CLI surface incl. `ls`, `show`, `logs`, `decisions`, `steer`, `cancel`, `answer`, `purge` | `aftman-cli` |
 | TUI: decision timeline, worker tail, assessment panel, steer and answer keybindings | `aftman-cli` |

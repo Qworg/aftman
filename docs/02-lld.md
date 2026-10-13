@@ -931,6 +931,14 @@ connection:** event pushes carry no subscription id, so overlapping subscription
 indistinguishable duplicates. A second `subscription.open` replaces the first
 (`replaced: true`); a client that wants two streams opens two connections.
 
+The exactly-once guarantee rests on one precondition that binds **every writer of a run's
+events** — the runtime, the daemon's failure marking, restart recovery, and the embedded
+`--no-daemon` path alike: an event is appended to the store *before* it is emitted to the hub, and
+a run's events are emitted in `seq` order with none skipped. A subscriber is registered for live
+delivery before its backlog is read, so anything it does not find in the log arrives live, and the
+overlap is dropped by `seq`. A writer that emitted before appending, or appended an event it never
+emitted, would produce a gap no client could detect from the stream alone.
+
 **Backpressure.** Each subscriber has a bounded queue (`HubConfig::subscriber_capacity`, default
 1,024). `emit` never blocks. If the queue is full the subscriber is removed, it still receives
 what was already queued, and then gets the `subscriber_lagged` push. For a single-run subscription

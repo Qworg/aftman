@@ -20,6 +20,7 @@
 // deeply nested generic requirement. The default limit is too low for that combination.
 #![recursion_limit = "512"]
 
+pub mod activity;
 pub mod ansi;
 pub mod assessment;
 pub mod clock;
@@ -41,6 +42,7 @@ pub mod testing;
 pub mod timefmt;
 pub mod worker;
 
+pub use activity::{StreamActivity, StreamUsage, ToolCall};
 pub use ansi::strip_control;
 pub use assessment::{
     AnswerValue, Assessment, Band, CheckSuppression, Opinion, Resolution, ResolvedCheck, Rung,

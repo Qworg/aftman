@@ -35,6 +35,7 @@ use aftman_core::worker::{
 };
 
 use crate::backends::{BackendOptions, SteerProtocol, build, supports_steering};
+use crate::output::StreamDecoder;
 
 /// How long to wait between `SIGINT` and `SIGKILL`.
 pub const DEFAULT_TERMINATE_GRACE: Duration = Duration::from_secs(5);
@@ -358,7 +359,14 @@ async fn pump(
     stream: Stream,
     output: std::sync::Arc<Mutex<aftman_core::log::BoundedLog>>,
     sink: WorkerEventSink,
+    kind: WorkerKind,
 ) {
+    // Only stdout carries the backend's structured stream. Stderr is the CLI's own
+    // diagnostics in whatever shape the CLI felt like emitting, so it passes through.
+    let mut decoder = match stream {
+        Stream::Stdout => Some(StreamDecoder::new(kind)),
+        Stream::Stderr => None,
+    };
     let mut buffer = vec![0u8; READ_CHUNK];
     loop {
         match reader.read(&mut buffer).await {
@@ -371,7 +379,17 @@ async fn pump(
                     let mut log = output
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    log.push(stream, &text);
+                    match &mut decoder {
+                        // A structured stream becomes the agent's own words and the tools
+                        // it ran, which is what a model judging it and a human watching it
+                        // both need. The JSON does not reach the log, so a bounded output
+                        // tail spends its bytes on prose rather than on envelope keys.
+                        Some(decoder) => decoder.push(&text, &mut |line| {
+                            log.push(Stream::Stdout, line);
+                            log.push(Stream::Stdout, "\n");
+                        }),
+                        None => log.push(stream, &text),
+                    }
                 }
                 // Signal after the bytes are visible, so a woken watcher always sees
                 // the output that woke it.
@@ -382,6 +400,16 @@ async fn pump(
                 break;
             }
         }
+    }
+    // A backend that exits mid-line still said something.
+    if let Some(mut decoder) = decoder {
+        let mut log = output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        decoder.finish(&mut |line| {
+            log.push(Stream::Stdout, line);
+            log.push(Stream::Stdout, "\n");
+        });
     }
 }
 
@@ -429,6 +457,7 @@ impl Worker for SubprocessWorker {
                 Stream::Stdout,
                 std::sync::Arc::clone(&ctx.output),
                 sink.clone(),
+                self.kind,
             ))
         });
         let stderr_task = child.stderr.take().map(|pipe| {
@@ -437,6 +466,7 @@ impl Worker for SubprocessWorker {
                 Stream::Stderr,
                 std::sync::Arc::clone(&ctx.output),
                 sink.clone(),
+                self.kind,
             ))
         });
 
@@ -620,6 +650,46 @@ mod tests {
         assert_eq!(outcome, WorkerOutcome::Completed);
         assert!(text.contains("hello"), "{text}");
         assert!(text.contains("oops"), "stderr must be captured too: {text}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_structured_backend_reaches_the_log_as_prose_not_json() -> TestResult {
+        // The recorded `pi --mode json` stream, played back through the real pipe path.
+        // This is what makes the decoder live: a model judging this worker, and a human
+        // watching it, must see the agent's words and the tools it ran, not envelope keys.
+        // The fixture is `cat`ed rather than embedded because it contains a single quote.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pi/one-shot.jsonl");
+        let worker = SubprocessWorker::new(
+            WorkerKind::Pi,
+            spec(&format!("cat '{}'", fixture.display())),
+        );
+        let (outcome, text) = drive(&worker, ctx(fresh_log(), Duration::from_secs(10))).await?;
+        assert_eq!(outcome, WorkerOutcome::Completed);
+        assert!(
+            text.contains("▸ read"),
+            "the tool call should be named in the log: {text}"
+        );
+        assert!(
+            text.contains("done"),
+            "the agent's words should be in the log: {text}"
+        );
+        assert!(
+            !text.contains("\"type\":"),
+            "no raw JSON envelope should reach the log: {text}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unstructured_backend_keeps_its_output_verbatim() -> TestResult {
+        // The other half of the switch. A `Generic` worker's own output is already the
+        // readable form, so decoding it would corrupt the only copy of it.
+        let worker =
+            SubprocessWorker::new(WorkerKind::Generic, spec("printf 'hello {\"a\":1}\\n'"));
+        let (_, text) = drive(&worker, ctx(fresh_log(), Duration::from_secs(10))).await?;
+        assert!(text.contains("hello {\"a\":1}"), "{text}");
         Ok(())
     }
 

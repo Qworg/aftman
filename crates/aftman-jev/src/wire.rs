@@ -94,12 +94,11 @@ pub struct ModelWire {
 #[must_use]
 pub fn json_content(text: &str) -> Value {
     let trimmed = text.trim_start();
-    if trimmed.starts_with('{') || trimmed.starts_with('[') {
-        if let Ok(parsed) = serde_json::from_str::<Value>(trimmed) {
-            if parsed.is_object() || parsed.is_array() {
-                return parsed;
-            }
-        }
+    if (trimmed.starts_with('{') || trimmed.starts_with('['))
+        && let Ok(parsed) = serde_json::from_str::<Value>(trimmed)
+        && (parsed.is_object() || parsed.is_array())
+    {
+        return parsed;
     }
     Value::String(text.to_owned())
 }

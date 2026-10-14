@@ -781,13 +781,13 @@ impl FactoryRuntime {
             // `worker_finished` would never become true again, so the run would
             // spin on the idle ticker forever making no progress.
             let mut just_finished = false;
-            if let Some(handle) = ls.worker.as_mut() {
-                if let Some(outcome) = handle.outcome.take() {
-                    self.finish_worker(state, handle.id, &outcome, handle)
-                        .await?;
-                    state.counters.failures += u32::from(!outcome.is_success());
-                    just_finished = true;
-                }
+            if let Some(handle) = ls.worker.as_mut()
+                && let Some(outcome) = handle.outcome.take()
+            {
+                self.finish_worker(state, handle.id, &outcome, handle)
+                    .await?;
+                state.counters.failures += u32::from(!outcome.is_success());
+                just_finished = true;
             }
             if just_finished {
                 ls.worker = None;
@@ -1228,15 +1228,16 @@ impl FactoryRuntime {
         ls: &mut Loop,
         control: &mut Option<ControlReceiver>,
     ) -> Result<(), RuntimeError> {
-        if ls.worker.as_ref().is_some_and(|w| w.outcome.is_some()) {
-            if let Some(mut handle) = ls.worker.take() {
-                if let Some(outcome) = handle.outcome.take() {
-                    self.finish_worker(state, handle.id, &outcome, &handle)
-                        .await?;
-                    state.counters.failures += u32::from(!outcome.is_success());
-                    ls.completed_while_waiting = true;
-                    self.snapshot(state).await?;
-                }
+        // Named rather than inlined into the chain below: as a chain clause the borrow of
+        // `ls.worker` would be extended over the body, and the `take()` would not borrow-check.
+        let finished = ls.worker.as_ref().is_some_and(|w| w.outcome.is_some());
+        if finished && let Some(mut handle) = ls.worker.take() {
+            if let Some(outcome) = handle.outcome.take() {
+                self.finish_worker(state, handle.id, &outcome, &handle)
+                    .await?;
+                state.counters.failures += u32::from(!outcome.is_success());
+                ls.completed_while_waiting = true;
+                self.snapshot(state).await?;
             }
             return Ok(());
         }

@@ -466,12 +466,12 @@ fn start(
 ) {
     // The keys refuse a second steer or answer before their prompt closes; this is the
     // backstop. A cancel is always issued, whatever else is in flight.
-    if let Some(busy) = &ui.busy {
-        if !matches!(action, Action::Cancel) {
-            let text = format!("still busy ({busy}); try again when it finishes");
-            ui.set_message(Tone::Info, &text);
-            return;
-        }
+    if let Some(busy) = &ui.busy
+        && !matches!(action, Action::Cancel)
+    {
+        let text = format!("still busy ({busy}); try again when it finishes");
+        ui.set_message(Tone::Info, &text);
+        return;
     }
     ui.busy = Some(busy_label(&action).to_owned());
     actions.spawn(perform(

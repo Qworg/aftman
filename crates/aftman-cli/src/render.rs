@@ -35,12 +35,11 @@ pub fn event_lines(event: &EventEnvelope) -> Vec<String> {
         event.seq.get(),
         event.summary()
     )];
-    if event.kind == EventKind::DirectiveSelected {
-        if let Some(reason) = event.payload.get("reason").and_then(Value::as_str) {
-            if !reason.is_empty() {
-                lines.push(format!("        reason: {reason}"));
-            }
-        }
+    if event.kind == EventKind::DirectiveSelected
+        && let Some(reason) = event.payload.get("reason").and_then(Value::as_str)
+        && !reason.is_empty()
+    {
+        lines.push(format!("        reason: {reason}"));
     }
     lines
 }
@@ -376,18 +375,18 @@ pub fn show_lines(
         ),
         format!("job         {}", truncate(&state.header.job.prompt, 200)),
     ];
-    if let Some(created) = events.iter().find(|e| e.kind == EventKind::RunCreated) {
-        if let Some(launch) = created.payload.get("launch").and_then(Value::as_object) {
-            let get = |key: &str| launch.get(key).and_then(Value::as_str).unwrap_or("?");
-            lines.push(format!(
-                "posture     permissions {}, external sandbox {}, steering {}",
-                get("permissions"),
-                get("external_sandbox"),
-                get("steering")
-            ));
-            if get("permissions") == "auto-approve" {
-                lines.push(format!("            {}", auto_approve_warning()));
-            }
+    if let Some(created) = events.iter().find(|e| e.kind == EventKind::RunCreated)
+        && let Some(launch) = created.payload.get("launch").and_then(Value::as_object)
+    {
+        let get = |key: &str| launch.get(key).and_then(Value::as_str).unwrap_or("?");
+        lines.push(format!(
+            "posture     permissions {}, external sandbox {}, steering {}",
+            get("permissions"),
+            get("external_sandbox"),
+            get("steering")
+        ));
+        if get("permissions") == "auto-approve" {
+            lines.push(format!("            {}", auto_approve_warning()));
         }
     }
     if let Some(directive) = &state.last_directive {

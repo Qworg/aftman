@@ -152,10 +152,10 @@ pub async fn end_orphan(identity: &ProcessIdentity, grace: Duration) -> OrphanOu
         return OrphanOutcome::Unverified(format!("{pgid} is not a worker process group"));
     }
     // A different boot: everything from the recorded one is gone.
-    if let (Some(recorded), Some(now)) = (&identity.boot_id, current_boot_id()) {
-        if *recorded != now {
-            return OrphanOutcome::AlreadyGone;
-        }
+    if let (Some(recorded), Some(now)) = (&identity.boot_id, current_boot_id())
+        && *recorded != now
+    {
+        return OrphanOutcome::AlreadyGone;
     }
     let Some(recorded_token) = identity.start_token.clone() else {
         return if group_exists(pgid) {

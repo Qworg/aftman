@@ -249,10 +249,10 @@ impl StreamDecoder {
                     _ => {
                         // `ACTIVE` carries a delta; `DONE` repeats the whole text, so
                         // only the delta is appended or the assistant would be doubled.
-                        if state == "ACTIVE" {
-                            if let Some(delta) = step.get("text_delta").and_then(Value::as_str) {
-                                self.append_assistant(delta, emit);
-                            }
+                        if state == "ACTIVE"
+                            && let Some(delta) = step.get("text_delta").and_then(Value::as_str)
+                        {
+                            self.append_assistant(delta, emit);
                         }
                     }
                 }
@@ -339,10 +339,8 @@ impl StreamDecoder {
                         .get("is_error")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
-                    if failed {
-                        if let Some(call) = self.activity.tool_calls.last_mut() {
-                            call.failed = true;
-                        }
+                    if failed && let Some(call) = self.activity.tool_calls.last_mut() {
+                        call.failed = true;
                     }
                     emit(if failed {
                         "✗ tool result"
@@ -370,10 +368,10 @@ impl StreamDecoder {
                         cost_usd: event.get("total_cost_usd").and_then(Value::as_f64),
                     });
                 }
-                if let Some(result) = event.get("result").and_then(Value::as_str) {
-                    if self.activity.assistant_text.trim().is_empty() {
-                        self.append_assistant(result, emit);
-                    }
+                if let Some(result) = event.get("result").and_then(Value::as_str)
+                    && self.activity.assistant_text.trim().is_empty()
+                {
+                    self.append_assistant(result, emit);
                 }
             }
             // `system` and `rate_limit_event` are harness bookkeeping, not agent activity.

@@ -59,8 +59,13 @@ pi --print --mode json --no-session -- <mission>
 - `--mode json` writes **JSONL session events** on stdout (session header, `agent_start`,
   `message_update`, `tool_execution_*`, `turn_end`, `agent_end`, `agent_settled`).
 - This is structured *progress*, not a constrained model output. Aftman parses it for tool
-  activity, token usage, and the final assistant text; it does **not** treat any field as trusted
-  evidence. See §7.
+  activity, token usage, and the final assistant text
+  (`aftman_workers::output::StreamDecoder`), and the log gets the agent's words and tool names
+  rather than the envelopes; it does **not** treat any field as trusted evidence. See §7.
+- The three structured backends agree on almost nothing. `pi` and `claude` envelope events under
+  `type`; **`agy` uses `event`**. A decoder that assumed one key produces an empty activity
+  summary for the other and reports a busy worker as quiet — a failure that looks like good news,
+  which is why it is checked against recorded output rather than `--help` (§12 item 6).
 - `--mode json` reserves stdout for protocol records, so anything not JSON on stdout is a
   diagnostic and is logged, not parsed.
 
@@ -191,9 +196,14 @@ rather than blocking. See §8.1 for the full posture mapping.
 - No mid-turn input channel: `supports_steering = false`. A `Steer` degrades to
   stop-then-resume-with-guidance only if `--resume-on-retry` is enabled; otherwise stop/retry.
 
-The exact stdout schema of `stream-json` is **not yet fixture-verified**. The parser must be built
-against recorded real output (see §12 item 6) before this backend is considered supported, and until then
-`aftman doctor --worker claude --probe` is required to enable it.
+The stdout schema of `stream-json` is verified against a recording
+(`crates/aftman-workers/tests/fixtures/claude/print.jsonl`, claude 2.1.293): `system`,
+`assistant`, `user`, `result`, with content blocks. `system` and `rate_limit_event` are harness
+bookkeeping rather than agent activity and are deliberately not rendered, so a log does not read as
+though the agent did something when the CLI was merely signing in. Claude reports
+cumulative-input usage per turn rather than a run total, so the last turn's counts are kept and not
+summed. There is no recorded fixture for a *failed* claude run, so that path is still only gated by
+`aftman doctor --worker claude --probe`.
 
 ## 6. The verifier is a worker
 
@@ -416,6 +426,9 @@ interrupt → wait terminate_grace (5s) → kill process group
    Hand-written fixtures for a third-party CLI format are how parsers rot. (Doc 09 M8 sequences
    this work; the red line here is that a backend without a recorded fixture stays gated behind
    `aftman doctor --probe`.)
+   *Recorded so far:* `pi/one-shot.jsonl` (with a tool call, and the `message_update` text-delta
+   shape that a hand-written input had got wrong), `agy/print.jsonl`, `claude/print.jsonl`. A
+   **failed** run per backend, and a `pi --mode rpc` session, are still unrecorded.
 7. Add the backend row to the matrix in §1 with the version you verified against.
 
 ## 13. What is deliberately not supported

@@ -328,6 +328,11 @@ Recorded in `handoff.md` at the end of the M3 session. Each is a separate behavi
      required evidence genuinely cannot fit.
    - **The digest now includes output**, which is a change to the M0 skip. Recorded in
      02-lld §7.1 with why it does not weaken the silent-worker property.
+   - **The tail is prose, not JSON.** `SubprocessWorker` now routes stdout through
+     `StreamDecoder` for the three structured backends, so the bounded tail spends its bytes on the
+     agent's words and tool names instead of envelope keys. Unstructured backends pass through
+     untouched. Covered by two tests that drive a real pipe: one plays the recorded `pi` stream back
+     through `cat`, the other checks a `Generic` worker's output is not altered.
    - **Cost, measured:** a request with the default excerpts (4 000-byte head, 12 000-byte tail)
      serialises to 16 241 bytes against 241 without — the caps, as expected. No live run was made;
      that is the only way to get a token number and it is billable.
@@ -452,6 +457,7 @@ work that turns "the command line launches" into "the output is understood":
 | Work | Crate |
 | --- | --- |
 | Record real CLI output for each backend into `tests/fixtures/`; parse the recording, not a guess | `aftman-workers` |
+| ~~First recordings: `pi/one-shot`, `agy/print`, `claude/print`~~ — **done**, with the decoder wired into the stdout pipe; a *failed* run per backend and a `pi --mode rpc` session remain | `aftman-workers` |
 | `agy` hardening: `--print-timeout`, stream-json event coverage | `aftman-workers` |
 | `claude` hardening: stream-json schema, `--json-schema` verifier output, `--resume` continuity | `aftman-workers` |
 | Verifier mission for all three, using `--json-schema` → `EvidenceResult` | `aftman-workers` |

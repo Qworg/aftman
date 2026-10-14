@@ -337,6 +337,10 @@ impl CliFactory {
             uncertainty_margin: aftman_daemon::default_margin(),
             steering_grace: std::time::Duration::from_secs(30),
             launch,
+            // The client's allowlisted environment, already validated for supervisor
+            // names by the protocol layer. Values go to the subprocess; the runtime
+            // records only the names.
+            forwarded_env: params.env.clone(),
         });
         Ok(Prepared {
             built: BuiltRun {

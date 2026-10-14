@@ -12,6 +12,7 @@
 //! subscription per connection**: a second `subscription.open` replaces the
 //! first. A client that wants two streams opens two connections.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use aftman_core::assessment::HumanDecision;
@@ -46,6 +47,14 @@ pub const MAX_EVENTS_LIMIT: usize = 5_000;
 pub const DEFAULT_RUN_LIST_LIMIT: usize = 50;
 /// `run.list` largest page; larger requests are clamped.
 pub const MAX_RUN_LIST_LIMIT: usize = 500;
+/// Most environment entries a client may forward in one `run.start`.
+pub const MAX_ENV_ENTRIES: usize = 64;
+/// Longest forwarded environment variable name.
+pub const MAX_ENV_NAME_BYTES: usize = 256;
+/// Longest forwarded environment variable value.
+pub const MAX_ENV_VALUE_BYTES: usize = 8 * 1024;
+/// Total forwarded bytes, names and values together.
+pub const MAX_ENV_TOTAL_BYTES: usize = 32 * 1024;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -228,7 +237,7 @@ pub struct DaemonStatusResult {
     /// Free-form facts supplied by the composition root. Bounded: at most 32 entries,
     /// keys of at most 64 bytes, values of at most 256.
     #[serde(default)]
-    pub info: std::collections::BTreeMap<String, String>,
+    pub info: BTreeMap<String, String>,
 }
 
 /// Everything `aftman run` can express. Only `repo` and `job` are required.
@@ -257,6 +266,18 @@ pub struct RunStartParams {
     pub ensemble: bool,
     #[serde(default)]
     pub simulate_model: bool,
+    /// Environment variables the client forwards to this run's worker.
+    ///
+    /// The daemon is started by the first client that needs it and keeps *that* shell's
+    /// environment for life, so without this a run from a second shell would use the
+    /// first shell's `PATH`, virtualenv, and anything else exported there. Forwarding is
+    /// an explicit allowlist chosen by the client, never the client's whole environment.
+    ///
+    /// Names only are recorded on the run; values are never persisted. A name that
+    /// belongs to the supervisor is rejected here and again where the worker environment
+    /// is built.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
 }
 
 impl RunStartParams {
@@ -275,6 +296,7 @@ impl RunStartParams {
             verify: None,
             ensemble: false,
             simulate_model: false,
+            env: BTreeMap::new(),
         }
     }
 }
@@ -587,6 +609,53 @@ fn check_opt(field: &str, text: Option<&String>) -> Result<(), ProtocolError> {
     text.map_or(Ok(()), |t| check_len(field, t, MAX_FIELD_BYTES))
 }
 
+/// Whether a name is a well-formed environment variable name.
+fn is_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Validate the environment a client asks to forward (hard rule 5: named bounds).
+///
+/// The supervisor-secret check is the important one, and it is asked of the module that
+/// owns the rule rather than restating the prefixes here: hard rule 2 keeps
+/// `TYPESAFE_*` out of every crate but `aftman-jev`, and duplicating the list is how a
+/// second copy drifts from the first.
+fn check_forwarded_env(env: &BTreeMap<String, String>) -> Result<(), ProtocolError> {
+    if env.len() > MAX_ENV_ENTRIES {
+        return Err(ProtocolError::invalid(format!(
+            "env forwards {} entries, over the limit of {MAX_ENV_ENTRIES}",
+            env.len()
+        )));
+    }
+    let mut total = 0usize;
+    for (name, value) in env {
+        if !is_env_name(name) {
+            return Err(ProtocolError::invalid(format!(
+                "env name {name:?} is not a valid environment variable name"
+            )));
+        }
+        check_len("env name", name, MAX_ENV_NAME_BYTES)?;
+        check_len("env value", value, MAX_ENV_VALUE_BYTES)?;
+        if aftman_workers::is_supervisor_secret(name) {
+            return Err(ProtocolError::invalid(format!(
+                "env name {name:?} belongs to the supervisor and may not be forwarded"
+            )));
+        }
+        total = total.saturating_add(name.len()).saturating_add(value.len());
+    }
+    if total > MAX_ENV_TOTAL_BYTES {
+        return Err(ProtocolError::invalid(format!(
+            "env forwards {total} bytes, over the limit of {MAX_ENV_TOTAL_BYTES}"
+        )));
+    }
+    Ok(())
+}
+
 /// Resolve a page size: absent gives `default`, zero is an error, larger than
 /// `max` is clamped.
 pub fn effective_limit(
@@ -674,6 +743,7 @@ impl Request {
                 check_opt("effort", p.effort.as_ref())?;
                 check_opt("model", p.model.as_ref())?;
                 check_opt("verify", p.verify.as_ref())?;
+                check_forwarded_env(&p.env)?;
             }
             Self::RunList(p) => {
                 effective_limit(p.limit, DEFAULT_RUN_LIST_LIMIT, MAX_RUN_LIST_LIMIT)?;
@@ -1427,5 +1497,192 @@ mod tests {
         assert!(wire.params.get("surface").is_none());
         let with = answer(Some("tui")).to_wire(1).expect("wire");
         assert_eq!(with.params["surface"], "tui");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Forwarded environment (M3 follow-up: the daemon keeps the starting shell's
+// environment, so a run has to bring its own).
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod forwarded_env_tests {
+    use super::{
+        ErrorCode, MAX_ENV_ENTRIES, MAX_ENV_TOTAL_BYTES, MAX_ENV_VALUE_BYTES, Request,
+        RunStartParams, decode_request,
+    };
+
+    /// Validate, and report the error code rather than the error, so a test can assert on
+    /// the code without needing `ProtocolError: std::error::Error`.
+    fn validate(params: RunStartParams) -> Result<(), ErrorCode> {
+        Request::RunStart(params)
+            .validate()
+            .map_err(|error| error.code)
+    }
+
+    fn params() -> RunStartParams {
+        RunStartParams::new("/repo", "do the thing")
+    }
+
+    /// Decode a `run.start` line, returning its params.
+    fn decode(line: &str) -> Result<RunStartParams, String> {
+        match decode_request(line) {
+            Ok(envelope) => match envelope.request {
+                Request::RunStart(p) => Ok(p),
+                other => Err(format!("expected run.start, got {other:?}")),
+            },
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    #[test]
+    fn an_ordinary_forwarded_variable_is_accepted() {
+        let mut p = params();
+        p.env.insert("VIRTUAL_ENV".to_owned(), "/venv".to_owned());
+        assert_eq!(validate(p), Ok(()));
+    }
+
+    #[test]
+    fn an_empty_map_is_accepted() {
+        assert_eq!(validate(params()), Ok(()));
+    }
+
+    #[test]
+    fn a_client_that_does_not_send_the_field_still_works() -> Result<(), String> {
+        // An older client predates this field, so it must decode as empty rather than
+        // fail the whole request.
+        let p = decode(r#"{"id":1,"method":"run.start","params":{"repo":"/repo","job":"j"}}"#)?;
+        assert!(p.env.is_empty());
+        assert_eq!(p.job, "j");
+        Ok(())
+    }
+
+    #[test]
+    fn a_forwarded_map_survives_the_wire() -> Result<(), String> {
+        let p = decode(
+            r#"{"id":1,"method":"run.start","params":{"repo":"/repo","job":"j","env":{"PATH":"/bin","VIRTUAL_ENV":"/venv"}}}"#,
+        )?;
+        assert_eq!(p.env.get("PATH").map(String::as_str), Some("/bin"));
+        assert_eq!(p.env.get("VIRTUAL_ENV").map(String::as_str), Some("/venv"));
+        assert_eq!(validate(p), Ok(()));
+        Ok(())
+    }
+
+    #[test]
+    fn a_supervisor_name_may_not_be_forwarded() {
+        // The point of the field: a client cannot ask for the supervisor's own namespace
+        // to be handed to a worker, which would put the billable key within the agent's
+        // reach. `AFTMAN_*` is the supervisor's namespace, so naming it here is not a
+        // hard-rule-2 concern (that rule covers the provider's variables).
+        for name in ["AFTMAN_WEB_TOKEN", "AFTMAN_JEV_API_KEY"] {
+            let mut p = params();
+            p.env.insert(name.to_owned(), "value".to_owned());
+            assert_eq!(
+                validate(p),
+                Err(ErrorCode::InvalidRequest),
+                "{name} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_refusal_does_not_echo_the_value() -> Result<(), String> {
+        // An error message is one of the places a value must never appear.
+        let mut p = params();
+        p.env
+            .insert("AFTMAN_WEB_TOKEN".to_owned(), "hunter2-canary".to_owned());
+        let error = Request::RunStart(p).validate().err().ok_or("must refuse")?;
+        assert!(
+            !error.message.contains("hunter2-canary"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("AFTMAN_WEB_TOKEN"),
+            "{}",
+            error.message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn an_invalid_name_is_refused() {
+        for name in [
+            "1LEADING_DIGIT",
+            "has-dash",
+            "has space",
+            "",
+            "has.dot",
+            "=",
+        ] {
+            let mut p = params();
+            p.env.insert(name.to_owned(), "v".to_owned());
+            assert_eq!(
+                validate(p),
+                Err(ErrorCode::InvalidRequest),
+                "{name:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_valid_name_shape_is_accepted() {
+        for name in ["PATH", "_UNDERSCORE", "A1", "with_underscores_and_digits9"] {
+            let mut p = params();
+            p.env.insert(name.to_owned(), "v".to_owned());
+            assert_eq!(validate(p), Ok(()), "{name:?} should be accepted");
+        }
+    }
+
+    #[test]
+    fn too_many_entries_is_refused() {
+        let mut p = params();
+        for n in 0..=MAX_ENV_ENTRIES {
+            p.env.insert(format!("VAR_{n}"), "v".to_owned());
+        }
+        assert_eq!(validate(p), Err(ErrorCode::InvalidRequest));
+    }
+
+    #[test]
+    fn an_oversize_value_is_refused() {
+        let mut p = params();
+        p.env
+            .insert("BIG".to_owned(), "x".repeat(MAX_ENV_VALUE_BYTES + 1));
+        assert_eq!(validate(p), Err(ErrorCode::InvalidRequest));
+    }
+
+    #[test]
+    fn an_oversize_total_is_refused_even_when_each_value_fits() {
+        // Named bounds: a per-value cap alone would let many 8 KiB values through.
+        let mut p = params();
+        let chunk = "x".repeat(4 * 1024);
+        let mut n = 0usize;
+        while n * chunk.len() <= MAX_ENV_TOTAL_BYTES && n < MAX_ENV_ENTRIES {
+            p.env.insert(format!("VAR_{n}"), chunk.clone());
+            n += 1;
+        }
+        assert!(
+            p.env.len() < MAX_ENV_ENTRIES,
+            "the test must trip the total cap, not the entry cap"
+        );
+        assert_eq!(validate(p), Err(ErrorCode::InvalidRequest));
+    }
+
+    #[test]
+    fn an_unknown_field_inside_params_is_still_refused() {
+        // Adding the field must not have loosened `deny_unknown_fields`.
+        let decoded = decode_request(
+            r#"{"id":1,"method":"run.start","params":{"repo":"/repo","job":"j","env":{},"not_a_field":true}}"#,
+        );
+        assert!(decoded.is_err(), "an unknown param must fail to decode");
+    }
+
+    #[test]
+    fn a_positional_env_is_refused() {
+        // `params` must be an object; an array would otherwise decode positionally.
+        let decoded = decode_request(
+            r#"{"id":1,"method":"run.start","params":{"repo":"/repo","job":"j","env":["PATH=/bin"]}}"#,
+        );
+        assert!(decoded.is_err(), "an array env must fail to decode");
     }
 }

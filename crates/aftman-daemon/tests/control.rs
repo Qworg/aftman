@@ -422,6 +422,8 @@ fn runtime_for(
         uncertainty_margin: 0.15,
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
+
+        forwarded_env: Default::default(),
     }))
 }
 
@@ -1884,6 +1886,8 @@ async fn a_finish_that_lands_after_the_timeout_is_not_failed() -> TestResult {
         uncertainty_margin: 0.15,
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
+
+        forwarded_env: Default::default(),
     });
     let outcome = rt.run(job(&repo)).await?;
     assert_eq!(outcome.status, FactoryStatus::Finished);

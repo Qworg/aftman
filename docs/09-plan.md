@@ -257,10 +257,9 @@ Scope decisions, stated rather than assumed:
   M3 does `Failed`. Resuming needs the worker's process to be adoptable, which is M6 territory.
 - **A human `Stop` ends the run as `Cancelled`, not `Stopped`.** `Stopped` is non-terminal and
   `core.completion:retry-stopped` would restart work a person had just stopped.
-- **The daemon keeps the environment it was started with, and workers inherit it.** Forwarding a
-  client's environment per run is a protocol and security decision, not a default to slip in.
-  It is documented in [07-surfaces.md §1](07-surfaces.md) and [08-security.md](08-security.md),
-  and `status` and `doctor` show the daemon's view beside the caller's. **Open for a decision.**
+- **The daemon keeps the environment it was started with.** Workers used to inherit it, which is
+  why a `GITHUB_TOKEN` exported in the shell that started the daemon reached every later run.
+  **Decided after this milestone: forward an allowlist per run**, and see the follow-ups below.
 - **One daemon per state directory**, and a per-run ownership claim (`runs/<id>/run.lock`) held
   by whichever process drives the run. Without the claim, a daemon auto-started by `aftman ls`
   would mark a live `aftman run --no-daemon` in another terminal as `Failed`.
@@ -293,14 +292,15 @@ Left open, deliberately visible:
 - The model-facing observation still sends empty `output_head` / `output_tail` for the active
   worker (`aftman-core::observation`, since M2). Filling them changes what is sent to a billable
   model and the byte-exact snapshot tests, so it was not folded into this milestone.
-  **Open for a decision.**
+  **Decided: fill them as designed.** Under way — see the follow-ups below.
 - The supervisor's `git` cannot be fully isolated from a worker that edits `.git/` *while an
   observation is running*: git has no switch that disables clean, smudge or process filters.
   Configuration present when the observation starts is neutralised; configuration that appears
   during it is detected, and that cycle's git evidence is discarded with a note. A stronger design
   — running the read-only commands against a supervisor-owned `GIT_DIR` so repository config is
   never read — is described in [08-security.md §3.2](08-security.md) with what it would break.
-  **Open for a decision**; it fits M8's hardening work.
+  **Decided: accept as it stands**, and file the in-process-git investigation as an issue rather
+  than build it now.
 - Recovery binds the socket only after orphans are reaped, so the first command after a daemon
   crash waits about one termination grace and says why.
 - An all-runs subscriber gets no marker when a run is abandoned; a run-scoped one does.
@@ -309,6 +309,34 @@ Left open, deliberately visible:
 
 **920 tests**, `cargo clippy --all-targets --all-features -- -D warnings` clean, `cargo fmt
 --check` clean, and the suite green with an empty environment.
+
+### M3 follow-ups — the three decisions, and what came of them
+
+Recorded in `handoff.md` at the end of the M3 session. Each is a separate behaviour change.
+
+1. **The run can see the worker's output.** *(Decided: fill `output_head` / `output_tail` as the
+   LLD always said. Not yet built.)* The model currently judges "is the worker stuck" without
+   seeing anything the agent printed; only parsed test counts reach it. The change touches what a
+   billable model is sent and the byte-exact snapshot tests, so it is its own commit.
+2. **The daemon contributes only a baseline; the run forwards an allowlist.** *(Built — see the
+   commit.)* `RunStartParams.env` carries the client's chosen names, bounded and validated, with a
+   supervisor name refused at both the protocol layer and the environment layer. Three things
+   changed beyond adding the field:
+   - `worker_environment()` no longer passes the daemon's environment through. It builds from the
+     daemon's **baseline** (`HOME`, `PATH`, `SHELL`, `TERM`, `TMPDIR`, locale, `XDG_*`) plus the
+     run's allowlist. Without this the symptom the task exists to fix — a variable exported in the
+     daemon's shell reaching every later worker — would have survived, because the field is
+     additive and the inheritance was the leak.
+   - `supervisor_environment()` was split out for the supervisor's own `git`, which is not an agent
+     and does need the daemon's environment. One helper serving both policies is how a worker came
+     to inherit the shell.
+   - `SSH_AUTH_SOCK` is in the client's default allowlist rather than the baseline: it is a live
+     signing capability, so the operator grants it rather than the daemon handing it out for
+     having sat in the right shell.
+3. **Supervisor `git` isolation is accepted as it stands.** *(Decided: accept; file the
+   investigation.)* The residual — a worker inserting a filter between the supervisor's config
+   scan and its `git diff` — is detected and the cycle's git evidence discarded with a note. The
+   in-process-git alternative is written up and waiting for a repository to file it against.
 
 *Deliverable:* `aftman serve` + `aftman watch` with a second client attaching mid-run without
 losing events.

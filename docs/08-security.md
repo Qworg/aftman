@@ -55,18 +55,44 @@ AFTMAN_JEV_API_KEY, AFTMAN_WEB_TOKEN, AFTMAN_* (prefix)
 OPENROUTER_API_KEY, ANTHROPIC_API_KEY, OPENAI_API_KEY     # unless explicitly granted
 ```
 
+**What a worker inherits, exactly.** `worker_environment()` does not pass the daemon's
+environment through. It builds a worker's environment from two named sources and nothing else:
+
+| Source | Contents |
+| --- | --- |
+| the daemon's **baseline** (`is_worker_baseline`) | `HOME`, `PATH`, `SHELL`, `USER`, `LOGNAME`, `TERM`, `TMPDIR`/`TMP`/`TEMP`, `TZ`, `LANG`/`LANGUAGE`, every `LC_*`, every `XDG_*` |
+| the run's **forwarded allowlist** | chosen by the client: a small default set plus every `--pass-env KEY` |
+
+Anything else the daemon happens to hold does not cross. That is deliberate and load-bearing:
+an auto-started daemon keeps whichever shell started it for life, so inheriting that environment
+wholesale let a `GITHUB_TOKEN` exported in one shell reach every later run's worker from any other
+shell. `SSH_AUTH_SOCK` is in the client's default allowlist rather than the baseline, because it
+is a live signing capability the operator should grant rather than something the daemon hands out
+for having sat in the right shell. The baseline exists so that a run forwarding nothing (a raw
+socket client today) still gets a usable `HOME` and `PATH`.
+
+The client refuses a forwarded name from the supervisor's namespace, and the daemon refuses it
+again ([02-lld.md section 11](02-lld.md)): the check is a second layer, not the only one. A value
+is never recorded — `RUN_CREATED` carries the forwarded *names* under `launch`, and a test sweeps
+the run's own files for a canary value.
+
 **Every subprocess the supervisor starts, and where its environment comes from.** Hard rule 3
-(`worker_environment()` for anything that spawns) holds everywhere except the one entry marked:
+(`worker_environment()` for anything that spawns) holds everywhere except the entries marked:
 
 | Spawn site | Environment |
 | --- | --- |
-| coding-agent workers (`aftman-workers/subprocess.rs`) | `worker_environment()` |
-| command evidence providers (`aftman-workers/evidence.rs`) | `worker_environment()` |
-| the supervisor's own `git` for observation (`aftman-daemon/obs.rs`) | `worker_environment()` minus every `GIT_*`, plus the hardening in section 3.2 |
+| coding-agent workers (`aftman-workers/subprocess.rs`) | `worker_environment()` — baseline plus the run's allowlist |
+| command evidence providers (`aftman-workers/evidence.rs`) | `worker_environment()` — the same, so a test command finds the agent's toolchain |
+| the supervisor's own `git` for observation (`aftman-daemon/obs.rs`) | `supervisor_environment()` minus every `GIT_*`, plus the hardening in section 3.2 |
 | `ps`, non-Linux orphan identification (`aftman-workers/process.rs`) | `worker_environment()` |
 | `aftman-jev/build.rs` (`rustc -vV`, at build time, no secrets exist) | build environment; not a runtime spawn |
-| **daemon auto-start** (`aftman-cli/autostart.rs`) | **inherited whole, the one exception** (below) |
+| **daemon auto-start** (`aftman-cli/autostart.rs`) | **inherited whole, one exception** (below) |
 | tests | not production code |
+
+`supervisor_environment()` is a *separate* function from `worker_environment()` because the two
+want different policies. The supervisor's `git` is not an agent: it needs the daemon's
+environment to run at all, and it must not see a secret. A single helper serving both is how a
+worker came to inherit the daemon's shell in the first place.
 
 `worker_environment()` reads the environment with `vars_os`: an entry that is not valid UTF-8 is
 dropped, deliberately, instead of panicking the supervisor.

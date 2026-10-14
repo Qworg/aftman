@@ -455,8 +455,12 @@ fn git_command_with_base(
     command.env_clear();
     // Hard rule 3: the supervisor's credentials never reach a subprocess. Then drop every
     // GIT_* variable the daemon happened to inherit; ours are set below.
+    // `build_worker_environment` is deliberately *not* used here. It narrows the
+    // environment to a worker baseline, and the supervisor's own `git` needs the daemon's
+    // environment to run at all — it is not an agent. What matters is the same in both
+    // cases: no secret, and no `GIT_*` variable the daemon happened to inherit.
     command.envs(
-        aftman_workers::build_worker_environment(
+        aftman_workers::build_supervisor_environment(
             base.into_iter()
                 .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
             &[],

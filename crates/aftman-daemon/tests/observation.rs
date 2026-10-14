@@ -435,6 +435,8 @@ fn real_runtime(dir: &Path, store: Arc<dyn RunStore>, model: Arc<DialModel>) -> 
         uncertainty_margin: 0.15,
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
+
+        forwarded_env: Default::default(),
     })
 }
 

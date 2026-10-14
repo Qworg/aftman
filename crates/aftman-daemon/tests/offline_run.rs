@@ -178,6 +178,8 @@ fn runtime(
         uncertainty_margin: 0.15,
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
+
+        forwarded_env: Default::default(),
     })
 }
 
@@ -443,6 +445,8 @@ async fn an_ensemble_enabled_run_still_reaches_the_same_verdict()
         uncertainty_margin: 0.15,
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
+
+        forwarded_env: Default::default(),
     });
     let outcome = rt.run(job(&h.repo)).await?;
     assert_eq!(outcome.status, FactoryStatus::Finished);
@@ -563,6 +567,8 @@ async fn skipped_cycles_do_not_reach_the_model() -> Result<(), Box<dyn std::erro
         uncertainty_margin: 0.15,
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
+
+        forwarded_env: Default::default(),
     });
     let outcome = rt.run(job(&h.repo)).await?;
 
@@ -642,6 +648,8 @@ fn runtime_with(
         uncertainty_margin: 0.15,
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
+
+        forwarded_env: Default::default(),
     })
 }
 
@@ -864,5 +872,193 @@ async fn a_routing_failure_degrades_to_the_globals_and_says_so()
         );
     }
     assert_eq!(outcome.status, FactoryStatus::Finished);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// M3 follow-up: the forwarded client environment.
+// ---------------------------------------------------------------------------
+
+/// Every file under `dir`, for the canary sweep.
+fn files_under(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+#[tokio::test]
+async fn a_forwarded_variable_reaches_the_worker_and_its_value_is_never_recorded()
+-> Result<(), Box<dyn std::error::Error>> {
+    // The two halves of the requirement, kept apart on purpose:
+    //   * delivery is proved by the worker reporting *whether* the variable is present,
+    //     not its value — because worker output is itself persisted, so echoing the value
+    //     would make the "never recorded" half untestable;
+    //   * non-recording is proved by sweeping every file the run wrote for the value.
+    const CANARY: &str = "hunter2-canary-value";
+
+    let h = harness()?;
+    let mut config = fast_config();
+    config.worker = WorkerKind::Generic;
+
+    let mission_dir = h._dir.path().join("missions");
+    std::fs::create_dir_all(&mission_dir)?;
+    let options = aftman_workers::BackendOptions {
+        command_template: Some(
+            "sh -c 'echo path=$PATH; if [ -n \"$MYCANARY\" ]; then echo canary-present; fi'"
+                .to_owned(),
+        ),
+        ..aftman_workers::BackendOptions::default()
+    };
+    let worker: Arc<dyn Worker> = Arc::new(aftman_workers::SubprocessWorker::backend(
+        WorkerKind::Generic,
+        options,
+        mission_dir,
+    ));
+
+    // A real client forwards its own PATH, which of course still finds `sh`. Prefixing
+    // the real one keeps the process launchable while making the client's value
+    // distinguishable.
+    let forwarded = std::collections::BTreeMap::from([
+        (
+            "PATH".to_owned(),
+            format!("/client/bin:{}", std::env::var("PATH").unwrap_or_default()),
+        ),
+        ("MYCANARY".to_owned(), CANARY.to_owned()),
+    ]);
+
+    let rt = FactoryRuntime::new(RuntimeDeps {
+        config,
+        store: Arc::clone(&h.store),
+        model: Arc::new(SimulatedModel::new()),
+        worker,
+        registry: ResponsibilityRegistry::builtin(),
+        definitions: test_definitions(),
+        evidence: aftman_core::evidence::EvidencePlan::default(),
+        evidence_temp_dir: test_evidence_dir(&h),
+        clock: Arc::new(SystemClock),
+        sink: Arc::clone(&h.sink) as Arc<dyn aftman_daemon::EventSink>,
+        ensemble_enabled: false,
+        uncertainty_margin: 0.15,
+        steering_grace: Duration::from_secs(30),
+        launch: Default::default(),
+        forwarded_env: forwarded,
+    });
+
+    let outcome = rt.run(job(&h.repo)).await?;
+    let state = h.store.load(outcome.run_id).await?;
+    let worker = state.workers.first().ok_or("a worker must have run")?;
+    let output = worker.output.tail(64 * 1024).to_owned();
+
+    assert!(
+        output.contains("path=/client/bin:"),
+        "the worker must see the client's PATH, not the daemon's: {output}"
+    );
+    assert!(
+        output.contains("canary-present"),
+        "the worker must receive the forwarded variable: {output}"
+    );
+
+    // Names are recorded; values are not.
+    let created = h.sink.of_kind(EventKind::RunCreated);
+    let launch = created
+        .first()
+        .and_then(|event| event.payload.get("launch"))
+        .ok_or("RUN_CREATED carries the launch map")?;
+    let recorded = launch
+        .get("forwarded_env")
+        .and_then(|value| value.as_str())
+        .ok_or("the forwarded names are recorded")?;
+    assert!(recorded.contains("MYCANARY"), "{recorded}");
+    assert!(recorded.contains("PATH"), "{recorded}");
+
+    let leaked: Vec<PathBuf> = files_under(h._dir.path())
+        .into_iter()
+        .filter(|path| std::fs::read_to_string(path).is_ok_and(|text| text.contains(CANARY)))
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "a forwarded value reached the run's own files: {leaked:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_evidence_provider_sees_the_forwarded_environment()
+-> Result<(), Box<dyn std::error::Error>> {
+    // A test command has to find the same toolchain the agent did, or a provider that
+    // shells out to `python` fails on a daemon whose `PATH` is not the operator's.
+    //
+    // The provider asserts the path itself and exits non-zero when it is wrong, so the
+    // recorded exit code is the evidence — no need to go looking for its stdout.
+    let h = harness()?;
+    let mut config = fast_config();
+    config.worker = WorkerKind::Generic;
+
+    let mission_dir = h._dir.path().join("missions");
+    std::fs::create_dir_all(&mission_dir)?;
+    let options = aftman_workers::BackendOptions {
+        command_template: Some("sh -c 'echo worker ran'".to_owned()),
+        ..aftman_workers::BackendOptions::default()
+    };
+    let worker: Arc<dyn Worker> = Arc::new(aftman_workers::SubprocessWorker::backend(
+        WorkerKind::Generic,
+        options,
+        mission_dir,
+    ));
+
+    let check_path = r#"case "$PATH" in /client/bin:*) echo "1 passed";; *) echo "wrong path: $PATH"; exit 3;; esac"#;
+    let evidence = aftman_core::evidence::EvidencePlan::from_toml(
+        &format!(
+            "[[evidence.commands]]\nid = \"where\"\nargv = [\"sh\", \"-c\", {}]\nrun_when = \"worker_completed\"\n",
+            serde_json::to_string(check_path)?
+        ),
+        "test",
+    )?;
+
+    let forwarded_path = format!("/client/bin:{}", std::env::var("PATH").unwrap_or_default());
+    let rt = FactoryRuntime::new(RuntimeDeps {
+        config,
+        store: Arc::clone(&h.store),
+        model: Arc::new(SimulatedModel::new()),
+        worker,
+        registry: ResponsibilityRegistry::builtin(),
+        definitions: test_definitions(),
+        evidence,
+        evidence_temp_dir: test_evidence_dir(&h),
+        clock: Arc::new(SystemClock),
+        sink: Arc::clone(&h.sink) as Arc<dyn aftman_daemon::EventSink>,
+        ensemble_enabled: false,
+        uncertainty_margin: 0.15,
+        steering_grace: Duration::from_secs(30),
+        launch: Default::default(),
+        forwarded_env: std::collections::BTreeMap::from([("PATH".to_owned(), forwarded_path)]),
+    });
+    rt.run(job(&h.repo)).await?;
+
+    // One collection per worker completion, and this run starts more than one worker
+    // before it gives up. Every one of them must have seen the client's PATH.
+    let collected = h.sink.of_kind(EventKind::EvidenceCollected);
+    assert!(!collected.is_empty(), "the provider must have run");
+    for event in &collected {
+        assert_eq!(
+            event.payload["exit_code"],
+            serde_json::json!(0),
+            "the provider must see the client's PATH, not the daemon's: {}",
+            event.payload["summary"]
+        );
+    }
     Ok(())
 }

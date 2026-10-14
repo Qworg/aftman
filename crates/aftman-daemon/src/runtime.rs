@@ -78,6 +78,16 @@ pub struct RuntimeDeps {
     /// by [`MAX_LAUNCH_ENTRIES`], [`MAX_LAUNCH_KEY_CHARS`] and [`MAX_LAUNCH_VALUE_CHARS`]
     /// (excess is dropped or truncated).
     pub launch: BTreeMap<String, String>,
+    /// Environment this run forwards to its worker and to its command evidence.
+    ///
+    /// Per run, not per daemon, because the daemon keeps whichever environment started
+    /// it: without this, a worker would use the `PATH` and virtualenv of a shell the
+    /// operator may not even have open. The client chooses the allowlist; this is the
+    /// result of that choice, and it has already been checked for supervisor names.
+    ///
+    /// **Values must never be recorded.** Names are written to `RUN_CREATED` under
+    /// `launch`; values reach a subprocess and nothing else.
+    pub forwarded_env: BTreeMap<String, String>,
 }
 
 /// Most `launch` entries recorded in `RUN_CREATED`.
@@ -497,7 +507,12 @@ impl FactoryRuntime {
             let mut state = RunState::new(header, FactoryStatus::Queued);
             self.emit(&mut state, EventKind::RunCreated, {
                 let mut payload = json!({ "repo": job.repo.display().to_string() });
-                let launch = bounded_launch(&self.deps.launch);
+                let mut launch = bounded_launch(&self.deps.launch);
+                // Names only. A value here would put a forwarded secret in the run log.
+                if !self.deps.forwarded_env.is_empty() {
+                    let names: Vec<String> = self.deps.forwarded_env.keys().cloned().collect();
+                    launch.insert("forwarded_env".to_owned(), names.join(","));
+                }
                 if !launch.is_empty() {
                     payload["launch"] = json!(launch);
                 }
@@ -1903,10 +1918,21 @@ impl FactoryRuntime {
             .cloned()
             .collect();
         for provider in due {
+            // Evidence runs with the same forwarded environment as the worker, so a
+            // test command finds the same `python` or `node` the agent did. Without
+            // this a provider would run with the daemon's `PATH` and could fail on a
+            // toolchain the worker had no trouble with.
+            let forwarded: Vec<(String, String)> = self
+                .deps
+                .forwarded_env
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
             let outcome = aftman_workers::run_provider(
                 &provider,
                 &job.repo,
                 &self.deps.evidence_temp_dir,
+                &forwarded,
                 self.now(),
             )
             .await;
@@ -1986,7 +2012,14 @@ impl FactoryRuntime {
             mission,
             model: self.deps.config.worker_model.clone(),
             timeout: self.deps.config.worker_timeout,
-            env: Vec::new(),
+            // The client's allowlisted environment, so the worker finds the toolchain the
+            // operator is actually using. `worker_environment` scrubs it again.
+            env: self
+                .deps
+                .forwarded_env
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect(),
             output: Arc::clone(&output),
             ledger: Some(Arc::new(StoreLedger {
                 store: Arc::clone(&self.deps.store),

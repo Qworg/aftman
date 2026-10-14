@@ -260,6 +260,14 @@ pub struct RunArgs {
     /// when it was not.
     #[arg(long)]
     pub simulate_model: bool,
+
+    /// Forward this environment variable from the calling shell to the worker.
+    ///
+    /// Repeatable. A name that is unset here is an error rather than a silent no-op, and
+    /// a name that belongs to the supervisor is refused. A small default set
+    /// ([`DEFAULT_FORWARD_ENV`]) is always forwarded.
+    #[arg(long = "pass-env", value_name = "KEY")]
+    pub pass_env: Vec<String>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -290,10 +298,13 @@ pub fn parse_status(text: &str) -> Result<FactoryStatus, CliError> {
     })
 }
 
-/// The environment lookup `run` validation uses, as a value so tests need no real
-/// environment variables.
+/// The environment lookup `run` validation and forwarding use, as a value so tests need
+/// no real environment variables.
 pub trait Env {
     fn var_is_set(&self, name: &str) -> bool;
+
+    /// The value of `name`, or `None` when it is unset or not valid UTF-8.
+    fn var(&self, name: &str) -> Option<String>;
 }
 
 /// The process environment.
@@ -303,7 +314,32 @@ impl Env for ProcessEnv {
     fn var_is_set(&self, name: &str) -> bool {
         std::env::var_os(name).is_some()
     }
+
+    fn var(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
 }
+
+/// Variables a run forwards to its worker without being asked.
+///
+/// The daemon is started by the first client that needs it and keeps *that* shell's
+/// environment for life, so a worker would otherwise use whichever shell happened to
+/// start the daemon rather than the one the operator is standing in. A different `PATH`
+/// or virtualenv is the common case; `SSH_AUTH_SOCK` is here because an agent that is
+/// asked to push needs the operator's agent, and the agent can sign with it without ever
+/// seeing the key.
+///
+/// This is deliberately small. Anything else an operator wants forwarded they name with
+/// `--pass-env`, because a default that forwards everything is not an allowlist.
+pub const DEFAULT_FORWARD_ENV: &[&str] = &[
+    "PATH",
+    "VIRTUAL_ENV",
+    "CONDA_PREFIX",
+    "SSH_AUTH_SOCK",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+];
 
 impl RunArgs {
     /// Everything the **client** must do before a run can be sent anywhere: the
@@ -377,11 +413,58 @@ impl RunArgs {
             verify: Some(self.verify.clone()),
             ensemble: self.ensemble,
             simulate_model: self.simulate_model,
+            env: self.forwarded_environment(env)?,
         };
         // The same validation the daemon applies, so the embedded path cannot accept
         // what the daemon would refuse (an empty job, an oversized one).
         Request::RunStart(params.clone()).validate()?;
         Ok(params)
+    }
+
+    /// The environment this run forwards to its worker.
+    ///
+    /// The daemon's environment is whichever shell started it, and it keeps that
+    /// environment for life, so without forwarding a worker would use the wrong `PATH`
+    /// or virtualenv whenever the operator is in a different shell from the one that
+    /// started the daemon.
+    ///
+    /// # Errors
+    /// [`CliError::Usage`] when a name is unset in this shell (rather than silently
+    /// forwarding nothing) or belongs to the supervisor.
+    fn forwarded_environment(
+        &self,
+        env: &dyn Env,
+    ) -> Result<std::collections::BTreeMap<String, String>, CliError> {
+        let mut forwarded = std::collections::BTreeMap::new();
+
+        // The default set: whichever of these this shell actually has.
+        for name in DEFAULT_FORWARD_ENV {
+            if let Some(value) = env.var(name) {
+                forwarded.insert((*name).to_owned(), value);
+            }
+        }
+
+        for name in &self.pass_env {
+            // The name is checked *before* its value is read, so a secret is never even
+            // copied into this process's memory on its way to being refused.
+            if aftman_workers::is_supervisor_secret(name) {
+                return Err(CliError::usage(format!(
+                    "--pass-env {name}: that name belongs to the supervisor and is never \
+                     forwarded to a worker"
+                )));
+            }
+            // An unset name is an error: silently forwarding nothing would make the flag
+            // look as though it had worked.
+            let value = env.var(name).ok_or_else(|| {
+                CliError::usage(format!(
+                    "--pass-env {name}: {name} is not set in this shell, so there is \
+                     nothing to forward"
+                ))
+            })?;
+            forwarded.insert(name.clone(), value);
+        }
+
+        Ok(forwarded)
     }
 }
 
@@ -425,6 +508,9 @@ impl DemoArgs {
             verify: "when-asked".to_owned(),
             ensemble: false,
             simulate_model: true,
+            // The demo forwards nothing: it runs the simulated worker, which has no
+            // toolchain to find.
+            pass_env: Vec::new(),
         }
     }
 }
@@ -439,6 +525,10 @@ mod tests {
     impl Env for FakeEnv {
         fn var_is_set(&self, name: &str) -> bool {
             self.0.contains(name)
+        }
+
+        fn var(&self, name: &str) -> Option<String> {
+            self.0.contains(name).then(|| format!("{name}-value"))
         }
     }
 
@@ -609,5 +699,191 @@ mod tests {
         );
         assert_eq!(parse_status("Running").unwrap(), FactoryStatus::Running);
         assert!(parse_status("sleeping").is_err());
+    }
+}
+
+/// Forwarding behaviour, kept separate from `run`'s validation tests so the allowlist is
+/// exercised on its own terms.
+#[cfg(test)]
+mod forwarded_env_tests {
+    use super::{DEFAULT_FORWARD_ENV, Env, RunArgs};
+
+    /// An environment built from explicit pairs, so a test never touches the real one.
+    struct FakeEnv(Vec<(&'static str, &'static str)>);
+
+    impl FakeEnv {
+        fn new(pairs: &[(&'static str, &'static str)]) -> Self {
+            Self(pairs.to_vec())
+        }
+    }
+
+    impl Env for FakeEnv {
+        fn var_is_set(&self, name: &str) -> bool {
+            self.0.iter().any(|(k, _)| *k == name)
+        }
+
+        fn var(&self, name: &str) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_owned())
+        }
+    }
+
+    fn args(repo: &std::path::Path, pass_env: &[&str]) -> RunArgs {
+        RunArgs {
+            repo: repo.to_owned(),
+            job: Some("do the thing".to_owned()),
+            job_file: None,
+            worker: "simulated".to_owned(),
+            cmd: None,
+            permissions: "sandboxed".to_owned(),
+            effort: None,
+            steer: false,
+            external_sandbox: false,
+            model: None,
+            verify: "when-asked".to_owned(),
+            ensemble: false,
+            simulate_model: true,
+            pass_env: pass_env.iter().map(|s| (*s).to_owned()).collect(),
+        }
+    }
+
+    fn repo() -> Result<tempfile::TempDir, String> {
+        tempfile::tempdir().map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn the_default_allowlist_forwards_what_the_shell_has() -> Result<(), String> {
+        let dir = repo()?;
+        let env = FakeEnv::new(&[
+            ("PATH", "/client/bin"),
+            ("VIRTUAL_ENV", "/client/venv"),
+            ("SSH_AUTH_SOCK", "/tmp/agent.sock"),
+        ]);
+        let params = args(dir.path(), &[])
+            .prepare(&env)
+            .map_err(|e| e.to_string())?;
+        assert_eq!(
+            params.env.get("PATH").map(String::as_str),
+            Some("/client/bin")
+        );
+        assert_eq!(
+            params.env.get("VIRTUAL_ENV").map(String::as_str),
+            Some("/client/venv")
+        );
+        assert_eq!(
+            params.env.get("SSH_AUTH_SOCK").map(String::as_str),
+            Some("/tmp/agent.sock")
+        );
+        // A default name this shell does not have is simply absent, not empty.
+        assert!(!params.env.contains_key("LANG"), "{:?}", params.env);
+        Ok(())
+    }
+
+    #[test]
+    fn an_arbitrary_variable_is_not_forwarded_without_being_asked_for() -> Result<(), String> {
+        // The allowlist is the point: a `GITHUB_TOKEN` exported in the daemon's shell must
+        // not reach a worker just because it exists.
+        let dir = repo()?;
+        let env = FakeEnv::new(&[("PATH", "/bin"), ("GITHUB_TOKEN", "canary-token")]);
+        let params = args(dir.path(), &[])
+            .prepare(&env)
+            .map_err(|e| e.to_string())?;
+        assert!(!params.env.contains_key("GITHUB_TOKEN"));
+        assert_eq!(params.env.len(), 1, "only PATH: {:?}", params.env);
+        Ok(())
+    }
+
+    #[test]
+    fn pass_env_forwards_a_named_variable() -> Result<(), String> {
+        let dir = repo()?;
+        let env = FakeEnv::new(&[("PATH", "/bin"), ("CARGO_TARGET_DIR", "/t")]);
+        let params = args(dir.path(), &["CARGO_TARGET_DIR"])
+            .prepare(&env)
+            .map_err(|e| e.to_string())?;
+        assert_eq!(
+            params.env.get("CARGO_TARGET_DIR").map(String::as_str),
+            Some("/t")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn pass_env_refuses_a_name_this_shell_does_not_have() -> Result<(), String> {
+        // Silently forwarding nothing would make the flag look as though it had worked.
+        let dir = repo()?;
+        let env = FakeEnv::new(&[("PATH", "/bin")]);
+        let error = args(dir.path(), &["NOT_SET_ANYWHERE"])
+            .prepare(&env)
+            .err()
+            .ok_or("must refuse")?;
+        let message = error.to_string();
+        assert!(message.contains("NOT_SET_ANYWHERE"), "{message}");
+        assert!(message.contains("not set"), "{message}");
+        Ok(())
+    }
+
+    #[test]
+    fn pass_env_refuses_a_supervisor_name() -> Result<(), String> {
+        // `AFTMAN_*` is the supervisor's namespace, so it is reserved rather than merely
+        // checked. The client refuses before the daemon would, and before reading the
+        // value.
+        let dir = repo()?;
+        let env = FakeEnv::new(&[("PATH", "/bin"), ("AFTMAN_WEB_TOKEN", "canary-token")]);
+        let error = args(dir.path(), &["AFTMAN_WEB_TOKEN"])
+            .prepare(&env)
+            .err()
+            .ok_or("must refuse")?;
+        let message = error.to_string();
+        assert!(message.contains("belongs to the supervisor"), "{message}");
+        assert!(
+            !message.contains("canary-token"),
+            "the refusal must not echo the value: {message}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forwarding_an_empty_set_is_fine_and_yields_no_entries() -> Result<(), String> {
+        let dir = repo()?;
+        let env = FakeEnv::new(&[]);
+        let params = args(dir.path(), &[])
+            .prepare(&env)
+            .map_err(|e| e.to_string())?;
+        assert!(params.env.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn the_default_allowlist_names_the_expected_variables() {
+        // Pinned so a change to the set is a deliberate, visible decision.
+        assert_eq!(
+            DEFAULT_FORWARD_ENV,
+            &[
+                "PATH",
+                "VIRTUAL_ENV",
+                "CONDA_PREFIX",
+                "SSH_AUTH_SOCK",
+                "LANG",
+                "LC_ALL",
+                "LC_CTYPE",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_prepared_params_pass_the_daemon_s_own_validation() -> Result<(), String> {
+        // Client and daemon must agree, or the embedded path would accept what the daemon
+        // refuses (or the reverse).
+        let dir = repo()?;
+        let env = FakeEnv::new(&[("PATH", "/bin"), ("VIRTUAL_ENV", "/venv")]);
+        let params = args(dir.path(), &[])
+            .prepare(&env)
+            .map_err(|e| e.to_string())?;
+        aftman_daemon::protocol::Request::RunStart(params)
+            .validate()
+            .map_err(|e| e.to_string())?;
+        Ok(())
     }
 }

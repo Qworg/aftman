@@ -661,7 +661,13 @@ Debounce rules:
   found by an integration test whose idle interval was shorter than its cycle;
 - **an idle tick only runs a cycle if there is something to decide.** The condition is
   `content_changed || time_driven_check_due`, not `content_changed` alone:
-  - `content_changed` compares an **`observation_content_digest`**: BLAKE3 over the canonical
+  - `content_changed` compares an **`observation_content_digest`**, which includes the active
+    worker's bounded output head and tail. That is deliberate: when the agent *says* something
+    new, that is a change worth assessing, and a digest that ignored output would treat a
+    talking worker as an unchanged observation. It does not weaken the property the skip exists
+    for, because a **silent** worker adds nothing to the digest — the M0 test that a silent
+    worker cannot burn the assessment budget still holds — and the debounce interval is what
+    bounds a chatty one. The digest is BLAKE3 over the canonical
     serialization of the observation with every volatile scalar removed — `elapsed` durations,
     `*_at` timestamps, and `EventSeq`. This is **not** the ensemble's `state_digest`, which must
     cover the exact bytes a judge saw and therefore keeps them

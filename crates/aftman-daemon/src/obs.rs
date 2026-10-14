@@ -22,11 +22,12 @@ use tokio::process::Command;
 
 use time::OffsetDateTime;
 
+use aftman_core::ansi::strip_control;
 use aftman_core::job::{Job, WorkerKind, WorkerStatus};
 use aftman_core::log::BoundedLog;
 use aftman_core::observation::{
     Counters, EventSummary, GitEvidence, Observation, RepoInstructions, TestResult, TestSource,
-    TestStatus, UntrackedExcerpt, cap_text, summarize_job, summarize_worker,
+    TestStatus, UntrackedExcerpt, WorkerOutputExcerpt, cap_text, summarize_job, summarize_worker,
 };
 use aftman_core::run::RunState;
 use aftman_core::worker::WorkerRecord;
@@ -38,6 +39,12 @@ pub const JOB_PROMPT_CAP: usize = 4_000;
 #[derive(Debug, Clone, Copy)]
 pub struct ObsCaps {
     pub diff_chars: usize,
+    /// Bytes of the worker's output head retained for the model.
+    ///
+    /// The head shows what the agent was asked to do and how it started, where the tail
+    /// shows where it ended up. The tail is the larger of the two because a worker that
+    /// has gone wrong has usually gone wrong most recently.
+    pub head_chars: usize,
     pub tail_chars: usize,
     pub events_history: usize,
     pub workers_history: usize,
@@ -50,6 +57,7 @@ impl Default for ObsCaps {
     fn default() -> Self {
         Self {
             diff_chars: 20_000,
+            head_chars: 4_000,
             tail_chars: 12_000,
             events_history: 30,
             workers_history: 10,
@@ -204,7 +212,37 @@ impl ObservationBuilder {
                 }),
             counters,
             evidence: evidence_map,
+            output: Self::output_excerpt(active, self.caps.head_chars, self.caps.tail_chars),
         }
+    }
+
+    /// The bounded, decoded output of the most recent worker.
+    ///
+    /// Decoded, because terminal control sequences cost tokens and mean nothing to a
+    /// model; see `aftman_core::ansi`. Both ends are capped and the cap is reported, so a
+    /// model is never shown a clipped log as though it were the whole thing.
+    fn output_excerpt(
+        worker: Option<&WorkerRecord>,
+        head_chars: usize,
+        tail_chars: usize,
+    ) -> Option<WorkerOutputExcerpt> {
+        let worker = worker?;
+        if worker.output.is_empty() {
+            // A worker that has printed nothing has nothing to show. `Some("")` would
+            // read as "this worker said nothing", which is true but adds no evidence.
+            return None;
+        }
+        let head_raw = worker.output.head(head_chars);
+        let tail_raw = worker.output.tail(tail_chars);
+        Some(WorkerOutputExcerpt {
+            worker_id: worker.id,
+            head_truncated: worker.output.head(usize::MAX).len() > head_chars,
+            tail_truncated: worker.output.tail(usize::MAX).len() > tail_chars,
+            head: strip_control(head_raw),
+            tail: strip_control(tail_raw),
+            total_bytes: worker.output.total_bytes(),
+            dropped_bytes: worker.output.dropped_bytes(),
+        })
     }
 
     /// A diff that only exists in simulation mode.
@@ -970,5 +1008,133 @@ mod tests {
         ] {
             assert!(is_safe_to_read(path), "{path} should be readable");
         }
+    }
+}
+
+/// The worker-output excerpt: what a model is shown of what the agent printed.
+#[cfg(test)]
+mod output_excerpt_tests {
+    use super::{ObsCaps, ObservationBuilder};
+    use aftman_core::ids::WorkerId;
+    use aftman_core::job::{TaskKind, WorkerKind};
+    use aftman_core::log::{BoundedLog, Stream};
+    use aftman_core::worker::WorkerRecord;
+
+    type TestResult = Result<(), String>;
+
+    fn worker(log: BoundedLog) -> WorkerRecord {
+        WorkerRecord::new(
+            WorkerId::new(),
+            WorkerKind::Pi,
+            TaskKind::Code,
+            "mission",
+            log,
+            true,
+        )
+    }
+
+    #[test]
+    fn a_worker_that_printed_nothing_has_no_excerpt() {
+        // `Some("")` would read as "this worker said nothing", which is true and adds no
+        // evidence; the field's absence says the same thing more cheaply.
+        let w = worker(BoundedLog::new(4096, 4096));
+        assert!(ObservationBuilder::output_excerpt(Some(&w), 100, 100).is_none());
+        assert!(ObservationBuilder::output_excerpt(None, 100, 100).is_none());
+    }
+
+    #[test]
+    fn a_short_log_appears_in_both_ends_because_it_fits() -> TestResult {
+        // `BoundedLog` keeps a head up to its *own* capacity and a tail of the most recent
+        // bytes, so a log smaller than the head capacity is wholly present in both.
+        let mut log = BoundedLog::new(4096, 4096);
+        log.push(Stream::Stdout, "start\n");
+        log.push(Stream::Stdout, "end\n");
+        let w = worker(log);
+        let excerpt = ObservationBuilder::output_excerpt(Some(&w), 100, 100)
+            .ok_or("a worker that printed has an excerpt")?;
+        assert_eq!(excerpt.head, "start\nend\n");
+        assert_eq!(excerpt.tail, "start\nend\n");
+        assert!(!excerpt.head_truncated);
+        assert!(!excerpt.tail_truncated);
+        assert_eq!(
+            excerpt.total_bytes, 10,
+            "6 bytes of \"start\\n\" plus 4 of \"end\\n\""
+        );
+        assert_eq!(excerpt.worker_id, w.id);
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_control_sequences_are_stripped_before_a_model_sees_them() -> TestResult {
+        // They cost tokens and mean nothing to a model; see `aftman_core::ansi`.
+        let mut log = BoundedLog::new(4096, 4096);
+        log.push(Stream::Stdout, "\u{1b}[31mred\u{1b}[0m plain\n");
+        log.push(Stream::Stdout, "\u{1b}]0;title\u{7}after");
+        let w = worker(log);
+        let excerpt =
+            ObservationBuilder::output_excerpt(Some(&w), 4096, 4096).ok_or("an excerpt")?;
+        assert!(excerpt.tail.contains("red plain"), "{:?}", excerpt.tail);
+        assert!(excerpt.tail.contains("after"), "{:?}", excerpt.tail);
+        assert!(!excerpt.tail.contains('\u{1b}'), "{:?}", excerpt.tail);
+        assert!(!excerpt.tail.contains("title"), "{:?}", excerpt.tail);
+        Ok(())
+    }
+
+    #[test]
+    fn a_long_log_is_capped_at_both_ends_and_says_so() -> TestResult {
+        let mut log = BoundedLog::new(2048, 2048);
+        log.push(Stream::Stdout, &"h".repeat(600));
+        log.push(Stream::Stdout, &"t".repeat(600));
+        let w = worker(log);
+        let excerpt = ObservationBuilder::output_excerpt(Some(&w), 100, 200).ok_or("an excerpt")?;
+        assert!(
+            excerpt.head.len() <= 100,
+            "head is {} bytes",
+            excerpt.head.len()
+        );
+        assert!(
+            excerpt.tail.len() <= 200,
+            "tail is {} bytes",
+            excerpt.tail.len()
+        );
+        assert!(excerpt.head_truncated, "the cap must be reported");
+        assert!(excerpt.tail_truncated);
+        assert!(
+            excerpt.head.starts_with('h'),
+            "the head keeps the beginning"
+        );
+        assert!(excerpt.tail.ends_with('t'), "the tail keeps the end");
+        Ok(())
+    }
+
+    #[test]
+    fn a_lossy_log_reports_what_it_dropped() -> TestResult {
+        // A model must not be shown a clipped log as though it were the whole thing.
+        let mut log = BoundedLog::new(64, 64);
+        for _ in 0..100 {
+            log.push(Stream::Stdout, "a chatty worker says hello\n");
+        }
+        let w = worker(log);
+        let excerpt = ObservationBuilder::output_excerpt(Some(&w), 32, 32).ok_or("an excerpt")?;
+        assert!(excerpt.dropped_bytes > 0, "{excerpt:?}");
+        assert!(excerpt.total_bytes > excerpt.dropped_bytes);
+        // Both ends are capped below the log's own capacities, so both report truncation.
+        assert!(excerpt.head_truncated, "{excerpt:?}");
+        assert!(excerpt.tail_truncated, "{excerpt:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn the_default_head_cap_is_smaller_than_the_tail_cap() {
+        // A worker that has gone wrong has usually gone wrong most recently, so the tail
+        // is where the evidence is.
+        let caps = ObsCaps::default();
+        assert!(caps.head_chars > 0);
+        assert!(
+            caps.head_chars < caps.tail_chars,
+            "head {} tail {}",
+            caps.head_chars,
+            caps.tail_chars
+        );
     }
 }

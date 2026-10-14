@@ -314,10 +314,23 @@ Left open, deliberately visible:
 
 Recorded in `handoff.md` at the end of the M3 session. Each is a separate behaviour change.
 
-1. **The run can see the worker's output.** *(Decided: fill `output_head` / `output_tail` as the
-   LLD always said. Not yet built.)* The model currently judges "is the worker stuck" without
-   seeing anything the agent printed; only parsed test counts reach it. The change touches what a
-   billable model is sent and the byte-exact snapshot tests, so it is its own commit.
+1. **The run can see the worker's output.** *(Built — see the commit.)* It judged "is the worker
+   stuck" without seeing anything the agent printed; only parsed test counts reached it. Now the
+   observation carries a bounded head and tail of the most recent worker's log
+   (`WorkerOutputExcerpt`), with terminal control sequences stripped
+   ([ansi.rs](../crates/aftman-core/src/ansi.rs)) because they cost tokens and mean nothing to a
+   model, and with `dropped_bytes` reported so a clipped log is never presented as a whole one.
+   Three things were found on the way:
+   - **Budget ordering.** `fit` checked the protected-evidence set *before* truncating oversized
+     pairs, so a chatty worker's 50 KiB tail counted in full and the request was **refused** —
+     supervision would stop rather than shrink a field it is required to keep. Truncation now runs
+     first, and the check runs on the bounded result. Refusing is still the outcome when the
+     required evidence genuinely cannot fit.
+   - **The digest now includes output**, which is a change to the M0 skip. Recorded in
+     02-lld §7.1 with why it does not weaken the silent-worker property.
+   - **Cost, measured:** a request with the default excerpts (4 000-byte head, 12 000-byte tail)
+     serialises to 16 241 bytes against 241 without — the caps, as expected. No live run was made;
+     that is the only way to get a token number and it is billable.
 2. **The daemon contributes only a baseline; the run forwards an allowlist.** *(Built — see the
    commit.)* `RunStartParams.env` carries the client's chosen names, bounded and validated, with a
    supervisor name refused at both the protocol layer and the environment layer. Three things

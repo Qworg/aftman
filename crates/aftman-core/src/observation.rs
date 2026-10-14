@@ -155,6 +155,37 @@ pub struct EventSummary {
     pub summary: String,
 }
 
+/// A bounded excerpt of the active worker's output.
+///
+/// The model is asked whether a worker is stuck, drifting, or looping, and it cannot
+/// answer that without seeing what the agent printed. The excerpts are the *decoded* log:
+/// terminal control sequences are stripped, because they cost tokens and mean nothing to
+/// a model ([`crate::ansi::strip_control`]).
+///
+/// The head shows what the agent was asked to do and how it started; the tail shows where
+/// it ended up. Both are capped, and `dropped_bytes` says how much of the middle is
+/// missing, so a model is never shown a clipped log as though it were the whole thing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkerOutputExcerpt {
+    pub worker_id: WorkerId,
+    pub head: String,
+    pub head_truncated: bool,
+    pub tail: String,
+    pub tail_truncated: bool,
+    /// Every byte the worker produced.
+    pub total_bytes: u64,
+    /// Bytes the log no longer retains.
+    pub dropped_bytes: u64,
+}
+
+impl WorkerOutputExcerpt {
+    /// Whether anything was actually printed.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.total_bytes == 0
+    }
+}
+
 /// The previous cycle's decision, so a model can see what it already said.
 ///
 /// Deliberately does **not** carry the assessment sequence number. That number
@@ -185,6 +216,11 @@ pub struct Observation {
     pub counters: Counters,
     /// Results of command evidence providers, keyed by provider id.
     pub evidence: BTreeMap<String, String>,
+    /// Bounded head and tail of the most recent worker's output.
+    ///
+    /// `None` when no worker has run yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<WorkerOutputExcerpt>,
 }
 
 impl Observation {
@@ -237,13 +273,18 @@ impl Observation {
             );
         }
         if has("worker_output") {
+            let excerpt = self.output.as_ref();
             put(
                 "worker_output",
                 self.active.as_ref().map_or(Value::Null, |w| {
                     json!({
                         "worker_id": w.id.to_string(),
-                        "output_head": String::new(),
-                        "output_tail": String::new(),
+                        "output_head": excerpt.map_or("", |e| e.head.as_str()),
+                        "output_tail": excerpt.map_or("", |e| e.tail.as_str()),
+                        "head_truncated": excerpt.is_some_and(|e| e.head_truncated),
+                        "tail_truncated": excerpt.is_some_and(|e| e.tail_truncated),
+                        "total_bytes": excerpt.map_or(0, |e| e.total_bytes),
+                        "dropped_bytes": excerpt.map_or(0, |e| e.dropped_bytes),
                     })
                 }),
             );
@@ -351,6 +392,12 @@ impl Observation {
             "prompt": self.job.prompt_excerpt,
             "repo": self.job.repo.display().to_string(),
             "active": self.active.as_ref().map(stable_worker_summary),
+            // Output is part of the digest on purpose: when the agent *says* something new,
+            // that is a change worth assessing. A silent worker adds nothing here, so the
+            // property that a silent worker cannot burn the assessment budget still holds;
+            // the debounce interval is what bounds a chatty one.
+            "output_head": self.output.as_ref().map(|e| &e.head),
+            "output_tail": self.output.as_ref().map(|e| &e.tail),
             "history": self.history.iter().map(stable_worker_summary).collect::<Vec<_>>(),
             "git_status": self.git.status_short,
             "diff": self.git.diff_excerpt,
@@ -557,6 +604,7 @@ mod tests {
                 ..Counters::default()
             },
             evidence: BTreeMap::new(),
+            output: None,
         }
     }
 
@@ -709,5 +757,147 @@ mod tests {
         let summary = super::summarize_job(&job, 0, 100);
         assert_eq!(summary.prompt_excerpt.chars().count(), 100);
         assert!(summary.prompt_truncated);
+    }
+}
+
+/// The worker's output as the model sees it, and what it does to the change detector.
+#[cfg(test)]
+mod worker_output_tests {
+    use super::{Counters, GitEvidence, JobSummary, Observation, WorkerOutputExcerpt};
+    use crate::ids::{RunId, WorkerId};
+    use crate::job::{FactoryStatus, WorkerKind};
+    use std::path::PathBuf;
+
+    fn excerpt(head: &str, tail: &str) -> WorkerOutputExcerpt {
+        WorkerOutputExcerpt {
+            worker_id: WorkerId::new(),
+            head: head.to_owned(),
+            head_truncated: false,
+            tail: tail.to_owned(),
+            tail_truncated: false,
+            total_bytes: (head.len() + tail.len()) as u64,
+            dropped_bytes: 0,
+        }
+    }
+
+    fn observation(output: Option<WorkerOutputExcerpt>) -> Observation {
+        Observation {
+            run_id: RunId::new(),
+            status: FactoryStatus::Assessing,
+            job: JobSummary {
+                prompt_excerpt: "add retries".into(),
+                prompt_truncated: false,
+                repo: PathBuf::from("/repo"),
+                elapsed_secs: 0,
+            },
+            active: Some(super::WorkerSummary {
+                id: WorkerId::new(),
+                kind: WorkerKind::Pi,
+                task: crate::job::TaskKind::Code,
+                status: crate::job::WorkerStatus::Running,
+                mission_excerpt: "mission".into(),
+                elapsed_secs: 1,
+                exit_code: None,
+                steer_count: 0,
+                supports_steering: true,
+            }),
+            history: Vec::new(),
+            git: GitEvidence::default(),
+            untracked: Vec::new(),
+            instructions: None,
+            tests: Vec::new(),
+            events: Vec::new(),
+            prior: None,
+            counters: Counters::default(),
+            evidence: Default::default(),
+            output,
+        }
+    }
+
+    fn providers() -> Vec<String> {
+        crate::observation::default_evidence()
+    }
+
+    #[test]
+    fn state_for_carries_the_worker_s_output() {
+        // The whole point: the model is asked whether a worker is stuck or drifting, and it
+        // cannot answer that without seeing what the agent printed.
+        let o = observation(Some(excerpt("started\n", "3 passed\n")));
+        let state = o.state_for(&providers());
+        let output = &state["worker_output"];
+        assert_eq!(output["output_head"], serde_json::json!("started\n"));
+        assert_eq!(output["output_tail"], serde_json::json!("3 passed\n"));
+        assert_eq!(output["head_truncated"], serde_json::json!(false));
+        assert_eq!(
+            output["total_bytes"],
+            serde_json::json!(17),
+            "8 bytes of head plus 9 of tail"
+        );
+    }
+
+    #[test]
+    fn state_for_reports_truncation_and_what_was_dropped() {
+        let mut e = excerpt("h", "t");
+        e.head_truncated = true;
+        e.tail_truncated = true;
+        e.dropped_bytes = 5_000;
+        let state = observation(Some(e)).state_for(&providers());
+        let output = &state["worker_output"];
+        assert_eq!(output["head_truncated"], serde_json::json!(true));
+        assert_eq!(output["tail_truncated"], serde_json::json!(true));
+        assert_eq!(output["dropped_bytes"], serde_json::json!(5_000));
+    }
+
+    #[test]
+    fn no_worker_output_is_an_empty_string_not_a_missing_field() {
+        // A run with no worker yet, and a run whose worker printed nothing, both read as
+        // empty rather than as a schema difference.
+        let state = observation(None).state_for(&providers());
+        assert_eq!(state["worker_output"]["output_head"], serde_json::json!(""));
+        assert_eq!(state["worker_output"]["output_tail"], serde_json::json!(""));
+        assert_eq!(state["worker_output"]["total_bytes"], serde_json::json!(0));
+    }
+
+    #[test]
+    fn output_is_part_of_the_change_detector() {
+        // When the agent *says* something new, that is a change worth assessing: the
+        // digest must not treat a worker that is talking as an unchanged observation.
+        let before = observation(Some(excerpt("a", "b"))).content_digest();
+        let after = observation(Some(excerpt("a", "c"))).content_digest();
+        assert_ne!(before, after, "new output must change the digest");
+
+        let head_changed = observation(Some(excerpt("z", "b"))).content_digest();
+        assert_ne!(before, head_changed);
+    }
+
+    #[test]
+    fn a_silent_worker_leaves_the_digest_alone() {
+        // The M0 property the digest skip exists for: a worker that prints nothing must not
+        // be able to burn the assessment budget. Including output in the digest does not
+        // weaken it, because a silent worker adds nothing to include.
+        let quiet = observation(Some(WorkerOutputExcerpt {
+            worker_id: WorkerId::new(),
+            head: String::new(),
+            head_truncated: false,
+            tail: String::new(),
+            tail_truncated: false,
+            total_bytes: 0,
+            dropped_bytes: 0,
+        }));
+        let first = quiet.content_digest();
+        let second = quiet.content_digest();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn the_excerpt_is_bounded_by_whatever_the_builder_capped_it_to() {
+        // `state_for` does not re-truncate: the cap belongs to the builder, so that the
+        // byte budget sees the real size rather than a second, silent one.
+        let big = "x".repeat(100_000);
+        let state = observation(Some(excerpt(&big, &big))).state_for(&providers());
+        assert_eq!(
+            state["worker_output"]["output_tail"].as_str().map(str::len),
+            Some(100_000)
+        );
     }
 }

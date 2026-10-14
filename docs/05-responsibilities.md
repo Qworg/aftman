@@ -294,7 +294,8 @@ let (git, untracked, instructions) = collect_repo(&repo, &cfg, deadline).await;
 let events = recent_events(&store, run_id, cfg).await;
 ```
 
-Byte caps (defaults, all configurable): diff 20,000 chars; each output tail 12,000 chars;
+Byte caps (defaults, all configurable): diff 20,000 chars; the most recent worker's output
+head 4,000 chars and tail 12,000 chars (terminal control sequences stripped);
 3 untracked files totalling 4,096 bytes; 30 events; 10 workers of history.
 
 Untracked excerpts skip: binary-looking files (NUL in the first 4 KiB), unreadable files, symlinks,

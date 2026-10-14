@@ -367,10 +367,10 @@ impl PidLock {
         if !ours {
             return;
         }
-        if let Err(error) = std::fs::remove_file(&self.path) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %self.path.display(), %error, "could not remove the pid file");
-            }
+        if let Err(error) = std::fs::remove_file(&self.path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %self.path.display(), %error, "could not remove the pid file");
         }
     }
 }
@@ -558,12 +558,11 @@ impl ClaimGuard {
         let ours = tokio::fs::metadata(&paths.socket)
             .await
             .is_ok_and(|m| (m.dev(), m.ino()) == socket_id);
-        if ours {
-            if let Err(error) = tokio::fs::remove_file(&paths.socket).await {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = %paths.socket.display(), %error, "could not remove the socket");
-                }
-            }
+        if ours
+            && let Err(error) = tokio::fs::remove_file(&paths.socket).await
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(path = %paths.socket.display(), %error, "could not remove the socket");
         }
         // `release` removes a file and drops the lock: quick, but still I/O.
         let _ = tokio::task::spawn_blocking(move || {

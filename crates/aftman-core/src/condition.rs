@@ -157,10 +157,10 @@ impl Condition {
     ) -> Vec<(CheckKey, f32, f32)> {
         let mut conflicts = Vec::new();
         self.walk_comparisons(&mut |key, value| {
-            if let Some(declared) = thresholds.get(key) {
-                if (*declared - *value).abs() > f32::EPSILON {
-                    conflicts.push((key.clone(), *value, *declared));
-                }
+            if let Some(declared) = thresholds.get(key)
+                && (*declared - *value).abs() > f32::EPSILON
+            {
+                conflicts.push((key.clone(), *value, *declared));
             }
         });
         conflicts
@@ -227,11 +227,11 @@ fn tokenize(text: &str) -> Result<Vec<String>, ConditionError> {
             '>' | '<' | '=' => {
                 flush(&mut current, &mut tokens);
                 let mut op = c.to_string();
-                if let Some(next) = chars.peek() {
-                    if *next == '=' || (c == '<' && *next == '>') {
-                        op.push(*next);
-                        chars.next();
-                    }
+                if let Some(next) = chars.peek().copied()
+                    && (next == '=' || (c == '<' && next == '>'))
+                {
+                    op.push(next);
+                    chars.next();
                 }
                 tokens.push(op);
             }

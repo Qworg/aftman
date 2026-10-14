@@ -283,14 +283,13 @@ impl EventHub {
             }
             id = state.next_id;
             state.next_id += 1;
-            if let Some(run) = run {
-                if let Some(ring) = state.ring.get(&run) {
-                    if ring.front().is_some_and(|e| e.seq.get() <= from) {
-                        covered = true;
-                        let start = ring.partition_point(|e| e.seq.get() < from);
-                        backlog.extend(ring.iter().skip(start).cloned());
-                    }
-                }
+            if let Some(run) = run
+                && let Some(ring) = state.ring.get(&run)
+                && ring.front().is_some_and(|e| e.seq.get() <= from)
+            {
+                covered = true;
+                let start = ring.partition_point(|e| e.seq.get() < from);
+                backlog.extend(ring.iter().skip(start).cloned());
             }
             let already = run.and_then(|r| {
                 state.abandoned.get(&r).map(|reason| Abandoned {

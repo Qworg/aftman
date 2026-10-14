@@ -766,13 +766,13 @@ impl Request {
             }
             Self::RunAnswer(p) => {
                 check_len("note", &p.note, MAX_ANSWER_BYTES)?;
-                if let Some(surface) = &p.surface {
-                    if !ANSWER_SURFACES.contains(&surface.as_str()) {
-                        return Err(ProtocolError::invalid(format!(
-                            "surface must be one of {}",
-                            ANSWER_SURFACES.join(", ")
-                        )));
-                    }
+                if let Some(surface) = &p.surface
+                    && !ANSWER_SURFACES.contains(&surface.as_str())
+                {
+                    return Err(ProtocolError::invalid(format!(
+                        "surface must be one of {}",
+                        ANSWER_SURFACES.join(", ")
+                    )));
                 }
                 if let HumanDecision::Guidance { text } = &p.decision {
                     check_len("guidance text", text, MAX_ANSWER_BYTES)?;

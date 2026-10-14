@@ -265,12 +265,12 @@ impl ResponsibilityDefinition {
                     .to_owned(),
             ));
         }
-        if let Some(threshold) = self.routing_threshold {
-            if !(0.0..=1.0).contains(&threshold) {
-                return Err(invalid(format!(
-                    "routing_threshold {threshold} is outside 0..=1"
-                )));
-            }
+        if let Some(threshold) = self.routing_threshold
+            && !(0.0..=1.0).contains(&threshold)
+        {
+            return Err(invalid(format!(
+                "routing_threshold {threshold} is outside 0..=1"
+            )));
         }
         if self.checks.is_empty() && self.rules.is_empty() {
             return Err(invalid(
@@ -282,12 +282,12 @@ impl ResponsibilityDefinition {
             if check_id.trim().is_empty() {
                 return Err(invalid("a check id is empty".to_owned()));
             }
-            if let Some(threshold) = check.min_threshold {
-                if !(0.0..=1.0).contains(&threshold) {
-                    return Err(invalid(format!(
-                        "check `{check_id}`: min_threshold {threshold} is outside 0..=1"
-                    )));
-                }
+            if let Some(threshold) = check.min_threshold
+                && !(0.0..=1.0).contains(&threshold)
+            {
+                return Err(invalid(format!(
+                    "check `{check_id}`: min_threshold {threshold} is outside 0..=1"
+                )));
             }
             let primitive = check.primitive.as_deref().unwrap_or("noul");
             match primitive {

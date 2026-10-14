@@ -621,20 +621,20 @@ pub mod builtin {
 
             let mut candidates: Vec<(f32, &str, &str)> = Vec::new();
             let off_track = threshold_for(&self.checks, "work_off_track");
-            if let Some(p) = input.check_value(&key(WORKER_HEALTH, "work_off_track")) {
-                if input.check_ge(&key(WORKER_HEALTH, "work_off_track"), off_track) {
-                    candidates.push((
-                        p,
-                        "core.worker-health:off-track",
-                        "active worker appears off track",
-                    ));
-                }
+            if let Some(p) = input.check_value(&key(WORKER_HEALTH, "work_off_track"))
+                && input.check_ge(&key(WORKER_HEALTH, "work_off_track"), off_track)
+            {
+                candidates.push((
+                    p,
+                    "core.worker-health:off-track",
+                    "active worker appears off track",
+                ));
             }
             let stuck = threshold_for(&self.checks, "worker_stuck");
-            if let Some(p) = input.check_value(&key(WORKER_HEALTH, "worker_stuck")) {
-                if input.check_ge(&key(WORKER_HEALTH, "worker_stuck"), stuck) {
-                    candidates.push((p, "core.worker-health:stuck", "active worker appears stuck"));
-                }
+            if let Some(p) = input.check_value(&key(WORKER_HEALTH, "worker_stuck"))
+                && input.check_ge(&key(WORKER_HEALTH, "worker_stuck"), stuck)
+            {
+                candidates.push((p, "core.worker-health:stuck", "active worker appears stuck"));
             }
             // Highest probability wins; ties broken by rule id for determinism.
             candidates.sort_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(b.1)));

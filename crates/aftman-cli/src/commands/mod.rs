@@ -129,19 +129,19 @@ impl Ctx {
         paths: &DaemonPaths,
         status: &DaemonStatusResult,
     ) -> Result<(), CliError> {
-        if let (Some(theirs), Ok(mine)) = (&status.state_dir, self.data_dir()) {
-            if !same_dir(theirs, &mine) {
-                return Err(CliError::usage(format!(
-                    "the daemon at {} (pid {}) serves the state directory {}, but this command \
-                     was told to use {}. Running on would read and write a different store \
-                     than you asked for. Pass the matching --data-dir, or `aftman stop` and \
-                     let the next command start a daemon for the one you want.",
-                    paths.socket.display(),
-                    status.pid,
-                    theirs.display(),
-                    mine.display()
-                )));
-            }
+        if let (Some(theirs), Ok(mine)) = (&status.state_dir, self.data_dir())
+            && !same_dir(theirs, &mine)
+        {
+            return Err(CliError::usage(format!(
+                "the daemon at {} (pid {}) serves the state directory {}, but this command \
+                 was told to use {}. Running on would read and write a different store \
+                 than you asked for. Pass the matching --data-dir, or `aftman stop` and \
+                 let the next command start a daemon for the one you want.",
+                paths.socket.display(),
+                status.pid,
+                theirs.display(),
+                mine.display()
+            )));
         }
         if status.version != env!("CARGO_PKG_VERSION") {
             errln!(

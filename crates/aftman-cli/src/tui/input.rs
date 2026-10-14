@@ -959,15 +959,15 @@ fn confirm_key(
                 );
                 return None;
             }
-            if matches!(what, Confirm::StopAnswer { .. }) {
-                if let Some(busy) = ui.busy.clone() {
-                    ui.mode = Mode::Confirm { what, typed };
-                    ui.set_message(
-                        Tone::Error,
-                        &format!("still busy ({busy}); wait, then Enter"),
-                    );
-                    return None;
-                }
+            if matches!(what, Confirm::StopAnswer { .. })
+                && let Some(busy) = ui.busy.clone()
+            {
+                ui.mode = Mode::Confirm { what, typed };
+                ui.set_message(
+                    Tone::Error,
+                    &format!("still busy ({busy}); wait, then Enter"),
+                );
+                return None;
             }
             ui.mode = Mode::Normal;
             return Some(match what {
@@ -1107,14 +1107,12 @@ fn submit(ui: &mut UiState, purpose: Purpose, editor: &LineEditor) -> Option<Act
             ..
         }
     );
-    if !stop_note {
-        if let Some(busy) = ui.busy.clone() {
-            again(
-                ui,
-                &format!("still busy ({busy}); press Enter again when it finishes"),
-            );
-            return None;
-        }
+    if !stop_note && let Some(busy) = ui.busy.clone() {
+        again(
+            ui,
+            &format!("still busy ({busy}); press Enter again when it finishes"),
+        );
+        return None;
     }
     match &purpose {
         Purpose::Steer => {

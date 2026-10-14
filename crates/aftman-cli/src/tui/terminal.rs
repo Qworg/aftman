@@ -193,10 +193,10 @@ pub fn spawn_input_thread(clock: Arc<dyn Clock>) -> io::Result<InputParts> {
                                 return;
                             }
                         };
-                        if let Some(event) = forwarded {
-                            if thread_tx.blocking_send(event).is_err() {
-                                return;
-                            }
+                        if let Some(event) = forwarded
+                            && thread_tx.blocking_send(event).is_err()
+                        {
+                            return;
                         }
                     }
                     Err(_) => {

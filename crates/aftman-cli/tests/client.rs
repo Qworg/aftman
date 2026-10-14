@@ -1417,10 +1417,10 @@ async fn a_dropped_next_resumes_the_page_in_flight_instead_of_asking_again() -> 
                 }
                 _ => continue,
             };
-            if let Ok(response) = message {
-                if !send(&mut write, &ServerMessage::Response(response)).await {
-                    return;
-                }
+            if let Ok(response) = message
+                && !send(&mut write, &ServerMessage::Response(response)).await
+            {
+                return;
             }
         }
     });

@@ -102,10 +102,10 @@ pub fn retry_after(headers: &[(String, String)], now: OffsetDateTime, max: Durat
             .map(|(_, value)| value.trim().to_owned())
     };
 
-    if let Some(raw) = lookup("retry-after-ms") {
-        if let Some(delay) = parse_millis(&raw) {
-            return classify(delay, max);
-        }
+    if let Some(raw) = lookup("retry-after-ms")
+        && let Some(delay) = parse_millis(&raw)
+    {
+        return classify(delay, max);
     }
     if let Some(raw) = lookup("retry-after") {
         if let Some(delay) = parse_seconds(&raw) {

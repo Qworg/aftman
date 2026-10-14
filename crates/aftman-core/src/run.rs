@@ -168,20 +168,20 @@ pub struct RunFilter {
 impl RunFilter {
     #[must_use]
     pub fn matching(&self, summary: &RunSummary) -> bool {
-        if let Some(statuses) = &self.status {
-            if !statuses.contains(&summary.status) {
-                return false;
-            }
+        if let Some(statuses) = &self.status
+            && !statuses.contains(&summary.status)
+        {
+            return false;
         }
-        if let Some(repo) = &self.repo {
-            if &summary.repo != repo {
-                return false;
-            }
+        if let Some(repo) = &self.repo
+            && &summary.repo != repo
+        {
+            return false;
         }
-        if let Some(cursor) = self.cursor {
-            if summary.id >= cursor {
-                return false;
-            }
+        if let Some(cursor) = self.cursor
+            && summary.id >= cursor
+        {
+            return false;
         }
         true
     }

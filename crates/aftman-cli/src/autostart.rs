@@ -353,13 +353,13 @@ pub async fn ensure_daemon(
                 // A child that died with an error will never become ready. One that
                 // exited 0 lost the start race to a daemon whose socket we are about
                 // to see.
-                if let Ok(Some(status)) = child.try_wait() {
-                    if !status.success() {
-                        return Err(AutostartError::Exited {
-                            status: status.to_string(),
-                            log: starter.log_path(),
-                        });
-                    }
+                if let Ok(Some(status)) = child.try_wait()
+                    && !status.success()
+                {
+                    return Err(AutostartError::Exited {
+                        status: status.to_string(),
+                        log: starter.log_path(),
+                    });
                 }
                 if now.duration_since(quiet_since) >= starter.ready_timeout {
                     return Err(AutostartError::NotReady {

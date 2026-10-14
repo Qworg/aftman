@@ -345,10 +345,8 @@ impl SubprocessWorker {
                 std::sync::atomic::Ordering::SeqCst,
             )
             .is_ok();
-        if cleared {
-            if let Ok(mut slot) = self.stdin.try_lock() {
-                *slot = None;
-            }
+        if cleared && let Ok(mut slot) = self.stdin.try_lock() {
+            *slot = None;
         }
     }
 }
@@ -445,10 +443,10 @@ impl Worker for SubprocessWorker {
         }
 
         // For an RPC backend the mission is the first line of input, not an argument.
-        if let Some(initial) = spec.steer.initial_prompt(&ctx.mission) {
-            if let Err(error) = self.write_stdin(&initial).await {
-                tracing::warn!(%error, "could not deliver the mission over stdin");
-            }
+        if let Some(initial) = spec.steer.initial_prompt(&ctx.mission)
+            && let Err(error) = self.write_stdin(&initial).await
+        {
+            tracing::warn!(%error, "could not deliver the mission over stdin");
         }
 
         let stdout_task = child.stdout.take().map(|pipe| {

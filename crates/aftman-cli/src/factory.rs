@@ -576,13 +576,13 @@ fn backend_options(
 /// A definition that does not parse, or one that would never propose anything.
 pub fn load_definitions_from(dir: Option<&Path>) -> Result<DefinitionSet, FactoryError> {
     let mut set = DefinitionSet::bundled().map_err(|e| FactoryError::Bundled(e.to_string()))?;
-    if let Some(dir) = dir {
-        if dir.is_dir() {
-            set.overlay_dir(dir).map_err(|e| FactoryError::Overlay {
-                dir: dir.to_owned(),
-                message: e.to_string(),
-            })?;
-        }
+    if let Some(dir) = dir
+        && dir.is_dir()
+    {
+        set.overlay_dir(dir).map_err(|e| FactoryError::Overlay {
+            dir: dir.to_owned(),
+            message: e.to_string(),
+        })?;
     }
     let unknown = set.unknown_ids();
     if !unknown.is_empty() {

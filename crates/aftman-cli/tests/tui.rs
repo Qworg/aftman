@@ -517,7 +517,12 @@ impl SharedBackend {
 }
 
 impl Backend for SharedBackend {
-    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    // ratatui 0.30 made `Backend` fallible-by-association. This backend wraps an
+    // in-memory `TestBackend`, so it cannot fail; `Infallible` says that in the type
+    // rather than pretending an io error is possible and converting one that never is.
+    type Error = std::convert::Infallible;
+
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
     where
         I: Iterator<Item = (u16, u16, &'a Cell)>,
     {
@@ -528,44 +533,44 @@ impl Backend for SharedBackend {
         self.with(|b| b.draw(content))
     }
 
-    fn append_lines(&mut self, n: u16) -> io::Result<()> {
+    fn append_lines(&mut self, n: u16) -> Result<(), Self::Error> {
         self.with(|b| b.append_lines(n))
     }
 
-    fn hide_cursor(&mut self) -> io::Result<()> {
+    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
         self.with(Backend::hide_cursor)
     }
 
-    fn show_cursor(&mut self) -> io::Result<()> {
+    fn show_cursor(&mut self) -> Result<(), Self::Error> {
         self.with(Backend::show_cursor)
     }
 
-    fn get_cursor_position(&mut self) -> io::Result<Position> {
+    fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
         self.with(Backend::get_cursor_position)
     }
 
-    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> io::Result<()> {
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> Result<(), Self::Error> {
         let position = position.into();
         self.with(|b| b.set_cursor_position(position))
     }
 
-    fn clear(&mut self) -> io::Result<()> {
+    fn clear(&mut self) -> Result<(), Self::Error> {
         self.with(Backend::clear)
     }
 
-    fn clear_region(&mut self, clear_type: ClearType) -> io::Result<()> {
+    fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
         self.with(|b| b.clear_region(clear_type))
     }
 
-    fn size(&self) -> io::Result<Size> {
+    fn size(&self) -> Result<Size, Self::Error> {
         self.with(|b| b.size())
     }
 
-    fn window_size(&mut self) -> io::Result<WindowSize> {
+    fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
         self.with(Backend::window_size)
     }
 
-    fn flush(&mut self) -> io::Result<()> {
+    fn flush(&mut self) -> Result<(), Self::Error> {
         // One flush per frame: the number of draws.
         self.1.fetch_add(1, Ordering::SeqCst);
         self.with(Backend::flush)
@@ -598,7 +603,12 @@ impl Watcher {
         height: u16,
     ) -> Result<Self, io::Error> {
         let backend = SharedBackend::new(width, height);
-        let mut terminal = Terminal::new(backend.clone())?;
+        // Infallible by construction (see the `Backend` impl below), so there is no error to
+        // propagate and no io error it could ever be converted into.
+        let mut terminal = match Terminal::new(backend.clone()) {
+            Ok(terminal) => terminal,
+            Err(never) => match never {},
+        };
         let (keys, mut input) = mpsc::channel(64);
         let task =
             tokio::spawn(async move { run_watch(&mut terminal, &mut input, run, &options).await });
@@ -1160,21 +1170,20 @@ async fn vanishing_daemon(
         let (read, mut write) = stream.into_split();
         let mut lines = BufReader::new(read).lines();
         // Header requests may arrive on their own connections; this is the first one.
-        if let Ok(Some(line)) = lines.next_line().await {
-            if let Ok(envelope) = decode_request(&line) {
-                if let Request::SubscriptionOpen(_) = envelope.request {
-                    let result = SubscriptionOpenResult {
-                        run_id: Some(run_id),
-                        from_seq: Some(EventSeq(1)),
-                        replaced: false,
-                        live: true,
-                    };
-                    if let Ok(response) = Response::ok(envelope.id, &result) {
-                        if let Ok(line) = encode_line(&ServerMessage::Response(response)) {
-                            let _ = write.write_all(line.as_bytes()).await;
-                        }
-                    }
-                }
+        if let Ok(Some(line)) = lines.next_line().await
+            && let Ok(envelope) = decode_request(&line)
+            && let Request::SubscriptionOpen(_) = envelope.request
+        {
+            let result = SubscriptionOpenResult {
+                run_id: Some(run_id),
+                from_seq: Some(EventSeq(1)),
+                replaced: false,
+                live: true,
+            };
+            if let Ok(response) = Response::ok(envelope.id, &result)
+                && let Ok(line) = encode_line(&ServerMessage::Response(response))
+            {
+                let _ = write.write_all(line.as_bytes()).await;
             }
         }
         // Gone: the connection, the listener and the socket file.

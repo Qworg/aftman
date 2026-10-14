@@ -734,12 +734,12 @@ async fn the_socket_never_exists_with_a_wider_mode() -> TestResult {
                 // Anything socket-like that appears anywhere in the directory.
                 if let Ok(entries) = std::fs::read_dir(&run_dir) {
                     for entry in entries.flatten() {
-                        if let Ok(meta) = entry.metadata() {
-                            if std::os::unix::fs::FileTypeExt::is_socket(&meta.file_type()) {
-                                samples.fetch_add(1, Ordering::SeqCst);
-                                if meta.permissions().mode() & 0o077 != 0 {
-                                    wide.fetch_add(1, Ordering::SeqCst);
-                                }
+                        if let Ok(meta) = entry.metadata()
+                            && std::os::unix::fs::FileTypeExt::is_socket(&meta.file_type())
+                        {
+                            samples.fetch_add(1, Ordering::SeqCst);
+                            if meta.permissions().mode() & 0o077 != 0 {
+                                wide.fetch_add(1, Ordering::SeqCst);
                             }
                         }
                     }

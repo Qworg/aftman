@@ -91,14 +91,14 @@ impl RunStore for MemoryRunStore {
             .ok_or(StoreError::NotFound(event.run_id))?;
         // Reject a sequence that would make the log ambiguous rather than
         // silently accepting an out-of-order history.
-        if let Some(last) = log.last() {
-            if event.seq <= last.seq {
-                return Err(StoreError::SeqConflict {
-                    run_id: event.run_id,
-                    seq: event.seq.get(),
-                    last: last.seq.get(),
-                });
-            }
+        if let Some(last) = log.last()
+            && event.seq <= last.seq
+        {
+            return Err(StoreError::SeqConflict {
+                run_id: event.run_id,
+                seq: event.seq.get(),
+                last: last.seq.get(),
+            });
         }
         log.push(event.clone());
         Ok(())

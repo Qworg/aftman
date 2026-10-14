@@ -211,6 +211,10 @@ Compaction is deterministic and ordered, and it records every action it takes:
    history → extra untracked files → diff middle → diffs → output heads).
 2. Truncate long strings **from the middle**, keeping both ends, and mark them
    `"…[truncated N bytes]…"` so a model is never shown a silently clipped fact.
+   Per-pair truncation runs **before** the required-evidence check, not after. A required
+   field can itself be enormous — the active worker's output tail is protected, and a chatty
+   worker produces megabytes of it — so measuring it first would exceed the budget and refuse
+   the request, stopping supervision altogether. Bounding it first keeps the evidence, shrunk.
 3. Never drop: the job prompt, the current status, the active worker's tail, the prior decision,
    or `counters`. If those alone exceed the budget the request is refused
    (`ModelError::BudgetExceeded`) and becomes an `Escalate`, because supervising with the

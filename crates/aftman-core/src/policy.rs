@@ -511,6 +511,7 @@ mod tests {
             prior: None,
             counters: Counters::default(),
             evidence: BTreeMap::new(),
+            output: None,
         }
     }
 

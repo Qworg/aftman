@@ -187,7 +187,8 @@ Each observation is compact and bounded:
 - the prior assessment and the prior intervention;
 - attempt/failure counts and elapsed factory time.
 
-Defaults: 20,000 characters of diff, 12,000 characters per captured output tail, 30 recent events,
+Defaults: 20,000 characters of diff, a 4,000-character output head and a 12,000-character
+tail for the most recent worker (stripped of terminal control sequences), 30 recent events,
 10 workers of history, 3 untracked files capped at 4,096 bytes total. All of these are typed
 config fields, and the request budget can shrink them further per call.
 

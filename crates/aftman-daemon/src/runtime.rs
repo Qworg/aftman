@@ -2375,6 +2375,7 @@ mod tests {
             prior: None,
             counters: Counters::default(),
             evidence: Default::default(),
+            output: None,
         }
     }
 

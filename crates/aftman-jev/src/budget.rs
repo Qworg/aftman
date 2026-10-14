@@ -68,6 +68,22 @@ pub fn fit(state: &Value, budget: &Budget) -> Result<BudgetFit, ModelError> {
     let mut work = state.clone();
     let mut measurements: BTreeMap<String, usize> = BTreeMap::new();
 
+    // ---- Step 1: cap any single pair -------------------------------------
+    //
+    // This runs **before** the protected-evidence check, and the order matters. That check
+    // refuses the request when the required evidence cannot fit, and a required field can
+    // itself be enormous: the active worker's output tail is protected, and a chatty worker
+    // produces megabytes of it. Measured first, that tail alone would exceed the budget and
+    // the request would be refused, so supervision would stop altogether. Measured after
+    // per-pair truncation it is a bounded field that fits. Keeping the evidence and shrinking
+    // it is strictly better than keeping none and refusing to ask.
+    let truncated_pairs =
+        truncate_long_strings(&mut work, budget.pair_bytes, budget.pair_target_bytes);
+    if truncated_pairs > 0 {
+        measurements.insert("pairs_truncated".to_owned(), truncated_pairs);
+    }
+
+    // ---- Step 2: is the required evidence, now bounded, small enough? -----
     let protected = byte_len(&protected_subset(&work));
     if protected > budget.request_bytes {
         return Err(ModelError::BudgetExceeded(format!(
@@ -76,14 +92,7 @@ pub fn fit(state: &Value, budget: &Budget) -> Result<BudgetFit, ModelError> {
         )));
     }
 
-    // ---- Step 1: cap any single pair -------------------------------------
-    let truncated_pairs =
-        truncate_long_strings(&mut work, budget.pair_bytes, budget.pair_target_bytes);
-    if truncated_pairs > 0 {
-        measurements.insert("pairs_truncated".to_owned(), truncated_pairs);
-    }
-
-    // ---- Step 2: drop, cheapest evidence first ---------------------------
+    // ---- Step 3: drop, cheapest evidence first ---------------------------
     // Runs when the hard cap is exceeded, and continues to the hysteresis target once
     // *any* compaction has started — including a per-pair truncation, which counts as
     // started. Without that second clause a state that step 1 alone brought just under
@@ -602,6 +611,80 @@ mod tests {
             byte_len(&fitted.state) <= small_budget().request_target_bytes,
             "got {} bytes",
             byte_len(&fitted.state)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_huge_worker_tail_is_shrunk_but_never_dropped() -> Result<(), Box<dyn std::error::Error>> {
+        // `worker_output.output_tail` is protected evidence: the model is asked whether a
+        // worker is stuck, and the tail is where that shows. Budget pressure must shrink
+        // it, never remove it.
+        let budget = Budget {
+            pair_bytes: 4_000,
+            request_bytes: 40_000,
+            pair_target_bytes: 2_000,
+            request_target_bytes: 20_000,
+        };
+        let state = json!({
+            "job": { "prompt": "add retries" },
+            "factory_status": { "status": "running" },
+            "active_worker": { "status": "running" },
+            "worker_output": {
+                "output_head": "h".repeat(4_000),
+                "output_tail": "t".repeat(50_000),
+            },
+            "counters": { "attempts": 1 },
+            "prior": null,
+        });
+
+        let fitted = fit(&state, &budget)?;
+        let tail = fitted.state["worker_output"]["output_tail"]
+            .as_str()
+            .ok_or("the tail must still be a string")?;
+        assert!(
+            !tail.is_empty(),
+            "the tail must never be dropped: {fitted:?}"
+        );
+        assert!(
+            tail.len() <= budget.pair_bytes,
+            "the tail must be shrunk to the pair budget, is {} bytes",
+            tail.len()
+        );
+        assert!(
+            byte_len(&fitted.state) <= budget.request_bytes,
+            "got {} bytes",
+            byte_len(&fitted.state)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn the_worker_excerpts_add_a_bounded_share_of_the_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // What the model sees of the worker costs bytes, so it is worth naming the number.
+        // The caps are the builder's (`ObsCaps`: 4 000 head, 12 000 tail by default).
+        let base = |output: serde_json::Value| {
+            json!({
+                "job": { "prompt": "add retries with backoff" },
+                "factory_status": { "status": "running" },
+                "active_worker": { "status": "running", "kind": "pi" },
+                "worker_output": output,
+                "counters": { "attempts": 1 },
+                "prior": null,
+                "test_results": [],
+            })
+        };
+        let without = byte_len(&base(json!({ "output_head": "", "output_tail": "" })));
+        let with = byte_len(&base(json!({
+            "output_head": "h".repeat(4_000),
+            "output_tail": "t".repeat(12_000),
+        })));
+        let added = with - without;
+        eprintln!("worker excerpts: {without} bytes without, {with} with (+{added})");
+        assert!(
+            added <= 20_000,
+            "the default caps must stay inside 20 000 bytes, added {added}"
         );
         Ok(())
     }

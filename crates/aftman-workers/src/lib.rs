@@ -21,12 +21,14 @@
 
 pub mod backends;
 pub mod evidence;
+pub mod output;
 pub mod process;
 pub mod simulated;
 pub mod subprocess;
 
 pub use backends::{BackendOptions, PermissionMode, SpecError, SteerProtocol};
 pub use evidence::run_provider;
+pub use output::{StreamDecoder, decode_all};
 pub use simulated::SimulatedWorker;
 pub use subprocess::{CommandSpec, SubprocessWorker};
 

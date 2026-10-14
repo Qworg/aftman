@@ -888,7 +888,7 @@ Methods (every params struct rejects unknown fields; a method with no params acc
 | --- | --- | --- |
 | `daemon.status` | none | `{version, uptime_secs, pid, runs_total, runs_active}` |
 | `daemon.stop` | none | `{ok}` (graceful shutdown) |
-| `run.start` | `repo, job` + optional `worker, cmd, permissions, effort, steer, external_sandbox, model, verify, ensemble, simulate_model` (the flags of `aftman run`) | `{run_id}` |
+| `run.start` | `repo, job` + optional `worker, cmd, permissions, effort, steer, external_sandbox, model, verify, ensemble, simulate_model, env` (the flags of `aftman run`) | `{run_id}` |
 | `run.list` | `status?[], limit?, cursor?` | `{runs: RunSummary[], next_cursor}` |
 | `run.get` | `run_id` | `RunState` |
 | `run.events` | `run_id, from_seq?, limit?` | `{events: EventEnvelope[], has_more}` |
@@ -909,6 +909,22 @@ follow such a run polls `run.events`. It is always true for an all-runs stream. 
 also returns **`state_dir`** (the directory the daemon serves, so a client can notice its own
 `--data-dir` differs), **`started_at`** (RFC 3339, from the injected clock) and **`info`** (free-form
 strings from the composition root, at most 32 entries, keys at most 64 bytes, values at most 256).
+**`env` is the run's forwarded environment**, and it is bounded like every other field (hard
+rule 5): at most `MAX_ENV_ENTRIES` (64) entries, `MAX_ENV_NAME_BYTES` (256) per name,
+`MAX_ENV_VALUE_BYTES` (8 KiB) per value, and `MAX_ENV_TOTAL_BYTES` (32 KiB) overall. A name must
+match `[A-Za-z_][A-Za-z0-9_]*`. A name belonging to the supervisor is refused here
+(`invalid_request`) and again where the worker environment is built, because the client chooses
+this map and a client that asked for `AFTMAN_WEB_TOKEN` would otherwise hand a worker the key that
+pays for its own supervision. The check is asked of the module that owns the rule rather than
+restating the prefixes, per hard rule 2.
+
+Its purpose is that the daemon keeps the environment of whichever shell started it, so without
+forwarding a run from a second shell would use the first shell's `PATH`, virtualenv, and anything
+else exported there. Values reach a subprocess and are never recorded; `RUN_CREATED` carries the
+forwarded *names* under `launch`. A client that sends no `env` (an older client, a raw socket
+client, the web UI in M4) is valid: the worker then gets the daemon's baseline only, which is
+documented in [08-security.md section 2.2](08-security.md).
+
 `run.start` requires an absolute `repo` (`invalid_repo` otherwise): a relative path would be
 resolved against the daemon's working directory, not the client's.
 

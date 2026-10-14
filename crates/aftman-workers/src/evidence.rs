@@ -27,10 +27,15 @@ use aftman_core::evidence::{CommandProvider, EvidenceOutcome, ProviderCwd};
 /// Never returns an error: a command that cannot be launched, times out, or is killed is
 /// reported as an outcome, because all three are things the supervisor should *see*
 /// rather than exceptions it should handle.
+///
+/// `forwarded_env` is the run's allowlisted environment, so a test command finds the
+/// same toolchain the agent did. It is passed through `worker_environment`, which
+/// scrubs supervisor names a second time.
 pub async fn run_provider(
     provider: &CommandProvider,
     repo: &Path,
     temp_dir: &Path,
+    forwarded_env: &[(String, String)],
     now: OffsetDateTime,
 ) -> EvidenceOutcome {
     let cwd = match provider.cwd {
@@ -38,7 +43,7 @@ pub async fn run_provider(
         ProviderCwd::Temp => temp_dir.to_path_buf(),
     };
     let started = tokio::time::Instant::now();
-    let outcome = run(provider, &cwd).await;
+    let outcome = run(provider, &cwd, forwarded_env).await;
     let duration = started.elapsed();
 
     match outcome {
@@ -73,6 +78,7 @@ pub async fn run_provider(
 async fn run(
     provider: &CommandProvider,
     cwd: &Path,
+    forwarded_env: &[(String, String)],
 ) -> Result<(Option<i32>, String, bool), String> {
     let (program, args) = provider
         .argv
@@ -88,7 +94,7 @@ async fn run(
     command.current_dir(cwd);
     // Scrubbed, exactly as a worker's environment is.
     command.env_clear();
-    command.envs(crate::worker_environment(&[]));
+    command.envs(crate::worker_environment(forwarded_env));
     command.stdin(std::process::Stdio::null());
     command.stdout(std::process::Stdio::piped());
     command.stderr(std::process::Stdio::piped());
@@ -220,6 +226,7 @@ mod tests {
             &provider(&["sh", "-c", "echo hello"]),
             dir.path(),
             dir.path(),
+            &[],
             now(),
         )
         .await;
@@ -244,6 +251,7 @@ mod tests {
             &provider(&["sh", "-c", "echo '1 failed'; exit 1"]),
             dir.path(),
             dir.path(),
+            &[],
             now(),
         )
         .await;
@@ -265,7 +273,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut configured = provider(&["sh", "-c", "exit 1"]);
         configured.success_exit_codes = vec![0, 1];
-        let outcome = run_provider(&configured, dir.path(), dir.path(), now()).await;
+        let outcome = run_provider(&configured, dir.path(), dir.path(), &[], now()).await;
         assert!(outcome.success);
         Ok(())
     }
@@ -277,6 +285,7 @@ mod tests {
             &provider(&["sh", "-c", "echo out; echo err >&2"]),
             dir.path(),
             dir.path(),
+            &[],
             now(),
         )
         .await;
@@ -291,7 +300,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let mut configured = provider(&["sh", "-c", "yes | head -c 500000"]);
         configured.max_output_bytes = 1000;
-        let outcome = run_provider(&configured, dir.path(), dir.path(), now()).await;
+        let outcome = run_provider(&configured, dir.path(), dir.path(), &[], now()).await;
         assert!(
             outcome.output_excerpt.len() <= 1000,
             "got {} bytes",
@@ -309,7 +318,7 @@ mod tests {
         let mut configured = provider(&["sleep", "60"]);
         configured.timeout_seconds = 1;
         let started = tokio::time::Instant::now();
-        let outcome = run_provider(&configured, dir.path(), dir.path(), now()).await;
+        let outcome = run_provider(&configured, dir.path(), dir.path(), &[], now()).await;
         assert!(outcome.launch_error.is_some(), "a timeout is reported");
         assert!(
             outcome.summary().contains("could not launch"),
@@ -330,6 +339,7 @@ mod tests {
             &provider(&["/definitely/not/a/binary"]),
             dir.path(),
             dir.path(),
+            &[],
             now(),
         )
         .await;
@@ -345,6 +355,7 @@ mod tests {
             &provider(&["true"]),
             std::path::Path::new("/definitely/not/here"),
             std::path::Path::new("/tmp"),
+            &[],
             now(),
         )
         .await;
@@ -359,6 +370,7 @@ mod tests {
             &provider(&["sh", "-c", "echo \"key=${TYPESAFE_API_KEY:-absent}\""]),
             dir.path(),
             dir.path(),
+            &[],
             now(),
         )
         .await;
@@ -375,7 +387,7 @@ mod tests {
         let dir = tempfile::tempdir()?;
         let repo = dir.path().join("repo");
         std::fs::create_dir_all(&repo)?;
-        let outcome = run_provider(&provider(&["pwd"]), &repo, dir.path(), now()).await;
+        let outcome = run_provider(&provider(&["pwd"]), &repo, dir.path(), &[], now()).await;
         let leaf = repo
             .file_name()
             .ok_or("a name")?
@@ -400,7 +412,7 @@ mod tests {
 
         let mut configured = provider(&["sh", "-c", "touch marker"]);
         configured.cwd = ProviderCwd::Temp;
-        let outcome = run_provider(&configured, &repo, &scratch, now()).await;
+        let outcome = run_provider(&configured, &repo, &scratch, &[], now()).await;
         assert!(outcome.success);
         assert!(
             scratch.join("marker").exists(),

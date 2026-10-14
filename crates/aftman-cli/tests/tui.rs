@@ -191,6 +191,8 @@ impl RuntimeFactory for TestFactory {
             .into_iter()
             .map(|(k, v)| (k.to_owned(), v.to_owned()))
             .collect(),
+
+            forwarded_env: Default::default(),
         });
         Ok(BuiltRun {
             runtime: Arc::new(runtime),

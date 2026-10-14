@@ -607,6 +607,8 @@ impl RuntimeFactory for TestFactory {
                 ("steering".to_owned(), params.steer.to_string()),
             ]
             .into(),
+
+            forwarded_env: Default::default(),
         });
         Ok(BuiltRun {
             runtime: Arc::new(runtime),

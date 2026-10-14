@@ -532,6 +532,8 @@ fn subprocess_runtime(
         uncertainty_margin: 0.15,
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
+
+        forwarded_env: Default::default(),
     }))
 }
 

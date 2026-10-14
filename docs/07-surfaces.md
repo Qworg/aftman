@@ -60,17 +60,26 @@ aftman serve [--socket <path>]          # foreground; --bind / --print-url arriv
     are therefore resolved to absolute paths in the client before anything is sent or passed on.
     A worker runs with its working directory set to the repository (every backend, `generic`
     included).
-  - **The daemon freezes its environment.** An auto-started daemon inherits the environment of
-    the CLI that started it, and every later run through it - its workers, its evidence
-    commands, its provider key - uses *that* environment, not the caller's. A key exported in a
-    later shell does not reach it. To change it: `aftman stop`, and the next command starts a
-    daemon with the new environment. Provider settings are the exception: the provider `.env`
-    file is re-read on every run, so putting the key there needs no restart. `aftman status` and
-    `aftman doctor` print the daemon's view (provider configured or not, model, base URL without
-    credentials, state directory, version) next to the caller's, and flag any disagreement; a
+  - **The daemon freezes its own environment, and a run brings its own.** An auto-started
+    daemon inherits the environment of the CLI that started it, and keeps it for life — so
+    without help, every later run's workers, evidence commands, and provider key would use
+    *that* shell's environment rather than the caller's. Two things follow:
+    - **A run forwards an allowlist of the caller's environment.** The client sends the names
+      it chooses — a small default set (`PATH`, `VIRTUAL_ENV`, `CONDA_PREFIX`, `SSH_AUTH_SOCK`,
+      `LANG`, `LC_ALL`, `LC_CTYPE`) plus every `--pass-env KEY` — and the worker and the run's
+      command evidence providers see those values. A name that is unset in the calling shell is
+      an error rather than a silent no-op, and a name from the supervisor's namespace is
+      refused. `show` and the TUI header list the forwarded *names*; values are never recorded.
+    - **The daemon contributes only a fixed baseline** ([08-security.md section 2.2](08-security.md)
+      lists it): `HOME`, `PATH`, `SHELL`, `TERM`, `TMPDIR`, locale and `XDG_*` variables. Anything
+      else the daemon happens to hold — a `GITHUB_TOKEN` exported in the shell that started it,
+      for example — does **not** cross. A run that forwards nothing (a raw socket client today,
+      the web UI in M4) gets the baseline and nothing more.
+    Provider settings are the exception to all of this: the provider `.env` file is re-read on
+    every run, so putting the key there needs no restart. `aftman status` and `aftman doctor`
+    print the daemon's view (provider configured or not, model, base URL without credentials,
+    state directory, version) next to the caller's, and flag any disagreement; a
     `model_unavailable` from a daemon says it was started without a provider and how to fix it.
-    Forwarding the caller's environment per run is a protocol and security decision that has not
-    been made.
   - **One daemon per state directory.** The daemon takes a lock in the state directory
     (`daemon.lock`) as well as its pid-file lock, so two daemons on different sockets cannot
     share runs. Auto-start reports which pid owns the directory instead of looping. A client

@@ -2056,3 +2056,128 @@ fn followers_of_a_run_the_daemon_could_not_record_exit_with_the_reason() {
     assert!(followed.stderr.contains("abandoned"), "{}", followed.stderr);
     std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o644)).expect("chmod back");
 }
+
+// ---------------------------------------------------------------------------
+// M3 follow-up: a run forwards the *calling* shell's environment.
+//
+// The daemon is started by the first client that needs it and keeps that shell's
+// environment for life. Before forwarding, a run from a second shell therefore used the
+// first shell's `PATH`, virtualenv, and anything else exported there — proved in the M3
+// review with a `GITHUB_TOKEN` exported in only one shell reaching every later worker.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_worker_sees_the_calling_shell_environment_not_the_daemons() {
+    let sb = Sandbox::new();
+    let real_path = std::env::var("PATH").unwrap_or_default();
+    let shell_a = format!("/shell-a/bin:{real_path}");
+    let shell_b = format!("/shell-b/bin:{real_path}");
+
+    // Start the daemon from shell A: this process's environment is what it keeps.
+    let started = sb.run_with(
+        &sb.run_args(&["--worker", "generic", "--external-sandbox", "--cmd", "true"]),
+        |c| {
+            c.env("PATH", &shell_a)
+                .env("SHELL_A_ONLY_TOKEN", "canary-not-allowlisted");
+        },
+    );
+    assert_eq!(started.code, 3, "the first job runs: {}", started.all());
+
+    // Now run from shell B, which has a different PATH and its own variable.
+    let cmd = "sh -c 'echo worker-path=$PATH; if [ -n \"$SHELL_A_ONLY_TOKEN\" ]; then echo shell-a-token-present; fi'";
+    let out = sb.run_with(
+        &sb.run_args(&["--worker", "generic", "--external-sandbox", "--cmd", cmd]),
+        |c| {
+            c.env("PATH", &shell_b);
+        },
+    );
+    let id = run_id_of(&out);
+    let logs = sb.run(&["logs", id.as_str()]);
+    assert_eq!(logs.code, 0, "{}", logs.all());
+
+    assert!(
+        logs.stdout.contains("/shell-b/bin:"),
+        "the worker must use the calling shell's PATH:\n{}",
+        logs.stdout
+    );
+    assert!(
+        !logs.stdout.contains("/shell-a/bin:"),
+        "the daemon's own shell must not leak into a later run:\n{}",
+        logs.stdout
+    );
+    assert!(
+        !logs.stdout.contains("shell-a-token-present"),
+        "a variable that was never allowlisted must not be forwarded:\n{}",
+        logs.stdout
+    );
+}
+
+#[test]
+fn pass_env_forwards_a_named_variable_and_refuses_a_supervisor_one() {
+    let sb = Sandbox::new();
+    let cmd = "sh -c 'if [ -n \"$CARGO_TARGET_DIR\" ]; then echo forwarded=$CARGO_TARGET_DIR; fi'";
+
+    let out = sb.run_with(
+        &sb.run_args(&[
+            "--worker",
+            "generic",
+            "--external-sandbox",
+            "--cmd",
+            cmd,
+            "--pass-env",
+            "CARGO_TARGET_DIR",
+        ]),
+        |c| {
+            c.env("CARGO_TARGET_DIR", "/forwarded-target");
+        },
+    );
+    let id = run_id_of(&out);
+    let logs = sb.run(&["logs", id.as_str()]);
+    assert!(
+        logs.stdout.contains("forwarded=/forwarded-target"),
+        "--pass-env must forward the named variable:\n{}",
+        logs.stdout
+    );
+
+    // A name from the supervisor's own namespace is refused, and the refusal must not
+    // echo the value. `AFTMAN_*` is the supervisor's namespace, so naming it is not a
+    // hard-rule-2 concern.
+    let refused = sb.run_with(
+        &sb.run_args(&[
+            "--worker",
+            "generic",
+            "--external-sandbox",
+            "--cmd",
+            "true",
+            "--pass-env",
+            "AFTMAN_WEB_TOKEN",
+        ]),
+        |c| {
+            c.env("AFTMAN_WEB_TOKEN", "canary-token-value");
+        },
+    );
+    assert_ne!(refused.code, 0, "a supervisor name must be refused");
+    assert!(
+        refused.all().contains("belongs to the supervisor"),
+        "{}",
+        refused.all()
+    );
+    assert!(
+        !refused.all().contains("canary-token-value"),
+        "the refusal must not echo the value: {}",
+        refused.all()
+    );
+
+    // A name that is unset in this shell is an error rather than a silent no-op.
+    let unset = sb.run(&sb.run_args(&[
+        "--worker",
+        "generic",
+        "--external-sandbox",
+        "--cmd",
+        "true",
+        "--pass-env",
+        "DEFINITELY_NOT_SET_ANYWHERE",
+    ]));
+    assert_ne!(unset.code, 0, "an unset name must be refused");
+    assert!(unset.all().contains("not set"), "{}", unset.all());
+}

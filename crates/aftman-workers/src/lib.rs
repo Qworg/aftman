@@ -111,40 +111,6 @@ pub fn build_worker_environment(
     env
 }
 
-/// The supervisor's own environment, for a subprocess the *supervisor* runs.
-///
-/// The supervisor's `git` is the only caller: it is not an agent, it needs the daemon's
-/// environment to be usable at all, and it must not see a secret. It is a separate
-/// function from [`worker_environment`] because the two want different policies, and a
-/// single helper serving both is how a worker ended up inheriting the daemon's shell.
-#[must_use]
-pub fn supervisor_environment() -> Vec<(String, String)> {
-    build_supervisor_environment(
-        std::env::vars_os()
-            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
-        &[],
-    )
-}
-
-/// The pure half of [`supervisor_environment`], over an explicit base.
-#[must_use]
-pub fn build_supervisor_environment(
-    base: impl IntoIterator<Item = (String, String)>,
-    extra: &[(String, String)],
-) -> Vec<(String, String)> {
-    let mut env: Vec<(String, String)> = base
-        .into_iter()
-        .filter(|(key, _)| !is_supervisor_secret(key))
-        .collect();
-    env.extend(
-        extra
-            .iter()
-            .filter(|(key, _)| !is_supervisor_secret(key))
-            .cloned(),
-    );
-    env
-}
-
 /// Whether an environment variable belongs to the supervisor rather than the agent.
 ///
 /// Prefix matching is deliberate: a future `TYPESAFE_*` or `AFTMAN_*` variable must
@@ -170,10 +136,7 @@ pub fn is_supervisor_secret(key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_supervisor_environment, build_worker_environment, is_supervisor_secret,
-        is_worker_baseline,
-    };
+    use super::{build_worker_environment, is_supervisor_secret, is_worker_baseline};
 
     #[test]
     fn supervisor_credentials_are_never_inherited() {
@@ -290,23 +253,6 @@ mod tests {
             "the client forwards its own virtualenv, so the daemon's must not appear: {env:?}"
         );
         assert!(!env.iter().any(|(_, v)| v == "canary-token-value"));
-    }
-
-    #[test]
-    fn the_supervisor_environment_still_scrubs_but_inherits() {
-        // The supervisor's own `git` is not an agent: it needs the daemon's environment to
-        // run, and must still never see a secret.
-        let base = vec![
-            ("PATH".to_owned(), "/usr/bin".to_owned()),
-            ("CARGO_HOME".to_owned(), "/cargo".to_owned()),
-            ("GITHUB_TOKEN".to_owned(), "still-inherited".to_owned()),
-            ("TYPESAFE_API_KEY".to_owned(), "must-not-leak".to_owned()),
-        ];
-        let env = build_supervisor_environment(base, &[]);
-        assert!(env.iter().any(|(k, _)| k == "CARGO_HOME"));
-        assert!(env.iter().any(|(k, _)| k == "GITHUB_TOKEN"));
-        assert!(!env.iter().any(|(k, _)| is_supervisor_secret(k)));
-        assert!(!env.iter().any(|(_, v)| v == "must-not-leak"));
     }
 
     #[test]

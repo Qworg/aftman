@@ -83,16 +83,15 @@ the run's own files for a canary value.
 | --- | --- |
 | coding-agent workers (`aftman-workers/subprocess.rs`) | `worker_environment()` — baseline plus the run's allowlist |
 | command evidence providers (`aftman-workers/evidence.rs`) | `worker_environment()` — the same, so a test command finds the agent's toolchain |
-| the supervisor's own `git` for observation (`aftman-daemon/obs.rs`) | `supervisor_environment()` minus every `GIT_*`, plus the hardening in section 3.2 |
 | `ps`, non-Linux orphan identification (`aftman-workers/process.rs`) | `worker_environment()` |
 | `aftman-jev/build.rs` (`rustc -vV`, at build time, no secrets exist) | build environment; not a runtime spawn |
 | **daemon auto-start** (`aftman-cli/autostart.rs`) | **inherited whole, one exception** (below) |
 | tests | not production code |
 
-`supervisor_environment()` is a *separate* function from `worker_environment()` because the two
-want different policies. The supervisor's `git` is not an agent: it needs the daemon's
-environment to run at all, and it must not see a secret. A single helper serving both is how a
-worker came to inherit the daemon's shell in the first place.
+Repository observation no longer spawns anything: it is in-process ([§3.2](#32-repository-observation-no-program-the-repository-names)),
+so the supervisor's own `git` and the `supervisor_environment()` helper that existed only for it
+are gone. The environment helpers that remain are for the two things that are still subprocesses:
+workers and evidence commands.
 
 `worker_environment()` reads the environment with `vars_os`: an entry that is not valid UTF-8 is
 dropped, deliberately, instead of panicking the supervisor.
@@ -188,75 +187,90 @@ mode = "sandboxed"   # sandboxed | auto-approve | interactive
 The correct controls are the agent's own sandbox, a container, or a throwaway checkout, and
 [04-workers.md §8](04-workers.md) says so in the same words.
 
-### 3.2 The supervisor's own `git`
+### 3.2 Repository observation: no program the repository names
 
-The daemon runs `git status`/`diff`/`rev-parse`/`branch`/`config` in the repository on every
-cycle. The repository is **controlled by the worker**, which can write `.git/config`,
-`.gitattributes`, `.git/info/attributes` and hooks, and git executes programs named there. An
-unhardened `git status` would therefore run the worker's code with the supervisor's
-credentials, and be a way out of a `sandboxed` worker. Every such `git` is run with
-(`obs::GIT_FORCED_CONFIG` and `git_command`):
+Every cycle the daemon observes the repository: status, a diff, changed file names, untracked
+excerpts, `HEAD`, branch. The repository is **controlled by the worker**, which can write
+`.git/config`, `.gitattributes`, `.git/info/attributes` and hooks, and `git` executes programs
+named there: clean/smudge/process filters, `core.fsmonitor`, hooks, `diff.external`,
+`diff.<driver>.textconv`. There is no `git` switch that disables the filter family, so running the
+`git` CLI with the supervisor's privileges is a way for a `sandboxed` worker to get code executed
+by the unrestricted supervisor.
 
-| Disabled | Why |
+The observation is therefore no longer a `git` subprocess. It is computed **in-process with
+`gix`** (`aftman-daemon/src/repo_observe.rs`), and the property is **by construction**, not by
+overriding known names:
+
+| Control | Why it holds by construction |
 | --- | --- |
-| the daemon's secrets (`worker_environment()`), and every inherited `GIT_*` | hard rule 3; `GIT_DIR`, `GIT_EXTERNAL_DIFF`, `GIT_SSH_COMMAND`, ... must not redirect or execute anything |
-| `core.fsmonitor=false` | an fsmonitor hook is an arbitrary program run by `status`/`diff` |
-| `core.hooksPath=/dev/null` | hooks (none run for these commands today; defence in depth) |
-| `--no-ext-diff`, `--no-textconv` | `diff.external` and `diff.<driver>.textconv` are programs |
-| `filter.<name>.clean/smudge/process/required` | clean filters run when git compares work tree and index. Every filter defined in the configuration as it stands when the observation starts, **in any scope** (local, worktree-scoped `config.worktree`, anything reached by `include.path`/`includeIf`), is overridden (`cat` / empty command) for that observation. A filter added *while* the observation runs is detected, not prevented (below) |
-| `core.pager`, `GIT_PAGER`, `PAGER` | a pager is a program |
-| `core.sshCommand`, `core.gitProxy`, `core.askPass`, `credential.helper`, `GIT_ASKPASS`, `SSH_ASKPASS`, `GIT_TERMINAL_PROMPT=0`, `protocol.ext.allow=never` | transports and credential helpers, which a lazy fetch would run |
-| `GIT_NO_LAZY_FETCH=1` | a partial clone's promisor remote is not contacted (git 2.44+; older git has no lazy fetch for these commands that we rely on) |
-| `--no-optional-locks`, `GIT_OPTIONAL_LOCKS=0` | `status` must not rewrite the index behind the worker |
-| `--ignore-submodules=all` | submodules' configs are repository-controlled too |
-| `GIT_CONFIG_GLOBAL/SYSTEM=/dev/null`, `GIT_CONFIG_NOSYSTEM=1` | user and system config are not the supervisor's to depend on |
+| No repository-selected filter program | Every conversion goes through a `gix_filter::Pipeline` this code builds with an **empty driver list** (`repo_observe::build_platform`). A `[filter "<name>"]` section is reachable only by looking the name up in that vector; an empty vector means a `.gitattributes` `filter=<name>` matches nothing. It is not an enumeration of denied names. |
+| No `fsmonitor` program | gix does not implement an fsmonitor hook; `core.fsmonitor` is never read as a program. |
+| No hooks | gix does not implement git hooks; `core.hooksPath` is not consulted. |
+| No external diff / textconv | The diff platform's driver list is also empty, and `prepare_diff_command` / `prepare_binary_to_text_cmd` are never called. The built-in diff runs with `Mode::ToGit`, whose `to_worktree()` is false, so binary-to-text is unreachable even if a driver existed. |
+| No lazy fetch, credential helper or pager | gix is built without a network client and spawns no transport, and there is no pager. |
+| No index writes | gix computes status without refreshing or writing the index. |
 
-Consequences stated plainly: `safe.directory` entries in global config are ignored, so a
-repository owned by another user is "dubious" to git and yields no git evidence (it is never
-trusted by adding `safe.directory=*`); and a repository relying on a clean filter for correct
-`status` output sees the filter replaced by `cat`, which only affects what the supervisor
-*observes*, never the working tree.
+The mid-observation window that the CLI path could only *detect* is now irrelevant rather than
+detected. gix loads the repository configuration into memory when it opens the repository and does
+not re-read it during the operation, so a `[filter]` section appended between opening and diffing
+is not seen this cycle; and even if it were seen, an empty driver list gives it nothing to select.
+The regression test `a_filter_inserted_mid_observation_is_never_run` plants a driver whose program
+touches a marker file **after** the observation has started and requires the marker never to
+appear. The same marker technique covers `fsmonitor`, hooks, external diff, textconv, clean and
+process filters, in local, worktree-scoped and `include`d configuration, and requires the
+observation to still have content.
 
-**How the filter list is computed.** From exactly the configuration the hardened commands will
-read: the same invocation (same scrubbed environment, same forced settings) runs `git config
---list --includes --name-only -z`, with no `--local` or other scope restriction, so system and
-global (both `/dev/null` here), local, worktree-scoped config (`extensions.worktreeConfig`), every
-file pulled in by `include.path` / `includeIf.*.path` from any of those, and the command line are
-all covered. `-z` keeps names with dots, spaces, capitals or `=` intact, and the overrides reach
-git through `GIT_CONFIG_COUNT/KEY_n/VALUE_n`, which has the precedence of `-c` but is not
-parsed, so a name cannot be mis-split into another key. Other name-keyed families: `diff.<d>.command`,
-`.textconv`, `.cachetextconv` and `diff.external` are not run because every `diff` is invoked
-with `--no-ext-diff --no-textconv` and `status` never runs them; `merge.<d>.driver` is only reachable
-from merge, which is never run; `core.fsmonitor` and `core.hooksPath` are forced with `-c`, which
-wins over every file scope including worktree config (tested).
+The reads that remain are bounded and non-executing: the index, the object database, and worktree
+files. Worktree files are opened `O_NONBLOCK | O_NOFOLLOW` and only if they are regular files, so
+a FIFO, device or symlink planted at a tracked or untracked path is skipped; a worktree file
+larger than 8 MiB is diffed as binary rather than read in full; the diff text is capped at
+`ObsCaps::diff_chars` (20 000) and `--stat` at `MAX_GIT_OUTPUT_BYTES` (256 KiB). The whole
+observation runs on one blocking thread under the 8 s deadline (`OBSERVATION_TIMEOUT`), and a
+timeout sets an interrupt the status walk polls, so a timed-out cycle records
+`evidence["observation_note"]` rather than leaving a thread hashing for minutes.
 
-**What is prevented, what is only detected, and why.**
+A blocking task cannot be killed, so the paths gix would open are also closed off by construction.
+Attributes and ignores are read **from the index**, not the worktree, so a FIFO planted at a
+`.gitattributes` or `.gitignore` path is never opened; `core.attributesFile` and
+`core.excludesFile` are overridden to `/dev/null` at open time; and a non-regular
+`$GIT_COMMON_DIR/info/attributes` or `info/exclude` is refused with a note rather than read. The
+worktree files that are opened are the regular files the status walk already identified, never a
+configured path. Tests plant FIFOs at each of those locations and require the cycle to finish.
 
-- *Prevented:* any code-executing configuration that is present when the observation starts, in
-  any scope, as above.
-- *Only detected:* configuration that appears *during* the observation. The worker runs
-  concurrently and controls `.git/`, so it can add a filter between the scan and the command
-  that follows; overriding by name cannot close that, because git offers no switch that disables
-  `clean`/`smudge`/`process` filters or `$GIT_DIR/info/attributes`. After the commands the scan is
-  repeated; if the set of code-executing entries (`filter.*`, `diff.*`, `include*`, `extensions.*`,
-  `core.fsmonitor`, `core.hookspath`, `core.attributesfile`, `core.worktree`) changed, that
-  cycle's git and untracked-file evidence is discarded, `observation_note` says so, and a
-  warning is logged. The window during which something can still run is therefore not closed,
-  only made visible; it is bounded by one observation and by what the worker can do anyway as
-  itself.
-- *Not built:* a name-independent design: run the read-only commands against a
-  supervisor-owned `GIT_DIR` shim (its own `config` and `info/attributes`, no hooks;
-  `GIT_OBJECT_DIRECTORY`, `GIT_INDEX_FILE` and `GIT_WORK_TREE` pointing at the real repository), so
-  repository configuration is never read at all. It would break or complicate linked worktrees,
-  split index, alternates, SHA-256 repositories (`extensions.objectFormat` lives in the config the
-  shim replaces) and sparse checkout, and `.gitattributes` in the work tree would still name
-  filters (harmlessly, as the shim defines none). Until it is built, treat a worker that edits
-  `.git/config` mid-observation as able to run one command as the supervisor's user, with no
-  secrets in its environment.
+**What this does not cover, stated plainly:**
 
-The same rule covers the other reads: only regular files
-are opened, never a FIFO, device or symlink, and never without a byte cap. Regression tests
-plant each of these in a real repository and require that the marker is never created.
+- **Submodules** are never reported as changed (`--ignore-submodules=all` semantics).
+- **Fidelity deviations**, all deliberate: worktree/index renames are not tracked, so a rename
+  appears as a deletion plus an untracked addition rather than `R old -> new`; a text file above
+  8 MiB is shown as binary; a changed file whose old blob is missing (a partial clone) is listed in
+  the status but omitted from the diff and stat; the no-newline-at-end `\ No newline` marker is not
+  emitted; attributes and ignores come from the index, so an **uncommitted** `.gitattributes` or
+  `.gitignore` does not change the observation; and `changed_files` holds raw (unquoted)
+  repository-relative paths. Everything else — the `XY path` status columns, C-style path quoting,
+  the `diff --git` / `index` / `---` / `+++` / `@@` headers and hunk bodies, and the `--stat`
+  layout — is reproduced to git's shape.
+- **SHA-256 repositories** cannot be opened without the `sha256` feature; the cycle yields no git
+  evidence and a note. The same is true of a bare repository or one owned by another user (gix's
+  trust check is not bypassed). These are safe failures, not silent fallbacks: there is **no CLI
+  fallback**, because a fallback would let an attacker craft a repository that gix rejects in order
+  to reach the weaker path.
+- **A FIFO at a core git file is a denial of service.** gix opens `.git/config`, `.git/index`,
+  loose objects and refs with a plain `File::open`, so a worker that replaces one with a FIFO can
+  block the observation thread. The cycle still times out and records
+  `evidence["observation_note"]`, but the thread may not return until a writer appears. The
+  attribute- and ignore-shaped paths are closed by construction (index-backed, with
+  `core.attributesFile`/`core.excludesFile` overridden and `info/attributes`/`info/exclude`
+  checked), but the rest is the structural cost of reading in-process: a child process could be
+  killed, a thread cannot. It is a denial of service, not code execution: no repository-named
+  program runs.
+- **Untrusted paths.** A repository-controlled path containing a newline or other control bytes is
+  C-quoted in both the status and the diff headers, so it cannot forge a second line; a path is
+  never interpolated into a command, because no command runs.
+
+The supervisor's own `git` is gone, and with it the forced-configuration table this section used to
+carry (`GIT_FORCED_CONFIG`, `config_scan`, and the supervisor environment helper). Hard rule 3
+still holds: the only subprocesses the supervisor spawns are workers and the daemon self-spawn
+([§2.2](#22-subprocess-hygiene)).
 
 ## 4. Network exposure
 

@@ -19,6 +19,7 @@ pub mod lifecycle;
 pub mod manager;
 pub mod obs;
 pub mod protocol;
+pub(crate) mod repo_observe;
 pub mod runtime;
 pub mod server;
 pub mod sink;

@@ -444,14 +444,6 @@ impl FactoryRuntime {
         self
     }
 
-    /// Run a different program as `git` for observation (a test double). Everything
-    /// else about how git is invoked stays as hardened in `obs`.
-    #[must_use]
-    pub fn with_git_program(mut self, program: impl Into<std::ffi::OsString>) -> Self {
-        self.builder.git_program = program.into();
-        self
-    }
-
     #[must_use]
     pub fn new(deps: RuntimeDeps) -> Self {
         let builder = ObservationBuilder::for_worker(deps.config.worker);

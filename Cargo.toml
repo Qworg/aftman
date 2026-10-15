@@ -25,6 +25,20 @@ async-trait = "0.1"
 blake3 = "1.5"
 clap = { version = "4.5", features = ["derive", "env"] }
 nix = { version = "0.29", features = ["signal", "process", "fs", "user"] }
+# In-process repository reading. Observing a repository must never execute a program the
+# repository names, and git's clean/smudge/process filters, fsmonitor, diff drivers and
+# textconv are all programs with no switch to disable them. gix gives status and diffs as
+# data, so the filter pipeline is one this code constructs (with an empty driver list)
+# rather than one the repository configures. Feature set is deliberately minimal: `status`
+# pulls in dirwalk/index/gix-diff and, through `blob-diff`, `attributes`/gix-filter, which is
+# the pipeline type we build empty ourselves; `revision` gives HEAD; `sha1` the object hash;
+# and `interrupt` the build that the status walk's interrupt polling is compiled against.
+gix = { version = "0.89", default-features = false, features = [
+  "status",
+  "revision",
+  "sha1",
+  "interrupt",
+] }
 # TUI: the crossterm backend is reached through `ratatui::crossterm`, so there is one
 # crossterm in the tree. 0.30 is the first release that drops `lru` (unsound: RUSTSEC-2026-0253,
 # RUSTSEC-2026-0002) and `paste` (unmaintained: RUSTSEC-2024-0436) from its dependencies.

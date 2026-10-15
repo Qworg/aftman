@@ -18,7 +18,7 @@ agent appear. Every milestone ends with the full offline suite green.
 | M5 — ensemble S1 and S2 | not started | — |
 | M6 — herdr | not started | — |
 | M7 — ensemble S3 and S4 | not started | — |
-| M8 — backend hardening and verifier missions | not started | — |
+| M8 — backend hardening and verifier missions | in progress; in-process repository observation built | — |
 
 As of the M3 commits: **920 tests passing**, `cargo clippy --all-targets --all-features -- -D
 warnings` clean, `cargo fmt --check` clean, and the whole suite green with an empty environment.
@@ -293,14 +293,10 @@ Left open, deliberately visible:
   worker (`aftman-core::observation`, since M2). Filling them changes what is sent to a billable
   model and the byte-exact snapshot tests, so it was not folded into this milestone.
   **Decided: fill them as designed.** Under way — see the follow-ups below.
-- The supervisor's `git` cannot be fully isolated from a worker that edits `.git/` *while an
-  observation is running*: git has no switch that disables clean, smudge or process filters.
-  Configuration present when the observation starts is neutralised; configuration that appears
-  during it is detected, and that cycle's git evidence is discarded with a note. A stronger design
-  — running the read-only commands against a supervisor-owned `GIT_DIR` so repository config is
-  never read — is described in [08-security.md §3.2](08-security.md) with what it would break.
-  **Decided: accept as it stands**, and file the in-process-git investigation as an issue rather
-  than build it now.
+- ~~The supervisor's `git` cannot be fully isolated from a worker that edits `.git/` *while an
+  observation is running*.~~ **Resolved in M8**: the observation is now computed in-process with
+  `gix` and an empty filter-driver list, so no configuration the repository writes can select a
+  program at all ([08-security.md §3.2](08-security.md)).
 - Recovery binds the socket only after orphans are reaped, so the first command after a daemon
   crash waits about one termination grace and says why.
 - An all-runs subscriber gets no marker when a run is abandoned; a run-scoped one does.
@@ -354,14 +350,15 @@ Each is a separate behaviour change.
      additive and the inheritance was the leak.
    - `supervisor_environment()` was split out for the supervisor's own `git`, which is not an agent
      and does need the daemon's environment. One helper serving both policies is how a worker came
-     to inherit the shell.
+     to inherit the shell. (M8 removed it again when the supervisor's `git` itself was removed: it
+     had no other caller.)
    - `SSH_AUTH_SOCK` is in the client's default allowlist rather than the baseline: it is a live
      signing capability, so the operator grants it rather than the daemon handing it out for
      having sat in the right shell.
-3. **Supervisor `git` isolation is accepted as it stands.** *(Decided: accept; file the
-   investigation.)* The residual — a worker inserting a filter between the supervisor's config
-   scan and its `git diff` — is detected and the cycle's git evidence discarded with a note. The
-   in-process-git alternative is filed as issue #1.
+3. **Supervisor `git` isolation.** *(Decided: accept at M3; **built in M8**.)* The residual — a
+   worker inserting a filter between the supervisor's config scan and its `git diff` — was
+   detected and the cycle's git evidence discarded with a note. The in-process-git investigation
+   (issue #1) has since been implemented: see [M8](#m8--backend-hardening-and-verifier-missions).
 
 ### Known gaps carried from M3
 
@@ -496,6 +493,61 @@ work that turns "the command line launches" into "the output is understood":
 fixture-verified stays gated behind `doctor --probe`; `mode = "sandboxed"` with `--worker pi` fails
 at startup with guidance rather than silently degrading; a verifier that modifies the repo is
 recorded as inconclusive, not as a pass.
+
+### M8 — in-process repository observation (built)
+
+The M3 review left one residual, and the M3 follow-up decided to accept it: a worker editing
+`.git/config` *while an observation ran* could insert a clean/smudge/process filter after the
+supervisor's config scan and before its `git diff`, and git has no switch that disables the filter
+family. The cycle's evidence was discarded afterwards, but the program had already run.
+
+**What was built.** Every repository read in `aftman-daemon` now goes through `gix`, replacing
+`obs::git_evidence`, `untracked_excerpts`, `config_scan` and the whole `git` CLI plumbing: status
+as two walks (HEAD-vs-index and index-vs-worktree), a worktree-vs-index unified
+diff, a git-shaped `--stat`, `HEAD`, branch, and the untracked excerpts. The filter and diff
+driver lists are built empty and the plumbing is the same `gix_status` entry point
+`Repository::index_worktree_status` itself calls, with `Mode::ToGit`; `prepare_diff_command` and
+`prepare_binary_to_text_cmd` are never called. There is **no CLI fallback**: if gix cannot open or
+observe the repository, the cycle gets no git evidence and the existing `observation_note`.
+
+**What it cost.** `gix 0.89` with a deliberately narrow feature set (`status`, `revision`, `sha1`,
+`interrupt`) — the investigation's probe added roughly 120–140 crates to the graph. In exchange
+`aftman-daemon` spawns no subprocess for observation at all. The fidelity work was the larger
+part: git's `XY path` status columns, C-style path quoting, `diff --git` / `index` / `---` /
+`+++` / `@@` headers and hunk bodies, and the `--stat` layout all had to be re-synthesised from
+structured data. A module of ~700 lines replaced ~450 lines of CLI plumbing and config scanning.
+
+**What it found.**
+- **gix's high-level API is not safe by default.** `Repository::status()` and
+  `diff_resource_cache()` build their pipeline from the repository's configuration and *do* run a
+  clean filter; the empty-driver plumbing is the only safe shape. The investigation's demo proves
+  both halves, and the `a_planted_*` tests here prove the plumbing.
+- **The concurrency window is closed twice over.** The empty driver list means a filter name
+  selects nothing; on top of that, gix snapshots configuration at open time, so a mid-observation
+  insertion is not even seen. `a_filter_inserted_mid_observation_is_never_run` covers the second.
+- **A huge file is the interrupt gap.** The built-in compare hashes a whole file with a throwaway
+  interrupt flag, so one very large same-size file can outlive the deadline. A custom
+  `CompareBlobs` refuses to hash above 32 MiB (reporting the file as changed) and a worktree file
+  above 8 MiB is diffed as binary rather than read in full.
+- **An in-process reader can be blocked where a killed child could not.** gix opens
+  `.gitattributes`, `.gitignore`, `core.attributesFile` and `info/attributes` with a plain
+  `File::open`, so a FIFO planted at one of those paths hung the blocking thread forever — the
+  probe that exposed this is `a_fifo_attributes_file_cannot_block_the_observation`. Fixed by
+  reading attributes and ignores from the index, overriding the two configured files to
+  `/dev/null`, and refusing a non-regular `info/attributes` or `info/exclude` with a note. This is
+  the general lesson: without a killable process boundary, every path gix will open has to be
+  either in the worktree we already type-checked or eliminated by configuration.
+- **`--stat` is more intricate than it looks.** The number column widens to fit `Bin` when any
+  binary file is present, a mode-only change prints as `0`, and the insertions/deletions summary
+  clauses are conditional; the tests pin all three against real git output.
+- **Dead code was removed rather than left as a tempting path.** The supervisor environment helper
+  (`supervisor_environment()` / `build_supervisor_environment`) existed only for the git child and
+  is gone, so no unused helper invites a subprocess back.
+
+**Scope decisions.** No rename tracking (a rename renders as a deletion plus an addition), no
+submodule status, no SHA-256 support without a further feature (it fails safely with a note),
+no intent-to-add diff, no `\ No newline at end of file` marker, and `changed_files` holds raw paths.
+Each is named in [08-security.md §3.2](08-security.md).
 
 ## Dependency policy
 

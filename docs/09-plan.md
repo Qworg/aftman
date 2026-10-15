@@ -497,6 +497,26 @@ fixture-verified stays gated behind `doctor --probe`; `mode = "sandboxed"` with 
 at startup with guidance rather than silently degrading; a verifier that modifies the repo is
 recorded as inconclusive, not as a pass.
 
+## Dependency policy
+
+Two decisions, both made because a check that can go red without a code change teaches
+people to ignore the check column.
+
+- **`cargo audit` gates on a pinned snapshot.** `advisories/` is a submodule pinned to one
+  commit of the RustSec database, and the `audit` job runs it with `--no-fetch`, so the
+  result is a function of this repository and nothing else. Refreshing is a deliberate act
+  (`scripts/refresh-advisories.sh`) whose commit records which advisories arrived and what
+  was done about them — a refresh nobody acts on is just a moved pin.
+- **Freshness comes from the schedule, not from drift.** A weekly `audit-live` job audits
+  against the live database and is deliberately *not* a gate: it runs only on the schedule,
+  so it cannot block a pull request, and a failure there means "refresh the snapshot and fix
+  what it finds" rather than "this change is broken".
+
+The arrangement exists because the check is not a function of the repository: a rustls
+advisory published on 2026-10-14 turned `main` red with no change here, and it was luck that
+an unrelated pull request happened to be open to notice it. The snapshot is what makes a red
+gate mean something; the schedule is what stops the snapshot going quietly stale.
+
 ## Deferred, with reasons
 
 | Deferred | Why |

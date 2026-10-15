@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use time::OffsetDateTime;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use aftman_core::ansi::strip_control;
 use aftman_core::job::{Job, WorkerKind, WorkerStatus};
@@ -76,6 +77,11 @@ pub struct ObservationBuilder {
     pub simulation: bool,
     /// The overall limit on assembling the repository evidence of one observation.
     pub timeout: Duration,
+    /// How many observations of *this* run may be outstanding at once.
+    ///
+    /// Per run, not per process: a run whose repository is hostile must not be able to degrade
+    /// the observations of runs that did nothing wrong. See [`MAX_CONCURRENT_OBSERVATIONS`].
+    slots: Arc<Semaphore>,
 }
 
 impl ObservationBuilder {
@@ -85,6 +91,7 @@ impl ObservationBuilder {
             caps: ObsCaps::default(),
             simulation,
             timeout: OBSERVATION_TIMEOUT,
+            slots: Arc::new(Semaphore::new(MAX_CONCURRENT_OBSERVATIONS)),
         }
     }
 
@@ -141,7 +148,7 @@ impl ObservationBuilder {
             )
         } else {
             let tests = active.map_or_else(Vec::new, |w| parse_worker_tests(&w.output));
-            match collect_repo(&job.repo, self.caps, self.timeout).await {
+            match collect_repo_with_slots(&job.repo, self.caps, self.timeout, &self.slots).await {
                 Ok(repo) => {
                     if let Some(why) = repo.note {
                         note = Some(why);
@@ -327,13 +334,66 @@ struct RepoEvidence {
 /// no blocking I/O occupies an async worker and no program the repository names is ever
 /// executed. On timeout the observer's interrupt flag is set, which makes gix give up at its
 /// next checkpoint rather than leaving a thread hashing a huge file for minutes.
-async fn collect_repo(repo: &Path, caps: ObsCaps, limit: Duration) -> Result<RepoEvidence, String> {
+/// How many observations of one run may be outstanding at once.
+///
+/// An in-process read cannot be killed, so a FIFO planted at a file gix opens blocks its thread
+/// for good: the deadline below still fires and the cycle continues, but the thread never
+/// returns. Unbounded, a run that keeps planting one consumes the blocking pool until every run
+/// stalls — including runs that did nothing wrong.
+///
+/// The permit is held by the *task*, not by the future that awaits it, so a task that never
+/// returns keeps its slot. That turns an unbounded leak into a fixed one: once this many
+/// observations of a run are wedged, that run's cycles skip observation with a note rather than
+/// queue behind them.
+///
+/// The set is **per run**, so a hostile repository degrades only its own run's observations. The
+/// count is generous for the same reason it is small: a run observes one repository, one cycle at
+/// a time, so ordinary operation never uses more than one — it fills up only when observations
+/// wedge, which is exactly what it is meant to bound. `repo_observe`'s non-regular-file refusals
+/// close the paths that can be checked before they are opened; this is what bounds the rest
+/// (`.git/config` is read during discovery, and a loose object wherever the diff needs it).
+pub const MAX_CONCURRENT_OBSERVATIONS: usize = 4;
+
+/// Take one observation slot, or say why this cycle must go without.
+///
+/// Refusing rather than waiting is deliberate: a queue in front of a task that may never
+/// return is a slower way to stop making progress, and the cycle has its own deadline.
+///
+/// The permit is *owned* rather than borrowed so it can be moved into the blocking task; a
+/// borrowed one would be released when this future is dropped, which on the timeout path is
+/// exactly when it must not be.
+fn claim_observation_slot(slots: &Arc<Semaphore>) -> Result<OwnedSemaphorePermit, String> {
+    Arc::clone(slots).try_acquire_owned().map_err(|_| {
+        format!(
+            "{MAX_CONCURRENT_OBSERVATIONS} repository observations are already in flight, so this \
+             cycle was skipped rather than queued behind them; git, untracked-file and AGENTS.md \
+             evidence were omitted"
+        )
+    })
+}
+
+/// Assemble the repository evidence for one cycle over an explicit slot set.
+///
+/// The slots are a parameter rather than a process-wide static so the bound can be tested
+/// without wedging a real thread — and so that one run's wedged observations cannot refuse
+/// another run's cycles. A genuinely blocked task holds its slot for the life of the process,
+/// which would also poison every other test sharing the binary.
+async fn collect_repo_with_slots(
+    repo: &Path,
+    caps: ObsCaps,
+    limit: Duration,
+    slots: &Arc<Semaphore>,
+) -> Result<RepoEvidence, String> {
     let deadline = tokio::time::Instant::now() + limit;
     let interrupt = Arc::new(AtomicBool::new(false));
     let repo_path = repo.to_path_buf();
+    // Taken here, moved into the task, and released only when the task ends — see
+    // `MAX_CONCURRENT_OBSERVATIONS` for why it must not be held by this future.
+    let permit = claim_observation_slot(slots)?;
     let observer = {
         let interrupt = interrupt.clone();
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             crate::repo_observe::observe(&repo_path, caps, &interrupt)
         })
     };
@@ -688,5 +748,66 @@ mod output_excerpt_tests {
         assert_eq!(excerpt.terminal_status.as_deref(), Some("success"));
         assert!(!excerpt.calls_truncated);
         Ok(())
+    }
+}
+
+/// The observation slot bound: what happens when every slot is taken by a task that will
+/// never return.
+#[cfg(test)]
+mod slot_tests {
+    use super::{ObsCaps, collect_repo_with_slots};
+    use std::path::Path;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+
+    const LIMIT: Duration = Duration::from_secs(8);
+
+    /// Every slot is taken by a task that has wedged — a FIFO at a path the non-regular-file
+    /// refusals cannot reach, which is the case the bound exists for. The cycle must be told
+    /// so and carry on, not queue behind something that may never finish.
+    #[tokio::test]
+    async fn a_cycle_with_no_free_slot_is_refused_without_waiting() {
+        let slots = Arc::new(Semaphore::new(1));
+        let _wedged = Arc::clone(&slots)
+            .try_acquire_owned()
+            .expect("the only slot");
+        let started = tokio::time::Instant::now();
+        let outcome =
+            collect_repo_with_slots(Path::new("/nonexistent"), ObsCaps::default(), LIMIT, &slots)
+                .await;
+        let why = match outcome {
+            Err(why) => why,
+            Ok(_) => panic!("no slot means no observation"),
+        };
+        assert!(why.contains("already in flight"), "{why}");
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "a refusal must not wait out the deadline: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The bound must not leak on the ordinary path. A slot that is not returned exhausts the
+    /// pool after a handful of normal cycles, which would look exactly like an attack.
+    #[tokio::test]
+    async fn a_finished_observation_returns_its_slot() {
+        let slots = Arc::new(Semaphore::new(1));
+        for attempt in 0..8 {
+            // `/nonexistent` is not a repository, so this takes the failure path; that path
+            // must release its slot just as a success does.
+            let _ = collect_repo_with_slots(
+                Path::new("/nonexistent"),
+                ObsCaps::default(),
+                LIMIT,
+                &slots,
+            )
+            .await;
+            assert_eq!(
+                slots.available_permits(),
+                1,
+                "the slot came back on attempt {attempt}"
+            );
+        }
     }
 }

@@ -1039,3 +1039,33 @@ async fn a_binary_change_is_labelled_not_inlined() {
         observation.git.diff_stat
     );
 }
+
+/// A FIFO at the index — a file gix opens for every status — is refused rather than read.
+///
+/// This is what keeps an ordinary cycle ordinary. The refusals cannot cover every path
+/// (`.git/config` is read during discovery, before any check can run, and a loose object is
+/// opened wherever the diff needs it); the observation slot bounds those. See
+/// `obs::slot_tests` for the bound itself, and `docs/08-security.md` §3.2 for the pair.
+#[tokio::test]
+async fn a_fifo_at_the_index_is_refused_rather_than_read() {
+    let dir = short_tempdir().expect("tempdir");
+    let repo = make_repo(dir.path());
+    // `mkfifo` will not replace the index git already wrote.
+    std::fs::remove_file(repo.join(".git/index")).expect("remove the index");
+    mkfifo(&repo.join(".git/index"));
+
+    let builder = ObservationBuilder::new(false);
+    let started = tokio::time::Instant::now();
+    let observation = observe(&builder, &repo).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "a refusal must be immediate, not a wait for the deadline: {:?}",
+        started.elapsed()
+    );
+    let note = observation
+        .evidence
+        .get("observation_note")
+        .expect("a refusal note");
+    assert!(note.contains("not a regular file"), "{note}");
+    assert!(observation.git.status_short.is_empty());
+}

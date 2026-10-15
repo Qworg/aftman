@@ -75,6 +75,13 @@ passes locally and fails in CI, or the reverse, is a bug in this file.
   every subprocess the supervisor spawns goes through `worker_environment()`; the one exception is
   the daemon self-spawn in `crates/aftman-cli/src/autostart.rs`, listed in `docs/08-security.md`
   §2.2. Add to that list deliberately or not at all.
+- **The advisory snapshot is pinned on purpose.** The `audit` job in
+  `.github/workflows/test.yml` audits against the `advisories/` submodule with `--no-fetch`,
+  so the gate is a function of this repository and a red result means something here
+  changed. New advisories arrive through the weekly `audit-live` job, not by drifting the
+  pin. Move it deliberately with `scripts/refresh-advisories.sh`, which prints what the
+  refresh brings in. After cloning, `git submodule update --init` if you want the audit to
+  work locally.
 - **`unsafe` is forbidden workspace-wide** (that is why there is no double fork). `rust-version` is
   1.88 — the floor set by a `time` security fix, not a preference — which is also why the TUI uses
   ratatui 0.30 rather than 0.29.

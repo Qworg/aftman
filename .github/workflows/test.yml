@@ -6,6 +6,18 @@ name: test
   push:
     branches: [main]
   pull_request:
+  # The advisory database is not part of this repository and it
+  # changes without us: on 2026-10-14 four rustls advisories were
+  # published and `main`, green on its previous run, went red.
+  # Nobody noticed, because only a pull request ran the check. The
+  # weekly run surfaces the next one on the day it lands instead.
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+# Every job here only reads.
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,7 +27,11 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
+      # `persist-credentials: false`: nothing here pushes, and the
+      # default leaves a token in .git/config for later steps.
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -27,20 +43,54 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      # The suite must pass with an empty environment: no credentials, no
-      # network, no real pi/agy/claude binary. See AGENTS.md hard rule 4.
+      # The suite must pass with an empty environment: no
+      # credentials, no network, no real pi/agy/claude binary.
+      # See AGENTS.md hard rule 4.
       - name: Test
         run: cargo test --workspace
         env:
           TYPESAFE_API_KEY: ""
           AFTMAN_CONFIG: ""
 
+  # The gate. Audited against the pinned snapshot in `advisories/`,
+  # so the result is a function of this repository and nothing else:
+  # the same commit audited two months apart gives the same answer,
+  # which is what makes a red result mean "something here changed".
+  # `--no-fetch` keeps that true; without it cargo-audit updates the
+  # snapshot in place and the pin means nothing.
+  #
+  # Refreshing is deliberate: scripts/refresh-advisories.sh.
   audit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: true
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@cargo-audit
-      - name: Audit
+
+      - name: Audit against the pinned advisory snapshot
+        run: cargo audit --db advisories --no-fetch --deny warnings
+
+  # The other half: has something been published that the snapshot
+  # does not know about? Deliberately not a gate — it runs only on
+  # the schedule, so it cannot block a pull request. A failure here
+  # means "refresh the snapshot and fix what it finds", not "this
+  # change is broken", and it is the signal that the pin is stale.
+  audit-live:
+    if: >-
+      github.event_name == 'schedule' ||
+      github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-audit
+
+      - name: Audit against the live advisory database
         run: cargo audit --deny warnings

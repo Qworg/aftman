@@ -312,7 +312,7 @@ Left open, deliberately visible:
 
 ### M3 follow-ups — the three decisions, and what came of them
 
-Recorded in `handoff.md` at the end of the M3 session. Each is a separate behaviour change.
+Each is a separate behaviour change.
 
 1. **The run can see the worker's output.** *(Built — see the commit.)* It judged "is the worker
    stuck" without seeing anything the agent printed; only parsed test counts reached it. Now the
@@ -354,7 +354,27 @@ Recorded in `handoff.md` at the end of the M3 session. Each is a separate behavi
 3. **Supervisor `git` isolation is accepted as it stands.** *(Decided: accept; file the
    investigation.)* The residual — a worker inserting a filter between the supervisor's config
    scan and its `git diff` — is detected and the cycle's git evidence discarded with a note. The
-   in-process-git alternative is written up and waiting for a repository to file it against.
+   in-process-git alternative is filed as issue #1.
+
+### Known gaps carried from M3
+
+Found in the M3 reviews. None is decided and none is urgent; they are written down so they are not
+rediscovered. Each is a candidate issue rather than a plan item.
+
+- Recovery binds the socket only after orphaned workers are reaped, so the first command after a
+  daemon crash waits about one termination grace (≈5 s) and says why.
+- An all-runs subscriber gets no marker when a run is abandoned; a run-scoped one does.
+- `Follow`'s liveness check (`check_driven`) is not strictly resumable across a dropped `next()`.
+- The TUI's decision list is not scrollable (it refuses to act below a minimum size instead); the
+  launch posture shows in the header only on terminals ≈140 columns wide (an `auto-approve` badge
+  always shows).
+- `EventKind::Unknown` and `ErrorCode::Unknown` lose the original string on re-serialisation.
+- `aftman decisions` prints f32 values widened to f64 (`margin=0.15000000596046448`); cosmetic —
+  `round4` in `runtime.rs` exists for exactly this.
+- Unverified by any review: recovery with many orphans at once, very large untracked trees, a state
+  directory on read-only or network storage, panics inside TUI tasks, terminals other than tmux,
+  and the non-Linux (`ps`-based) orphan identity path.
+- The CLI e2e suite takes 25–35 s because of the stubborn-worker tests.
 
 *Deliverable:* `aftman serve` + `aftman watch` with a second client attaching mid-run without
 losing events.

@@ -75,6 +75,14 @@ passes locally and fails in CI, or the reverse, is a bug in this file.
   every subprocess the supervisor spawns goes through `worker_environment()`; the one exception is
   the daemon self-spawn in `crates/aftman-cli/src/autostart.rs`, listed in `docs/08-security.md`
   §2.2. Add to that list deliberately or not at all.
+- **The repository observation is in-process `gix`, never a `git` child**
+  (`crates/aftman-daemon/src/repo_observe.rs`). Do not reintroduce a CLI path or a fallback: the
+  repository is worker-controlled, and a `git` subprocess runs clean/smudge/process filters,
+  fsmonitor and hooks it names, with no switch to disable them
+  (`docs/08-security.md` §3.2). The filter and diff-driver lists must stay empty, and
+  `prepare_diff_command` / `prepare_binary_to_text_cmd` must never be called. The observation
+  tests must not require the `git` binary on `PATH` — fixtures may be created with `git`, but the
+  observation itself must run without it.
 - **The advisory snapshot is pinned on purpose.** The `audit` job in
   `.github/workflows/test.yml` audits against the `advisories/` submodule with `--no-fetch`,
   so the gate is a function of this repository and a red result means something here

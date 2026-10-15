@@ -248,9 +248,9 @@ explicit `evidence` list or the default set.
 | `worker_activity` | Decoded stream: tool-call and failure counts, distinct tool names (capped at 32), tokens, cost, the backend's own terminal status | included |
 | `worker_history` | Summaries of ended workers | included |
 | `steering_history` | Steers sent, outcomes, queue depth | included |
-| `git_status` | `git status --short --untracked-files=all` | included |
-| `git_diff` | Bounded diff, plus `--stat` | included |
-| `changed_files` | Names only | included |
+| `git_status` | `git status --short --untracked-files=all`-equivalent, computed in-process with `gix` | included |
+| `git_diff` | Bounded worktree-vs-index diff, plus git-shaped `--stat` | included |
+| `changed_files` | Raw repository-relative paths | included |
 | `untracked_evidence` | Bounded excerpts of untracked text files | included |
 | `repo_instructions` | `AGENTS.override.md` / `AGENTS.md`, transient | included |
 | `test_summary` | Parsed test results from output and command evidence | included |

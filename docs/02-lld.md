@@ -1230,14 +1230,17 @@ network access**.
   one-hour job makes at most ~720 requests if every cycle fires, typically far fewer.
 - Request size is bounded by the budget module, so cost is bounded by *cycles*, not by repository
   size.
-- Observation assembly (git + filesystem) never blocks the run loop and is bounded by one 8 s
-  deadline (`obs::OBSERVATION_TIMEOUT`). Git runs as a child process (killed, with its process
-  group, on timeout; output capped at 256 KiB per command); file reads happen on blocking threads,
-  only for regular files opened `O_NONBLOCK | O_NOFOLLOW` (a FIFO or symlink named `AGENTS.md`, or
-  among the untracked files, is skipped), with a byte cap enforced while reading. On timeout the
-  repository evidence of that cycle is omitted and `evidence["observation_note"]` says so; the
-  cycle still runs and a cancel is answered. Every git is hardened as described in
-  [08-security.md section 3.2](08-security.md).
+- Observation assembly (repository + filesystem) never blocks the run loop and is bounded by one
+  8 s deadline (`obs::OBSERVATION_TIMEOUT`). The repository status, diff and `--stat` are computed
+  **in-process with `gix`** (`aftman-daemon/src/repo_observe.rs`), so the supervisor spawns no
+  `git` and never executes a program the repository names; the whole read runs on one blocking
+  thread, signalling an interrupt the status walk polls when the deadline passes. Output is
+  capped (20 000 characters of diff, 256 KiB of `--stat`); worktree files are opened
+  `O_NONBLOCK | O_NOFOLLOW` and only if regular files (a FIFO or symlink named `AGENTS.md`, or
+  among the untracked files, is skipped), with a byte cap enforced while reading. On timeout or
+  any failure the repository evidence of that cycle is omitted and
+  `evidence["observation_note"]` says so; the cycle still runs and a cancel is answered. The
+  security property is described in [08-security.md section 3.2](08-security.md).
 - The daemon holds at most one `WorkerRecord::output` ring per run; ended runs drop their logs to
   disk and keep only summaries in memory. Default in-memory budget: 50 MB, configurable.
 

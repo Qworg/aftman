@@ -179,7 +179,7 @@ Each observation is compact and bounded:
 - the original job and current factory status;
 - active worker summary, recent worker history, output tails, exit status, elapsed time;
 - one worker's steering and attempt history;
-- `git status`, a bounded diff, and changed file names;
+- repository status, a bounded diff, and changed file names, read in-process with `gix` so the supervisor runs no program the repository names;
 - bounded excerpts of untracked text files (new tests and sources never appear in a diff);
 - bounded repository-root `AGENTS.override.md` / `AGENTS.md` instructions, transient only;
 - parsed test summaries from worker output and from command evidence;

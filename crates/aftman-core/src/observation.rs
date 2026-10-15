@@ -80,11 +80,11 @@ pub struct WorkerSummary {
 /// Git state at observation time.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GitEvidence {
-    /// `git status --short --untracked-files=all`.
+    /// `git status --short --untracked-files=all`-shaped text, computed in-process.
     pub status_short: String,
-    /// A capped diff.
+    /// A capped worktree-vs-index unified diff.
     pub diff_excerpt: String,
-    /// `git diff --stat`, which survives truncation better than the full diff.
+    /// `git diff --stat`-shaped text, which survives truncation better than the full diff.
     pub diff_stat: String,
     pub changed_files: Vec<String>,
     pub head_sha: Option<String>,

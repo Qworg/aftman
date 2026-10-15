@@ -30,14 +30,6 @@ fn have_git() -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
-fn real_git() -> PathBuf {
-    let out = Command::new("sh")
-        .args(["-c", "command -v git"])
-        .output()
-        .expect("sh");
-    PathBuf::from(String::from_utf8_lossy(&out.stdout).trim())
-}
-
 /// A plain git (no hardening) for setting up repositories and for the control runs.
 fn git(repo: &Path, args: &[&str]) -> std::process::Output {
     Command::new("git")
@@ -249,49 +241,6 @@ async fn planted_hooks_are_not_run() {
     assert!(!marker.exists(), "a hook ran during observation");
 }
 
-#[tokio::test]
-async fn git_sees_a_scrubbed_environment() {
-    if !have_git() {
-        return;
-    }
-    let dir = short_tempdir().expect("tempdir");
-    let repo = make_repo(dir.path());
-    let dump = dir.path().join("env-dump");
-    let fake = script(
-        dir.path(),
-        "fake-git",
-        &format!(
-            "env > {}\nexec {} \"$@\"",
-            dump.display(),
-            real_git().display()
-        ),
-    );
-    let mut builder = ObservationBuilder::new(false);
-    builder.git_program = fake.into_os_string();
-    let observation = observe(&builder, &repo).await;
-    assert!(!observation.git.status_short.is_empty() || observation.git.head_sha.is_some());
-
-    let env = std::fs::read_to_string(&dump).expect("the fake git ran");
-    for line in env.lines() {
-        let key = line.split('=').next().unwrap_or("");
-        assert!(
-            !key.starts_with("TYPESAFE_") && !key.starts_with("AFTMAN_"),
-            "a supervisor variable reached git: {key}"
-        );
-    }
-    for expected in [
-        "GIT_PAGER=cat",
-        "GIT_CONFIG_GLOBAL=/dev/null",
-        "GIT_TERMINAL_PROMPT=0",
-        "GIT_OPTIONAL_LOCKS=0",
-    ] {
-        assert!(
-            env.lines().any(|l| l == expected),
-            "missing {expected}:\n{env}"
-        );
-    }
-}
-
 // ---- F4: nothing blocks, everything is bounded ------------------------------------
 
 fn mkfifo(path: &Path) {
@@ -336,6 +285,116 @@ async fn special_files_in_the_repository_are_skipped_without_blocking() {
 }
 
 #[tokio::test]
+async fn a_fifo_attributes_file_cannot_block_the_observation() {
+    if !have_git() {
+        return;
+    }
+    let dir = short_tempdir().expect("tempdir");
+    let repo = make_repo(dir.path());
+    dirty(&repo);
+    // A worker can plant a FIFO where gix looks for attributes; opening it must not hang.
+    mkfifo(&repo.join(".gitattributes"));
+    let observation = tokio::time::timeout(
+        Duration::from_secs(5),
+        observe(&ObservationBuilder::new(false), &repo),
+    )
+    .await;
+    assert!(
+        observation.is_ok(),
+        "the observation hung on a FIFO .gitattributes"
+    );
+}
+
+#[tokio::test]
+async fn a_fifo_gitignore_cannot_block_the_observation() {
+    if !have_git() {
+        return;
+    }
+    let dir = short_tempdir().expect("tempdir");
+    let repo = make_repo(dir.path());
+    dirty(&repo);
+    mkfifo(&repo.join(".gitignore"));
+    let observation = tokio::time::timeout(
+        Duration::from_secs(5),
+        observe(&ObservationBuilder::new(false), &repo),
+    )
+    .await;
+    assert!(
+        observation.is_ok(),
+        "the observation hung on a FIFO .gitignore"
+    );
+}
+
+#[tokio::test]
+async fn a_fifo_configured_attributes_file_cannot_block_the_observation() {
+    if !have_git() {
+        return;
+    }
+    let dir = short_tempdir().expect("tempdir");
+    let repo = make_repo(dir.path());
+    dirty(&repo);
+    let fifo = repo.join("attributes-fifo");
+    mkfifo(&fifo);
+    git(
+        &repo,
+        &[
+            "config",
+            "core.attributesFile",
+            fifo.to_str().expect("utf8"),
+        ],
+    );
+    let observation = tokio::time::timeout(
+        Duration::from_secs(5),
+        observe(&ObservationBuilder::new(false), &repo),
+    )
+    .await;
+    assert!(
+        observation.is_ok(),
+        "the observation hung on a configured FIFO attributes file"
+    );
+}
+
+#[tokio::test]
+async fn a_fifo_info_attributes_yields_a_note_not_a_hang() {
+    if !have_git() {
+        return;
+    }
+    let dir = short_tempdir().expect("tempdir");
+    let repo = make_repo(dir.path());
+    dirty(&repo);
+    mkfifo(&repo.join(".git/info/attributes"));
+    let observation = tokio::time::timeout(
+        Duration::from_secs(5),
+        observe(&ObservationBuilder::new(false), &repo),
+    )
+    .await
+    .expect("the observation hung on a FIFO .git/info/attributes");
+    assert!(
+        observation.evidence.contains_key("observation_note"),
+        "a non-regular info/attributes is refused with a note"
+    );
+    assert!(observation.git.status_short.is_empty());
+}
+
+#[tokio::test]
+async fn ignored_files_are_not_reported_as_untracked() {
+    if !have_git() {
+        return;
+    }
+    let dir = short_tempdir().expect("tempdir");
+    let repo = make_repo(dir.path());
+    std::fs::write(repo.join(".gitignore"), "ignored.txt\n").expect("write");
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-q", "-m", "ignore"]);
+    std::fs::write(repo.join("ignored.txt"), "ignored\n").expect("write");
+    std::fs::write(repo.join("real.txt"), "real\n").expect("write");
+    let observation = observe(&ObservationBuilder::new(false), &repo).await;
+    let status = &observation.git.status_short;
+    assert!(status.contains("?? real.txt"), "{status:?}");
+    assert!(!status.contains("ignored.txt"), "{status:?}");
+}
+
+#[tokio::test]
 async fn a_large_regular_file_is_read_only_up_to_its_cap() {
     if !have_git() {
         return;
@@ -361,23 +420,23 @@ async fn a_large_regular_file_is_read_only_up_to_its_cap() {
 }
 
 #[tokio::test]
-async fn a_hanging_git_costs_the_timeout_and_is_killed() {
+async fn a_timed_out_observation_reports_a_note_instead_of_hanging() {
+    if !have_git() {
+        return;
+    }
     let dir = short_tempdir().expect("tempdir");
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo).expect("mkdir");
-    let pids = dir.path().join("pids");
-    let fake = script(
-        dir.path(),
-        "hang-git",
-        &format!(
-            "echo $$ >> {}\nsleep 600 &\necho $! >> {}\nwait",
-            pids.display(),
-            pids.display()
-        ),
-    );
+    let repo = make_repo(dir.path());
+    // A file whose hash must be computed keeps the blocking observer busy past the zero
+    // deadline, so the timeout path is exercised rather than a lucky fast finish.
+    let big = repo.join("big.bin");
+    std::fs::write(&big, vec![7u8; 24 * 1024 * 1024]).expect("write");
+    git(&repo, &["add", "big.bin"]);
+    git(&repo, &["commit", "-q", "-m", "big"]);
+    std::fs::write(&big, vec![8u8; 24 * 1024 * 1024]).expect("write");
+    dirty(&repo);
+
     let mut builder = ObservationBuilder::new(false);
-    builder.git_program = fake.into_os_string();
-    builder.timeout = Duration::from_millis(400);
+    builder.timeout = Duration::ZERO;
 
     let started = tokio::time::Instant::now();
     let observation = observe(&builder, &repo).await;
@@ -386,22 +445,12 @@ async fn a_hanging_git_costs_the_timeout_and_is_killed() {
         "{:?}",
         started.elapsed()
     );
-    assert!(observation.evidence.contains_key("observation_note"));
+    let note = observation
+        .evidence
+        .get("observation_note")
+        .expect("a timeout note");
+    assert!(note.contains("exceeded"), "{note}");
     assert!(observation.git.status_short.is_empty());
-
-    // Neither the fake git nor what it spawned outlives the observation.
-    wait_until("the hung git to be killed", || async {
-        std::fs::read_to_string(&pids)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|l| l.trim().parse::<u32>().ok())
-            .all(|pid| {
-                !Path::new(&format!("/proc/{pid}")).exists()
-                    || std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                        .is_ok_and(|s| s.contains(") Z "))
-            })
-    })
-    .await;
 }
 
 fn real_runtime(dir: &Path, store: Arc<dyn RunStore>, model: Arc<DialModel>) -> FactoryRuntime {
@@ -502,16 +551,16 @@ async fn a_run_with_a_fifo_agents_md_can_be_cancelled_promptly() -> TestResult {
 }
 
 #[tokio::test]
-async fn a_run_whose_git_hangs_can_still_be_cancelled() -> TestResult {
+async fn a_run_whose_observation_times_out_can_still_be_cancelled() -> TestResult {
+    if !have_git() {
+        return Ok(());
+    }
     let dir = short_tempdir()?;
-    let repo = dir.path().join("repo");
-    std::fs::create_dir_all(&repo)?;
-    let fake = script(dir.path(), "hang-git", "sleep 600");
+    let repo = make_repo(dir.path());
     let store: Arc<dyn RunStore> = Arc::new(FileRunStore::new(dir.path().join("state")));
     let model = Arc::new(DialModel::new(Mode::Working));
     let runtime = real_runtime(dir.path(), store.clone(), model.clone())
-        .with_git_program(fake)
-        .with_observation_timeout(Duration::from_millis(300));
+        .with_observation_timeout(Duration::from_millis(1));
     cancel_is_prompt(runtime, store, repo, model).await
 }
 
@@ -519,7 +568,7 @@ async fn a_run_whose_git_hangs_can_still_be_cancelled() -> TestResult {
 
 #[test]
 fn the_supervisors_credentials_and_git_variables_are_not_passed_on() {
-    // Exercised through the public environment builder the git command uses.
+    // Exercised through the public environment builder the worker subprocess uses.
     let base = [
         ("PATH", "/usr/bin"),
         ("HOME", "/home/x"),
@@ -771,47 +820,222 @@ async fn diff_drivers_in_worktree_config_are_not_run_by_status_or_diff() {
     .await;
 }
 
-/// A fake git that plants a filter in the repository the first time it is asked to `diff`,
-/// then runs the real git: configuration changing mid-observation, deterministically.
+/// A filter inserted into `.git/config` **after** the observation has started must be a
+/// no-op. This is the window the CLI path could not close: it overrode the driver names it
+/// saw in a scan, so a driver added between the scan and the `git diff` was still run. With
+/// an empty driver list there is no name to add that can select a program, and gix's config
+/// snapshot at open time means the insertion is not even seen this cycle.
 #[tokio::test]
-async fn configuration_that_changes_during_the_observation_discards_the_git_evidence() {
+async fn a_filter_inserted_mid_observation_is_never_run() {
+    if !have_git() {
+        return;
+    }
+    let dir = short_tempdir().expect("tempdir");
+    let marker = dir.path().join("marker-mid");
+    let evil = script(
+        dir.path(),
+        "evil.sh",
+        &format!("touch {}\ncat", marker.display()),
+    );
+    let repo = make_repo(dir.path());
+    std::fs::write(repo.join(".gitattributes"), "*.txt filter=late\n").expect("attributes");
+    dirty(&repo);
+
+    // Prove the plant is live when the driver exists (via `-c`, so the repository's own
+    // config stays clean until the mid-observation insertion).
+    git(
+        &repo,
+        &[
+            "-c",
+            &format!("filter.late.clean={}", evil.display()),
+            "status",
+        ],
+    );
+    assert!(
+        marker.exists(),
+        "the plant is not live; the test proves nothing"
+    );
+    std::fs::remove_file(&marker).expect("reset");
+
+    let builder = ObservationBuilder::new(false);
+    let (state, job) = state_and_job(&repo);
+    let task = tokio::spawn(async move {
+        builder
+            .build(
+                &state,
+                &job,
+                None,
+                Vec::new(),
+                &[],
+                OffsetDateTime::now_utc(),
+            )
+            .await
+    });
+    // Let the observer open and snapshot the configuration, then plant the driver.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    append(
+        &repo.join(".git/config"),
+        &format!("[filter \"late\"]\n\tclean = {}\n", evil.display()),
+    );
+    let observation = task.await.expect("the observation task did not panic");
+    assert!(
+        !marker.exists(),
+        "a filter inserted mid-observation ran during observation"
+    );
+    assert!(
+        observation
+            .git
+            .changed_files
+            .iter()
+            .any(|f| f.ends_with("a.txt")),
+        "the observation still has content: {:?}",
+        observation.git
+    );
+}
+
+// ---- fidelity: the text the model sees -----------------------------------------------
+
+#[tokio::test]
+async fn status_letters_and_head_and_branch_are_reported() {
     if !have_git() {
         return;
     }
     let dir = short_tempdir().expect("tempdir");
     let repo = make_repo(dir.path());
-    dirty(&repo);
-    let once = dir.path().join("mutated-once");
-    let fake = script(
-        dir.path(),
-        "mutating-git",
-        &format!(
-            "for a in \"$@\"; do\n  if [ \"$a\" = diff ] && [ ! -e {once} ]; then\n    touch {once}\n    printf '[filter \"late\"]\\n\\tclean = /bin/true\\n' >> {repo}/.git/config\n  fi\ndone\nexec {real} \"$@\"",
-            once = once.display(),
-            repo = repo.display(),
-            real = real_git().display(),
-        ),
-    );
-    let mut builder = ObservationBuilder::new(false);
-    builder.git_program = fake.into_os_string();
+    std::fs::write(repo.join("a.txt"), "two\n").expect("write");
+    std::fs::remove_file(repo.join("b.rs")).expect("remove");
+    std::fs::write(repo.join("new.txt"), "new\n").expect("write");
+    let staged = repo.join("staged.txt");
+    std::fs::write(&staged, "staged\n").expect("write");
+    git(&repo, &["add", "staged.txt"]);
 
-    let observation = observe(&builder, &repo).await;
-    assert!(once.exists(), "the fake git mutated the configuration");
+    let observation = observe(&ObservationBuilder::new(false), &repo).await;
+    let status = &observation.git.status_short;
+    assert!(status.contains(" M a.txt"), "{status:?}");
+    assert!(status.contains(" D b.rs"), "{status:?}");
+    assert!(status.contains("?? new.txt"), "{status:?}");
+    assert!(status.contains("A  staged.txt"), "{status:?}");
+    assert!(observation.git.changed_files.iter().any(|f| f == "a.txt"));
+    assert_eq!(observation.git.head_sha.as_deref().map(str::len), Some(40));
+    let expected_branch =
+        String::from_utf8_lossy(&git(&repo, &["rev-parse", "--abbrev-ref", "HEAD"]).stdout)
+            .trim()
+            .to_owned();
+    assert_eq!(
+        observation.git.branch.as_deref(),
+        Some(expected_branch.as_str())
+    );
+}
+
+#[tokio::test]
+async fn a_modified_file_reaches_the_diff_and_the_stat_with_a_hunk() {
+    if !have_git() {
+        return;
+    }
+    let dir = short_tempdir().expect("tempdir");
+    let repo = make_repo(dir.path());
+    std::fs::write(repo.join("a.txt"), "one\ntwo\nthree\n").expect("write");
+    git(&repo, &["add", "a.txt"]);
+    git(&repo, &["commit", "-q", "-m", "three"]);
+    std::fs::write(repo.join("a.txt"), "one\nTWO\nthree\n").expect("write");
+
+    let observation = observe(&ObservationBuilder::new(false), &repo).await;
+    let diff = &observation.git.diff_excerpt;
+    assert!(diff.contains("diff --git a/a.txt b/a.txt"), "{diff:?}");
+    assert!(diff.contains("--- a/a.txt"), "{diff:?}");
+    assert!(diff.contains("+++ b/a.txt"), "{diff:?}");
+    assert!(diff.contains("@@ -1,3 +1,3 @@"), "{diff:?}");
+    assert!(diff.contains("-two"), "{diff:?}");
+    assert!(diff.contains("+TWO"), "{diff:?}");
+    let stat = &observation.git.diff_stat;
+    assert!(stat.contains("a.txt | 2 +-"), "{stat:?}");
+    assert!(
+        stat.contains("1 file changed, 1 insertion(+), 1 deletion(-)"),
+        "{stat:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_deleted_file_is_a_deletion_in_the_diff() {
+    if !have_git() {
+        return;
+    }
+    let dir = short_tempdir().expect("tempdir");
+    let repo = make_repo(dir.path());
+    std::fs::remove_file(repo.join("b.rs")).expect("remove");
+
+    let observation = observe(&ObservationBuilder::new(false), &repo).await;
+    let diff = &observation.git.diff_excerpt;
+    assert!(diff.contains("deleted file mode 100644"), "{diff:?}");
+    assert!(diff.contains("+++ /dev/null"), "{diff:?}");
+    assert!(diff.contains("@@ -1 +0,0 @@"), "{diff:?}");
+    assert!(
+        observation.git.diff_stat.contains("b.rs | 1 -"),
+        "{:?}",
+        observation.git.diff_stat
+    );
+}
+
+#[tokio::test]
+async fn a_new_repository_with_no_commits_yields_no_head_and_no_error() {
+    if !have_git() {
+        return;
+    }
+    let dir = short_tempdir().expect("tempdir");
+    let repo = dir.path().join("repo");
+    std::fs::create_dir_all(&repo).expect("mkdir");
+    git(&repo, &["init", "-q"]);
+    let observation = observe(&ObservationBuilder::new(false), &repo).await;
+    assert!(
+        !observation.evidence.contains_key("observation_note"),
+        "{:?}",
+        observation.evidence
+    );
+    assert!(
+        observation.git.head_sha.is_none(),
+        "{:?}",
+        observation.git.head_sha
+    );
+    assert!(observation.git.status_short.is_empty());
+}
+
+#[tokio::test]
+async fn a_directory_that_is_not_a_repository_yields_a_note() {
+    let dir = short_tempdir().expect("tempdir");
+    let repo = dir.path().join("not-a-repo");
+    std::fs::create_dir_all(&repo).expect("mkdir");
+    let observation = observe(&ObservationBuilder::new(false), &repo).await;
     let note = observation
         .evidence
         .get("observation_note")
-        .expect("a note records that the evidence was discarded");
-    assert!(note.contains("changed during the observation"), "{note}");
-    assert!(observation.git.status_short.is_empty() && observation.git.diff_excerpt.is_empty());
-    assert!(observation.untracked.is_empty());
-
-    // The next cycle sees the new configuration from the start, so it is both safe
-    // (overridden) and complete.
-    let next = observe(&builder, &repo).await;
+        .expect("a note explains the missing git evidence");
     assert!(
-        !next.evidence.contains_key("observation_note"),
-        "{:?}",
-        next.evidence
+        note.contains("repository") || note.contains("open"),
+        "{note}"
     );
-    assert!(next.git.changed_files.iter().any(|f| f.ends_with("a.txt")));
+    assert!(observation.git.status_short.is_empty());
+}
+
+#[tokio::test]
+async fn a_binary_change_is_labelled_not_inlined() {
+    if !have_git() {
+        return;
+    }
+    let dir = short_tempdir().expect("tempdir");
+    let repo = make_repo(dir.path());
+    std::fs::write(repo.join("blob.dat"), b"\x00\x01binary\n").expect("write");
+    git(&repo, &["add", "blob.dat"]);
+    git(&repo, &["commit", "-q", "-m", "bin"]);
+    std::fs::write(repo.join("blob.dat"), b"\x00\x02binary\n").expect("write");
+    let observation = observe(&ObservationBuilder::new(false), &repo).await;
+    assert!(
+        observation.git.diff_excerpt.contains("Binary files"),
+        "{:?}",
+        observation.git.diff_excerpt
+    );
+    assert!(
+        observation.git.diff_stat.contains("Bin "),
+        "{:?}",
+        observation.git.diff_stat
+    );
 }

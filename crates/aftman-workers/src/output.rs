@@ -95,6 +95,15 @@ impl StreamDecoder {
         std::mem::take(&mut self.activity)
     }
 
+    /// What the stream has said so far.
+    ///
+    /// Readable while the stream is still arriving, because a worker that is looping is
+    /// exactly the one worth judging before it finishes.
+    #[must_use]
+    pub fn activity(&self) -> &StreamActivity {
+        &self.activity
+    }
+
     /// Decode one line.
     fn consume(&mut self, line: &str, emit: &mut impl FnMut(&str)) {
         self.activity.lines += 1;
@@ -156,7 +165,7 @@ impl StreamDecoder {
                     .get("toolName")
                     .and_then(Value::as_str)
                     .unwrap_or("tool");
-                self.activity.tool_calls.push(ToolCall {
+                self.activity.note_tool_call(ToolCall {
                     name: name.to_owned(),
                     failed: false,
                 });
@@ -172,14 +181,8 @@ impl StreamDecoder {
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
                 let millis = event.get("durationMs").and_then(Value::as_u64);
-                if let Some(call) = self
-                    .activity
-                    .tool_calls
-                    .iter_mut()
-                    .rev()
-                    .find(|call| call.name == name && !call.failed)
-                {
-                    call.failed = failed;
+                if failed {
+                    self.activity.note_tool_failure(name);
                 }
                 let timing = millis.map_or(String::new(), |ms| format!(" ({ms}ms)"));
                 emit(&format!(
@@ -230,7 +233,7 @@ impl StreamDecoder {
                             .unwrap_or("tool");
                         match state {
                             "ACTIVE" => {
-                                self.activity.tool_calls.push(ToolCall {
+                                self.activity.note_tool_call(ToolCall {
                                     name: name.to_owned(),
                                     failed: false,
                                 });
@@ -312,7 +315,7 @@ impl StreamDecoder {
                         }
                         Some("tool_use") => {
                             let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
-                            self.activity.tool_calls.push(ToolCall {
+                            self.activity.note_tool_call(ToolCall {
                                 name: name.to_owned(),
                                 failed: false,
                             });
@@ -339,8 +342,8 @@ impl StreamDecoder {
                         .get("is_error")
                         .and_then(Value::as_bool)
                         .unwrap_or(false);
-                    if failed && let Some(call) = self.activity.tool_calls.last_mut() {
-                        call.failed = true;
+                    if failed {
+                        self.activity.note_last_tool_failure();
                     }
                     emit(if failed {
                         "✗ tool result"
@@ -416,6 +419,7 @@ pub fn decode_all(kind: WorkerKind, stream: &str) -> (Vec<String>, StreamActivit
 #[cfg(test)]
 mod tests {
     use super::{ASSISTANT_TEXT_CAP, StreamDecoder, decode_all};
+    use aftman_core::activity::MAX_TOOL_CALLS;
     use aftman_core::job::WorkerKind;
 
     type TestResult = Result<(), Box<dyn std::error::Error>>;
@@ -603,6 +607,34 @@ mod tests {
         assert!(
             logged > ASSISTANT_TEXT_CAP * 2,
             "the log kept {logged} bytes"
+        );
+    }
+
+    #[test]
+    fn a_long_stream_of_tool_calls_is_capped_but_counted_in_full() {
+        // What the cap must not do is hide a loop: the retained list samples the names,
+        // and the count is what says the agent has called the same tool 500 times.
+        let mut stream = String::new();
+        for _ in 0..(MAX_TOOL_CALLS + 20) {
+            stream.push_str("{\"type\":\"tool_execution_start\",\"toolName\":\"read\"}\n");
+        }
+        let (lines, activity) = decode_all(WorkerKind::Pi, &stream);
+        assert_eq!(
+            activity.tool_calls.len(),
+            MAX_TOOL_CALLS,
+            "the list is bounded"
+        );
+        assert_eq!(
+            activity.tool_calls(),
+            MAX_TOOL_CALLS + 20,
+            "the count is not"
+        );
+        assert!(activity.calls_truncated());
+        assert_eq!(activity.tool_names(), vec!["read"]);
+        assert_eq!(
+            lines.len(),
+            MAX_TOOL_CALLS + 20,
+            "every call is still logged"
         );
     }
 

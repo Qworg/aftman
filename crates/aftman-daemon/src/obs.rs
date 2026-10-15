@@ -27,7 +27,8 @@ use aftman_core::job::{Job, WorkerKind, WorkerStatus};
 use aftman_core::log::BoundedLog;
 use aftman_core::observation::{
     Counters, EventSummary, GitEvidence, Observation, RepoInstructions, TestResult, TestSource,
-    TestStatus, UntrackedExcerpt, WorkerOutputExcerpt, cap_text, summarize_job, summarize_worker,
+    TestStatus, UntrackedExcerpt, WorkerActivityExcerpt, WorkerOutputExcerpt, cap_text,
+    summarize_job, summarize_worker,
 };
 use aftman_core::run::RunState;
 use aftman_core::worker::WorkerRecord;
@@ -213,6 +214,7 @@ impl ObservationBuilder {
             counters,
             evidence: evidence_map,
             output: Self::output_excerpt(active, self.caps.head_chars, self.caps.tail_chars),
+            activity: Self::activity_excerpt(active),
         }
     }
 
@@ -243,6 +245,19 @@ impl ObservationBuilder {
             total_bytes: worker.output.total_bytes(),
             dropped_bytes: worker.output.dropped_bytes(),
         })
+    }
+
+    /// The bounded view of what the most recent worker's stream said it was doing.
+    ///
+    /// `None` when the backend has no structured stream, and when it has one but has not
+    /// produced anything yet: reporting "0 tool calls" for a worker that has simply not
+    /// spoken would read as a worker that did nothing, which is a different claim.
+    fn activity_excerpt(worker: Option<&WorkerRecord>) -> Option<WorkerActivityExcerpt> {
+        let activity = worker?.activity.as_ref()?;
+        if activity.lines == 0 {
+            return None;
+        }
+        Some(WorkerActivityExcerpt::from_activity(activity))
     }
 
     /// A diff that only exists in simulation mode.
@@ -1015,6 +1030,7 @@ mod tests {
 #[cfg(test)]
 mod output_excerpt_tests {
     use super::{ObsCaps, ObservationBuilder};
+    use aftman_core::activity::{StreamActivity, StreamUsage, ToolCall};
     use aftman_core::ids::WorkerId;
     use aftman_core::job::{TaskKind, WorkerKind};
     use aftman_core::log::{BoundedLog, Stream};
@@ -1136,5 +1152,48 @@ mod output_excerpt_tests {
             caps.head_chars,
             caps.tail_chars
         );
+    }
+
+    #[test]
+    fn the_activity_excerpt_is_absent_when_there_is_nothing_to_say() -> TestResult {
+        // A generic backend has no structured stream, and a structured one that has not
+        // spoken yet is indistinguishable from it. Both must read as absent rather than as
+        // "0 tool calls", which is a claim about the agent rather than about the backend.
+        let quiet = worker(BoundedLog::new(64, 64));
+        assert!(ObservationBuilder::activity_excerpt(Some(&quiet)).is_none());
+        assert!(ObservationBuilder::activity_excerpt(None).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn the_activity_excerpt_projects_the_decoded_summary() -> TestResult {
+        let mut w = worker(BoundedLog::new(64, 64));
+        w.activity = Some(StreamActivity {
+            assistant_text: "done".into(),
+            lines: 36,
+            tool_calls: vec![ToolCall {
+                name: "read".into(),
+                failed: false,
+            }],
+            tool_call_count: 1,
+            usage: Some(StreamUsage {
+                input_tokens: Some(137),
+                output_tokens: Some(2),
+                cost_usd: Some(0.000_074_358),
+            }),
+            terminal_status: Some("success".into()),
+            aborted: Some(false),
+            ..StreamActivity::default()
+        });
+        let excerpt = ObservationBuilder::activity_excerpt(Some(&w))
+            .ok_or("a worker that decoded a stream has an excerpt")?;
+        assert_eq!(excerpt.tool_calls, 1);
+        assert_eq!(excerpt.tool_names, vec!["read".to_owned()]);
+        assert_eq!(excerpt.failed_tools, 0);
+        assert_eq!(excerpt.input_tokens, Some(137));
+        assert_eq!(excerpt.cost_usd, Some(0.000_074_358));
+        assert_eq!(excerpt.terminal_status.as_deref(), Some("success"));
+        assert!(!excerpt.calls_truncated);
+        Ok(())
     }
 }

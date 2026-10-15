@@ -333,6 +333,13 @@ Each is a separate behaviour change.
      agent's words and tool names instead of envelope keys. Unstructured backends pass through
      untouched. Covered by two tests that drive a real pipe: one plays the recorded `pi` stream back
      through `cat`, the other checks a `Generic` worker's output is not altered.
+   - **The decoded summary reaches the model** (issue #2). `WorkerRecord::activity` carries the
+     decoded `StreamActivity`, `pump` publishes it as the stream arrives so a loop is visible
+     *before* the worker finishes, and the observation projects it as `worker_activity`. The
+     tool-call list is capped at 256 with the true count kept separate: persisting an unbounded
+     list is the same class of bug as an uncapped output tail, and the count is the signal a cap
+     would otherwise hide. The counts are in the content digest; a repeat of one tool with
+     identical results changes the count and nothing else.
    - **Cost, measured:** a request with the default excerpts (4 000-byte head, 12 000-byte tail)
      serialises to 16 241 bytes against 241 without — the caps, as expected. No live run was made;
      that is the only way to get a token number and it is billable.

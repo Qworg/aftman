@@ -20,6 +20,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::activity::StreamActivity;
 use crate::ids::{CheckKey, EventSeq, RunId, WorkerId};
 use crate::job::{FactoryStatus, Job, JobSummary, RunConfig, TaskKind, WorkerKind, WorkerStatus};
 use crate::log::BoundedLog;
@@ -30,6 +31,7 @@ pub static DEFAULT_EVIDENCE: &[&str] = &[
     "factory_status",
     "active_worker",
     "worker_output",
+    "worker_activity",
     "worker_history",
     "steering_history",
     "git_status",
@@ -200,6 +202,70 @@ pub struct PriorDecision {
 }
 
 /// One cycle's bounded evidence.
+/// The most distinct tool names carried into an observation.
+///
+/// The count is what shows a loop; the names are what say *which* loop. A model does not
+/// need more than a handful to recognise one, and every name costs tokens.
+pub const MAX_ACTIVITY_TOOL_NAMES: usize = 32;
+
+/// What the most recent worker's stream said it was doing, bounded for a model.
+///
+/// This is the decoded view of a structured agent stream, and it exists because a run of
+/// forty identical tool calls is a loop: that is visible in these counts in a way the
+/// output tail cannot show, since the tail holds the *words* rather than the actions.
+///
+/// Evidence, not a verdict — it says what happened, and policy is still the only thing
+/// that may turn it into a directive.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct WorkerActivityExcerpt {
+    /// Every tool call the stream contained, including ones whose record was dropped.
+    pub tool_calls: usize,
+    /// Failures across every call seen, including ones not retained.
+    pub failed_tools: usize,
+    /// Distinct tool names in first-use order, capped at [`MAX_ACTIVITY_TOOL_NAMES`].
+    pub tool_names: Vec<String>,
+    pub tool_names_truncated: bool,
+    /// Whether the retained call list held fewer calls than the stream made.
+    pub calls_truncated: bool,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cost_usd: Option<f64>,
+    /// The backend's own terminal status, where it reports one.
+    pub terminal_status: Option<String>,
+    pub aborted: Option<bool>,
+    /// Lines that did not parse, and the total. A stream that is mostly unparsed means the
+    /// backend's format moved, which is worth saying rather than showing an empty activity
+    /// as a quiet worker.
+    pub unparsed_lines: usize,
+    pub lines: usize,
+}
+
+impl WorkerActivityExcerpt {
+    /// Bound a decoded summary for a model.
+    #[must_use]
+    pub fn from_activity(activity: &StreamActivity) -> Self {
+        let names = activity.tool_names();
+        Self {
+            tool_calls: activity.tool_calls(),
+            failed_tools: activity.failed_tools(),
+            tool_names_truncated: names.len() > MAX_ACTIVITY_TOOL_NAMES,
+            tool_names: names
+                .iter()
+                .take(MAX_ACTIVITY_TOOL_NAMES)
+                .map(|name| (*name).to_owned())
+                .collect(),
+            calls_truncated: activity.calls_truncated(),
+            input_tokens: activity.usage.and_then(|usage| usage.input_tokens),
+            output_tokens: activity.usage.and_then(|usage| usage.output_tokens),
+            cost_usd: activity.usage.and_then(|usage| usage.cost_usd),
+            terminal_status: activity.terminal_status.clone(),
+            aborted: activity.aborted,
+            unparsed_lines: activity.unparsed_lines,
+            lines: activity.lines,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Observation {
     pub run_id: RunId,
@@ -221,6 +287,12 @@ pub struct Observation {
     /// `None` when no worker has run yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<WorkerOutputExcerpt>,
+    /// Bounded view of what the most recent worker's stream said it was doing.
+    ///
+    /// `None` for a backend with no structured stream, and for one that has not produced
+    /// anything to decode yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<WorkerActivityExcerpt>,
 }
 
 impl Observation {
@@ -285,6 +357,30 @@ impl Observation {
                         "tail_truncated": excerpt.is_some_and(|e| e.tail_truncated),
                         "total_bytes": excerpt.map_or(0, |e| e.total_bytes),
                         "dropped_bytes": excerpt.map_or(0, |e| e.dropped_bytes),
+                    })
+                }),
+            );
+        }
+        if has("worker_activity") {
+            put(
+                "worker_activity",
+                self.active.as_ref().map_or(Value::Null, |w| {
+                    self.activity.as_ref().map_or(Value::Null, |a| {
+                        json!({
+                            "worker_id": w.id.to_string(),
+                            "tool_calls": a.tool_calls,
+                            "failed_tools": a.failed_tools,
+                            "tool_names": a.tool_names,
+                            "tool_names_truncated": a.tool_names_truncated,
+                            "calls_truncated": a.calls_truncated,
+                            "input_tokens": a.input_tokens,
+                            "output_tokens": a.output_tokens,
+                            "cost_usd": a.cost_usd,
+                            "terminal_status": a.terminal_status,
+                            "aborted": a.aborted,
+                            "unparsed_lines": a.unparsed_lines,
+                            "lines": a.lines,
+                        })
                     })
                 }),
             );
@@ -398,6 +494,11 @@ impl Observation {
             // the debounce interval is what bounds a chatty one.
             "output_head": self.output.as_ref().map(|e| &e.head),
             "output_tail": self.output.as_ref().map(|e| &e.tail),
+            // The tool counts are here for the case the output tail cannot see: a worker
+            // repeating one tool with identical results changes the count and nothing
+            // else. Like the output, this costs nothing for a silent worker.
+            "tool_calls": self.activity.as_ref().map(|a| a.tool_calls),
+            "failed_tools": self.activity.as_ref().map(|a| a.failed_tools),
             "history": self.history.iter().map(stable_worker_summary).collect::<Vec<_>>(),
             "git_status": self.git.status_short,
             "diff": self.git.diff_excerpt,
@@ -605,6 +706,7 @@ mod tests {
             },
             evidence: BTreeMap::new(),
             output: None,
+            activity: None,
         }
     }
 
@@ -762,8 +864,12 @@ mod tests {
 
 /// The worker's output as the model sees it, and what it does to the change detector.
 #[cfg(test)]
-mod worker_output_tests {
-    use super::{Counters, GitEvidence, JobSummary, Observation, WorkerOutputExcerpt};
+mod worker_evidence_tests {
+    use super::{
+        Counters, GitEvidence, JobSummary, MAX_ACTIVITY_TOOL_NAMES, Observation,
+        WorkerActivityExcerpt, WorkerOutputExcerpt,
+    };
+    use crate::activity::{StreamActivity, ToolCall};
     use crate::ids::{RunId, WorkerId};
     use crate::job::{FactoryStatus, WorkerKind};
     use std::path::PathBuf;
@@ -810,6 +916,7 @@ mod worker_output_tests {
             prior: None,
             counters: Counters::default(),
             evidence: Default::default(),
+            activity: None,
             output,
         }
     }
@@ -899,5 +1006,88 @@ mod worker_output_tests {
             state["worker_output"]["output_tail"].as_str().map(str::len),
             Some(100_000)
         );
+    }
+
+    #[test]
+    fn state_for_carries_what_the_worker_did() {
+        // The point of the projection: the model can see that the agent made twelve tool
+        // calls and two of them failed, which a log tail cannot tell it.
+        let mut o = observation(None);
+        o.activity = Some(WorkerActivityExcerpt {
+            tool_calls: 12,
+            failed_tools: 2,
+            tool_names: vec!["read".into(), "bash".into()],
+            ..WorkerActivityExcerpt::default()
+        });
+        let state = o.state_for(&providers());
+        let activity = &state["worker_activity"];
+        assert_eq!(activity["tool_calls"], serde_json::json!(12));
+        assert_eq!(activity["failed_tools"], serde_json::json!(2));
+        assert_eq!(activity["tool_names"], serde_json::json!(["read", "bash"]));
+    }
+
+    #[test]
+    fn no_activity_is_null_rather_than_zero_calls() {
+        // "no structured stream" and "a worker that did nothing" are different claims;
+        // reporting zero calls for the first would be a claim the model cannot check.
+        let state = observation(None).state_for(&providers());
+        assert_eq!(state["worker_activity"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn the_tool_counts_are_part_of_the_change_detector() {
+        // A worker repeating one tool with identical results changes the count and nothing
+        // else, so the digest has to see it or the loop stays invisible.
+        let mut before = observation(None);
+        before.activity = Some(WorkerActivityExcerpt {
+            tool_calls: 3,
+            ..WorkerActivityExcerpt::default()
+        });
+        let mut after = observation(None);
+        after.activity = Some(WorkerActivityExcerpt {
+            tool_calls: 40,
+            ..WorkerActivityExcerpt::default()
+        });
+        assert_ne!(before.content_digest(), after.content_digest());
+    }
+
+    #[test]
+    fn the_projection_bounds_the_tool_names_but_not_the_count() {
+        let total = MAX_ACTIVITY_TOOL_NAMES + 5;
+        let activity = StreamActivity {
+            tool_calls: (0..total)
+                .map(|i| ToolCall {
+                    name: format!("t{i}"),
+                    failed: false,
+                })
+                .collect(),
+            tool_call_count: total,
+            ..StreamActivity::default()
+        };
+        let excerpt = WorkerActivityExcerpt::from_activity(&activity);
+        assert_eq!(excerpt.tool_names.len(), MAX_ACTIVITY_TOOL_NAMES);
+        assert!(excerpt.tool_names_truncated);
+        assert_eq!(excerpt.tool_calls, total, "the count is not bounded");
+    }
+
+    #[test]
+    fn the_excerpt_carries_usage_and_status() {
+        let activity = StreamActivity {
+            usage: Some(crate::activity::StreamUsage {
+                input_tokens: Some(137),
+                output_tokens: Some(2),
+                cost_usd: Some(0.000_074_358),
+            }),
+            terminal_status: Some("success".into()),
+            aborted: Some(false),
+            lines: 36,
+            ..StreamActivity::default()
+        };
+        let excerpt = WorkerActivityExcerpt::from_activity(&activity);
+        assert_eq!(excerpt.input_tokens, Some(137));
+        assert_eq!(excerpt.output_tokens, Some(2));
+        assert_eq!(excerpt.terminal_status.as_deref(), Some("success"));
+        assert_eq!(excerpt.aborted, Some(false));
+        assert_eq!(excerpt.lines, 36);
     }
 }

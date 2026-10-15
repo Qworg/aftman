@@ -245,6 +245,7 @@ explicit `evidence` list or the default set.
 | `factory_status` | Status, counters, elapsed, attempts | always included |
 | `active_worker` | Kind, mission, model, elapsed, status, exit | included |
 | `worker_output` | Head and tail of the bounded log, per stream | included |
+| `worker_activity` | Decoded stream: tool-call and failure counts, distinct tool names (capped at 32), tokens, cost, the backend's own terminal status | included |
 | `worker_history` | Summaries of ended workers | included |
 | `steering_history` | Steers sent, outcomes, queue depth | included |
 | `git_status` | `git status --short --untracked-files=all` | included |

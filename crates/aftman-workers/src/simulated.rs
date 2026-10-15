@@ -187,6 +187,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             env: Vec::new(),
             output,
+            activity: Arc::new(Mutex::new(None)),
             ledger: None,
         }
     }

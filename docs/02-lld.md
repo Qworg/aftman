@@ -111,6 +111,7 @@ pub struct WorkerRecord {
     pub started_at: Option<OffsetDateTime>,
     pub ended_at: Option<OffsetDateTime>,
     pub output: BoundedLog,             // ring buffer, 12k chars default, both streams
+    pub activity: Option<StreamActivity>, // decoded structured stream; None if the backend has none
     pub steers: Vec<SteerRecord>,
     pub artifact_ref: Option<String>,   // herdr pane id / agent name, for the surface
 }

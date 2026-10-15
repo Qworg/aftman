@@ -42,13 +42,26 @@ impl StreamUsage {
     }
 }
 
+/// The most tool calls retained in [`StreamActivity::tool_calls`].
+///
+/// The counts are what show a loop, and the list is what names the tools; neither needs
+/// every call from a long run. Keeping them all would let a chatty agent grow a persisted
+/// record without bound, which is the same reason the assistant prose is capped.
+pub const MAX_TOOL_CALLS: usize = 256;
+
 /// The summary of one agent stream.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct StreamActivity {
     /// Assistant prose, concatenated across deltas and capped.
     pub assistant_text: String,
     pub assistant_text_truncated: bool,
+    /// The tool calls kept, in order, at most [`MAX_TOOL_CALLS`] of them. The counts below
+    /// are authoritative for how many there were; this is the sample that names them.
     pub tool_calls: Vec<ToolCall>,
+    /// Every tool call the stream contained, including ones not retained.
+    pub tool_call_count: usize,
+    /// Failures across every call seen, including ones not retained.
+    pub failed_tool_count: usize,
     pub usage: Option<StreamUsage>,
     /// `pi` reports whether the run was aborted rather than completing.
     pub aborted: Option<bool>,
@@ -62,14 +75,67 @@ pub struct StreamActivity {
 }
 
 impl StreamActivity {
-    #[must_use]
-    pub fn tool_calls(&self) -> usize {
-        self.tool_calls.len()
+    /// Record a tool call, retaining it only while there is room.
+    ///
+    /// The counters keep counting past the cap: a run with more calls than are worth
+    /// keeping is precisely the run whose call count matters.
+    pub fn note_tool_call(&mut self, call: ToolCall) {
+        self.tool_call_count += 1;
+        if call.failed {
+            self.failed_tool_count += 1;
+        }
+        if self.tool_calls.len() < MAX_TOOL_CALLS {
+            self.tool_calls.push(call);
+        }
     }
 
+    /// Record that the most recent call with this name failed.
+    ///
+    /// Counted as a failure *report*, which is what a backend actually emits. A call whose
+    /// record fell outside the retained list is still counted: a long, failing run is
+    /// exactly the one whose failure count matters, and dropping it would hide it.
+    pub fn note_tool_failure(&mut self, name: &str) {
+        self.failed_tool_count += 1;
+        if let Some(call) = self
+            .tool_calls
+            .iter_mut()
+            .rev()
+            .find(|call| call.name == name && !call.failed)
+        {
+            call.failed = true;
+        }
+    }
+
+    /// Record a failure for the most recent call, for backends whose result event does not
+    /// name the tool that produced it.
+    pub fn note_last_tool_failure(&mut self) {
+        self.failed_tool_count += 1;
+        if let Some(call) = self.tool_calls.iter_mut().rev().find(|call| !call.failed) {
+            call.failed = true;
+        }
+    }
+
+    /// How many tool calls the stream contained, including ones not retained.
+    ///
+    /// The stored count wins when the decoder filled it; otherwise the retained list is
+    /// the answer, so a summary assembled by hand — in a test, or from a fixture — can set
+    /// only the list and still count correctly.
+    #[must_use]
+    pub fn tool_calls(&self) -> usize {
+        self.tool_call_count.max(self.tool_calls.len())
+    }
+
+    /// How many calls the agent's own harness reported as failed.
     #[must_use]
     pub fn failed_tools(&self) -> usize {
-        self.tool_calls.iter().filter(|call| call.failed).count()
+        self.failed_tool_count
+            .max(self.tool_calls.iter().filter(|call| call.failed).count())
+    }
+
+    /// Whether the retained list holds fewer calls than the stream made.
+    #[must_use]
+    pub fn calls_truncated(&self) -> bool {
+        self.tool_calls() > self.tool_calls.len()
     }
 
     /// The distinct tool names used, in first-use order.
@@ -115,7 +181,7 @@ impl StreamActivity {
 
 #[cfg(test)]
 mod tests {
-    use super::{StreamActivity, StreamUsage, ToolCall};
+    use super::{MAX_TOOL_CALLS, StreamActivity, StreamUsage, ToolCall};
 
     #[test]
     fn tool_calls_are_counted_and_deduplicated_by_name() {
@@ -200,5 +266,100 @@ mod tests {
             !StreamActivity::default().looks_structured(),
             "nothing at all"
         );
+    }
+
+    #[test]
+    fn the_retained_list_is_capped_but_the_count_is_not() {
+        let mut activity = StreamActivity::default();
+        for i in 0..(MAX_TOOL_CALLS + 10) {
+            activity.note_tool_call(ToolCall {
+                name: if i % 2 == 0 { "read" } else { "bash" }.to_owned(),
+                failed: false,
+            });
+        }
+        assert_eq!(
+            activity.tool_calls.len(),
+            MAX_TOOL_CALLS,
+            "the list is bounded"
+        );
+        assert_eq!(
+            activity.tool_calls(),
+            MAX_TOOL_CALLS + 10,
+            "the count is not"
+        );
+        assert!(activity.calls_truncated());
+        // The sample still names what the agent used, which is the list's whole purpose.
+        assert_eq!(activity.tool_names(), vec!["read", "bash"]);
+    }
+
+    #[test]
+    fn a_failure_on_a_dropped_call_still_counts() {
+        // The case a naive cap would hide: a long run that looks fine until it fails. The
+        // retained list cannot show it, so the count has to.
+        let mut activity = StreamActivity::default();
+        for _ in 0..(MAX_TOOL_CALLS + 5) {
+            activity.note_tool_call(ToolCall {
+                name: "read".into(),
+                failed: false,
+            });
+        }
+        activity.note_tool_failure("read");
+        assert_eq!(activity.failed_tools(), 1, "the failure is still counted");
+        assert_eq!(activity.tool_calls(), MAX_TOOL_CALLS + 5);
+    }
+
+    #[test]
+    fn a_failure_marks_the_most_recent_call_of_that_name() {
+        let mut activity = StreamActivity::default();
+        activity.note_tool_call(ToolCall {
+            name: "read".into(),
+            failed: false,
+        });
+        activity.note_tool_call(ToolCall {
+            name: "bash".into(),
+            failed: false,
+        });
+        activity.note_tool_failure("bash");
+        assert_eq!(activity.failed_tools(), 1);
+        assert!(activity.tool_calls[1].failed, "bash is the one that failed");
+        assert!(!activity.tool_calls[0].failed);
+
+        // A later report for another name marks that name's most recent call, not the
+        // same call twice. There is no call id in these streams, so the most recent match
+        // is the best the decoder can do; the earlier `read` is left alone.
+        activity.note_tool_call(ToolCall {
+            name: "read".into(),
+            failed: false,
+        });
+        activity.note_tool_failure("read");
+        assert_eq!(activity.failed_tools(), 2);
+        assert!(activity.tool_calls[1].failed, "bash");
+        assert!(activity.tool_calls[2].failed, "the most recent read");
+        assert!(
+            !activity.tool_calls[0].failed,
+            "the earlier read is untouched"
+        );
+    }
+
+    #[test]
+    fn a_summary_assembled_by_hand_counts_from_its_list() {
+        // Fixtures and tests set the list without the counters. Reporting zero for those
+        // would be wrong, and silently so.
+        let activity = StreamActivity {
+            tool_calls: vec![
+                ToolCall {
+                    name: "read".into(),
+                    failed: false,
+                },
+                ToolCall {
+                    name: "bash".into(),
+                    failed: true,
+                },
+            ],
+            ..StreamActivity::default()
+        };
+        assert_eq!(activity.tool_calls(), 2);
+        assert_eq!(activity.failed_tools(), 1);
+        assert!(!activity.calls_truncated());
     }
 }

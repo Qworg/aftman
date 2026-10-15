@@ -28,6 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc;
 
+use aftman_core::activity::StreamActivity;
 use aftman_core::job::WorkerKind;
 use aftman_core::log::Stream;
 use aftman_core::worker::{
@@ -356,6 +357,7 @@ async fn pump(
     mut reader: impl AsyncReadExt + Unpin,
     stream: Stream,
     output: std::sync::Arc<Mutex<aftman_core::log::BoundedLog>>,
+    activity: std::sync::Arc<Mutex<Option<StreamActivity>>>,
     sink: WorkerEventSink,
     kind: WorkerKind,
 ) {
@@ -388,6 +390,15 @@ async fn pump(
                         }),
                         None => log.push(stream, &text),
                     }
+                }
+                // Publish what the stream has said so far. A worker that is looping is
+                // exactly the one worth judging *before* it finishes, so this cannot wait
+                // for the process to exit.
+                if let Some(decoder) = decoder.as_ref() {
+                    *activity
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        Some(decoder.activity().clone());
                 }
                 // Signal after the bytes are visible, so a woken watcher always sees
                 // the output that woke it.
@@ -454,6 +465,7 @@ impl Worker for SubprocessWorker {
                 pipe,
                 Stream::Stdout,
                 std::sync::Arc::clone(&ctx.output),
+                std::sync::Arc::clone(&ctx.activity),
                 sink.clone(),
                 self.kind,
             ))
@@ -463,6 +475,7 @@ impl Worker for SubprocessWorker {
                 pipe,
                 Stream::Stderr,
                 std::sync::Arc::clone(&ctx.output),
+                std::sync::Arc::clone(&ctx.activity),
                 sink.clone(),
                 self.kind,
             ))
@@ -610,6 +623,7 @@ mod tests {
             timeout,
             env: Vec::new(),
             output,
+            activity: Arc::new(Mutex::new(None)),
             ledger: None,
         }
     }
@@ -676,6 +690,74 @@ mod tests {
         assert!(
             !text.contains("\"type\":"),
             "no raw JSON envelope should reach the log: {text}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_structured_backend_publishes_what_the_agent_did() -> TestResult {
+        // The whole chain in one test: bytes from the recorded `pi --mode json` stream,
+        // through the decoder, into the slot the runtime copies onto the worker record.
+        // The recording has one `read` call and the reply "done".
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pi/one-shot.jsonl");
+        let worker = SubprocessWorker::new(
+            WorkerKind::Pi,
+            spec(&format!("cat '{}'", fixture.display())),
+        );
+        let context = ctx(fresh_log(), Duration::from_secs(10));
+        let published = Arc::clone(&context.activity);
+        let (outcome, _) = drive(&worker, context).await?;
+        assert_eq!(outcome, WorkerOutcome::Completed);
+
+        let activity = published
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or("a structured stream must publish what it decoded")?;
+        assert_eq!(activity.tool_calls(), 1);
+        assert_eq!(activity.tool_names(), vec!["read"]);
+        assert_eq!(activity.failed_tools(), 0);
+        assert_eq!(activity.assistant_text.trim(), "done");
+        assert!(activity.usage.is_some(), "pi reports usage");
+        assert_eq!(activity.aborted, Some(false));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn activity_is_visible_while_the_worker_is_still_running() -> TestResult {
+        // The property that makes the summary worth having. A worker that is looping has to
+        // read as looping *before* it finishes, or the supervisor only finds out once the
+        // work is done and the bypass already happened.
+        let worker = SubprocessWorker::new(
+            WorkerKind::Pi,
+            spec("printf '{\"type\":\"tool_execution_start\",\"toolName\":\"read\"}\\n'; sleep 30"),
+        )
+        .with_terminate_grace(Duration::from_millis(200));
+        let context = ctx(fresh_log(), Duration::from_secs(30));
+        let published = Arc::clone(&context.activity);
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let running =
+            tokio::spawn(async move { worker.run(context, WorkerEventSink::new(tx)).await });
+
+        // Poll while the process is still alive: `sleep 30` is nowhere near done when the
+        // first line has been decoded.
+        let mut seen = false;
+        for _ in 0..200 {
+            let current = published
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if current.is_some_and(|a| a.tool_calls() == 1) {
+                seen = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        running.abort();
+        assert!(
+            seen,
+            "the summary must be published before the worker exits"
         );
         Ok(())
     }

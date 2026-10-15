@@ -254,15 +254,27 @@ configured path. Tests plant FIFOs at each of those locations and require the cy
   trust check is not bypassed). These are safe failures, not silent fallbacks: there is **no CLI
   fallback**, because a fallback would let an attacker craft a repository that gix rejects in order
   to reach the weaker path.
-- **A FIFO at a core git file is a denial of service.** gix opens `.git/config`, `.git/index`,
-  loose objects and refs with a plain `File::open`, so a worker that replaces one with a FIFO can
-  block the observation thread. The cycle still times out and records
-  `evidence["observation_note"]`, but the thread may not return until a writer appears. The
-  attribute- and ignore-shaped paths are closed by construction (index-backed, with
-  `core.attributesFile`/`core.excludesFile` overridden and `info/attributes`/`info/exclude`
-  checked), but the rest is the structural cost of reading in-process: a child process could be
-  killed, a thread cannot. It is a denial of service, not code execution: no repository-named
-  program runs.
+- **A FIFO at a core git file is a denial of service, bounded rather than prevented.** gix opens
+  these with a plain `File::open`, so a worker that replaces one with a FIFO blocks the observation
+  thread — and a child process could be killed where a thread cannot. That is the structural cost
+  of reading in-process, and it is bounded in two ways rather than left open.
+
+  The **predictable paths are refused before they are opened**: `.git/index`, `HEAD`,
+  `packed-refs`, `shallow`, `objects/info/alternates`, the whole `refs` tree, and
+  `info/attributes`/`info/exclude`. A symlink or non-regular file at any of them ends the cycle
+  with a note. Git never writes any of them as anything else, so nothing legitimate is refused.
+
+  Two paths cannot be checked that way: `.git/config` is read *during* discovery, before any check
+  can run, and a loose object is opened wherever the diff needs it. Those are bounded by the
+  **observation slot** instead. Each run holds four; the permit lives in the blocking task rather
+  than in the future that awaits it, so a wedged task never gives it back. After four wedged
+  observations that run's cycles skip observation with a note rather than queue behind them, which
+  bounds the leak to four threads instead of the blocking pool. The slots are **per run**, so a
+  hostile repository degrades its own supervision and no other run's.
+
+  The cycle times out and records `evidence["observation_note"]` either way — though see #9: that
+  note currently does not reach the decision model. This remains a denial of service, not code
+  execution: no repository-named program runs.
 - **Untrusted paths.** A repository-controlled path containing a newline or other control bytes is
   C-quoted in both the status and the diff headers, so it cannot forge a second line; a path is
   never interpolated into a command, because no command runs.

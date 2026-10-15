@@ -268,6 +268,59 @@ fn build_platform(
     ))
 }
 
+/// Refuse a non-regular file at a path gix will open.
+///
+/// An in-process read cannot be killed, so a FIFO planted at one of these paths blocks the
+/// observation thread for good — the async deadline still fires, but the thread never comes
+/// back. Git never writes any of these as anything but a regular file, so refusing is a safe
+/// failure with a note rather than a hang. A missing file is fine and means nothing to check.
+fn refuse_non_regular(path: &Path, what: &str) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(format!(
+            "the repository's {what} is not a regular file; refusing to read it"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// The most entries [`refuse_non_regular_tree`] will look at before giving up. A refs tree
+/// with more entries than this is not something to walk, and stopping early is safe: this is
+/// defence in depth behind the observation slot bound, not the thing that makes the
+/// observation terminate.
+const MAX_TREE_ENTRIES: usize = 100_000;
+
+/// Refuse a non-regular entry anywhere under `dir`, iteratively so a deeply nested tree
+/// cannot overflow the stack.
+fn refuse_non_regular_tree(dir: &Path, what: &str) -> Result<(), String> {
+    let mut stack = vec![dir.to_path_buf()];
+    let mut seen = 0usize;
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            seen += 1;
+            if seen > MAX_TREE_ENTRIES {
+                return Ok(());
+            }
+            let path = entry.path();
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            let kind = metadata.file_type();
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_symlink() || !kind.is_file() {
+                return Err(format!(
+                    "the repository's {what} contains an entry that is not a regular file; \
+                     refusing to read it"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Open the repository read-only, refusing wholesale to let the configuration point the
 /// attribute or exclude machinery at a file the worker controls outside the worktree.
 fn open_repository(path: &Path) -> Result<gix::Repository, String> {
@@ -277,19 +330,29 @@ fn open_repository(path: &Path) -> Result<gix::Repository, String> {
     ]);
     let repo = gix::discover_opts(path, Default::default(), options)
         .map_err(|err| format!("could not open the repository read-only: {err}"))?;
-    // The worktree attributes/excludes come from the index, but `$GIT_COMMON_DIR/info/attributes`
-    // and `info/exclude` are still read from disk by gix; they are worker-controlled and could be
-    // FIFOs. Refusing a non-regular file is a safe failure with a note, not a hang.
+    // The worktree attributes/excludes come from the index, but several files under `.git`
+    // are still read from disk by gix, and every one of them is worker-controlled. A FIFO at
+    // any of them blocks the observation thread for good: an in-process open cannot be
+    // interrupted, so the deadline fires and the thread stays blocked. Refusing a non-regular
+    // file is a safe failure with a note, not a hang.
+    //
+    // This is defence in depth, not the guarantee. `.git/config` is read *during* discovery,
+    // before this point, and a loose object is opened wherever the diff needs it — neither can
+    // be checked here. What bounds those is the observation slot in `crate::obs`: a blocked
+    // thread keeps its slot, so the damage is a fixed number of threads rather than the whole
+    // blocking pool. See `docs/08-security.md` §3.2.
     for name in ["info/attributes", "info/exclude"] {
-        let candidate = repo.common_dir().join(name);
-        if let Ok(metadata) = std::fs::symlink_metadata(&candidate)
-            && (metadata.file_type().is_symlink() || !metadata.is_file())
-        {
-            return Err(format!(
-                "the repository's .git/{name} is not a regular file; refusing to read it"
-            ));
-        }
+        refuse_non_regular(&repo.common_dir().join(name), &format!(".git/{name}"))?;
     }
+    refuse_non_regular(&repo.index_path(), ".git/index")?;
+    refuse_non_regular(&repo.git_dir().join("HEAD"), ".git/HEAD")?;
+    refuse_non_regular(&repo.common_dir().join("packed-refs"), ".git/packed-refs")?;
+    refuse_non_regular(&repo.common_dir().join("shallow"), ".git/shallow")?;
+    refuse_non_regular(
+        &repo.common_dir().join("objects/info/alternates"),
+        ".git/objects/info/alternates",
+    )?;
+    refuse_non_regular_tree(&repo.common_dir().join("refs"), ".git/refs")?;
     Ok(repo)
 }
 

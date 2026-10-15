@@ -549,6 +549,23 @@ submodule status, no SHA-256 support without a further feature (it fails safely 
 no intent-to-add diff, no `\ No newline at end of file` marker, and `changed_files` holds raw paths.
 Each is named in [08-security.md §3.2](08-security.md).
 
+### Bounding the in-process reader
+
+The rewrite above closes code execution but cannot make an in-process read interruptible, so a FIFO
+planted at a file gix opens blocks its thread for good. Two mitigations, both in the same change
+that introduced the exposure:
+
+- **Refuse the predictable paths.** `.git/index`, `HEAD`, `packed-refs`, `shallow`,
+  `objects/info/alternates`, the `refs` tree and `info/attributes`/`info/exclude` are checked for
+  being regular files before gix opens them. Git never writes them as anything else.
+- **Bound the rest per run.** `.git/config` is read during discovery and loose objects wherever the
+  diff needs them, so neither can be refused up front. Each run gets four observation slots, the
+  permit is held by the blocking task rather than the awaiting future, and a refusal is a note
+  rather than a queue. Per run, so one hostile repository degrades only its own supervision.
+
+A thread that is blocked is also *not* released at exit, which matters because the runtime waits for
+blocking tasks on shutdown — already handled, since the CLI calls `shutdown_timeout` before exiting.
+
 ## Dependency policy
 
 Two decisions, both made because a check that can go red without a code change teaches

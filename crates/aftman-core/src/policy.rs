@@ -512,6 +512,7 @@ mod tests {
             counters: Counters::default(),
             evidence: BTreeMap::new(),
             output: None,
+            activity: None,
         }
     }
 

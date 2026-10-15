@@ -23,6 +23,7 @@ use serde_json::json;
 use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 
+use aftman_core::activity::StreamActivity;
 use aftman_core::assessment::{HumanDecision, ResolvedCheck, Rung};
 use aftman_core::clock::Clock;
 use aftman_core::definitions::DefinitionSet;
@@ -361,6 +362,10 @@ struct WorkerHandle {
     /// worker's tail would always read as empty, and the supervisor would be
     /// judging a worker it cannot see.
     output: Arc<Mutex<BoundedLog>>,
+    /// The decoded summary the backend publishes as it reads its stream. Kept here for the
+    /// same reason as `output`: the runtime copies it into the worker record, so a worker
+    /// that is looping can be seen to be looping before it finishes.
+    activity: Arc<Mutex<Option<StreamActivity>>>,
     /// The worker's task, kept so a stop can reap or abort it.
     task: tokio::task::JoinHandle<()>,
 }
@@ -808,7 +813,7 @@ impl FactoryRuntime {
             // taken after, so it carries no stale unflushed count.
             if let Some(handle) = ls.worker.as_ref() {
                 self.flush_output(state, handle, false).await?;
-                self.sync_output(state, handle);
+                self.sync_live(state, handle);
             }
 
             // ---- gather evidence --------------------------------------------
@@ -1604,11 +1609,19 @@ impl FactoryRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let ended_at = self.now();
+        let activity = handle
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         if let Some(record) = state.workers.iter_mut().find(|w| w.id == handle.id) {
             record.status = WorkerStatus::Stopped;
             record.exit = Some(aftman_core::job::WorkerExit::terminated());
             record.ended_at = Some(ended_at);
             record.output = snapshot;
+            // A stopped worker's activity is still evidence: a run that was interrupted
+            // mid-loop should say so rather than look like a run that did nothing.
+            record.activity = activity;
         }
         self.emit(
             state,
@@ -1852,14 +1865,26 @@ impl FactoryRuntime {
     /// The worker writes into a shared bounded log; the record is what the
     /// observation reads. Without this sync, a running worker's tail would always be
     /// empty.
-    fn sync_output(&self, state: &mut RunState, handle: &WorkerHandle) {
+    /// Copy what the worker is producing *now* into its record.
+    ///
+    /// Both halves matter while the worker runs: the log tail is how a model sees what the
+    /// agent is saying, and the activity summary is how it sees what the agent is *doing*.
+    /// A worker that has called the same tool two hundred times looks busy in the log and
+    /// looks looping here, and the second is the one the decision turns on.
+    fn sync_live(&self, state: &mut RunState, handle: &WorkerHandle) {
         let snapshot = handle
             .output
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let activity = handle
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         if let Some(record) = state.workers.iter_mut().find(|w| w.id == handle.id) {
             record.output = snapshot;
+            record.activity = activity;
         }
     }
 
@@ -1878,6 +1903,11 @@ impl FactoryRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let activity = handle
+            .activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
         if let Some(record) = state.workers.iter_mut().find(|w| w.id == id) {
             record.status = outcome.status();
             record.exit = outcome.exit();
@@ -1885,6 +1915,9 @@ impl FactoryRuntime {
             // The final output must survive the worker's exit; otherwise the last
             // thing a worker did before finishing is invisible.
             record.output = snapshot;
+            // Same for what it did: the summary is what says whether the work that just
+            // finished was eight tool calls or the same one eight hundred times.
+            record.activity = activity;
         }
         self.emit(
             state,
@@ -1967,6 +2000,7 @@ impl FactoryRuntime {
         let id = WorkerId::new();
         let capacity = self.deps.config.obs_tail_chars.max(4_096);
         let output = Arc::new(Mutex::new(BoundedLog::new(capacity, capacity)));
+        let activity: Arc<Mutex<Option<StreamActivity>>> = Arc::new(Mutex::new(None));
 
         let mut record = WorkerRecord::new(
             id,
@@ -2022,6 +2056,7 @@ impl FactoryRuntime {
                 .map(|(name, value)| (name.clone(), value.clone()))
                 .collect(),
             output: Arc::clone(&output),
+            activity: Arc::clone(&activity),
             ledger: Some(Arc::new(StoreLedger {
                 store: Arc::clone(&self.deps.store),
                 run_id: state.header.id,
@@ -2041,6 +2076,7 @@ impl FactoryRuntime {
             signals: signal_rx,
             done: done_rx,
             output,
+            activity,
             task,
         })
     }
@@ -2376,6 +2412,7 @@ mod tests {
             prior: None,
             counters: Counters::default(),
             evidence: Default::default(),
+            activity: None,
             output: None,
         }
     }

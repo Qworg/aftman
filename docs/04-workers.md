@@ -66,6 +66,12 @@ pi --print --mode json --no-session -- <mission>
   `type`; **`agy` uses `event`**. A decoder that assumed one key produces an empty activity
   summary for the other and reports a busy worker as quiet — a failure that looks like good news,
   which is why it is checked against recorded output rather than `--help` (§12 item 6).
+- The decoded summary is recorded on the worker (`WorkerRecord::activity`) and reaches the model as
+  `worker_activity`: tool-call and failure counts, the distinct tool names, tokens, cost, and the
+  backend's own terminal status. The **counts** are what make a loop visible — a worker repeating one
+  tool with identical results changes the count and nothing else — and they keep counting past the
+  retention cap, because a long failing run is exactly the one whose count matters. The summary is
+  published while the worker is still running, so a loop can be judged before the worker exits.
 - `--mode json` reserves stdout for protocol records, so anything not JSON on stdout is a
   diagnostic and is logged, not parsed.
 

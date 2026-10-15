@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+use crate::activity::StreamActivity;
 use crate::ids::WorkerId;
 use crate::job::{TaskKind, WorkerExit, WorkerKind, WorkerStatus};
 use crate::log::{BoundedLog, Stream};
@@ -171,6 +172,14 @@ pub struct WorkerCtx {
     /// supervisor can react long before the process exits. The lock is held only
     /// for the duration of one push.
     pub output: Arc<Mutex<BoundedLog>>,
+    /// Where a backend that decodes its stream publishes what it has learned about the
+    /// agent's actions so far.
+    ///
+    /// Shared for the same reason `output` is, and it matters more here: a worker that is
+    /// looping is exactly the one worth judging *before* it finishes, so the summary has to
+    /// be visible while the worker is still running. The lock is held only long enough to
+    /// replace the summary.
+    pub activity: Arc<Mutex<Option<StreamActivity>>>,
     /// Where a backend that launches a process records it, so that a supervisor that
     /// dies abruptly cannot leave an agent running unaccounted for (see
     /// [`ProcessLedger`]). `None` for backends that launch nothing, and in tests.
@@ -267,6 +276,14 @@ pub struct WorkerRecord {
     #[serde(with = "crate::timefmt::opt", default)]
     pub ended_at: Option<OffsetDateTime>,
     pub output: BoundedLog,
+    /// What a structured stream told us the agent actually did: tool calls, usage, and the
+    /// backend's own terminal status. `None` for a backend that emits no structured stream,
+    /// and for one that has not produced anything to decode yet.
+    ///
+    /// This is evidence, not a verdict: it says what happened, and `policy` is still the
+    /// only thing that may turn it into a directive.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<StreamActivity>,
     pub steers: Vec<SteerRecord>,
     #[serde(with = "crate::timefmt::opt", default)]
     pub last_steered_at: Option<OffsetDateTime>,
@@ -299,6 +316,7 @@ impl WorkerRecord {
             started_at: None,
             ended_at: None,
             output,
+            activity: None,
             steers: Vec::new(),
             last_steered_at: None,
             artifact_ref: None,

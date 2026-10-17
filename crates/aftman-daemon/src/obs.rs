@@ -110,7 +110,8 @@ impl ObservationBuilder {
     /// deadline ([`OBSERVATION_TIMEOUT`]), and a timeout sets an interrupt the observer
     /// polls. Observing a repository never executes a program the repository names; see
     /// [`crate::repo_observe`]. On any failure or timeout the repository evidence is omitted
-    /// and a note says so under `evidence["observation_note"]`.
+    /// and a note says so under `Observation::observation_note`, which the model is shown and
+    /// which policy uses to refuse `Finish`.
     pub async fn build(
         &self,
         state: &RunState,
@@ -178,9 +179,12 @@ impl ObservationBuilder {
                 },
             ));
         }
-        if let Some(why) = note {
-            evidence_map.insert("observation_note".to_owned(), why);
-        }
+        // A note means the repository evidence is missing or incomplete — a timeout, a
+        // refused FIFO, a directory that is not a repository. It is a field of the observation
+        // rather than a command-evidence entry, because an entry is only emitted for a
+        // selected provider id and this one was silently dropped from every state the model
+        // saw, leaving a failed observation indistinguishable from a clean tree.
+        let observation_note = note;
         if self.simulation {
             evidence_map.insert(
                 "simulated".to_owned(),
@@ -217,6 +221,7 @@ impl ObservationBuilder {
             evidence: evidence_map,
             output: Self::output_excerpt(active, self.caps.head_chars, self.caps.tail_chars),
             activity: Self::activity_excerpt(active),
+            observation_note,
         }
     }
 

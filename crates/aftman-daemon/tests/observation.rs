@@ -370,7 +370,7 @@ async fn a_fifo_info_attributes_yields_a_note_not_a_hang() {
     .await
     .expect("the observation hung on a FIFO .git/info/attributes");
     assert!(
-        observation.evidence.contains_key("observation_note"),
+        observation.observation_note.is_some(),
         "a non-regular info/attributes is refused with a note"
     );
     assert!(observation.git.status_short.is_empty());
@@ -446,8 +446,8 @@ async fn a_timed_out_observation_reports_a_note_instead_of_hanging() {
         started.elapsed()
     );
     let note = observation
-        .evidence
-        .get("observation_note")
+        .observation_note
+        .as_deref()
         .expect("a timeout note");
     assert!(note.contains("exceeded"), "{note}");
     assert!(observation.git.status_short.is_empty());
@@ -987,9 +987,9 @@ async fn a_new_repository_with_no_commits_yields_no_head_and_no_error() {
     git(&repo, &["init", "-q"]);
     let observation = observe(&ObservationBuilder::new(false), &repo).await;
     assert!(
-        !observation.evidence.contains_key("observation_note"),
+        observation.observation_note.is_none(),
         "{:?}",
-        observation.evidence
+        observation.observation_note
     );
     assert!(
         observation.git.head_sha.is_none(),
@@ -1006,8 +1006,8 @@ async fn a_directory_that_is_not_a_repository_yields_a_note() {
     std::fs::create_dir_all(&repo).expect("mkdir");
     let observation = observe(&ObservationBuilder::new(false), &repo).await;
     let note = observation
-        .evidence
-        .get("observation_note")
+        .observation_note
+        .as_deref()
         .expect("a note explains the missing git evidence");
     assert!(
         note.contains("repository") || note.contains("open"),
@@ -1063,8 +1063,8 @@ async fn a_fifo_at_the_index_is_refused_rather_than_read() {
         started.elapsed()
     );
     let note = observation
-        .evidence
-        .get("observation_note")
+        .observation_note
+        .as_deref()
         .expect("a refusal note");
     assert!(note.contains("not a regular file"), "{note}");
     assert!(observation.git.status_short.is_empty());

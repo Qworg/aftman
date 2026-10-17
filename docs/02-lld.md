@@ -250,7 +250,8 @@ pub enum   SuppressionReason { NotPermitted, Invariant(Invariant), HigherPriorit
 pub enum   Invariant { OverallTimeout, AttemptsExhausted, WorkerLimit, VerificationAlreadyRun,
     AssessmentBudget, ModelUnavailable, UnresolvedUncertainty,
     // No worker has ever run, so there is nothing to declare complete.
-    NoWorkAttempted }
+    NoWorkAttempted,
+    UnobservedRepository }
 pub struct Routing { pub always: bool, pub instructions: Option<String>, pub threshold: f32 }
 
 // ---- store ------------------------------------------------------------

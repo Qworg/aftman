@@ -129,6 +129,15 @@ pub enum Invariant {
     /// A model that answers optimistically on the first cycle — before any work exists —
     /// would otherwise finish a job that never started.
     NoWorkAttempted,
+    /// The repository could not be read this cycle, so "nothing has changed" is not a claim
+    /// the supervisor is in a position to make.
+    ///
+    /// Without this, a run whose repository cannot be observed — a timeout, a refused FIFO, a
+    /// repository gix declines — sees empty git evidence, which is byte-identical to a clean
+    /// working tree, and can finish on the strength of it. The state now says why
+    /// ([`crate::observation::Observation::observation_note`]), but the wrong direction to be
+    /// wrong in is concluding "nothing changed" from "nothing could be seen".
+    UnobservedRepository,
 }
 
 /// Why a proposal was not selected.

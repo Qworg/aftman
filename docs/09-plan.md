@@ -18,10 +18,12 @@ agent appear. Every milestone ends with the full offline suite green.
 | M5 — ensemble S1 and S2 | not started | — |
 | M6 — herdr | not started | — |
 | M7 — ensemble S3 and S4 | not started | — |
-| M8 — backend hardening and verifier missions | in progress; in-process repository observation built | — |
+| M8 — backend hardening and verifier missions | in progress: in-process repository observation, its denial-of-service bound, and the observation-note invariant | — |
 
-As of the M3 commits: **920 tests passing**, `cargo clippy --all-targets --all-features -- -D
-warnings` clean, `cargo fmt --check` clean, and the whole suite green with an empty environment.
+At the merge of the observation-note work: **1031 tests passing**, `cargo clippy --all-targets
+--all-features -- -D warnings` clean, `cargo fmt --check` clean, and the whole suite green with an
+empty environment. The count is a snapshot of when this line was written; `cargo test` is the
+authority.
 (394 as of M2.)
 
 ### Where the record lives
@@ -565,6 +567,21 @@ that introduced the exposure:
 
 A thread that is blocked is also *not* released at exit, which matters because the runtime waits for
 blocking tasks on shutdown — already handled, since the CLI calls `shutdown_timeout` before exiting.
+
+### A failed observation is visible, and cannot finish a run
+
+The in-process rewrite made one failure mode more reachable, and reviewing it exposed that the
+failure was already invisible: `observation_note` was written into `Observation::evidence`, which
+`state_for` emits only for a *selected provider id* — and the decision call's provider set did not
+include it. So a run that could not read its repository sent the model empty git evidence and no
+explanation, which is byte-identical to a clean working tree, and could `Finish` on the strength of
+it.
+
+Two changes. The note is now a field of the observation (`Observation::observation_note`) rather
+than an evidence entry, so no provider selection can drop it, and it is in the default set. And
+`Invariant::UnobservedRepository` refuses `Finish` while it is set: "nothing has changed" must not be
+concluded from "nothing could be seen". A job pointed at a plain directory produces the note too, and
+that is deliberate — aftman cannot observe such a job, so it should not declare its work complete.
 
 ## Dependency policy
 

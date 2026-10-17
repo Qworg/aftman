@@ -2405,6 +2405,7 @@ mod tests {
             counters: Counters::default(),
             evidence: Default::default(),
             activity: None,
+            observation_note: None,
             output: None,
         }
     }

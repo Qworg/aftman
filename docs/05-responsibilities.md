@@ -246,6 +246,7 @@ explicit `evidence` list or the default set.
 | `active_worker` | Kind, mission, model, elapsed, status, exit | included |
 | `worker_output` | Head and tail of the bounded log, per stream | included |
 | `worker_activity` | Decoded stream: tool-call and failure counts, distinct tool names (capped at 32), tokens, cost, the backend's own terminal status | included |
+| `observation_note` | Why the repository could not be read this cycle, when it could not | included |
 | `worker_history` | Summaries of ended workers | included |
 | `steering_history` | Steers sent, outcomes, queue depth | included |
 | `git_status` | `git status --short --untracked-files=all`-equivalent, computed in-process with `gix` | included |
@@ -344,6 +345,7 @@ Applied before any priority comparison. They cannot be overridden by a score:
 | Model error this cycle | only conservative directives are permitted (see §7) |
 | **Any active check unresolved** (`UnresolvedInBand`, `SuppressedByContest`, `Unresolved`) | `Finish` suppressed (`Invariant::UnresolvedUncertainty`). A high-priority inhibitor rule that cannot fire because its own measurement is uncertain must not silently disarm: uncertainty about a blocker blocks, it does not permit. |
 | **No worker has ever run** | `Finish` suppressed (`Invariant::NoWorkAttempted`). A model that answers optimistically on the first cycle — before any work exists — would otherwise end a job that never started. Added during M2, after a test model did exactly that. |
+| **The repository could not be read** | `Finish` suppressed (`Invariant::UnobservedRepository`). Empty git evidence is byte-identical to a clean working tree, so "nothing has changed" would be an absence of evidence read as evidence of absence. Added in M8, after an in-process observation made that failure mode reachable. |
 | **No proposal survived and no worker is running** | `Escalate`, not `Continue`. `Continue` with nothing to continue with is a stall, and the run would spin on the idle ticker until the overall timeout. |
 
 ### 6.2 The `Finish` precondition

@@ -249,6 +249,9 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
     if input.counters.workers_run == 0 {
         invariants.push(Invariant::NoWorkAttempted);
     }
+    if input.observation.observation_note.is_some() {
+        invariants.push(Invariant::UnobservedRepository);
+    }
 
     // ---- Phase 2: filter, then take the highest priority -------------------
 
@@ -366,6 +369,15 @@ fn refusal(
             // judgement, so it belongs here rather than in a check.
             if input.counters.workers_run == 0 {
                 return Some(SuppressionReason::Invariant(Invariant::NoWorkAttempted));
+            }
+            // The repository could not be read, so "nothing has changed" is an absence of
+            // evidence rather than evidence of absence. Same posture as uncertainty: the one
+            // input that cannot be re-derived from anything else in the state has to block
+            // rather than quietly read as clean.
+            if input.observation.observation_note.is_some() {
+                return Some(SuppressionReason::Invariant(
+                    Invariant::UnobservedRepository,
+                ));
             }
             if uncertainty_blocks_finish {
                 return Some(SuppressionReason::Invariant(
@@ -513,6 +525,7 @@ mod tests {
             evidence: BTreeMap::new(),
             output: None,
             activity: None,
+            observation_note: None,
         }
     }
 
@@ -666,6 +679,44 @@ mod tests {
         assert!(decision.suppressed.iter().any(|s| matches!(
             s.reason,
             SuppressionReason::Invariant(Invariant::NoWorkAttempted)
+        )));
+    }
+
+    #[test]
+    fn finish_is_refused_when_the_repository_could_not_be_observed() {
+        // Empty git evidence is byte-identical to a clean tree. When the observation failed,
+        // "nothing has changed" is an absence of evidence — and `Finish` is the one
+        // irreversible action, so it must not be taken on it. Without this, a run whose
+        // repository could not be read (a timeout, a refused FIFO, a directory that is not a
+        // repository) would be able to declare complete work nobody could see.
+        let mut o = observation();
+        o.observation_note = Some("repository observation exceeded 8s".to_owned());
+        let counters = Counters {
+            workers_run: 1,
+            verifier_completed: true,
+            ..Counters::default()
+        };
+        let config = RunConfig::default();
+        let checks = checks(&[
+            ("core.completion", "ready_to_finish", 0.95),
+            ("core.completion", "requirements_satisfied", 0.95),
+            ("core.verification", "tests_sufficient", 0.95),
+            ("core.verification", "needs_verification", 0.10),
+        ]);
+        let decision = arbitrate(&input(&o, &counters, &config, &checks), &[finish()]);
+        assert_ne!(
+            decision.selected,
+            finish().directive,
+            "Finish must be refused"
+        );
+        assert!(
+            decision
+                .invariants
+                .contains(&Invariant::UnobservedRepository)
+        );
+        assert!(decision.suppressed.iter().any(|s| matches!(
+            s.reason,
+            SuppressionReason::Invariant(Invariant::UnobservedRepository)
         )));
     }
 

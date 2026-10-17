@@ -32,6 +32,7 @@ pub static DEFAULT_EVIDENCE: &[&str] = &[
     "active_worker",
     "worker_output",
     "worker_activity",
+    "observation_note",
     "worker_history",
     "steering_history",
     "git_status",
@@ -293,6 +294,17 @@ pub struct Observation {
     /// anything to decode yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activity: Option<WorkerActivityExcerpt>,
+    /// Why the repository could not be read this cycle, when it could not.
+    ///
+    /// A field rather than an entry in `evidence`, because `evidence` is only emitted for a
+    /// selected provider id: the note used to live there and was silently dropped from every
+    /// state the model saw, which made a failed observation byte-identical to a clean tree.
+    ///
+    /// Set only when there *is* a repository and reading it failed — a job pointed at a plain
+    /// directory has no git evidence by definition, which is a setup fact rather than a
+    /// failure, and this must not read as one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_note: Option<String>,
 }
 
 impl Observation {
@@ -383,6 +395,14 @@ impl Observation {
                         })
                     })
                 }),
+            );
+        }
+        if has("observation_note") {
+            put(
+                "observation_note",
+                self.observation_note
+                    .as_ref()
+                    .map_or(Value::Null, |note| json!(note)),
             );
         }
         if has("worker_history") {
@@ -494,6 +514,10 @@ impl Observation {
             // the debounce interval is what bounds a chatty one.
             "output_head": self.output.as_ref().map(|e| &e.head),
             "output_tail": self.output.as_ref().map(|e| &e.tail),
+            // A cycle that starts being observable again, or stops, is a change worth
+            // assessing: it is the difference between "nothing changed" and "nothing could
+            // be seen".
+            "observation_note": self.observation_note,
             // The tool counts are here for the case the output tail cannot see: a worker
             // repeating one tool with identical results changes the count and nothing
             // else. Like the output, this costs nothing for a silent worker.
@@ -707,6 +731,7 @@ mod tests {
             evidence: BTreeMap::new(),
             output: None,
             activity: None,
+            observation_note: None,
         }
     }
 
@@ -917,6 +942,7 @@ mod worker_evidence_tests {
             counters: Counters::default(),
             evidence: Default::default(),
             activity: None,
+            observation_note: None,
             output,
         }
     }
@@ -1068,6 +1094,35 @@ mod worker_evidence_tests {
         assert_eq!(excerpt.tool_names.len(), MAX_ACTIVITY_TOOL_NAMES);
         assert!(excerpt.tool_names_truncated);
         assert_eq!(excerpt.tool_calls, total, "the count is not bounded");
+    }
+
+    #[test]
+    fn state_for_carries_the_observation_note() {
+        // The point of #9: a failed observation must be visible to the model, not only in a
+        // log. Empty git evidence and a clean tree are otherwise the same state.
+        let mut o = observation(None);
+        o.observation_note = Some("repository observation exceeded 8s".to_owned());
+        let state = o.state_for(&providers());
+        assert_eq!(
+            state["observation_note"],
+            serde_json::json!("repository observation exceeded 8s")
+        );
+    }
+
+    #[test]
+    fn a_readable_repository_reports_no_note() {
+        let state = observation(None).state_for(&providers());
+        assert_eq!(state["observation_note"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn gaines_and_losses_of_sight_are_part_of_the_change_detector() {
+        // Gaining or losing sight of the repository is a change worth assessing: it is the
+        // difference between "nothing changed" and "nothing could be seen".
+        let silent = observation(None).content_digest();
+        let mut blind = observation(None);
+        blind.observation_note = Some("timed out".to_owned());
+        assert_ne!(silent, blind.content_digest());
     }
 
     #[test]

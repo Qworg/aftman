@@ -272,9 +272,12 @@ configured path. Tests plant FIFOs at each of those locations and require the cy
   bounds the leak to four threads instead of the blocking pool. The slots are **per run**, so a
   hostile repository degrades its own supervision and no other run's.
 
-  The cycle times out and records `evidence["observation_note"]` either way — though see #9: that
-  note currently does not reach the decision model. This remains a denial of service, not code
-  execution: no repository-named program runs.
+  The cycle times out and records `Observation::observation_note` either way. That note is a field
+  of the observation rather than a command-evidence entry (an entry is only emitted for a selected
+  provider id, and the note used to be silently dropped from every state the model saw); it is in
+  the default provider set, and `Invariant::UnobservedRepository` refuses `Finish` while it is
+  set — because empty git evidence is otherwise indistinguishable from a clean tree. This remains a
+  denial of service, not code execution: no repository-named program runs.
 - **Untrusted paths.** A repository-controlled path containing a newline or other control bytes is
   C-quoted in both the status and the diff headers, so it cannot forge a second line; a path is
   never interpolated into a command, because no command runs.

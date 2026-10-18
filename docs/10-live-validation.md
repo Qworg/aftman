@@ -86,6 +86,9 @@ aftman run \
 - `--external-sandbox` asserts that isolation comes from a container, VM, or throwaway checkout.
   **For `pi` this is what makes `sandboxed` true rather than aspirational** — without it a
   sandboxed `pi` run is refused at startup, which is the fail-closed behaviour working.
+- **`--model` matters, and a bad one fails quietly.** `pi` with a model that answers with empty
+  content produces a well-formed stream with no prose and no tool calls: the worker runs, exits 0,
+  and does nothing. If a run produces no worker output at all, check the model before the backend.
 - `--simulate-model` runs the *worker* half offline with a fake decision model. Use it if you want
   to exercise a backend without spending Jev tokens; it does not exercise Jev.
 - `--pass-env KEY` forwards one variable from your shell to the worker (repeatable). A small default
@@ -162,6 +165,8 @@ This is definition-of-done item 2 (see [09-plan.md](09-plan.md)):
 | `run` refuses a sandboxed `pi` | `pi` has no sandbox flag of its own | Add `--external-sandbox` only if isolation really is external |
 | The run ends `Escalate` with no worker started | Nothing was attempted and no proposal arrived | Check `decisions`; this is fail-safe, not a crash |
 | The run never finishes | Watch `decisions` for the invariant holding it | Often `UnobservedRepository` — see step 0 |
+| A worker "completes" with no output | Either a bad model (`pi` above) or a CLI that refused the turn | Run step 2; check the model |
+| After a rebuild the old behaviour persists | `aftman run` drives a **daemon**, and the daemon spawns the worker | `aftman stop`, then retry — the next command starts a daemon from the new binary |
 
 ## Safety, briefly
 

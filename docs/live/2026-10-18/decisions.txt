@@ -1,0 +1,16 @@
+[   8] ensemble enabled=false margin=0.15000000596046448 unresolved=0
+[  10] selected StartWorker (1 invariants)
+[  18] ensemble enabled=false margin=0.15000000596046448 unresolved=0
+[  21] selected Verify (0 invariants)
+        suppressed core.completion:work-remains       higher_priority
+[  28] ensemble enabled=false margin=0.15000000596046448 unresolved=0
+[  29] selected Continue (1 invariants)
+[  35] ensemble enabled=false margin=0.15000000596046448 unresolved=0
+[  36] selected Continue (1 invariants)
+[  42] ensemble enabled=false margin=0.15000000596046448 unresolved=0
+[  43] selected Continue (1 invariants)
+[  50] ensemble enabled=false margin=0.15000000596046448 unresolved=0
+[  52] selected StartWorker (1 invariants)
+[  60] ensemble enabled=false margin=0.15000000596046448 unresolved=0
+[  62] selected Escalate (3 invariants)
+        suppressed core.completion:work-remains       invariant:WorkerLimit

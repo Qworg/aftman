@@ -16,6 +16,14 @@ use aftman_core::activity::{StreamActivity, StreamUsage, ToolCall};
 use aftman_core::job::WorkerKind;
 use serde_json::Value;
 
+/// The most a single line may occupy before it is flushed as a fragment.
+///
+/// A line is newline-delimited, but nothing stops a worker writing a large blob with no
+/// newline in it. Without this the buffer grows with the output, `find('\n')` rescans more
+/// bytes on every chunk, and `BoundedLog` — and therefore the model — sees nothing at all
+/// until the process exits.
+pub const MAX_LINE_BYTES: usize = 1024 * 1024;
+
 /// How much assistant prose is retained. The log tail is separately bounded; this cap is
 /// for the *summary*, which reaches a model.
 pub const ASSISTANT_TEXT_CAP: usize = 4_000;
@@ -36,6 +44,17 @@ fn envelope_for(kind: WorkerKind) -> Envelope {
         WorkerKind::Agy => Envelope::Event,
         WorkerKind::Generic | WorkerKind::HerdrPane | WorkerKind::Simulated => Envelope::Plain,
     }
+}
+
+/// Whether this backend's stdout is a structured stream at all.
+///
+/// `false` means the output is already the readable form and must not be decoded: buffering
+/// it waiting for a newline, and then reporting `tool_calls: 0` for a backend that has no
+/// tool calls to report, are both wrong — the second presents "no stream" as "the worker did
+/// nothing".
+#[must_use]
+pub fn has_structured_stream(kind: WorkerKind) -> bool {
+    !matches!(envelope_for(kind), Envelope::Plain)
 }
 
 /// Renders a structured stream into readable lines.
@@ -81,6 +100,18 @@ impl StreamDecoder {
             if !line.is_empty() {
                 self.consume(line, emit);
             }
+        }
+        // A line that never ends is not a line. Flush the front of it as a fragment: that
+        // bounds the buffer, and a fragment that fails to parse is kept in the log rather
+        // than dropped, so nothing is lost silently.
+        if self.buffer.len() > MAX_LINE_BYTES {
+            let mut end = MAX_LINE_BYTES;
+            while end > 0 && !self.buffer.is_char_boundary(end) {
+                end -= 1;
+            }
+            let fragment: String = self.buffer.drain(..end).collect();
+            self.activity.unparsed_lines += 1;
+            emit(&fragment);
         }
     }
 

@@ -293,10 +293,16 @@ impl SubprocessWorker {
 
         // Move stdin into the shared slot so steering can reach it.
         if let Some(stdin) = child.stdin.take() {
-            let mut slot = self.stdin.try_lock();
-            if let Ok(slot) = &mut slot {
-                **slot = Some(stdin);
-            }
+            // If the slot cannot be taken, say so: dropping the handle would leave this
+            // worker silently unsteerable, and a steer that is accepted but undeliverable
+            // still counts against the steer budget.
+            let mut slot = self.stdin.try_lock().map_err(|_| {
+                WorkerError::Io(
+                    "could not install the worker's stdin: it is held by another operation"
+                        .to_owned(),
+                )
+            })?;
+            *slot = Some(stdin);
         }
         Ok((child, pgid))
     }
@@ -371,20 +377,28 @@ async fn pump(
     sink: WorkerEventSink,
     kind: WorkerKind,
 ) {
-    // Only stdout carries the backend's structured stream. Stderr is the CLI's own
-    // diagnostics in whatever shape the CLI felt like emitting, so it passes through.
+    // Only a *structured* backend's stdout goes through the decoder. A `Generic` worker's
+    // output is already the readable form: decoding it buffers it waiting for a newline it
+    // may never have, rescans the buffer on every chunk, and publishes `tool_calls: 0` —
+    // presenting a backend with no stream as a worker that did nothing.
     let mut decoder = match stream {
-        Stream::Stdout => Some(StreamDecoder::new(kind)),
-        Stream::Stderr => None,
+        Stream::Stdout if crate::output::has_structured_stream(kind) => {
+            Some(StreamDecoder::new(kind))
+        }
+        _ => None,
     };
+    // A character can straddle two reads; carry the incomplete tail rather than letting a
+    // lossy conversion replace both halves with U+FFFD.
+    let mut carry: Vec<u8> = Vec::new();
     let mut buffer = vec![0u8; READ_CHUNK];
     loop {
         match reader.read(&mut buffer).await {
             Ok(0) => break,
             Ok(read) => {
-                // Lossy: an agent's output is not guaranteed to be valid UTF-8, and
-                // dropping the process over one bad byte would be absurd.
-                let text = String::from_utf8_lossy(&buffer[..read]);
+                // Lossy for anything invalid (an agent's output is not guaranteed to be
+                // UTF-8, and dropping the process over one bad byte would be absurd), but a
+                // *split* sequence is carried, not mangled.
+                let text = utf8_chunk(&mut carry, &buffer[..read]);
                 {
                     let mut log = output
                         .lock()
@@ -420,6 +434,20 @@ async fn pump(
             }
         }
     }
+    // A truncated multibyte sequence at EOF is lossy, but it is still output.
+    if !carry.is_empty() {
+        let tail = String::from_utf8_lossy(&carry).into_owned();
+        let mut log = output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match &mut decoder {
+            Some(decoder) => decoder.push(&tail, &mut |line| {
+                log.push(Stream::Stdout, line);
+                log.push(Stream::Stdout, "\n");
+            }),
+            None => log.push(stream, &tail),
+        }
+    }
     // A backend that exits mid-line still said something.
     if let Some(mut decoder) = decoder {
         let mut log = output
@@ -431,6 +459,29 @@ async fn pump(
         });
     }
 }
+
+/// The complete part of a chunk, carrying an incomplete trailing UTF-8 sequence forward.
+fn utf8_chunk(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
+    let mut bytes = std::mem::take(carry);
+    bytes.extend_from_slice(chunk);
+    let complete = match std::str::from_utf8(&bytes) {
+        Ok(_) => bytes.len(),
+        Err(error) => match error.error_len() {
+            // Incomplete at the end: keep it for the next read.
+            None => error.valid_up_to(),
+            // Definitely invalid: let the lossy conversion replace it, rather than carrying
+            // a byte that will never become valid.
+            Some(len) => error.valid_up_to() + len,
+        },
+    };
+    *carry = bytes[complete..].to_vec();
+    String::from_utf8_lossy(&bytes[..complete]).into_owned()
+}
+
+/// How long the output pipes are given to reach EOF after the child exits.
+///
+/// Bounded because a backgrounded grandchild can hold them open indefinitely.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 #[async_trait]
 impl Worker for SubprocessWorker {
@@ -467,7 +518,12 @@ impl Worker for SubprocessWorker {
         if let Some(initial) = spec.steer.initial_prompt(&ctx.mission)
             && let Err(error) = self.write_stdin(&initial).await
         {
-            tracing::warn!(%error, "could not deliver the mission over stdin");
+            // For a stdin-fed backend the mission *is* the payload. A worker that never
+            // received it would sit there doing nothing and read as a quiet worker, so this
+            // is a launch failure. Dropping `guard` on the way out kills the group.
+            return Err(WorkerError::Io(format!(
+                "could not deliver the mission over stdin: {error}"
+            )));
         }
 
         let stdout_task = child.stdout.take().map(|pipe| {
@@ -520,9 +576,21 @@ impl Worker for SubprocessWorker {
             }
         };
 
-        // Let the pipes drain before returning, so the final output reaches the log.
-        for task in [stdout_task, stderr_task].into_iter().flatten() {
-            let _ = task.await;
+        // The pipes reach EOF only when every process holding them exits. A worker that
+        // backgrounds a helper (`npm run dev &`) keeps them open after the child exits, so an
+        // unbounded drain hangs `run` right here: the worker stays `Running`, `Finish` is
+        // suppressed by `WorkerLimit`, and the helper keeps writing to the repository — which
+        // is exactly what the process group exists to prevent. Give the pipes a moment, then
+        // end the group: it is the worker's, and the worker is over.
+        let mut drain = Box::pin(async move {
+            for task in [stdout_task, stderr_task].into_iter().flatten() {
+                let _ = task.await;
+            }
+        });
+        if tokio::time::timeout(DRAIN_GRACE, &mut drain).await.is_err() {
+            Self::signal_group(pgid, Signal::SIGKILL);
+            // Take whatever the pumps had already buffered before they hit EOF.
+            let _ = tokio::time::timeout(DRAIN_GRACE, &mut drain).await;
         }
         guard.armed = false;
         self.clear_live(pgid);
@@ -801,6 +869,60 @@ mod tests {
         assert!(
             seen,
             "the summary must be published before the worker exits"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_backgrounded_helper_does_not_hang_the_worker() -> TestResult {
+        // The child exits 0, but `sleep 300` inherited its stdout, so the pipe never reaches
+        // EOF. An unbounded drain kept `run` here for five minutes: the worker stayed
+        // `Running`, `Finish` was suppressed, and the helper kept writing to the repository.
+        let worker = SubprocessWorker::new(WorkerKind::Generic, spec("sleep 300 & echo done"));
+        let started = std::time::Instant::now();
+        let (outcome, text) = drive(&worker, ctx(fresh_log(), Duration::from_secs(10))).await?;
+        assert_eq!(outcome, WorkerOutcome::Completed);
+        assert!(text.contains("done"), "{text}");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "the drain must be bounded, took {:?}",
+            started.elapsed()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_line_with_no_newline_cannot_grow_without_bound() -> TestResult {
+        // A structured backend's stdout goes through the decoder, which buffers until a
+        // newline. Two megabytes with none must still reach the log rather than sit in the
+        // buffer — and must not grow it with the output.
+        let worker = SubprocessWorker::new(
+            WorkerKind::Pi,
+            spec("head -c 2000000 /dev/zero | tr '\\0' x"),
+        );
+        let (outcome, text) = drive(&worker, ctx(fresh_log(), Duration::from_secs(10))).await?;
+        assert_eq!(outcome, WorkerOutcome::Completed);
+        assert!(
+            !text.is_empty(),
+            "an over-long line must be flushed as a fragment, not held"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_unstructured_backend_publishes_no_activity() -> TestResult {
+        // Publishing `tool_calls: 0` for a backend that has no structured stream presents
+        // "nothing to say" as "the worker did nothing".
+        let worker = SubprocessWorker::new(WorkerKind::Generic, spec("echo hello"));
+        let context = ctx(fresh_log(), Duration::from_secs(5));
+        let published = Arc::clone(&context.activity);
+        let (_, _) = drive(&worker, context).await?;
+        assert!(
+            published
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "a backend with no structured stream must publish no activity"
         );
         Ok(())
     }

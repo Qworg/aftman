@@ -221,13 +221,22 @@ process filters, in local, worktree-scoped and `include`d configuration, and req
 observation to still have content.
 
 The reads that remain are bounded and non-executing: the index, the object database, and worktree
-files. Worktree files are opened `O_NONBLOCK | O_NOFOLLOW` and only if they are regular files, so
-a FIFO, device or symlink planted at a tracked or untracked path is skipped; a worktree file
-larger than 8 MiB is diffed as binary rather than read in full; the diff text is capped at
-`ObsCaps::diff_chars` (20 000) and `--stat` at `MAX_GIT_OUTPUT_BYTES` (256 KiB). The whole
-observation runs on one blocking thread under the 8 s deadline (`OBSERVATION_TIMEOUT`), and a
-timeout sets an interrupt the status walk polls, so a timed-out cycle records
-`evidence["observation_note"]` rather than leaving a thread hashing for minutes.
+files. A worktree file larger than 8 MiB is diffed as binary rather than read in full; the diff
+text is capped at `ObsCaps::diff_chars` (20 000), `--stat` at `MAX_GIT_OUTPUT_BYTES` (256 KiB), and
+the status text at `MAX_STATUS_BYTES` (256 KiB) / `MAX_STATUS_ENTRIES` (2 000), with `truncated` set
+when any of them cut. The whole observation runs on one blocking thread under the 8 s deadline
+(`OBSERVATION_TIMEOUT`), and a timeout sets an interrupt the status walk polls, so a timed-out cycle
+records `observation_note` rather than leaving a thread hashing for minutes.
+
+**How worktree files are opened, precisely.** Only the paths this module opens itself — the
+untracked-file excerpts and `AGENTS.md` — use `O_NONBLOCK | O_NOFOLLOW` on a confirmed regular
+file. Tracked files in the diff and status-hash paths are typed by a `symlink_metadata` check and
+then opened by gix's own `File::open`: a worker that swaps a regular file for a FIFO *between* the
+check and the read blocks that read. The type check means a FIFO planted in advance is skipped; it
+does not make the open non-blocking, and it cannot close that window. What bounds the window is the
+observation slot, per run, in `crates/aftman-daemon/src/obs.rs`: a wedged read keeps its slot, so
+after `MAX_CONCURRENT_OBSERVATIONS` of them the run's cycles skip observation with a note instead of
+consuming the blocking pool.
 
 A blocking task cannot be killed, so the paths gix would open are also closed off by construction.
 Attributes and ignores are read **from the index**, not the worktree, so a FIFO planted at a

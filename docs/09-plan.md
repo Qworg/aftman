@@ -490,6 +490,7 @@ work that turns "the command line launches" into "the output is understood":
 | Verifier-mutation detection (diff the tree before/after) | `aftman-core` |
 | Per-backend permission mapping (§8.1) implemented and tested, including the `pi` refusal path | `aftman-workers` |
 | Update the §1 matrix with verified versions; `doctor --probe` gating for unverified backends | docs, `aftman-cli` |
+| ~~Preflight for a live run: versions, `--help` flag drift, repository check, and a one-turn worker probe~~ — **built**; the records it produces are still owed, see [10-live-validation.md](10-live-validation.md) | `aftman-cli` |
 
 **Exit criteria:** each backend parses its recorded fixture; a backend whose stream schema is not
 fixture-verified stays gated behind `doctor --probe`; `mode = "sandboxed"` with `--worker pi` fails

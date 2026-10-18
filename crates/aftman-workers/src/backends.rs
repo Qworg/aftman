@@ -548,11 +548,58 @@ pub fn build(
     }
 }
 
+/// The one-shot spec a preflight checks, with every optional flag set so the flags it
+/// extracts are a superset of what a real run passes.
+///
+/// Built by the same functions a run uses, so a preflight can never check a list that has
+/// drifted from the argv the backend actually receives. `None` for a backend that is not
+/// driven through a one-shot CLI (generic templates are the operator's own argv).
+#[must_use]
+pub fn preflight_spec(kind: WorkerKind, mission: &str) -> Option<Result<CommandSpec, SpecError>> {
+    let options = BackendOptions {
+        model: Some("preflight-model".to_owned()),
+        effort: Some("medium".to_owned()),
+        executable: None,
+        permissions: PermissionMode::Sandboxed,
+        external_sandbox: true,
+        human_available: false,
+        command_template: None,
+        prefer_steering: false,
+        extra_args: Vec::new(),
+    };
+    match kind {
+        WorkerKind::Pi => Some(Ok(pi_oneshot(mission, &options))),
+        WorkerKind::Agy => Some(agy(mission, &options)),
+        WorkerKind::Claude => Some(claude(mission, &options)),
+        WorkerKind::Generic | WorkerKind::Simulated | WorkerKind::HerdrPane => None,
+    }
+}
+
+/// The distinct flags an argv passes, in order.
+///
+/// `--print=<mission>` yields `--print`, a bare `--` is a separator rather than a flag, and
+/// a flag's *value* is not a flag. Used to check an installed CLI's `--help` against what
+/// this module builds.
+#[must_use]
+pub fn spec_flags(args: &[String]) -> Vec<String> {
+    let mut flags: Vec<String> = Vec::new();
+    for arg in args {
+        if !arg.starts_with('-') || arg == "--" || arg == "-" {
+            continue;
+        }
+        let flag = arg.split('=').next().unwrap_or(arg.as_str()).to_owned();
+        if !flags.contains(&flag) {
+            flags.push(flag);
+        }
+    }
+    flags
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         BackendOptions, MAX_ARG_BYTES, PermissionMode, SpecError, SteerProtocol, agy, build,
-        claude, generic, pi_oneshot, pi_rpc,
+        claude, generic, pi_oneshot, pi_rpc, preflight_spec, spec_flags,
     };
     use aftman_core::job::WorkerKind;
 
@@ -959,5 +1006,52 @@ mod tests {
         )?;
         assert_eq!(spec.program, "/opt/agy");
         Ok(())
+    }
+
+    #[test]
+    fn a_preflight_spec_exposes_every_flag_a_run_passes() {
+        // Derived from the builders a run uses, so the check cannot drift from the argv.
+        let pi = preflight_spec(WorkerKind::Pi, "preflight")
+            .expect("pi has a one-shot spec")
+            .expect("it builds");
+        let flags = spec_flags(&pi.args);
+        for expected in [
+            "--print",
+            "--mode",
+            "--no-session",
+            "--no-approve",
+            "--model",
+            "--thinking",
+        ] {
+            assert!(
+                flags.contains(&expected.to_owned()),
+                "pi: {expected} is missing from {flags:?}"
+            );
+        }
+        assert!(
+            !flags.contains(&"--".to_owned()),
+            "the argument separator is not a flag: {flags:?}"
+        );
+    }
+
+    #[test]
+    fn a_flag_with_an_attached_value_is_split_from_its_value() {
+        // `agy --print=<mission>` attaches the mission; the flag is `--print`.
+        let agy = preflight_spec(WorkerKind::Agy, "preflight")
+            .expect("agy has a one-shot spec")
+            .expect("it builds");
+        let flags = spec_flags(&agy.args);
+        assert!(flags.contains(&"--print".to_owned()), "{flags:?}");
+        assert!(flags.contains(&"--output-format".to_owned()), "{flags:?}");
+        assert!(
+            !flags.iter().any(|flag| flag.starts_with("--print=")),
+            "an attached value must be split off: {flags:?}"
+        );
+    }
+
+    #[test]
+    fn a_backend_without_a_one_shot_cli_has_no_preflight_spec() {
+        assert!(preflight_spec(WorkerKind::Generic, "preflight").is_none());
+        assert!(preflight_spec(WorkerKind::Simulated, "preflight").is_none());
     }
 }

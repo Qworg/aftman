@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use aftman_core::clock::SystemClock;
 use aftman_core::ids::RunId;
+use aftman_core::job::WorkerKind;
 use aftman_daemon::RuntimeFactory as _;
 
 use crate::autostart;
@@ -153,11 +154,16 @@ pub fn usage(ctx: &Ctx, since: Option<String>, run_id: Option<String>) -> Result
     Ok(exit::FINISHED)
 }
 
-/// `aftman doctor [--probe]`.
+/// `aftman doctor [--probe] [--probe-workers] [--repo <path>]`.
 ///
 /// # Errors
 /// Provider settings that do not resolve.
-pub async fn doctor(ctx: &Ctx, probe: bool) -> Result<u8, CliError> {
+pub async fn doctor(
+    ctx: &Ctx,
+    probe: bool,
+    probe_workers: bool,
+    repo: Option<&Path>,
+) -> Result<u8, CliError> {
     let data_dir = ctx.data_dir()?;
     outln!("aftman {}", env!("CARGO_PKG_VERSION"))?;
     outln!("state dir   {}", data_dir.display())?;
@@ -175,16 +181,11 @@ pub async fn doctor(ctx: &Ctx, probe: bool) -> Result<u8, CliError> {
     outln!()?;
     outln!("workers")?;
     outln!("  simulated  available (offline; no agent binary needed)")?;
-    for name in ["pi", "agy", "claude"] {
-        outln!(
-            "  {:<10} {}",
-            name,
-            if which(name) {
-                "binary found"
-            } else {
-                "binary not found"
-            }
-        )?;
+    // Anything found here that will not work is collected rather than returned, so one
+    // pass reports every problem instead of the first.
+    let mut problems = false;
+    for kind in [WorkerKind::Pi, WorkerKind::Agy, WorkerKind::Claude] {
+        worker_line(kind, &mut problems)?;
     }
     outln!("  generic    available (needs --cmd)")?;
     outln!("  herdr:pane not available from the command line (herdr surface, M6)")?;
@@ -235,14 +236,20 @@ pub async fn doctor(ctx: &Ctx, probe: bool) -> Result<u8, CliError> {
     if !view.loopback {
         outln!("  transport   HTTPS")?;
     }
+    // A preflight reports everything that is wrong in one pass, so an unconfigured
+    // provider is recorded rather than returned: the repository and worker sections still
+    // have something useful to say.
     if !view.configured {
         outln!()?;
         outln!("  Configure a provider to supervise with a real model, or pass")?;
         outln!("  --simulate-model to run offline.")?;
-        return Ok(exit::CONFIG);
+        problems = true;
     }
 
-    if probe {
+    if probe && !view.configured {
+        outln!()?;
+        outln!("  probe skipped: no provider is configured")?;
+    } else if probe {
         outln!()?;
         outln!("  probing (one billable question, no retries)...")?;
         let client = aftman_jev::SystemOneClient::new(
@@ -264,16 +271,267 @@ pub async fn doctor(ctx: &Ctx, probe: bool) -> Result<u8, CliError> {
             Err(error) => {
                 outln!("  reachable   no")?;
                 outln!("  error       {} ({})", error, error.code())?;
-                return Ok(exit::FAILED);
+                problems = true;
             }
         }
     }
     outln!()?;
     outln!(
-        "git         {}",
+        "git         {} (not needed by aftman; repositories are read in-process)",
         if which("git") { "found" } else { "not found" }
     )?;
+
+    if let Some(repo) = repo {
+        repository_section(repo, &mut problems)?;
+    }
+
+    if probe_workers {
+        outln!()?;
+        outln!("worker probe (each installed CLI, one trivial turn; costs the agent's tokens)")?;
+        probe_workers_live(&mut problems).await?;
+    }
+
+    outln!()?;
+    if problems {
+        outln!("NOT READY: fix the items marked above before a live run.")?;
+        return Ok(exit::CONFIG);
+    }
+    outln!("ready for a live run")?;
     Ok(exit::FINISHED)
+}
+
+/// How long one probe turn may take. A coding agent starting cold is slow; a probe that
+/// hangs is not worth waiting for.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// The most of a CLI's own output to keep when running `--version` / `--help`.
+const PROBE_CAPTURE_CAP: usize = 64 * 1024;
+
+/// Run a CLI read-only and return what it printed.
+///
+/// The environment comes from `worker_environment`: this spawns a subprocess like any other
+/// (hard rule 3), and diagnostics have no reason to follow a second policy.
+fn capture(binary: &str, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new(binary)
+        .args(args)
+        .env_clear()
+        .envs(aftman_workers::worker_environment(&[]))
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    text.truncate(PROBE_CAPTURE_CAP);
+    Some(text)
+}
+
+/// Whether a `--help` text documents a flag.
+///
+/// A token comparison, not a substring one: `--mode-list` or a sentence containing `--model`
+/// must not count as the flag being there. Lenient about punctuation, because every CLI
+/// formats its help differently.
+fn help_mentions(help: &str, flag: &str) -> bool {
+    help.split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | '[' | ']' | '|'))
+        .any(|token| {
+            token == flag
+                // `--model` listed as bare, or with a trailing `=`.
+                || token.strip_suffix('=') == Some(flag)
+                // `--print=<PROMPT>`, which is how most help formats attach a value.
+                || token
+                    .strip_prefix(flag)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
+}
+
+/// One agent CLI: present, which version, and whether it still accepts every flag aftman
+/// passes.
+///
+/// The flag list comes from the argv the backend itself builds
+/// (`aftman_workers::backends::spec_flags`), so it cannot drift from what a run would pass —
+/// which is exactly the failure this is here to catch.
+fn worker_line(kind: WorkerKind, problems: &mut bool) -> Result<(), CliError> {
+    let name = kind.as_str();
+    let Some(spec) = aftman_workers::backends::preflight_spec(kind, "preflight") else {
+        return Ok(());
+    };
+    let spec = match spec {
+        Ok(spec) => spec,
+        Err(error) => {
+            outln!("  {name:<10} not usable: {error}")?;
+            *problems = true;
+            return Ok(());
+        }
+    };
+    if !which(&spec.program) {
+        outln!("  {name:<10} not installed")?;
+        return Ok(());
+    }
+    let version = capture(&spec.program, &["--version"])
+        .and_then(|text| {
+            text.lines()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "version unknown".to_owned());
+    let help = capture(&spec.program, &["--help"]).unwrap_or_default();
+    let flags = aftman_workers::backends::spec_flags(&spec.args);
+    let missing: Vec<&str> = flags
+        .iter()
+        .filter(|flag| !help_mentions(&help, flag))
+        .map(String::as_str)
+        .collect();
+    outln!("  {name:<10} {version}")?;
+    if missing.is_empty() {
+        outln!(
+            "             all {} flag(s) aftman passes are still in --help",
+            flags.len()
+        )?;
+    } else {
+        outln!(
+            "             DRIFT: --help does not mention {}. A run will probably fail; \
+             re-record the backend's output and update backends.rs.",
+            missing.join(", ")
+        )?;
+        *problems = true;
+    }
+    Ok(())
+}
+
+/// Whether the path is somewhere aftman can observe: a git repository with a working tree.
+///
+/// Not pedantry. `Invariant::UnobservedRepository` refuses to finish a run whose repository
+/// cannot be read, so a job pointed at a plain directory can never complete. Saying so here
+/// costs nothing and saves the run.
+fn repository_section(repo: &Path, problems: &mut bool) -> Result<(), CliError> {
+    outln!()?;
+    outln!("repository  {}", repo.display())?;
+    if !repo.is_dir() {
+        outln!("  NOT a directory")?;
+        *problems = true;
+        return Ok(());
+    }
+    let worktree = repo.join(".git").exists();
+    let bare = repo.join("HEAD").exists() && repo.join("objects").is_dir();
+    if bare && !worktree {
+        outln!("  bare repository: there is no working tree to observe")?;
+        outln!("  point aftman at a checkout instead")?;
+        *problems = true;
+        return Ok(());
+    }
+    if !worktree {
+        outln!("  NOT a git repository")?;
+        outln!("  aftman reads a working tree through git; with no repository here there is")?;
+        outln!("  no diff evidence, and a run will not finish what it cannot observe")?;
+        *problems = true;
+        return Ok(());
+    }
+    outln!("  git repository")?;
+    Ok(())
+}
+
+/// Run each installed agent CLI once on a trivial mission and decode what it printed.
+///
+/// The check that fixtures cannot make: whether the CLI, as installed right now, produces
+/// the stream the decoder expects. Costs the agent's tokens and takes as long as the CLI
+/// does, so it is opt-in.
+async fn probe_workers_live(problems: &mut bool) -> Result<(), CliError> {
+    for kind in [WorkerKind::Pi, WorkerKind::Agy, WorkerKind::Claude] {
+        let name = kind.as_str();
+        let Some(spec) = aftman_workers::backends::preflight_spec(kind, "Reply with exactly: ok")
+        else {
+            continue;
+        };
+        let spec = match spec {
+            Ok(spec) => spec,
+            Err(error) => {
+                outln!("  {name:<10} not usable: {error}")?;
+                *problems = true;
+                continue;
+            }
+        };
+        if !which(&spec.program) {
+            outln!("  {name:<10} skipped (not installed)")?;
+            continue;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("aftman-probe-{}-{}", name, std::process::id()));
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            outln!("             cannot create the probe directory: {error}")?;
+            *problems = true;
+            continue;
+        }
+        outln!("  {name:<10} running one turn...")?;
+        let started = std::time::Instant::now();
+        let run = tokio::time::timeout(
+            PROBE_TIMEOUT,
+            tokio::process::Command::new(&spec.program)
+                .args(&spec.args)
+                .current_dir(&dir)
+                .env_clear()
+                .envs(aftman_workers::worker_environment(&[]))
+                .stdin(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
+        match run {
+            Ok(Ok(output)) => {
+                let code = output.status.code().unwrap_or(-1);
+                let text = String::from_utf8_lossy(&output.stdout);
+                let (_, activity) = aftman_workers::decode_all(kind, &text);
+                outln!("             exit {code} in {:?}", started.elapsed())?;
+                if activity.lines == 0 {
+                    // Nothing on stdout is not format drift: the CLI probably refused the
+                    // turn (no login, no quota). Say what it said rather than guessing.
+                    outln!("             no stream on stdout; the CLI produced nothing to decode")?;
+                    let why = first_line(&String::from_utf8_lossy(&output.stderr));
+                    if !why.is_empty() {
+                        outln!("             stderr: {why}")?;
+                    }
+                    *problems = true;
+                } else if activity.looks_structured() {
+                    outln!("             {}", activity.summary())?;
+                    outln!(
+                        "             stream parsed: the installed CLI still speaks the format aftman decodes"
+                    )?;
+                } else {
+                    outln!(
+                        "             DRIFT: {} line(s), {} unparsed — the stream is not the \
+                         format aftman decodes",
+                        activity.lines,
+                        activity.unparsed_lines
+                    )?;
+                    let why = first_line(&String::from_utf8_lossy(&output.stderr));
+                    if !why.is_empty() {
+                        outln!("             stderr: {why}")?;
+                    }
+                    *problems = true;
+                }
+            }
+            Ok(Err(error)) => {
+                outln!("             could not run: {error}")?;
+                *problems = true;
+            }
+            Err(_) => {
+                outln!("             timed out after {}s", PROBE_TIMEOUT.as_secs())?;
+                *problems = true;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The first non-empty line of a CLI's stderr, bounded, for a one-line explanation.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
+        .chars()
+        .take(160)
+        .collect()
 }
 
 /// Is the daemon reachable, and where does it live? Never starts one. Prints the
@@ -359,4 +617,39 @@ fn which(binary: &str) -> bool {
             candidate.is_file()
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{first_line, help_mentions};
+
+    #[test]
+    fn a_flag_is_matched_as_a_token_not_a_substring() {
+        let help = "  -m, --model <MODEL>  the model\n  --mode-list  unrelated\n";
+        assert!(help_mentions(help, "--model"), "listed with a value");
+        assert!(help_mentions(help, "-m"), "short form");
+        // `--mode` is a prefix of `--mode-list`; being a prefix is not being documented.
+        assert!(
+            !help_mentions(help, "--mode"),
+            "a longer flag must not satisfy a shorter one"
+        );
+        assert!(!help_mentions(help, "--thinking"), "absent");
+    }
+
+    #[test]
+    fn an_attached_value_still_matches_its_flag() {
+        assert!(help_mentions("  --print=<PROMPT>  run once\n", "--print"));
+        assert!(help_mentions("  --print=TEXT\n", "--print"));
+        assert!(!help_mentions("  --printout\n", "--print"));
+    }
+
+    #[test]
+    fn the_first_line_is_bounded_and_skips_blanks() {
+        assert_eq!(
+            first_line("\n\n   boom: something went wrong   \nmore\n"),
+            "boom: something went wrong"
+        );
+        assert!(first_line(&"x".repeat(1000)).chars().count() <= 160);
+        assert_eq!(first_line("   \n\n"), "");
+    }
 }

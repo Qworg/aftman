@@ -13,6 +13,7 @@ Read in order the first time. Each doc stands alone after that.
 | 07 | [Surfaces](07-surfaces.md) | You are touching the CLI, the daemon protocol, herdr, or the web UI |
 | 08 | [Security](08-security.md) | You are touching credentials, subprocess environments, or network exposure |
 | 09 | [Plan](09-plan.md) | You want to know what gets built in what order |
+| 10 | [Live validation runbook](10-live-validation.md) | You are about to exercise the real decision model or a real agent CLI for the first time |
 
 ## The one-paragraph version
 

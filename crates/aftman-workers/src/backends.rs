@@ -575,6 +575,33 @@ pub fn preflight_spec(kind: WorkerKind, mission: &str) -> Option<Result<CommandS
     }
 }
 
+/// The one-shot spec a live one-turn probe runs: the CLI's own defaults, no overrides.
+///
+/// Deliberately distinct from [`preflight_spec`], which sets *every* optional flag —
+/// including a placeholder model — so the `--help` check can see them. Passing that
+/// placeholder to a real turn makes the provider reject the request, which turns a probe
+/// into a false alarm about the CLI.
+#[must_use]
+pub fn probe_spec(kind: WorkerKind, mission: &str) -> Option<Result<CommandSpec, SpecError>> {
+    let options = BackendOptions {
+        model: None,
+        effort: None,
+        executable: None,
+        permissions: PermissionMode::Sandboxed,
+        external_sandbox: true,
+        human_available: false,
+        command_template: None,
+        prefer_steering: false,
+        extra_args: Vec::new(),
+    };
+    match kind {
+        WorkerKind::Pi => Some(Ok(pi_oneshot(mission, &options))),
+        WorkerKind::Agy => Some(agy(mission, &options)),
+        WorkerKind::Claude => Some(claude(mission, &options)),
+        WorkerKind::Generic | WorkerKind::Simulated | WorkerKind::HerdrPane => None,
+    }
+}
+
 /// The distinct flags an argv passes, in order.
 ///
 /// `--print=<mission>` yields `--print`, a bare `--` is a separator rather than a flag, and
@@ -599,7 +626,7 @@ pub fn spec_flags(args: &[String]) -> Vec<String> {
 mod tests {
     use super::{
         BackendOptions, MAX_ARG_BYTES, PermissionMode, SpecError, SteerProtocol, agy, build,
-        claude, generic, pi_oneshot, pi_rpc, preflight_spec, spec_flags,
+        claude, generic, pi_oneshot, pi_rpc, preflight_spec, probe_spec, spec_flags,
     };
     use aftman_core::job::WorkerKind;
 
@@ -1053,5 +1080,30 @@ mod tests {
     fn a_backend_without_a_one_shot_cli_has_no_preflight_spec() {
         assert!(preflight_spec(WorkerKind::Generic, "preflight").is_none());
         assert!(preflight_spec(WorkerKind::Simulated, "preflight").is_none());
+    }
+
+    #[test]
+    fn a_live_probe_passes_no_placeholder_model() {
+        // The flag check needs `--model` to appear, so it sets a placeholder. A real turn
+        // must not: a nonexistent model makes the provider reject the request, and the
+        // probe would report a working CLI as broken.
+        for kind in [WorkerKind::Pi, WorkerKind::Agy, WorkerKind::Claude] {
+            let spec = probe_spec(kind, "mission")
+                .expect("a one-shot backend")
+                .expect("it builds");
+            assert!(
+                !spec.args.iter().any(|arg| arg == "preflight-model"),
+                "{kind:?} passes a placeholder model: {:?}",
+                spec.args
+            );
+            assert!(
+                !spec
+                    .args
+                    .iter()
+                    .any(|arg| arg == "--model" || arg == "--thinking"),
+                "{kind:?} overrides a model or effort: {:?}",
+                spec.args
+            );
+        }
     }
 }

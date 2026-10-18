@@ -261,7 +261,17 @@ impl SubprocessWorker {
         command.env_clear();
         command.envs(crate::worker_environment(&ctx.env));
         command.envs(spec.env.iter().cloned());
-        command.stdin(std::process::Stdio::piped());
+        // stdin follows the steer protocol, and this is not cosmetic. A one-shot backend
+        // does not read it, but an *open* pipe is not the same as no input: a CLI that
+        // drains stdin before starting (pi does) reads until EOF, and a pipe nobody writes
+        // to never reaches EOF. Every one-shot run then hung until the 45-minute worker
+        // timeout, silently — which is what the first live run found.
+        //
+        // `Stdio::null()` gives an immediate EOF, which is what "no input" means.
+        command.stdin(match spec.steer {
+            SteerProtocol::None => std::process::Stdio::null(),
+            SteerProtocol::PiRpc => std::process::Stdio::piped(),
+        });
         command.stdout(std::process::Stdio::piped());
         command.stderr(std::process::Stdio::piped());
         // Its own process group, so termination reaches grandchildren.
@@ -662,6 +672,39 @@ mod tests {
         assert_eq!(outcome, WorkerOutcome::Completed);
         assert!(text.contains("hello"), "{text}");
         assert!(text.contains("oops"), "stderr must be captured too: {text}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_one_shot_backend_gets_an_immediate_eof_on_stdin() -> TestResult {
+        // The regression this exists for: a one-shot CLI that drains stdin before starting
+        // (pi does) must not wait for an EOF that never arrives. `cat` blocks exactly when
+        // stdin is an open pipe and exits at once when it is closed, so this distinguishes
+        // the two without needing a real agent binary.
+        let worker = SubprocessWorker::new(WorkerKind::Generic, spec("cat; echo done"));
+        let (outcome, text) = drive(&worker, ctx(fresh_log(), Duration::from_secs(5))).await?;
+        assert_eq!(
+            outcome,
+            WorkerOutcome::Completed,
+            "a one-shot backend must not wait on stdin: {text}"
+        );
+        assert!(text.contains("done"), "{text}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_steering_backend_takes_its_mission_over_stdin() -> TestResult {
+        // The other half of the same decision: an RPC backend is fed on stdin, so the pipe
+        // must stay open and writable. `Generic` is used only so the echo is not decoded;
+        // the mechanism under test is that `SteerProtocol::PiRpc` selects a pipe.
+        let mut rpc = spec("head -n 1");
+        rpc.steer = SteerProtocol::PiRpc;
+        let worker = SubprocessWorker::new(WorkerKind::Generic, rpc);
+        let (_, text) = drive(&worker, ctx(fresh_log(), Duration::from_secs(5))).await?;
+        assert!(
+            text.contains("do the thing"),
+            "the mission must reach the child over stdin: {text}"
+        );
         Ok(())
     }
 

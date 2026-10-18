@@ -129,6 +129,18 @@ pub enum Invariant {
     /// A model that answers optimistically on the first cycle — before any work exists —
     /// would otherwise finish a job that never started.
     NoWorkAttempted,
+    /// A worker is still running, so finishing now would abandon it mid-turn.
+    ///
+    /// Distinct from [`Invariant::WorkerLimit`], which is about the *count* of workers. Both
+    /// used to be recorded as `WorkerLimit`, so `aftman decisions` answered "why didn't it
+    /// finish?" with the wrong reason.
+    WorkerStillActive,
+    /// `verify = always` and no verifier has completed, so finishing would claim a
+    /// verification that never happened.
+    ///
+    /// [`Invariant::VerificationAlreadyRun`] means the opposite — a verifier *has* run — and
+    /// was being used for both.
+    VerificationIncomplete,
     /// The repository could not be read this cycle, so "nothing has changed" is not a claim
     /// the supervisor is in a position to make.
     ///

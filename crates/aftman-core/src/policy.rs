@@ -239,6 +239,13 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
     if input.counters.verifiers_run > 0 {
         invariants.push(Invariant::VerificationAlreadyRun);
     }
+    if input.active_worker.is_some() {
+        invariants.push(Invariant::WorkerStillActive);
+    }
+    if input.config.verify == crate::job::VerifyPolicy::Always && !input.counters.verifier_completed
+    {
+        invariants.push(Invariant::VerificationIncomplete);
+    }
     if input.counters.attempts >= input.config.max_attempts {
         invariants.push(Invariant::AttemptsExhausted);
     }
@@ -286,7 +293,11 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
             SuppressionReason::Invariant(Invariant::WorkerLimit)
         )
     });
-    if worker_limit_hit && input.active_worker.is_none() {
+    // `surviving.is_empty()` matters: without it this generic escalation replaced the
+    // selection even when a higher-priority proposal had survived the same cycle, so a
+    // specific `ask` from `core.human-escalation` was discarded in favour of
+    // "worker budget is exhausted".
+    if worker_limit_hit && input.active_worker.is_none() && surviving.is_empty() {
         return PolicyDecision {
             selected: Directive::Escalate {
                 reason: "worker limit reached before completion".into(),
@@ -385,13 +396,13 @@ fn refusal(
                 ));
             }
             if input.active_worker.is_some() {
-                return Some(SuppressionReason::Invariant(Invariant::WorkerLimit));
+                return Some(SuppressionReason::Invariant(Invariant::WorkerStillActive));
             }
             if input.config.verify == crate::job::VerifyPolicy::Always
                 && !input.counters.verifier_completed
             {
                 return Some(SuppressionReason::Invariant(
-                    Invariant::VerificationAlreadyRun,
+                    Invariant::VerificationIncomplete,
                 ));
             }
             None

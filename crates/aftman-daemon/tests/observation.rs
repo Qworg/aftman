@@ -1069,3 +1069,49 @@ async fn a_fifo_at_the_index_is_refused_rather_than_read() {
     assert!(note.contains("not a regular file"), "{note}");
     assert!(observation.git.status_short.is_empty());
 }
+
+/// An intent-to-add entry has no blob pair to diff, and it must not stop the walk.
+///
+/// `tracked` is sorted by path, so a `break` on the first non-diffable entry silently
+/// dropped the diff and stat of every path sorting after it — the model saw "modified, but
+/// nothing to show", with `truncated` false.
+#[tokio::test]
+async fn an_intent_to_add_entry_does_not_hide_the_diffs_after_it() {
+    if !have_git() {
+        return;
+    }
+    let dir = short_tempdir().expect("tempdir");
+    let repo = make_repo(dir.path());
+    // `a0.txt` sorts before both committed files, so it hits the walk first.
+    std::fs::write(repo.join("a0.txt"), "new\n").expect("write");
+    git(&repo, &["add", "-N", "a0.txt"]);
+    dirty(&repo);
+
+    let observation = observe(&ObservationBuilder::new(false), &repo).await;
+    assert!(
+        observation.git.diff_excerpt.contains("b.rs"),
+        "the diff stopped at the non-diffable entry: {:?}",
+        observation.git.diff_excerpt
+    );
+    assert!(
+        observation.git.diff_stat.contains("b.rs"),
+        "the stat stopped too: {:?}",
+        observation.git.diff_stat
+    );
+}
+
+/// A path inside a repository is not the repository, and observing the enclosing one would
+/// report changes outside the job — silently, so `UnobservedRepository` would not fire.
+#[tokio::test]
+async fn a_path_inside_a_repository_is_refused_rather_than_widened() {
+    let dir = short_tempdir().expect("tempdir");
+    let repo = make_repo(dir.path());
+    let sub = repo.join("sub");
+    std::fs::create_dir_all(&sub).expect("mkdir");
+    std::fs::write(sub.join("x.txt"), "x\n").expect("write");
+
+    let observation = observe(&ObservationBuilder::new(false), &sub).await;
+    let note = observation.observation_note.as_deref().unwrap_or_default();
+    assert!(note.contains("not the root"), "{note}");
+    assert!(observation.git.status_short.is_empty());
+}

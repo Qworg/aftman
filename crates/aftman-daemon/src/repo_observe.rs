@@ -101,10 +101,39 @@ struct Tracked {
     diffable: bool,
 }
 
+/// The most untracked paths collected before the excerpt budget even applies.
+///
+/// A worker can generate build output faster than the supervisor can describe it, and every
+/// untracked path here reaches a string the model is sent.
+const MAX_UNTRACKED_PATHS: usize = 4_000;
+
+/// The most status lines rendered into `status_short`.
+///
+/// Git prints one line per changed path, and the repository is worker-controlled: an
+/// unbounded status string breaks hard rule 5 and, worse, can push the request past the
+/// model budget, which is then reported as a *model* failure rather than as a large
+/// repository.
+const MAX_STATUS_ENTRIES: usize = 2_000;
+
+/// The most bytes of status text. A count alone is not a bound, because paths can be long.
+const MAX_STATUS_BYTES: usize = 256 * 1024;
+
 #[derive(Default)]
 struct WalkCollector {
     tracked: Vec<Tracked>,
     untracked: Vec<Vec<u8>>,
+    /// Set when a bound above stopped the walk from recording everything it saw.
+    capped: bool,
+}
+
+impl WalkCollector {
+    fn push_untracked(&mut self, path: Vec<u8>) {
+        if self.untracked.len() >= MAX_UNTRACKED_PATHS {
+            self.capped = true;
+        } else {
+            self.untracked.push(path);
+        }
+    }
 }
 
 impl<'index> VisitEntry<'index> for WalkCollector {
@@ -141,14 +170,13 @@ impl<'index> VisitEntry<'index> for WalkCollector {
             }
             iw::Entry::DirectoryContents { entry, .. } => {
                 if entry.status == gix::dir::entry::Status::Untracked {
-                    self.untracked.push(entry.rela_path.as_bytes().to_vec());
+                    self.push_untracked(entry.rela_path.as_bytes().to_vec());
                 }
             }
             // Rewrite tracking is disabled, so this is unreachable in practice. Record the
             // destination so the path is not silently dropped.
             iw::Entry::Rewrite { dirwalk_entry, .. } => {
-                self.untracked
-                    .push(dirwalk_entry.rela_path.as_bytes().to_vec());
+                self.push_untracked(dirwalk_entry.rela_path.as_bytes().to_vec());
             }
         }
     }
@@ -407,7 +435,7 @@ fn status_short(
     staged: &BTreeMap<Vec<u8>, u8>,
     tracked: &[Tracked],
     untracked: &[Vec<u8>],
-) -> String {
+) -> (String, bool) {
     let mut rows: BTreeMap<&[u8], (u8, u8)> = BTreeMap::new();
     for (path, x) in staged {
         rows.insert(path.as_slice(), (*x, b' '));
@@ -416,25 +444,39 @@ fn status_short(
         let row = rows.entry(entry.path.as_slice()).or_insert((b' ', b' '));
         row.1 = entry.y;
     }
-    let mut lines: Vec<String> = rows
-        .into_iter()
-        .map(|(path, (x, y))| format!("{}{} {}", x as char, y as char, quote_path(path, true)))
-        .collect();
-
     let mut untracked_sorted: Vec<&[u8]> = untracked.iter().map(Vec::as_slice).collect();
     untracked_sorted.sort_unstable();
     untracked_sorted.dedup();
-    lines.extend(
-        untracked_sorted
-            .into_iter()
-            .map(|path| format!("?? {}", quote_path(path, true))),
-    );
 
-    let mut out = lines.join("\n");
-    if !out.is_empty() {
-        out.push('\n');
+    // Both bounds are checked per line: a count stops a million tiny paths, and a byte
+    // budget stops a thousand enormous ones.
+    let mut out = String::new();
+    let mut entries = 0usize;
+    let mut capped = false;
+    for (path, (x, y)) in rows {
+        if entries >= MAX_STATUS_ENTRIES || out.len() >= MAX_STATUS_BYTES {
+            capped = true;
+            break;
+        }
+        out.push_str(&format!(
+            "{}{} {}\n",
+            x as char,
+            y as char,
+            quote_path(path, true)
+        ));
+        entries += 1;
     }
-    out
+    if !capped {
+        for path in untracked_sorted {
+            if entries >= MAX_STATUS_ENTRIES || out.len() >= MAX_STATUS_BYTES {
+                capped = true;
+                break;
+            }
+            out.push_str(&format!("?? {}\n", quote_path(path, true)));
+            entries += 1;
+        }
+    }
+    (out, capped)
 }
 
 fn git_evidence(
@@ -447,6 +489,25 @@ fn git_evidence(
         .workdir()
         .ok_or_else(|| "the repository has no working tree".to_owned())?
         .to_owned();
+
+    // `discover_opts` searches upward. Without this, a path that is not itself a
+    // working-tree root would silently describe whatever repository encloses it — reporting
+    // changes outside the job, with no note, so `UnobservedRepository` would not gate
+    // `Finish` either. The job names the repository it wants observed.
+    let requested = repo_path
+        .canonicalize()
+        .map_err(|err| format!("could not resolve the repository path: {err}"))?;
+    let root = workdir
+        .canonicalize()
+        .map_err(|err| format!("could not resolve the working tree: {err}"))?;
+    if root != requested {
+        return Err(format!(
+            "{} is not the root of a git working tree (its repository root is {}); \
+             aftman observes the repository a job names, not one enclosing it",
+            requested.display(),
+            root.display()
+        ));
+    }
 
     let index_holder = repo
         .index_or_load_from_head_or_empty()
@@ -566,7 +627,7 @@ fn git_evidence(
         interrupt,
     )?;
 
-    let (diff_excerpt, truncated) = cap_text(&full_diff, caps.diff_chars);
+    let (diff_excerpt, diff_capped) = cap_text(&full_diff, caps.diff_chars);
     let untracked = untracked_excerpts(&collector.untracked, &workdir, caps);
 
     let head_sha = repo
@@ -580,9 +641,15 @@ fn git_evidence(
         .flatten()
         .map(|name| name.shorten().to_string());
 
+    let (status_short, status_capped) =
+        status_short(&staged, &collector.tracked, &collector.untracked);
+    // `truncated` means "what you are being shown is not all of it", so every bound counts:
+    // the diff excerpt, the status text, and the untracked list.
+    let truncated = diff_capped || status_capped || collector.capped;
+
     Ok((
         GitEvidence {
-            status_short: status_short(&staged, &collector.tracked, &collector.untracked),
+            status_short,
             diff_excerpt,
             diff_stat,
             changed_files,
@@ -623,8 +690,15 @@ fn diff_and_stat(
     let mut stats: Vec<StatLine> = Vec::new();
 
     for entry in &collector.tracked {
-        if !entry.diffable || interrupt.load(Ordering::Relaxed) || diffs.len() >= diff_budget {
+        if interrupt.load(Ordering::Relaxed) || diffs.len() >= diff_budget {
             break;
+        }
+        // A conflicted, intent-to-add or submodule entry has no blob pair to diff — but it
+        // must not *stop* the walk. `collector.tracked` is sorted by path, so `break` here
+        // silently dropped the diff and stat of every path that sorts after the first such
+        // entry, leaving the model "modified, but nothing to show" with `truncated` false.
+        if !entry.diffable {
+            continue;
         }
         let relative = entry.path.as_bstr();
         let old_kind = entry.old_mode.unwrap_or(EntryKind::Blob);
@@ -1126,7 +1200,32 @@ fn read_instructions(repo: &Path, cap_chars: usize) -> Option<RepoInstructions> 
 
 #[cfg(test)]
 mod tests {
-    use super::{StatLine, is_safe_to_read, quote_path, render_stat};
+    use super::{
+        MAX_STATUS_ENTRIES, StatLine, is_safe_to_read, quote_path, render_stat, status_short,
+    };
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn a_huge_untracked_list_is_capped_and_reports_it() {
+        // Before the cap this string grew with the repository, and could push the request
+        // past the model budget — which the runtime reports as a *model* failure, a wrong
+        // diagnosis for a large working tree.
+        let untracked: Vec<Vec<u8>> = (0..(MAX_STATUS_ENTRIES + 50))
+            .map(|i| format!("f{i:06}").into_bytes())
+            .collect();
+        let (text, capped) = status_short(&BTreeMap::new(), &[], &untracked);
+        assert!(capped, "the cap must be reported, not applied silently");
+        assert_eq!(text.lines().count(), MAX_STATUS_ENTRIES);
+        assert!(text.lines().all(|line| line.starts_with("?? ")));
+    }
+
+    #[test]
+    fn a_normal_status_is_not_capped_and_keeps_gits_shape() {
+        let untracked = vec![b"a.txt".to_vec()];
+        let (text, capped) = status_short(&BTreeMap::new(), &[], &untracked);
+        assert!(!capped);
+        assert_eq!(text, "?? a.txt\n");
+    }
 
     #[test]
     fn a_newline_in_a_path_cannot_forge_a_line() {

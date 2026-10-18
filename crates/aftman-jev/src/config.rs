@@ -46,6 +46,9 @@ pub enum SettingsError {
 
     #[error("{key} is not a number: {value}")]
     NotANumber { key: String, value: String },
+
+    #[error("{0}")]
+    Budget(String),
 }
 
 /// What the client needs to talk to a provider.
@@ -96,12 +99,15 @@ impl JevSettings {
     /// Whether the base URL points at a loopback address.
     #[must_use]
     pub fn is_loopback(&self) -> bool {
-        let rest = self
-            .base_url
-            .split_once("://")
-            .map(|(_, rest)| rest)
-            .unwrap_or(&self.base_url);
-        matches!(host_of(rest), "127.0.0.1" | "localhost" | "::1")
+        // Parsed, not split: `http://evil.example?@127.0.0.1` has a host of
+        // `evil.example`, and a hand-rolled authority split reads `127.0.0.1`. `doctor`
+        // reports this value, so getting it wrong also misreports the transport.
+        url::Url::parse(&self.base_url)
+            .ok()
+            .and_then(|url| url.host_str().map(ToOwned::to_owned))
+            .is_some_and(|host| {
+                matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]")
+            })
     }
 }
 
@@ -164,6 +170,38 @@ pub fn default_env_file_with(env: &dyn Fn(&str) -> Option<String>) -> Option<std
 /// The process environment wins over the file, always.
 pub fn resolve(file: Option<&BTreeMap<String, String>>) -> Result<JevSettings, SettingsError> {
     resolve_with(&|key| std::env::var(key).ok(), file)
+}
+
+/// The budget, with overridden caps and targets scaled to match.
+///
+/// The targets are what compaction aims for *after* it starts (hysteresis), so a target above
+/// its cap can never be reached: `reduce` would stop early and `fit` would then fail having
+/// "compacted" nothing. Scaling keeps the relationship the defaults have (12 000 / 20 000 and
+/// 60 000 / 120 000). A zero cap is refused rather than obeyed, because it makes every request
+/// unrepresentable.
+fn budget_with_overrides(pair: Option<u64>, request: Option<u64>) -> Result<Budget, SettingsError> {
+    let mut budget = Budget::default();
+    if let Some(pair) = pair {
+        let bytes = usize::try_from(pair).unwrap_or(usize::MAX);
+        if bytes == 0 {
+            return Err(SettingsError::Budget(
+                "AFTMAN_JEV_PAIR_BUDGET_BYTES must be at least 1".to_owned(),
+            ));
+        }
+        budget.pair_bytes = bytes;
+        budget.pair_target_bytes = bytes.saturating_mul(12) / 20;
+    }
+    if let Some(request) = request {
+        let bytes = usize::try_from(request).unwrap_or(usize::MAX);
+        if bytes == 0 {
+            return Err(SettingsError::Budget(
+                "AFTMAN_JEV_REQUEST_BUDGET_BYTES must be at least 1".to_owned(),
+            ));
+        }
+        budget.request_bytes = bytes;
+        budget.request_target_bytes = bytes / 2;
+    }
+    Ok(budget)
 }
 
 /// Every environment variable provider resolution reads. The composition root takes a
@@ -293,15 +331,13 @@ pub fn resolve_with(
         settings.retry.max_retry_after =
             Duration::from_secs(parse_u64("AFTMAN_JEV_MAX_RETRY_AFTER_SECONDS", &raw)?);
     }
-    if let Some(raw) = lookup("AFTMAN_JEV_PAIR_BUDGET_BYTES") {
-        settings.budget.pair_bytes =
-            usize::try_from(parse_u64("AFTMAN_JEV_PAIR_BUDGET_BYTES", &raw)?).unwrap_or(usize::MAX);
-    }
-    if let Some(raw) = lookup("AFTMAN_JEV_REQUEST_BUDGET_BYTES") {
-        settings.budget.request_bytes =
-            usize::try_from(parse_u64("AFTMAN_JEV_REQUEST_BUDGET_BYTES", &raw)?)
-                .unwrap_or(usize::MAX);
-    }
+    let pair = lookup("AFTMAN_JEV_PAIR_BUDGET_BYTES")
+        .map(|raw| parse_u64("AFTMAN_JEV_PAIR_BUDGET_BYTES", &raw))
+        .transpose()?;
+    let request = lookup("AFTMAN_JEV_REQUEST_BUDGET_BYTES")
+        .map(|raw| parse_u64("AFTMAN_JEV_REQUEST_BUDGET_BYTES", &raw))
+        .transpose()?;
+    settings.budget = budget_with_overrides(pair, request)?;
 
     Ok(settings)
 }
@@ -320,17 +356,6 @@ fn parse_u64(key: &str, raw: &str) -> Result<u64, SettingsError> {
 /// A base URL may carry a provider path — `https://openrouter.ai/api` is the
 /// documented OpenRouter form — so the host has to be extracted rather than assumed
 /// to be everything after the scheme.
-fn host_of(rest: &str) -> &str {
-    let authority = rest.split('/').next().unwrap_or("");
-    // `user:pass@host`: the host is what follows the last `@`. Getting this wrong would
-    // let `http://localhost@evil.example` pass as loopback.
-    let authority = authority.rsplit('@').next().unwrap_or("");
-    if let Some(inner) = authority.strip_prefix('[') {
-        return inner.split(']').next().unwrap_or("");
-    }
-    authority.split(':').next().unwrap_or("")
-}
-
 /// Validate and normalise a base URL.
 ///
 /// A path is allowed (some providers mount the API under one); a `/v1` prefix is not,
@@ -361,27 +386,34 @@ pub fn redact_url(raw: &str) -> String {
 
 fn validate_base_url_inner(raw: &str) -> Result<String, SettingsError> {
     let trimmed = raw.trim().trim_end_matches('/');
-    let Some((scheme, rest)) = trimmed.split_once("://") else {
-        return Err(SettingsError::InvalidBaseUrl(raw.to_owned()));
-    };
-    if rest.is_empty() || host_of(rest).is_empty() {
+    // Parsed with a real URL parser rather than split on `/`. Hand-rolled authority parsing
+    // gets this wrong in the direction that matters: WHATWG ends the authority at `?` or `#`
+    // and treats `\` as a path separator, so `http://evil.example?@127.0.0.1` has a host of
+    // `evil.example` — while `rsplit('@')` reads `127.0.0.1` and calls it loopback. The key
+    // then goes to `evil.example` in cleartext, and `doctor` reports it as loopback.
+    let url =
+        url::Url::parse(trimmed).map_err(|_| SettingsError::InvalidBaseUrl(raw.to_owned()))?;
+    // Checked most-informative-error first: an `http` URL to a non-loopback host is the
+    // cleartext risk, and naming it that way is more useful than "invalid".
+    if url.query().is_some() || url.fragment().is_some() {
         return Err(SettingsError::InvalidBaseUrl(raw.to_owned()));
     }
-    if rest.contains("/v1") {
+    // A path prefix is legitimate — `https://openrouter.ai/api` is a documented provider
+    // base — but `/v1` is not, because `endpoint()` appends `/v1/systemone` to it.
+    if url.path().contains("/v1") {
         return Err(SettingsError::BaseUrlHasPath(raw.to_owned()));
     }
-
-    match scheme {
-        "https" => Ok(trimmed.to_owned()),
-        "http" => {
-            if matches!(host_of(rest), "127.0.0.1" | "localhost" | "::1") {
-                Ok(trimmed.to_owned())
-            } else {
-                Err(SettingsError::InsecureBaseUrl(raw.to_owned()))
-            }
-        }
-        _ => Err(SettingsError::InvalidBaseUrl(raw.to_owned())),
+    let Some(host) = url.host_str() else {
+        return Err(SettingsError::InvalidBaseUrl(raw.to_owned()));
+    };
+    let loopback = matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]");
+    match url.scheme() {
+        "https" => {}
+        "http" if loopback => {}
+        "http" => return Err(SettingsError::InsecureBaseUrl(raw.to_owned())),
+        _ => return Err(SettingsError::InvalidBaseUrl(raw.to_owned())),
     }
+    Ok(trimmed.to_owned())
 }
 
 #[cfg(test)]
@@ -606,5 +638,63 @@ JUNK LINE
             }
             other => panic!("expected NotANumber, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn a_host_cannot_be_smuggled_past_the_loopback_check() {
+        // WHATWG ends the authority at `?` or `#` and treats `\` as a path separator, so
+        // each of these has a non-loopback host — while splitting the whole string on `/` and
+        // then on the last `@` reads `127.0.0.1` and calls it loopback, sending the key to
+        // `evil.example` in cleartext.
+        for raw in [
+            "http://evil.example?@127.0.0.1",
+            "http://evil.example#@localhost",
+            "http://evil.example\\@localhost",
+        ] {
+            assert!(
+                validate_base_url(raw).is_err(),
+                "{raw} was accepted as a loopback base URL"
+            );
+        }
+    }
+
+    #[test]
+    fn https_and_genuine_loopback_are_still_accepted() {
+        for raw in [
+            "https://api.typesafe.ai",
+            "http://127.0.0.1:8080",
+            "http://localhost",
+            "http://[::1]:9000",
+        ] {
+            assert!(validate_base_url(raw).is_ok(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn a_provider_path_prefix_is_allowed_but_v1_is_not() {
+        // `https://openrouter.ai/api` is a documented provider base. Rejecting every path
+        // would break it; `/v1` is refused because `endpoint()` appends `/v1/systemone`.
+        assert!(validate_base_url("https://openrouter.ai/api").is_ok());
+        assert!(matches!(
+            validate_base_url("https://api.typesafe.ai/v1"),
+            Err(SettingsError::BaseUrlHasPath(_))
+        ));
+    }
+
+    #[test]
+    fn is_loopback_uses_the_parsed_host() {
+        let hostile = JevSettings {
+            base_url: "http://evil.example?@127.0.0.1".to_owned(),
+            ..JevSettings::default()
+        };
+        assert!(
+            !hostile.is_loopback(),
+            "`doctor` would report a hostile URL as loopback"
+        );
+        let local = JevSettings {
+            base_url: "http://127.0.0.1:8080".to_owned(),
+            ..JevSettings::default()
+        };
+        assert!(local.is_loopback());
     }
 }

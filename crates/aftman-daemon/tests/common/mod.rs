@@ -609,6 +609,7 @@ impl RuntimeFactory for TestFactory {
             .into(),
 
             forwarded_env: Default::default(),
+            jev_budget: Default::default(),
         });
         Ok(BuiltRun {
             runtime: Arc::new(runtime),

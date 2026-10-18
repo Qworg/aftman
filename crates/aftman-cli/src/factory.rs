@@ -278,7 +278,7 @@ impl CliFactory {
         let config = run_config(params)?;
         let options = backend_options(params, self.human_available)?;
         let mut launch = BTreeMap::new();
-        let model = self.build_model(params.simulate_model, &mut launch)?;
+        let (model, jev_budget) = self.build_model(params.simulate_model, &mut launch)?;
         crate::statedir::ensure(&self.data_dir)
             .map_err(|e| internal(format!("preparing the state directory: {e}")))?;
         let worker = build_worker(&config, &options, &self.data_dir)?;
@@ -341,6 +341,7 @@ impl CliFactory {
             // names by the protocol layer. Values go to the subprocess; the runtime
             // records only the names.
             forwarded_env: params.env.clone(),
+            jev_budget,
         });
         Ok(Prepared {
             built: BuiltRun {
@@ -371,10 +372,14 @@ impl CliFactory {
         &self,
         simulate_model: bool,
         launch: &mut BTreeMap<String, String>,
-    ) -> Result<Arc<dyn DecisionModel>, ProtocolError> {
+    ) -> Result<(Arc<dyn DecisionModel>, aftman_core::model::Budget), ProtocolError> {
         if simulate_model {
             launch.insert("supervisor".to_owned(), "simulated".to_owned());
-            return Ok(Arc::new(SimulatedModel::new()));
+            // A simulated model never builds a request, so the budget is irrelevant.
+            return Ok((
+                Arc::new(SimulatedModel::new()),
+                aftman_core::model::Budget::default(),
+            ));
         }
         let file = self.inputs.env_file_map();
         let settings = aftman_jev::resolve_with(&self.inputs.lookup(), file.as_ref())
@@ -386,15 +391,21 @@ impl CliFactory {
             ));
         }
         let view = settings.view(aftman_jev::CredentialSource::Environment);
+        // Taken before the settings move into the client: the runtime needs the same budget
+        // the operator configured, not a default.
+        let jev_budget = settings.budget;
         launch.insert("supervisor".to_owned(), "jev".to_owned());
         launch.insert("model".to_owned(), view.model);
         launch.insert("base_url".to_owned(), view.base_url);
         launch.insert("loopback".to_owned(), view.loopback.to_string());
         let transport = Arc::new(aftman_jev::ReqwestTransport::new());
         let recorder = Arc::new(UsageRecorder::in_state_dir(&self.data_dir));
-        Ok(Arc::new(
-            aftman_jev::SystemOneClient::new(settings, transport, Arc::new(SystemClock))
-                .with_usage(recorder),
+        Ok((
+            Arc::new(
+                aftman_jev::SystemOneClient::new(settings, transport, Arc::new(SystemClock))
+                    .with_usage(recorder),
+            ),
+            jev_budget,
         ))
     }
 

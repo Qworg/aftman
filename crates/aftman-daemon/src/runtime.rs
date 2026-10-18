@@ -71,6 +71,13 @@ pub struct RuntimeDeps {
     pub ensemble_enabled: bool,
     pub uncertainty_margin: f32,
     pub steering_grace: Duration,
+    /// The request budget the provider was configured with.
+    ///
+    /// Passed to every `ask` rather than defaulted: `AFTMAN_JEV_*_BUDGET_BYTES` were parsed
+    /// and shown by `doctor`, but both call sites here passed `Budget::default()`, so an
+    /// operator who set one got a budget they had not asked for — and a cap lowered *below*
+    /// the fixed target could never be met, so every request would be refused.
+    pub jev_budget: aftman_core::model::Budget,
     /// How the worker is launched, as the composition root describes it: opaque
     /// key/value pairs such as `permissions`, `external_sandbox`, `steering`. Written
     /// into the `RUN_CREATED` payload under `launch`, so a run launched with approvals
@@ -600,7 +607,7 @@ impl FactoryRuntime {
             ),
             &self.deps.definitions,
             &job.prompt,
-            &aftman_core::model::Budget::default(),
+            &self.deps.jev_budget,
         )
         .await;
 
@@ -902,7 +909,7 @@ impl FactoryRuntime {
                         ),
                         &state_json,
                         &questions,
-                        &aftman_core::model::Budget::default(),
+                        &self.deps.jev_budget,
                     )
                     .await
                 {

@@ -113,6 +113,14 @@ pub enum Command {
         /// Ask the decision model one question to prove connectivity. Costs tokens.
         #[arg(long)]
         probe: bool,
+        /// Run each installed agent CLI once on a trivial mission and decode what it
+        /// printed. Costs the agent's tokens, and takes as long as the CLI does.
+        #[arg(long)]
+        probe_workers: bool,
+        /// A repository to check: aftman observes a git working tree, and will not finish
+        /// a run it cannot observe.
+        #[arg(long, value_name = "PATH")]
+        repo: Option<PathBuf>,
     },
     /// Run the daemon in the foreground.
     Serve {

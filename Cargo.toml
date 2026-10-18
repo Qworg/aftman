@@ -51,6 +51,8 @@ reqwest = { version = "0.12", default-features = false, features = [
   "json",
 ] }
 serde = { version = "1.0", features = ["derive"] }
+# URL parsing for the base-URL guard. Already in the tree via reqwest.
+url = "2.5"
 serde_json = "1.0"
 tempfile = "3.12"
 thiserror = "2.0"

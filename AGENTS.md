@@ -38,8 +38,11 @@ you change a trait, a wire format, a config key, or a threshold.
 - Time: always `tokio::time::Instant` for elapsed measurement. Wall-clock stamps come from one
   injected clock so tests can control them.
 - IDs: `uuid::Uuid` v7 (time-ordered) for runs and workers. Sequence numbers for events.
-- Serialization: `serde` with `#[serde(deny_unknown_fields)]` on inputs, `extra` tolerated on
-  model responses (Jev adds answer types over time — ignore, don't fail).
+- Serialization: `serde` with `#[serde(deny_unknown_fields)]` on inputs, and additive change
+  tolerated on model responses: fields and answers we did not ask for are ignored. A **requested**
+  key answered with a type this client does not model is *not* additive — it is the provider renaming
+  a primitive — and is fatal, because the alternative is a run that looks supervised while every
+  check has no probability.
 - No `.unwrap()` on I/O in library crates.
 
 ## Commands

@@ -103,7 +103,9 @@ fn a_recorded_response_parses_with_its_extra_primitive_ignored()
             ..
         } => {
             assert!((score - 2.4).abs() < 0.001);
-            assert_eq!(*level, Some(3));
+            // `{0: 0.03, 1: 0.11, 2: 0.46, 3: 0.40}` — the argmax is 2. This asserted 3,
+            // the highest key present, while the comment above said "the level is the argmax".
+            assert_eq!(*level, Some(2));
             assert!((probabilities[&2] - 0.46).abs() < f32::EPSILON);
         }
         other => panic!("expected a score, got {other:?}"),

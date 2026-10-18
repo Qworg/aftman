@@ -438,7 +438,7 @@ fn repository_section(repo: &Path, problems: &mut bool) -> Result<(), CliError> 
 async fn probe_workers_live(problems: &mut bool) -> Result<(), CliError> {
     for kind in [WorkerKind::Pi, WorkerKind::Agy, WorkerKind::Claude] {
         let name = kind.as_str();
-        let Some(spec) = aftman_workers::backends::preflight_spec(kind, "Reply with exactly: ok")
+        let Some(spec) = aftman_workers::backends::probe_spec(kind, "Reply with exactly: ok")
         else {
             continue;
         };
@@ -486,7 +486,7 @@ async fn probe_workers_live(problems: &mut bool) -> Result<(), CliError> {
                     // Nothing on stdout is not format drift: the CLI probably refused the
                     // turn (no login, no quota). Say what it said rather than guessing.
                     outln!("             no stream on stdout; the CLI produced nothing to decode")?;
-                    let why = first_line(&String::from_utf8_lossy(&output.stderr));
+                    let why = stderr_excerpt(&String::from_utf8_lossy(&output.stderr));
                     if !why.is_empty() {
                         outln!("             stderr: {why}")?;
                     }
@@ -503,7 +503,7 @@ async fn probe_workers_live(problems: &mut bool) -> Result<(), CliError> {
                         activity.lines,
                         activity.unparsed_lines
                     )?;
-                    let why = first_line(&String::from_utf8_lossy(&output.stderr));
+                    let why = stderr_excerpt(&String::from_utf8_lossy(&output.stderr));
                     if !why.is_empty() {
                         outln!("             stderr: {why}")?;
                     }
@@ -523,15 +523,19 @@ async fn probe_workers_live(problems: &mut bool) -> Result<(), CliError> {
     Ok(())
 }
 
-/// The first non-empty line of a CLI's stderr, bounded, for a one-line explanation.
-fn first_line(text: &str) -> String {
-    text.lines()
+/// Up to three non-empty lines of a CLI's stderr, bounded, for a one-line explanation.
+///
+/// Three rather than one because the useful line is often not the first — a banner or a
+/// warning usually comes before the actual error — and the whole of a stack trace never is.
+fn stderr_excerpt(text: &str) -> String {
+    let lines: Vec<String> = text
+        .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("")
-        .chars()
-        .take(160)
-        .collect()
+        .filter(|line| !line.is_empty())
+        .take(3)
+        .map(|line| line.chars().take(160).collect())
+        .collect();
+    lines.join(" | ")
 }
 
 /// Is the daemon reachable, and where does it live? Never starts one. Prints the
@@ -621,7 +625,7 @@ fn which(binary: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_line, help_mentions};
+    use super::{help_mentions, stderr_excerpt};
 
     #[test]
     fn a_flag_is_matched_as_a_token_not_a_substring() {
@@ -644,12 +648,18 @@ mod tests {
     }
 
     #[test]
-    fn the_first_line_is_bounded_and_skips_blanks() {
+    fn the_stderr_excerpt_skips_blanks_and_takes_a_few_lines() {
         assert_eq!(
-            first_line("\n\n   boom: something went wrong   \nmore\n"),
-            "boom: something went wrong"
+            stderr_excerpt("\n\n   boom: something went wrong   \nmore\nand more\n"),
+            "boom: something went wrong | more | and more"
         );
-        assert!(first_line(&"x".repeat(1000)).chars().count() <= 160);
-        assert_eq!(first_line("   \n\n"), "");
+        // Bounded per line, and it stops at three.
+        let noisy: String = (0..10)
+            .map(|i| format!("{}{}\n", i, "x".repeat(400)))
+            .collect();
+        let excerpt = stderr_excerpt(&noisy);
+        assert_eq!(excerpt.split(" | ").count(), 3);
+        assert!(excerpt.split(" | ").all(|line| line.chars().count() <= 160));
+        assert_eq!(stderr_excerpt("   \n\n"), "");
     }
 }

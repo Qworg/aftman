@@ -67,6 +67,12 @@ pub trait Transport: Send + Sync {
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, ModelError>;
 }
 
+/// The most of a provider response this client will read.
+///
+/// A supervision answer is a few kilobytes. Anything near this is a proxy error page or a
+/// provider bug, and allocating for it unbounded is a denial of service against the daemon.
+pub const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+
 /// The real transport.
 pub struct ReqwestTransport {
     client: reqwest::Client,
@@ -82,6 +88,15 @@ impl ReqwestTransport {
         Self {
             client: reqwest::Client::builder()
                 .user_agent(concat!("aftman/", env!("CARGO_PKG_VERSION")))
+                // `docs/03-jev.md` §10.2: no proxying. `reqwest` enables the system proxy by
+                // default and its matcher has no loopback bypass, so with `HTTP_PROXY` set a
+                // legitimate `http://127.0.0.1` base would send the key in cleartext *to the
+                // proxy*. The key goes to the configured endpoint, nowhere else.
+                .no_proxy()
+                // An API endpoint that redirects is a misconfiguration, and a 307/308 would
+                // re-POST the whole state — including repository contents — to whatever host
+                // the redirect names, with the `Authorization` header attached.
+                .redirect(reqwest::redirect::Policy::none())
                 .build()
                 .unwrap_or_default(),
         }
@@ -129,11 +144,22 @@ impl Transport for ReqwestTransport {
                 )
             })
             .collect();
-        let body = response
-            .bytes()
+        // Bounded: a provider (or a proxy that answered instead of it) must not be able to
+        // make the supervisor allocate without limit. A supervision response is kilobytes.
+        let mut response = response;
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
             .map_err(|error| ModelError::Transport(error.to_string()))?
-            .to_vec();
+        {
+            if body.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                return Err(ModelError::Transport(format!(
+                    "response body exceeded {MAX_RESPONSE_BYTES} bytes; refusing to read it"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
         Ok(HttpResponse {
             status,
             headers,

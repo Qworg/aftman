@@ -651,7 +651,7 @@ gate mean something; the schedule is what stops the snapshot going quietly stale
 | Risk | Impact | Mitigation |
 | --- | --- | --- |
 | Jev latency too high to supervise in-flight work | The architecture's core hypothesis fails | Debounce interval, explicit timeouts, `Decisive`-only opinions, and a documented measurement in M1 rather than a marketing claim |
-| A model change alters answer shapes | Silent wrong supervision | Missing requested answers are fatal; unknown types ignored; recorded fixtures; `model` persisted as reported |
+| A model change alters answer shapes | Silent wrong supervision | Missing requested answers are fatal, and so is a requested key answered with an unknown type (a renamed primitive, not an addition); answers and fields nobody asked for are ignored; recorded fixtures; `model` persisted as reported |
 | Prompt injection through repository content | Bad judgments | Jev receives state + questions, not instructions; judges are tool-less; opinions cannot finish |
 | Agent CLI flags drift | Backends break | Fixture recordings + `doctor --probe`; flags centralised per backend |
 | Shadow-mode disagreement between upstream and aftman expectations | Operator confusion | Ported ids and thresholds verbatim; deviations listed in doc 05 |

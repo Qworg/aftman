@@ -159,11 +159,15 @@ pub fn parse_answers(
             Ok(Some(answer)) => {
                 parsed.insert(key.clone(), answer);
             }
+            // A key we *asked about*, answered with a type this client does not model, is
+            // not an additive change — it is the provider renaming a primitive. Silently
+            // dropping it leaves every check without a probability and the run looking
+            // healthy while supervision is blind, so it is as fatal as a missing answer.
+            // (Answers we did not ask for are still ignored; see `an_unrequested_answer_is_ignored`.)
             Ok(None) => {
-                tracing::warn!(
-                    key = %key,
-                    "provider returned an answer type this client does not model; ignoring it"
-                );
+                return Err(ModelError::InvalidAnswer(format!(
+                    "{key}: the provider returned an answer type this client does not model"
+                )));
             }
             Err(detail) => return Err(ModelError::InvalidAnswer(format!("{key}: {detail}"))),
         }
@@ -240,7 +244,23 @@ fn parse_answer(raw: &Value, question: &Question) -> Result<Option<AnswerValue>,
             // Keys arrive as JSON *strings*; `serde_json` will not turn them into
             // `u32` for us, so convert explicitly and reject a non-numeric key.
             let probabilities = indexed_number_map(raw.get("probabilities"))?;
-            let level = probabilities.keys().max().copied();
+            if probabilities
+                .keys()
+                .any(|level| *level as usize >= criteria.len())
+            {
+                return Err(format!(
+                    "probabilities has a key outside the rubric 0..={}",
+                    criteria.len().saturating_sub(1)
+                ));
+            }
+            // The most probable level, not the highest key present: the provider sends the
+            // whole distribution, so `keys().max()` was always the last level whatever the
+            // probabilities said. This value is persisted and replayed, so a wrong level is a
+            // wrong record rather than only a wrong display. Ties go to the lower level.
+            let level = probabilities
+                .iter()
+                .max_by(|a, b| a.1.total_cmp(b.1).then(b.0.cmp(a.0)))
+                .map(|(level, _)| *level);
             let confidence = raw
                 .get("confidence")
                 .and_then(Value::as_f64)
@@ -267,6 +287,11 @@ fn number_map(raw: Option<&Value>, field: &str) -> Result<BTreeMap<String, f32>,
         let number = value
             .as_f64()
             .ok_or_else(|| format!("{field}.{key} is not a number"))?;
+        // A probability is a probability: NaN, infinity, and 1e39 (which becomes `inf` as
+        // f32) must not reach a check's arithmetic.
+        if !number.is_finite() {
+            return Err(format!("{field}.{key} is not a finite number"));
+        }
         out.insert(key.clone(), number as f32);
     }
     Ok(out)
@@ -284,6 +309,9 @@ fn indexed_number_map(raw: Option<&Value>) -> Result<BTreeMap<u32, f32>, String>
         let number = value
             .as_f64()
             .ok_or_else(|| format!("probabilities.{key} is not a number"))?;
+        if !number.is_finite() {
+            return Err(format!("probabilities.{key} is not a finite number"));
+        }
         out.insert(index, number as f32);
     }
     Ok(out)
@@ -384,9 +412,11 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_answer_type_is_dropped_not_fatal() -> Result<(), Box<dyn std::error::Error>> {
-        // The provider adds primitives over time; a response containing one it has
-        // not taught us must not break assessment of the others.
+    fn an_unknown_answer_type_for_a_requested_key_is_fatal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The provider renaming a primitive is a *subtractive* change. Dropping the answer
+        // would answer no check and look healthy; extra types the provider adds for questions
+        // nobody asked are still ignored, which is what additive tolerance means.
         let questions = BTreeMap::from([
             (
                 key("core.completion__ready_to_finish"),
@@ -401,8 +431,8 @@ mod tests {
             "core.completion__ready_to_finish": { "type": "noul", "noul": 0.9 },
             "core.worker-health__worker_stuck": { "type": "distribution", "pdf": [0.1, 0.9] }
         }))?;
-        let answers = parse_answers(&response, &questions)?;
-        assert_eq!(answers.len(), 1, "the unknown primitive is dropped");
+        let error = parse_answers(&response, &questions).expect_err("an unusable answer is fatal");
+        assert!(matches!(error, ModelError::InvalidAnswer(_)), "{error:?}");
         Ok(())
     }
 
@@ -480,7 +510,9 @@ mod tests {
                 ..
             } => {
                 assert_eq!(probabilities[&2], 0.46);
-                assert_eq!(*level, Some(3), "level is the argmax, derived locally");
+                // `{2: 0.46, 3: 0.40}` — the argmax is 2. This asserted 3, the highest key
+                // present, while its message claimed to be testing the argmax.
+                assert_eq!(*level, Some(2), "level is the argmax, derived locally");
             }
             other => panic!("expected a score, got {other:?}"),
         }

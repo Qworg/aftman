@@ -486,6 +486,7 @@ fn real_runtime(dir: &Path, store: Arc<dyn RunStore>, model: Arc<DialModel>) -> 
         launch: Default::default(),
 
         forwarded_env: Default::default(),
+        jev_budget: Default::default(),
     })
 }
 

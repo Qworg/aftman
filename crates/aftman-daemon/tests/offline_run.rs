@@ -180,6 +180,7 @@ fn runtime(
         launch: Default::default(),
 
         forwarded_env: Default::default(),
+        jev_budget: Default::default(),
     })
 }
 
@@ -447,6 +448,7 @@ async fn an_ensemble_enabled_run_still_reaches_the_same_verdict()
         launch: Default::default(),
 
         forwarded_env: Default::default(),
+        jev_budget: Default::default(),
     });
     let outcome = rt.run(job(&h.repo)).await?;
     assert_eq!(outcome.status, FactoryStatus::Finished);
@@ -569,6 +571,7 @@ async fn skipped_cycles_do_not_reach_the_model() -> Result<(), Box<dyn std::erro
         launch: Default::default(),
 
         forwarded_env: Default::default(),
+        jev_budget: Default::default(),
     });
     let outcome = rt.run(job(&h.repo)).await?;
 
@@ -650,6 +653,7 @@ fn runtime_with(
         launch: Default::default(),
 
         forwarded_env: Default::default(),
+        jev_budget: Default::default(),
     })
 }
 
@@ -955,6 +959,7 @@ async fn a_forwarded_variable_reaches_the_worker_and_its_value_is_never_recorded
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
         forwarded_env: forwarded,
+        jev_budget: Default::default(),
     });
 
     let outcome = rt.run(job(&h.repo)).await?;
@@ -1045,6 +1050,7 @@ async fn an_evidence_provider_sees_the_forwarded_environment()
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
         forwarded_env: std::collections::BTreeMap::from([("PATH".to_owned(), forwarded_path)]),
+        jev_budget: Default::default(),
     });
     rt.run(job(&h.repo)).await?;
 

@@ -424,6 +424,7 @@ fn runtime_for(
         launch: Default::default(),
 
         forwarded_env: Default::default(),
+        jev_budget: Default::default(),
     }))
 }
 
@@ -1888,6 +1889,7 @@ async fn a_finish_that_lands_after_the_timeout_is_not_failed() -> TestResult {
         launch: Default::default(),
 
         forwarded_env: Default::default(),
+        jev_budget: Default::default(),
     });
     let outcome = rt.run(job(&repo)).await?;
     assert_eq!(outcome.status, FactoryStatus::Finished);

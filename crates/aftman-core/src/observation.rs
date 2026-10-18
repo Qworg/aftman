@@ -514,6 +514,10 @@ impl Observation {
             // the debounce interval is what bounds a chatty one.
             "output_head": self.output.as_ref().map(|e| &e.head),
             "output_tail": self.output.as_ref().map(|e| &e.tail),
+            // The byte count, not just the text: a worker looping on one line produces a
+            // shift-invariant head and tail, so the excerpts stay identical forever and the
+            // loop would be skipped as "unchanged".
+            "output_total_bytes": self.output.as_ref().map(|e| e.total_bytes),
             // A cycle that starts being observable again, or stops, is a change worth
             // assessing: it is the difference between "nothing changed" and "nothing could
             // be seen".
@@ -1006,9 +1010,12 @@ mod worker_evidence_tests {
     #[test]
     fn a_silent_worker_leaves_the_digest_alone() {
         // The M0 property the digest skip exists for: a worker that prints nothing must not
-        // be able to burn the assessment budget. Including output in the digest does not
-        // weaken it, because a silent worker adds nothing to include.
-        let quiet = observation(Some(WorkerOutputExcerpt {
+        // be able to burn the assessment budget, so two cycles differing only in a
+        // per-cycle counter must hash the same.
+        //
+        // This used to hash one observation twice, which every deterministic hash passes —
+        // it could not have failed however the digest changed.
+        let mut quiet = observation(Some(WorkerOutputExcerpt {
             worker_id: WorkerId::new(),
             head: String::new(),
             head_truncated: false,
@@ -1018,8 +1025,33 @@ mod worker_evidence_tests {
             dropped_bytes: 0,
         }));
         let first = quiet.content_digest();
-        let second = quiet.content_digest();
-        assert_eq!(first, second);
+        quiet.counters.assessments += 1;
+        assert_eq!(
+            first,
+            quiet.content_digest(),
+            "a counter the digest excludes must not change it"
+        );
+
+        // And the property only means something if a change *is* visible.
+        quiet.output = Some(excerpt("a", "b"));
+        assert_ne!(first, quiet.content_digest());
+    }
+
+    #[test]
+    fn repeating_identical_output_changes_the_digest_by_its_size() {
+        // A worker looping on one line keeps the head and tail byte-identical — the tail is
+        // shift-invariant by the line's period — so only the byte count moves. Without it in
+        // the digest, a loop printing the same thing was skipped as unchanged until the
+        // worker timeout.
+        let mut small = observation(Some(excerpt("Retrying...\n", "Retrying...\n")));
+        if let Some(output) = small.output.as_mut() {
+            output.total_bytes = 100;
+        }
+        let mut big = observation(Some(excerpt("Retrying...\n", "Retrying...\n")));
+        if let Some(output) = big.output.as_mut() {
+            output.total_bytes = 200;
+        }
+        assert_ne!(small.content_digest(), big.content_digest());
     }
 
     #[test]

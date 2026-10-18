@@ -584,6 +584,35 @@ than an evidence entry, so no provider selection can drop it, and it is in the d
 concluded from "nothing could be seen". A job pointed at a plain directory produces the note too, and
 that is deliberate — aftman cannot observe such a job, so it should not declare its work complete.
 
+### M8 — live validation, and what it found
+
+Run on 2026-10-18 against the real provider and the real agent CLIs, following
+[10-live-validation.md](10-live-validation.md). This is definition-of-done item 2, and the first
+time either integration was exercised.
+
+**Proved.** `doctor --probe` reached Jev and answered in **206 ms**, reporting `jev-1.13.0` for a
+request of `jev-latest` — the first measurement of the hypothesis the architecture rests on, which
+the risk register had only assumed. `doctor --probe-workers` parsed a stream from all three CLIs. A
+supervised run of `pi` created the file it was asked to create, and the supervisor ran a verifier
+and escalated when the working tree still did not match "change nothing else".
+
+**Found three faults, two of them aftman's.**
+
+- **A one-shot worker was given an open stdin pipe that was never closed.** A CLI that drains stdin
+  at startup — `pi` does — waited for an EOF that never came, so every one-shot run hung silently
+  until the 45-minute `worker_timeout`. Measured both ways: open pipe, 0 bytes, timeout; closed,
+  218 KB in seconds. Fixed.
+- **`doctor --probe-workers` reused the `--help` spec**, placeholder model and all, so the live turn
+  asked for a model that does not exist. `agy` and `claude` returned parsed *error* streams and the
+  probe called working CLIs broken. Fixed with a separate `probe_spec`.
+- **A worker that exits 0 having done nothing is indistinguishable from success.** A model returning
+  empty content produced `WORKER_COMPLETED: success` three times with no output at all. Not aftman's
+  bug, but the shape is the one this project keeps guarding against, and a `doctor` warning for
+  "parsed, but no content and zero usage" is the obvious follow-up.
+
+Both of aftman's faults had the same character: a healthy-looking result over a broken path.
+Neither was reachable from the test suite, because both needed a real CLI to expose.
+
 ## Dependency policy
 
 Two decisions, both made because a check that can go red without a code change teaches

@@ -1,0 +1,44 @@
+run id      01a14dc5-b4de-7091-89b5-1ede8ddc8a97
+created     2026-10-18 6:49:24.959032933 +00:00:00
+repo        /tmp/aftman-live/repo
+status      needs_human
+worker      pi
+last seq    64
+job         Create a file named HELLO.txt containing exactly the word hello. Change nothing else.
+posture     permissions auto-approve, external sandbox false, steering unsupported
+            WARNING: --permissions auto-approve: the agent runs with its approval prompts suppressed, and aftman does not sandbox it. Isolation is yours to provide.
+directive   Escalate (worker limit reached before completion)
+
+open escalation 01a14dc6-ed44-70f7-bfb6-db962af811ae (check)
+  The worker budget is exhausted and the job does not look complete.
+  answer: aftman answer 01a14dc5-b4de-7091-89b5-1ede8ddc8a97 01a14dc6-ed44-70f7-bfb6-db962af811ae "<guidance>"   (or --accept --recheck --stop --claim-complete)
+
+timeline
+  > [   2] STATE_CHANGED: -> routing
+  > [   4] STATE_CHANGED: -> running
+  > [   5] STATE_CHANGED: -> assessing
+  * [  10] DIRECTIVE_SELECTED: StartWorker
+          reason: meaningful implementation work remains
+  > [  12] STATE_CHANGED: -> running
+  > [  15] STATE_CHANGED: -> assessing
+  * [  21] DIRECTIVE_SELECTED: Verify
+          reason: independent verification is warranted
+  > [  23] STATE_CHANGED: -> running
+  > [  25] STATE_CHANGED: -> assessing
+  * [  29] DIRECTIVE_SELECTED: Continue
+  > [  30] STATE_CHANGED: -> running
+  > [  32] STATE_CHANGED: -> assessing
+  * [  36] DIRECTIVE_SELECTED: Continue
+  > [  37] STATE_CHANGED: -> running
+  > [  39] STATE_CHANGED: -> assessing
+  * [  43] DIRECTIVE_SELECTED: Continue
+  > [  44] STATE_CHANGED: -> running
+  > [  47] STATE_CHANGED: -> assessing
+  * [  52] DIRECTIVE_SELECTED: StartWorker
+          reason: meaningful implementation work remains
+  > [  54] STATE_CHANGED: -> running
+  > [  57] STATE_CHANGED: -> assessing
+  * [  62] DIRECTIVE_SELECTED: Escalate
+          reason: worker limit reached before completion
+  ? [  63] ESCALATION_RAISED
+  > [  64] STATE_CHANGED: -> needs_human

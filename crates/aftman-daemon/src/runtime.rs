@@ -1561,6 +1561,10 @@ impl FactoryRuntime {
         }
         self.transition(state, FactoryStatus::Cancelled).await?;
         ls.finish_reason = Some(reason.to_owned());
+        // Snapshotted here on purpose: a cancel must be observable as soon as it is accepted,
+        // before the drive loop reaches `emit_final`. That means the terminal status can be
+        // visible a moment before `RUN_FINISHED` is appended, which is why a follower does not
+        // end on the status alone — see `follow::Follow`.
         self.snapshot(state).await?;
         Ok(())
     }
@@ -1826,6 +1830,9 @@ impl FactoryRuntime {
         );
         self.deps.store.append(&event).await?;
         state.last_seq = seq;
+        // Snapshot *after* the append, never before: the snapshot is how a reader learns the
+        // run is over, so a terminal status must never be visible before the event that says
+        // so. A follower that ends on the status would otherwise never deliver `RUN_FINISHED`.
         self.deps.store.snapshot(state).await?;
         self.deps.sink.emit(&event);
         Ok(())

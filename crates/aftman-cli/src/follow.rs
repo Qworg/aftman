@@ -37,6 +37,15 @@ use aftman_daemon::protocol::{
 
 use crate::client::{ClientConfig, ClientError, Connection};
 
+/// How long a polling stream keeps looking for the terminal event after the status says the
+/// run is over.
+///
+/// A cancel snapshots the terminal status *before* the drive loop appends `RUN_FINISHED` — a
+/// cancel must be observable as soon as it is accepted — so ending on the status alone can
+/// drop the one event that explains why the stream ended. Bounded, because a run that ends
+/// without that event (recorded failed by recovery) must still let a follower finish.
+const TERMINAL_GRACE: Duration = Duration::from_secs(2);
+
 /// How long a polling stream waits between looks at the log.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(300);
 
@@ -149,19 +158,42 @@ async fn poll_round(
         );
     }
     let get = Request::RunGet(RunIdParams { run_id });
-    match conn.exchange(first_id + 1, &get, limit, &mut stray).await {
-        Ok(response) => match response.into_result::<aftman_core::run::RunState>() {
-            Ok(state) => (
-                Some(conn),
-                Ok(PollRound {
-                    events: Vec::new(),
-                    state: Some((state.status.as_str().to_owned(), state.status.is_terminal())),
-                }),
-            ),
-            Err(error) => (Some(conn), Err(ClientError::Protocol(error))),
-        },
-        Err(error) => (None, Err(error)),
-    }
+    let state: aftman_core::run::RunState =
+        match conn.exchange(first_id + 1, &get, limit, &mut stray).await {
+            Ok(response) => match response.into_result() {
+                Ok(state) => state,
+                Err(error) => return (Some(conn), Err(ClientError::Protocol(error))),
+            },
+            Err(error) => return (None, Err(error)),
+        };
+    let terminal = state.status.is_terminal();
+    // The page above was read *before* the status, so a terminal status means the terminal
+    // event may have landed in between. Ending on the status alone would hide from the caller
+    // the one event that explains why the stream ended — and no gap check can see it, because
+    // nothing was skipped: it was never asked for. Read the page again, once per run.
+    let events = if terminal {
+        let again = Request::RunEvents(RunEventsParams {
+            run_id,
+            from_seq: Some(from_seq),
+            limit: Some(MAX_EVENTS_LIMIT),
+        });
+        match conn.exchange(first_id + 2, &again, limit, &mut stray).await {
+            Ok(response) => match response.into_result::<RunEventsResult>() {
+                Ok(page) => page.events,
+                Err(error) => return (Some(conn), Err(ClientError::Protocol(error))),
+            },
+            Err(error) => return (None, Err(error)),
+        }
+    } else {
+        Vec::new()
+    };
+    (
+        Some(conn),
+        Ok(PollRound {
+            events,
+            state: Some((state.status.as_str().to_owned(), terminal)),
+        }),
+    )
 }
 
 /// A cheap, cloneable window onto a [`Follow`]'s health, kept up to date by the stream
@@ -235,6 +267,9 @@ pub struct Follow {
     stats: FollowStats,
     polling: bool,
     terminal_seen: bool,
+    /// When the status first said the run was over, so the wait for the terminal event is
+    /// bounded.
+    terminal_since: Option<Instant>,
     retry: Retry,
     attempt: Option<JoinHandle<Result<Established, ClientError>>>,
     liveness: Duration,
@@ -288,6 +323,7 @@ impl Follow {
             stats: FollowStats::default(),
             polling: false,
             terminal_seen: false,
+            terminal_since: None,
             retry: Retry {
                 failed: 0,
                 backoff: config.reconnect_backoff,
@@ -525,8 +561,14 @@ impl Follow {
             self.pending.extend(round.events);
             return Ok(false);
         }
-        if self.terminal_seen {
-            // Terminal, and the log was empty after we saw that: it is over.
+        if let Some(since) = self.terminal_since {
+            // The status says the run is over. `accept` ends the stream as soon as the
+            // terminal *event* arrives, so keep looking for it for a bounded moment instead
+            // of ending on the status alone.
+            if since.elapsed() < TERMINAL_GRACE {
+                self.poll_at = Instant::now() + POLL_INTERVAL;
+                return Ok(false);
+            }
             self.finished = true;
             self.sync_status();
             return Ok(true);
@@ -535,9 +577,10 @@ impl Follow {
             return Ok(false);
         };
         if terminal {
-            // Look at the log once more before declaring it over: events may have
-            // landed between the two reads.
+            // Look at the log once more before declaring it over: events may have landed
+            // between the two reads.
             self.terminal_seen = true;
+            self.terminal_since = Some(Instant::now());
             return Ok(false);
         }
         // Not driven, not finished, nothing new. A run another process drives still

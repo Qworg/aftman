@@ -734,3 +734,29 @@ async fn next_is_cancel_safe() {
     }
     assert_eq!(got, seqs(1..=40));
 }
+
+/// Two writers can reach one run's log — a supervisor that is slow rather than stuck, and the
+/// manager recording the same end at shutdown — so the hub can be handed `seq` 2 before `seq` 1.
+///
+/// `register` finds a resume point with `partition_point`, which assumes sorted input: an
+/// out-of-order insert makes a resume look covered while returning nothing, a gap no client can
+/// detect.
+#[tokio::test]
+async fn the_ring_stays_ordered_when_a_second_writer_interleaves() {
+    let (store, hub) = setup(64, 16);
+    let run = new_run(&store).await;
+    hub.emit(&event(run, 2));
+    hub.emit(&event(run, 1));
+    // And a duplicate, which the losing writer produces.
+    hub.emit(&event(run, 1));
+
+    let mut sub = hub
+        .subscribe(Some(run), Some(EventSeq(1)))
+        .await
+        .expect("subscribe");
+    assert_eq!(
+        take(&mut sub, 2).await,
+        seqs(1..=2),
+        "the ring must be ordered and must not hold a seq twice"
+    );
+}

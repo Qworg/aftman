@@ -960,15 +960,20 @@ impl Response {
 }
 
 /// `{ "event": <EventEnvelope> }`, no `id`.
+///
+/// Deliberately *not* `deny_unknown_fields`: this is server→client, and the daemon is
+/// long-lived and started by whichever client got there first, so mixed versions are normal.
+/// A field added here must not make an older client drop every event line it receives; the
+/// same rule that tolerates additive change on model responses applies to a push. Inputs stay
+/// strict.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct EventPush {
     pub event: EventEnvelope,
 }
 
-/// `{ "error": {...} }`, no `id`: out of band, such as `subscriber_lagged`.
+/// `{ "error": {...} }`, no `id`: out of band, such as `subscriber_lagged`. Tolerant for the
+/// same reason as [`EventPush`].
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ErrorPush {
     pub error: ProtocolError,
 }

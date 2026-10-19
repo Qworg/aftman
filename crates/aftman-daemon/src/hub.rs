@@ -441,12 +441,27 @@ impl EventSink for EventHub {
             let mut state = self.shared.lock();
             let cap = self.shared.config.replay_capacity;
             if cap > 0 {
-                state
-                    .ring
-                    .entry(event.run_id)
-                    .or_default()
-                    .push_back(event.clone());
-                state.order.push_back(event.run_id);
+                // In `seq` order, and at most once. Two writers can reach one run's log — a
+                // supervisor that is slow rather than stuck, and the manager recording the
+                // same end at shutdown — so the ring can be handed events out of order.
+                // `register` finds a resume point with `partition_point`, which assumes
+                // sorted input: an out-of-order insert makes a resume look covered when it
+                // is empty, which is a gap no client can detect.
+                let inserted = {
+                    let ring = state.ring.entry(event.run_id).or_default();
+                    match ring.binary_search_by_key(&event.seq, |held| held.seq) {
+                        Ok(_) => false,
+                        Err(at) => {
+                            ring.insert(at, event.clone());
+                            true
+                        }
+                    }
+                };
+                if inserted {
+                    state.order.push_back(event.run_id);
+                }
+                // A duplicate is still fanned out below (a client may not have seen it), but
+                // it must not occupy two slots in the ring or its eviction order.
                 while state.order.len() > cap {
                     let Some(old) = state.order.pop_front() else {
                         break;

@@ -91,13 +91,17 @@ impl RunStore for MemoryRunStore {
             .ok_or(StoreError::NotFound(event.run_id))?;
         // Reject a sequence that would make the log ambiguous rather than
         // silently accepting an out-of-order history.
-        if let Some(last) = log.last()
-            && event.seq <= last.seq
-        {
+        // Contiguous, and starting at 1: the file store rejects `seq` 0 on an empty log and
+        // this one used to accept any first seq, so the two stores disagreed about what a log
+        // is. A test on one was not a test of the other.
+        let expected = log
+            .last()
+            .map_or(1, |last| last.seq.get().saturating_add(1));
+        if event.seq.get() != expected {
             return Err(StoreError::SeqConflict {
                 run_id: event.run_id,
                 seq: event.seq.get(),
-                last: last.seq.get(),
+                last: expected.saturating_sub(1),
             });
         }
         log.push(event.clone());
@@ -108,6 +112,21 @@ impl RunStore for MemoryRunStore {
         let mut inner = self.lock();
         if !inner.headers.contains_key(&state.header.id) {
             return Err(StoreError::NotFound(state.header.id));
+        }
+        // Same rule as the file store: never ahead of the log. This store used to overwrite
+        // whatever it was given and recover, so a test here could not catch the file store's
+        // trap.
+        let log_last = inner
+            .events
+            .get(&state.header.id)
+            .and_then(|log| log.last())
+            .map_or(0, |event| event.seq.get());
+        if state.last_seq.get() > log_last {
+            return Err(StoreError::SnapshotMismatch {
+                run_id: state.header.id,
+                snapshot: state.last_seq.get(),
+                log: log_last,
+            });
         }
         inner.snapshots.insert(state.header.id, state.clone());
         Ok(())
@@ -336,7 +355,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_snapshot_ahead_of_the_log_is_corruption() -> Result<(), Box<dyn std::error::Error>> {
+    async fn a_gap_or_seq_zero_is_refused_like_the_file_store()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let store = MemoryRunStore::new();
+        let id = RunId::new();
+        store.create(&header(id)).await?;
+        // An empty log starts at 1; this store used to accept any first seq, including 0.
+        let error = store.append(&event(id, 0)).await.expect_err("seq 0");
+        assert!(
+            matches!(error, crate::StoreError::SeqConflict { .. }),
+            "{error:?}"
+        );
+        store.append(&event(id, 1)).await?;
+        let error = store.append(&event(id, 3)).await.expect_err("a gap");
+        assert!(
+            matches!(error, crate::StoreError::SeqConflict { .. }),
+            "{error:?}"
+        );
+        store.append(&event(id, 2)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_ahead_of_the_log_is_refused_like_the_file_store()
+    -> Result<(), Box<dyn std::error::Error>> {
         let store = MemoryRunStore::new();
         let id = RunId::new();
         store.create(&header(id)).await?;
@@ -344,9 +386,9 @@ mod tests {
 
         let mut state = store.load(id).await?;
         state.last_seq = EventSeq(9);
-        store.snapshot(&state).await?;
-
-        let error = store.load(id).await.expect_err("snapshot ahead of log");
+        // This store used to overwrite whatever it was given and recover, so a test here
+        // could not have caught the file store's trap. Same rule now.
+        let error = store.snapshot(&state).await.expect_err("ahead of log");
         assert!(matches!(
             error,
             crate::StoreError::SnapshotMismatch {
@@ -355,6 +397,13 @@ mod tests {
                 ..
             }
         ));
+
+        let mut valid = store.load(id).await?;
+        // Behind the log, which is the normal state between an append and the next snapshot.
+        assert_eq!(valid.last_seq, EventSeq(0));
+        valid.status = FactoryStatus::Running;
+        store.snapshot(&valid).await?;
+        assert_eq!(store.load(id).await?.status, FactoryStatus::Running);
         Ok(())
     }
 

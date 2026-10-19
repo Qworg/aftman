@@ -1171,12 +1171,18 @@ impl RunManager {
             )
             .await?;
         let runtime = built.runtime;
-        // On failure the runtime has already removed whatever it created.
-        let started = runtime
-            .start(built.job)
-            .await
-            .map_err(|e| runtime_error(&e))?;
-        let run_id = started.run_id();
+        // The id is ours so that a failure can clean the hub as well as the store: the
+        // runtime removes what it created, but `RUN_CREATED` may already have been pushed to
+        // subscribers, and an event for a run the store no longer has is a run a follower can
+        // subscribe to and then wait on forever.
+        let run_id = RunId::new();
+        let started = match runtime.start_with_id(built.job, run_id).await {
+            Ok(started) => started,
+            Err(error) => {
+                self.hub().forget(run_id);
+                return Err(runtime_error(&error));
+            }
+        };
         let (control, receiver) = RunControl::channel();
 
         let mut live = self.live();
@@ -1678,6 +1684,15 @@ impl RunManager {
         let stuck: Vec<RunId> = self.live().runs.keys().copied().collect();
         for run_id in stuck {
             tracing::error!(%run_id, "a run task could not be stopped; recording it Failed");
+            // `owned = true` deliberately. A task that ignores `abort` cannot record its
+            // own end, and a run must not be left `running` by a daemon that exits — that is
+            // the property `a_run_task_that_cannot_be_aborted_is_still_recorded_failed_at_shutdown`
+            // pins. Taking the claim instead (as the review suggested) turns this into a no-op
+            // whenever the supervisor still holds it, which is exactly the stuck case.
+            //
+            // The cost is a possible second writer when the supervisor is *slow* rather than
+            // stuck. `SeqConflict` makes one of them lose, and the ring insert now keeps its
+            // order, so a duplicate cannot become the silent resume gap the review found.
             if let Err(why) = self
                 .fail_after_the_fact(
                     run_id,

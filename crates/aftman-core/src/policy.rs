@@ -423,6 +423,14 @@ fn refusal(
             None
         }
         Directive::Verify { .. } => {
+            // A verifier judges a settled tree. While a code worker is running the tree is
+            // still moving, so a verification would measure something that no longer exists
+            // by the time it finishes — and the runtime used to abandon that worker rather
+            // than stop it. The built-in `core.verification` rule already holds back here;
+            // this closes it for a user-defined rule that proposes `verify` outright.
+            if input.active_worker.is_some() {
+                return Some(SuppressionReason::Invariant(Invariant::WorkerStillActive));
+            }
             if input.counters.verifiers_run > 0 {
                 return Some(SuppressionReason::Invariant(
                     Invariant::VerificationAlreadyRun,

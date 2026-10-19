@@ -393,7 +393,14 @@ impl Connection {
                     server_shutdown = true;
                     break;
                 }
-                Some(_) = requests.join_next(), if !requests.is_empty() => continue,
+                Some(_) = requests.join_next(), if !requests.is_empty() => {
+                    // A request that has just finished is activity. Without this, a
+                    // `run.cancel` that took longer than `idle_timeout` left the idle
+                    // deadline in the past, and the next iteration could close a connection
+                    // the client was still using.
+                    last_request = tokio::time::Instant::now();
+                    continue;
+                }
                 _ = async {
                     if let Some(task) = subscription.as_mut() {
                         let _ = task.await;

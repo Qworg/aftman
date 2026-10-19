@@ -484,11 +484,19 @@ impl FactoryRuntime {
     /// # Errors
     /// [`RuntimeError::BadRepo`] or a store failure.
     pub async fn start(&self, job: Job) -> Result<StartedRun, RuntimeError> {
+        self.start_with_id(job, RunId::new()).await
+    }
+
+    /// [`start`](Self::start) with the caller choosing the id.
+    ///
+    /// A caller that owns a hub needs this: `RUN_CREATED` is pushed to subscribers before
+    /// the first snapshot, so a failure after that point must be able to remove the run from
+    /// the hub as well as the store — and the hub is keyed by id.
+    pub async fn start_with_id(&self, job: Job, run_id: RunId) -> Result<StartedRun, RuntimeError> {
         if !job.repo.is_dir() {
             return Err(RuntimeError::BadRepo(job.repo.display().to_string()));
         }
 
-        let run_id = RunId::new();
         // Claim before the run exists, so there is no moment at which a run
         // directory is visible to another process and unowned.
         let Some(claim) = self.deps.store.claim_new(run_id).await? else {
@@ -822,7 +830,7 @@ impl FactoryRuntime {
             // if the worker that just finished has vanished from the evidence. Policy
             // uses a different notion — `state.active_worker()`, running only — because
             // "may I steer it" and "may I start another" are about the live process.
-            let event_summaries = self.recent_event_summaries(run_id).await;
+            let event_summaries = self.recent_event_summaries(run_id, state.last_seq).await;
             let most_recent = state.workers.last().cloned();
             let observation = self
                 .builder
@@ -1837,8 +1845,17 @@ impl FactoryRuntime {
         Ok(event)
     }
 
-    async fn recent_event_summaries(&self, run_id: RunId) -> Vec<EventSummary> {
-        let from = EventSeq(1);
+    /// The most recent events, for the model-facing history.
+    ///
+    /// Reads a bounded *tail*, not the whole log. This runs every cycle, so a full read is
+    /// O(n) per cycle and O(n²) over a run — with the entire log, `WORKER_OUTPUT` payloads
+    /// included, in memory each time. The window is several times `events_history` because
+    /// `WorkerOutput` events are filtered out below and must not crowd out the rest.
+    async fn recent_event_summaries(&self, run_id: RunId, last_seq: EventSeq) -> Vec<EventSummary> {
+        /// How far back to read. Larger than `ObsCaps::events_history` (30) so that
+        /// filtering out worker output still leaves a full history.
+        const WINDOW: u64 = 256;
+        let from = EventSeq(last_seq.0.saturating_sub(WINDOW).max(1));
         match self.deps.store.events(run_id, from).await {
             // `WorkerOutput` is left out of the model-facing history: summaries carry
             // no payload text anyway, and worker output must not be echoed into what
@@ -2116,6 +2133,15 @@ impl FactoryRuntime {
             }
 
             Directive::Verify { .. } => {
+                // A verifier judges a *settled* tree, so whatever was running is superseded —
+                // exactly as `Retry` does it. Dropping the handle instead ran
+                // `WorkerHandle::drop`, which aborts the task: no `WORKER_TERMINATED`, the
+                // record left at `Running` for good (`active_worker()` only looks at the last
+                // record, so nothing ever closes it), and the process killed by the backend's
+                // drop but never reaped or cleared from the ledger.
+                if let Some(old) = worker {
+                    self.stop_worker(state, old, StopWhy::Superseded).await?;
+                }
                 let mission = verify_mission(job);
                 Ok(Some(
                     self.start_worker(state, job, TaskKind::Verify, mission, None)

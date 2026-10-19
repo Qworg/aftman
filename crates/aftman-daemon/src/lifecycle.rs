@@ -313,12 +313,15 @@ impl PidLock {
         // there.
         let mut contended = 0;
         for _ in 0..12 {
+            // `O_NOFOLLOW`: this path is truncated and rewritten below, so a symlink
+            // planted at it would truncate its target. A pid file is never a symlink.
             let file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(false)
                 .read(true)
                 .write(true)
                 .mode(0o600)
+                .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
                 .open(path)
                 .map_err(|e| io(path, e))?;
             between_open_and_lock();

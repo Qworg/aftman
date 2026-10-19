@@ -70,10 +70,13 @@ pub fn open_log(data_dir: &Path, max: u64) -> std::io::Result<std::fs::File> {
     ensure(data_dir)?;
     let log = data_dir.join(LOG_FILE);
     rotate_log(&log, max)?;
+    // `O_NOFOLLOW`: the log is appended to, so a symlink planted at its path would grow
+    // whatever it points at. Nothing in a state directory is legitimately a symlink.
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
         .open(log)
 }
 

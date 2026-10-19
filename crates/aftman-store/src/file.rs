@@ -368,7 +368,12 @@ fn append_blocking(
             parse_event_log(id, &bytes)?.last_seq().get()
         }
     };
-    if event.seq.get() <= last {
+    // Exactly the next one. `<=` accepted a gap, and `read_page`'s fast path and the "no
+    // gaps" promise (`docs/02-lld.md` §11) both assume contiguity — after one gap every
+    // `events_page` falls back to parsing the whole log, which is the bounded-memory
+    // guarantee gone. `SeqConflict` already means "your view of the log is stale", which is
+    // exactly what a caller producing a gap has.
+    if event.seq.get() != last.saturating_add(1) {
         return Err(StoreError::SeqConflict {
             run_id: id,
             seq: event.seq.get(),
@@ -400,6 +405,27 @@ fn snapshot_blocking(
     if !paths.meta.exists() {
         return Err(StoreError::NotFound(id));
     }
+    // The log's last seq, from this store's cache or by reading it once.
+    let log_last = match writes.log {
+        Some((_, seq)) => seq,
+        None => match std::fs::read(&paths.events) {
+            Ok(bytes) => parse_event_log(id, &bytes)?.last_seq().get(),
+            // A run created but not yet appended to: an empty log.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => return Err(io_err(paths.events.display(), error)),
+        },
+    };
+    // A snapshot may be *behind* the log — normal between an append and the next snapshot —
+    // but never *ahead*: that describes events that do not exist, and `load` then reports
+    // `SnapshotMismatch` for the run's whole life, which is not repairable through the API
+    // because a corrective snapshot used to be dropped as stale (below).
+    if state.last_seq.get() > log_last {
+        return Err(StoreError::SnapshotMismatch {
+            run_id: id,
+            snapshot: state.last_seq.get(),
+            log: log_last,
+        });
+    }
     let stored = match writes.snapshot_seq {
         Some(seq) => Some(seq),
         None => std::fs::read(&paths.state)
@@ -407,7 +433,10 @@ fn snapshot_blocking(
             .and_then(|b| serde_json::from_slice::<RunState>(&b).ok())
             .map(|s| s.last_seq.get()),
     };
-    if stored.is_some_and(|stored| state.last_seq.get() < stored) {
+    // Dropped only when it is behind a snapshot that is itself valid. A stored snapshot that
+    // is *ahead* of the log is the corrupt state this check exists to prevent; a lower one is
+    // then the repair, not a regression.
+    if stored.is_some_and(|stored| state.last_seq.get() < stored && stored <= log_last) {
         tracing::warn!(
             run_id = %id,
             stale = state.last_seq.get(),
@@ -974,7 +1003,31 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_snapshot_ahead_of_the_log_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+    async fn a_gap_in_the_log_is_refused() -> Result<(), Box<dyn std::error::Error>> {
+        // `read_page`'s fast path and the "no gaps" promise (`02-lld.md` §11) assume
+        // contiguity; after one gap every `events_page` falls back to parsing the whole log.
+        let (_dir, store) = store()?;
+        let id = RunId::new();
+        store.create(&header(id)).await?;
+        store.append(&event(id, 1)).await?;
+        for skipped in [3u64, 0] {
+            let error = store
+                .append(&event(id, skipped))
+                .await
+                .expect_err("only seq 2 follows seq 1");
+            assert!(
+                matches!(error, crate::StoreError::SeqConflict { .. }),
+                "seq {skipped}: {error:?}"
+            );
+        }
+        // And the next one is still accepted.
+        store.append(&event(id, 2)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_ahead_of_the_log_is_refused_and_the_run_stays_usable()
+    -> Result<(), Box<dyn std::error::Error>> {
         let (_dir, store) = store()?;
         let id = RunId::new();
         store.create(&header(id)).await?;
@@ -982,9 +1035,10 @@ mod tests {
 
         let mut state = store.load(id).await?;
         state.last_seq = EventSeq(7);
-        store.snapshot(&state).await?;
-
-        let error = store.load(id).await.expect_err("snapshot ahead of log");
+        // This used to be accepted, after which `load` reported `SnapshotMismatch` for the
+        // run's whole life — and a corrective lower snapshot was dropped as stale, so the run
+        // could not be repaired through the API. It is refused at the write now.
+        let error = store.snapshot(&state).await.expect_err("ahead of log");
         assert!(matches!(
             error,
             crate::StoreError::SnapshotMismatch {
@@ -993,6 +1047,14 @@ mod tests {
                 ..
             }
         ));
+
+        // And nothing was written: the legitimate snapshot still loads and still saves.
+        let mut valid = store.load(id).await?;
+        // Behind the log, which is the normal state between an append and the next snapshot.
+        assert_eq!(valid.last_seq, EventSeq(0));
+        valid.status = FactoryStatus::Running;
+        store.snapshot(&valid).await?;
+        assert_eq!(store.load(id).await?.status, FactoryStatus::Running);
         Ok(())
     }
 

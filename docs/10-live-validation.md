@@ -65,6 +65,10 @@ same `StreamDecoder` a supervised run uses, and reports whether the stream parse
 
 - `stream parsed` — the installed CLI still speaks the format aftman decodes. This is the check
   fixtures cannot make.
+- `EMPTY: the stream parsed, but it carried no prose, no tool calls and no tokens` — the CLI is
+  installed and **not working**, which is a different failure from drift and a worse one, because
+  the stream looked fine. Check the model and the login. This verdict exists because a broken `pi`
+  model passed the first live validation as "stream parsed".
 - `no stream on stdout` — the CLI refused the turn (not logged in, no quota, wrong account). Not
   drift. The first line of its stderr is printed.
 - `DRIFT: N line(s), M unparsed` — it produced output aftman cannot read. Same treatment as step 0.

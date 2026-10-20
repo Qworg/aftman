@@ -1911,6 +1911,20 @@ impl FactoryRuntime {
         }
     }
 
+    /// Whether a worker that has just finished produced nothing at all.
+    ///
+    /// `success` is about the exit code. A worker can exit 0 having done nothing — a model that
+    /// answered with empty content, a CLI that refused a turn and still exited 0 — and that must be
+    /// visible without an operator diffing byte counts. The activity answers it precisely for a
+    /// structured backend, because a stream can be well-formed and carry nothing; for a backend with
+    /// no structured stream, "it printed nothing at all" is the only signal there is.
+    fn produced_nothing(activity: Option<&StreamActivity>, output: &BoundedLog) -> bool {
+        match activity {
+            Some(activity) => activity.produced_nothing(),
+            None => output.is_empty(),
+        }
+    }
+
     async fn finish_worker(
         &self,
         state: &mut RunState,
@@ -1931,6 +1945,12 @@ impl FactoryRuntime {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        // A worker can exit 0 having done nothing — a model answering with empty content, a CLI
+        // that refused a turn and still exited 0 — and that used to be indistinguishable from a
+        // worker that did the work. The activity answers it precisely for a structured backend
+        // (it carries the prose, the tool calls and the token count); for a backend with no
+        // structured stream, "it printed nothing at all" is the only signal there is.
+        let empty = Self::produced_nothing(activity.as_ref(), &snapshot);
         if let Some(record) = state.workers.iter_mut().find(|w| w.id == id) {
             record.status = outcome.status();
             record.exit = outcome.exit();
@@ -1949,6 +1969,10 @@ impl FactoryRuntime {
                 "worker_id": id.to_string(),
                 "outcome": format!("{outcome:?}"),
                 "success": outcome.is_success(),
+                // `success` is about the exit code. This is about whether the worker said
+                // anything: an exit-0 worker that produced nothing is not a completed job, and
+                // a surface should be able to show the difference without diffing byte counts.
+                "empty": empty,
             }),
         )
         .await?;
@@ -2487,5 +2511,56 @@ mod tests {
         assert!(mission.contains("must not trust"));
         assert!(mission.contains("Do not modify the repository"));
         assert!(mission.contains("Report only"));
+    }
+}
+
+/// The "did this worker actually do anything" decision that `WorkerCompleted.empty` records.
+#[cfg(test)]
+mod empty_completion_tests {
+    use super::FactoryRuntime;
+    use aftman_core::activity::StreamActivity;
+    use aftman_core::log::{BoundedLog, Stream};
+
+    #[test]
+    fn a_worker_that_printed_nothing_is_empty() {
+        let log = BoundedLog::new(64, 64);
+        assert!(
+            FactoryRuntime::produced_nothing(None, &log),
+            "a worker with no output at all"
+        );
+    }
+
+    #[test]
+    fn a_worker_that_printed_something_is_not_empty() {
+        let mut log = BoundedLog::new(64, 64);
+        log.push(Stream::Stdout, "hello");
+        assert!(!FactoryRuntime::produced_nothing(None, &log));
+    }
+
+    #[test]
+    fn a_parsed_stream_that_said_nothing_is_empty_even_with_a_stderr_warning() {
+        // The live-run case: `pi` wrote a 313-byte stderr warning and a well-formed stream that
+        // carried no prose, no tool calls and no tokens, then exited 0. The log is not empty,
+        // so only the activity can tell that nothing happened.
+        let mut log = BoundedLog::new(4096, 4096);
+        log.push(
+            Stream::Stderr,
+            "Warning: extension package needs peerDependencies",
+        );
+        let said_nothing = StreamActivity {
+            lines: 9,
+            ..StreamActivity::default()
+        };
+        assert!(FactoryRuntime::produced_nothing(Some(&said_nothing), &log));
+    }
+
+    #[test]
+    fn a_worker_that_spoke_is_not_empty() {
+        let log = BoundedLog::new(64, 64);
+        let spoke = StreamActivity {
+            assistant_text: "ok".into(),
+            ..StreamActivity::default()
+        };
+        assert!(!FactoryRuntime::produced_nothing(Some(&spoke), &log));
     }
 }

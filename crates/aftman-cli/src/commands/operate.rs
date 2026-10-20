@@ -300,6 +300,38 @@ pub async fn doctor(
     Ok(exit::FINISHED)
 }
 
+/// What a one-turn probe concluded.
+#[derive(Debug, PartialEq, Eq)]
+enum ProbeVerdict {
+    /// The stream parsed and carried something.
+    Working,
+    /// The stream parsed but carried no prose, no tool calls and no tokens. Installed, and not
+    /// working — the case that let a broken `pi` model read as "stream parsed".
+    Empty,
+    /// The CLI produced lines this client cannot read.
+    Drift,
+    /// Nothing on stdout at all: the CLI refused the turn.
+    Silent,
+}
+
+/// Classify one probe turn.
+///
+/// Separate from the printing so it can be tested without a real agent binary.
+fn probe_verdict(activity: &aftman_core::activity::StreamActivity) -> ProbeVerdict {
+    if activity.lines == 0 {
+        // Not format drift: the CLI produced nothing to decode, so it probably refused the
+        // turn (no login, no quota).
+        return ProbeVerdict::Silent;
+    }
+    if !activity.looks_structured() {
+        return ProbeVerdict::Drift;
+    }
+    if activity.produced_nothing() {
+        return ProbeVerdict::Empty;
+    }
+    ProbeVerdict::Working
+}
+
 /// How long one probe turn may take. A coding agent starting cold is slow; a probe that
 /// hangs is not worth waiting for.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(180);
@@ -482,32 +514,50 @@ async fn probe_workers_live(problems: &mut bool) -> Result<(), CliError> {
                 let text = String::from_utf8_lossy(&output.stdout);
                 let (_, activity) = aftman_workers::decode_all(kind, &text);
                 outln!("             exit {code} in {:?}", started.elapsed())?;
-                if activity.lines == 0 {
-                    // Nothing on stdout is not format drift: the CLI probably refused the
-                    // turn (no login, no quota). Say what it said rather than guessing.
-                    outln!("             no stream on stdout; the CLI produced nothing to decode")?;
-                    let why = stderr_excerpt(&String::from_utf8_lossy(&output.stderr));
-                    if !why.is_empty() {
-                        outln!("             stderr: {why}")?;
+                match probe_verdict(&activity) {
+                    ProbeVerdict::Silent => {
+                        outln!(
+                            "             no stream on stdout; the CLI produced nothing to decode"
+                        )?;
+                        let why = stderr_excerpt(&String::from_utf8_lossy(&output.stderr));
+                        if !why.is_empty() {
+                            outln!("             stderr: {why}")?;
+                        }
+                        *problems = true;
                     }
-                    *problems = true;
-                } else if activity.looks_structured() {
-                    outln!("             {}", activity.summary())?;
-                    outln!(
-                        "             stream parsed: the installed CLI still speaks the format aftman decodes"
-                    )?;
-                } else {
-                    outln!(
-                        "             DRIFT: {} line(s), {} unparsed — the stream is not the \
-                         format aftman decodes",
-                        activity.lines,
-                        activity.unparsed_lines
-                    )?;
-                    let why = stderr_excerpt(&String::from_utf8_lossy(&output.stderr));
-                    if !why.is_empty() {
-                        outln!("             stderr: {why}")?;
+                    ProbeVerdict::Drift => {
+                        outln!(
+                            "             DRIFT: {} line(s), {} unparsed — the stream is not the \
+                             format aftman decodes",
+                            activity.lines,
+                            activity.unparsed_lines
+                        )?;
+                        let why = stderr_excerpt(&String::from_utf8_lossy(&output.stderr));
+                        if !why.is_empty() {
+                            outln!("             stderr: {why}")?;
+                        }
+                        *problems = true;
                     }
-                    *problems = true;
+                    ProbeVerdict::Empty => {
+                        outln!("             {}", activity.summary())?;
+                        outln!(
+                            "             EMPTY: the stream parsed, but it carried no prose, no \
+                             tool calls and no tokens. The CLI is installed and not working — \
+                             check its model and login before blaming the backend."
+                        )?;
+                        let why = stderr_excerpt(&String::from_utf8_lossy(&output.stderr));
+                        if !why.is_empty() {
+                            outln!("             stderr: {why}")?;
+                        }
+                        *problems = true;
+                    }
+                    ProbeVerdict::Working => {
+                        outln!("             {}", activity.summary())?;
+                        outln!(
+                            "             stream parsed: the installed CLI still speaks the \
+                             format aftman decodes"
+                        )?;
+                    }
                 }
             }
             Ok(Err(error)) => {
@@ -625,7 +675,7 @@ fn which(binary: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{help_mentions, stderr_excerpt};
+    use super::{ProbeVerdict, help_mentions, probe_verdict, stderr_excerpt};
 
     #[test]
     fn a_flag_is_matched_as_a_token_not_a_substring() {
@@ -645,6 +695,40 @@ mod tests {
         assert!(help_mentions("  --print=<PROMPT>  run once\n", "--print"));
         assert!(help_mentions("  --print=TEXT\n", "--print"));
         assert!(!help_mentions("  --printout\n", "--print"));
+    }
+
+    #[test]
+    fn a_probe_that_parsed_but_said_nothing_is_not_a_pass() {
+        // The case that hid a broken `pi` model: a well-formed stream with no prose, no tool
+        // calls and no tokens read as "stream parsed" and passed.
+        use aftman_core::activity::{StreamActivity, StreamUsage};
+        let parsed_but_empty = StreamActivity {
+            lines: 9,
+            usage: Some(StreamUsage {
+                input_tokens: Some(0),
+                output_tokens: Some(0),
+                cost_usd: None,
+            }),
+            ..StreamActivity::default()
+        };
+        assert_eq!(probe_verdict(&parsed_but_empty), ProbeVerdict::Empty);
+
+        let working = StreamActivity {
+            assistant_text: "ok".into(),
+            lines: 9,
+            ..StreamActivity::default()
+        };
+        assert_eq!(probe_verdict(&working), ProbeVerdict::Working);
+
+        let silent = StreamActivity::default();
+        assert_eq!(probe_verdict(&silent), ProbeVerdict::Silent);
+
+        let drift = StreamActivity {
+            lines: 10,
+            unparsed_lines: 9,
+            ..StreamActivity::default()
+        };
+        assert_eq!(probe_verdict(&drift), ProbeVerdict::Drift);
     }
 
     #[test]

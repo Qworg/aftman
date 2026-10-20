@@ -596,6 +596,15 @@ the risk register had only assumed. `doctor --probe-workers` parsed a stream fro
 supervised run of `pi` created the file it was asked to create, and the supervisor ran a verifier
 and escalated when the working tree still did not match "change nothing else".
 
+**A second live validation (2026-10-20) found a fourth fault, in the decoder.** All three
+CLIs parsed (pi 1.3.0, agy 1.4.2, claude 2.1.299), Jev answered in 260 ms, and a supervised run
+created the file it was asked to create. But the worker's prose was recorded **one word per
+line**: a backend sends its prose in deltas — `pi` sends them a character at a time — and each
+delta was emitted as a line of its own. The activity summary was unaffected, which is why the
+probe reported a healthy 17 655 tokens while the readable log was unreadable. The decoder now
+assembles the prose and emits it a line at a time. Only a live run finds that: the fixtures
+have one delta per line, so they could not.
+
 **Found three faults, two of them aftman's.**
 
 - **A one-shot worker was given an open stdin pipe that was never closed.** A CLI that drains stdin

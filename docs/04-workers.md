@@ -24,7 +24,7 @@ pub trait Worker: Send + Sync {
 | Backend | Selection | Transport | Live steering | Non-interactive permissions | Verified against |
 | --- | --- | --- | --- | --- | --- |
 | `pi` | `--worker pi` | `pi --print --mode json` (one-shot) or `pi --mode rpc` (steerable) | **Yes** (RPC) | no sandbox flag — see §8.1 | pi 1.3.0 |
-| `agy` | `--worker agy` | `agy --print="…" --output-format stream-json` | No | `--sandbox` | agy 1.3.5 |
+| `agy` | `--worker agy` | `agy --print="…" --output-format stream-json` | No | `--sandbox` | agy 1.4.2 |
 | `claude` | `--worker claude` | `claude -p --output-format stream-json` | No (resume only) | `--permission-mode` / `--permission-prompts` | claude 2.1.299 |
 | `generic` | `--worker generic --cmd …` | operator-supplied argv template | No | operator's responsibility | — |
 | `herdr-pane` | `--worker herdr:pane` | drives a herdr pane + recognized agent | **Yes** (`agent prompt`) | inherits the pane's agent | herdr 0.8.2 |
@@ -33,14 +33,22 @@ pub trait Worker: Send + Sync {
 `aftman doctor` reports each backend's availability and version. A backend whose binary is missing
 is a startup error with the exact binary name and an install hint, not a mid-run surprise.
 
-Versions verified on 2026-10-18 by `aftman doctor --probe-workers` and a supervised live run.
+Versions verified on 2026-10-20 by `aftman doctor --probe-workers` and a supervised live run
+(`docs/live/2026-10-20/`).
 `aftman doctor` re-checks every flag these backends pass against the installed CLI's `--help`,
 deriving the list from the argv the backend builds, so drift shows up before a run does.
 
 **`pi`'s model matters as much as its version.** One model answered with `content: []` and
 `"totalTokens": 0`: a well-formed stream containing no prose and no tool calls, so the worker "ran"
 and did nothing while exiting 0. If a `pi` run produces no output, check the model before the
-backend — `--model deepseek/deepseek-flash` was verified working against pi 1.3.0.
+backend — `--model deepseek/deepseek-flash` was verified working against pi 1.3.0, and the
+default model worked too on 2026-10-20, so it is the *model* rather than the version that
+decides.
+
+**The agent's own tooling can write to the tree.** `pi`'s extension leaves a
+`.pi-lens-probe-home/` directory behind, so a job that says "change nothing else" can never
+complete in an environment where that extension is installed — the tree really did change, and
+the agent usually says so itself. This is a fact about the job, not a supervisor defect.
 
 ## 2. One-shot vs. steerable
 

@@ -159,11 +159,14 @@ attributable to a real model version later.
 Retry policy (mirrors upstream defaults, tightened):
 
 - `max_retries = 2` (override with `AFTMAN_JEV_MAX_RETRIES`);
-- backoff: 250ms, 1s, with ±30% jitter;
+- backoff: 250ms, 500ms, 1s, 2s (doubling, capped at `max_delay`), with ±30% jitter;
 - `retry-after-ms` (milliseconds) takes precedence over `retry-after` (seconds *or* HTTP-date);
 - a `retry-after` longer than `AFTMAN_JEV_MAX_RETRY_AFTER` (default 30s) aborts rather than
   sleeping — a supervisor that blocks for minutes is worse than one that reports uncertainty;
-- total wall-clock budget per attempt chain: `timeout * 4`;
+- total wall-clock budget per attempt chain: `timeout * 4`. **Enforced**: the chain stops
+  when the budget is spent, because a supervisor that blocks for ninety seconds has stopped
+  supervising. (It was promised here and not implemented, so three 10-second timeouts plus two
+  30-second `Retry-After` waits came to more than ninety against a promised forty.);
 - `X-TypeSafe-Retry-Count` is incremented per retry.
 
 Error body message extraction follows the provider's shapes in order: `error` (string or
@@ -299,8 +302,14 @@ Implementations:
 1. Base URL is the only provider switch. Never branch on hostname.
 2. Never send the API key anywhere except the configured base URL. No telemetry, no proxying, no
    fallback endpoints.
-3. Keep the upstream env var names (`TYPESAFE_*`) so existing setups and `.env` files work.
-4. `.env` loading order, non-overriding, real environment always wins:
+3. A **budget refusal is not a model failure.** A request that cannot be compacted is
+   reported as `BUDGET_EXCEEDED` and counted separately from `consecutive_model_failures`; three
+   of them escalate as `observation_too_large` — "raise the budget or reduce the evidence" —
+   rather than as `model_unavailable: supervision is blind`, which is the opposite of the truth.
+   The refusal carries what was measured, because "reduce the evidence" is only actionable if it
+   says which evidence.
+4. Keep the upstream env var names (`TYPESAFE_*`) so existing setups and `.env` files work.
+5. `.env` loading order, non-overriding, real environment always wins:
    1. `$XDG_CONFIG_HOME/aftman/.env`;
    2. the process environment.
 
@@ -311,10 +320,10 @@ Implementations:
    would send the key to the attacker. Repository-supplied `.env` files may be passed to the
    *worker* environment as ordinary variables; they may not reach supervisor configuration. See
    [08-security.md §2.1](08-security.md).
-5. Persist the *reported* model, keep the *requested* model alongside it.
-6. Tolerate additive API change (ignore), never tolerate subtractive change silently (missing
+6. Persist the *reported* model, keep the *requested* model alongside it.
+7. Tolerate additive API change (ignore), never tolerate subtractive change silently (missing
    requested answers are fatal).
-7. Record `x-typesafe-request-id` for every request so an answer can be reported to the provider.
+8. Record `x-typesafe-request-id` for every request so an answer can be reported to the provider.
 
 ## 11. Failure-mode summary
 

@@ -59,6 +59,13 @@ pub struct Counters {
     /// Cycles skipped because the observation content was unchanged.
     pub assessments_skipped: u32,
     pub consecutive_model_failures: u32,
+    /// Cycles whose request was refused by the budget.
+    ///
+    /// Kept apart from `consecutive_model_failures` on purpose: a request that cannot be
+    /// compacted is a *repository that is too big to describe*, not a model that has gone
+    /// away. Counting them together made the supervisor escalate with "model_unavailable:
+    /// supervision is blind" — the opposite of the truth, and with no usage line to show why.
+    pub consecutive_budget_failures: u32,
     /// Elapsed wall time. Volatile: excluded from the content digest.
     pub elapsed_secs: u64,
 }

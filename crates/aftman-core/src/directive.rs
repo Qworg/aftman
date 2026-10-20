@@ -141,6 +141,12 @@ pub enum Invariant {
     /// [`Invariant::VerificationAlreadyRun`] means the opposite — a verifier *has* run — and
     /// was being used for both.
     VerificationIncomplete,
+    /// The observation could not be compacted to fit the request budget, three cycles running.
+    ///
+    /// Distinct from [`Invariant::ModelUnavailable`]: the model is fine, the request is too
+    /// big. The two were one counter, so a repository too large to describe was reported as
+    /// "model_unavailable: supervision is blind".
+    ObservationTooLarge,
     /// The repository could not be read this cycle, so "nothing has changed" is not a claim
     /// the supervisor is in a position to make.
     ///

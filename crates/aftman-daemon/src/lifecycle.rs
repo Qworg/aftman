@@ -181,12 +181,40 @@ impl DaemonPaths {
 }
 
 /// The private directory the socket is bound in before it is renamed into place.
+///
+/// The name carries a random component as well as the pid. With a user-chosen socket
+/// directory — `/tmp/…`, which `AGENTS.md` itself suggests — a predictable name is a
+/// denial of service: anyone who can guess the pid can create the directory first and the
+/// daemon then refuses to bind. The random part is fixed-length, so the socket-path budget
+/// below stays exact.
 fn staging_dir(socket: &Path) -> PathBuf {
     socket
         .parent()
         .unwrap_or_else(|| Path::new("."))
-        .join(format!(".st{}", std::process::id()))
+        .join(format!(".st{}-{}", std::process::id(), staging_token()))
 }
+
+/// A per-process random token for the staging directory name.
+///
+/// Not a secret and not a cryptographic token: it only has to be unguessable by someone
+/// who can create a file in the socket's directory. The clock and the pid are enough for
+/// that, and they cost nothing.
+fn staging_token() -> &'static str {
+    // One token per process: every call must agree on the name, or the staged socket would
+    // be bound in a different directory than the one that was created.
+    static TOKEN: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TOKEN.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        format!("{nanos:016x}{:08x}", std::process::id())
+    })
+}
+
+/// The number of bytes the staging directory's name adds to a socket path.
+///
+/// Fixed, so `max_socket_path_bytes` does not depend on the clock.
+const STAGING_SUFFIX_BYTES: usize = 24;
 
 /// Where the socket is bound before it is renamed to its final name.
 fn staged_socket(socket: &Path) -> PathBuf {
@@ -198,10 +226,16 @@ fn staged_socket(socket: &Path) -> PathBuf {
 }
 
 /// The longest final socket path that can be bound under the current pid
-/// (the staging directory adds `/.st<pid>` to the path that is bound).
+/// (the staging directory adds its name to the path that is bound).
 #[must_use]
 pub fn max_socket_path_bytes() -> usize {
-    MAX_SOCKET_PATH_BYTES - format!("/.st{}", std::process::id()).len()
+    MAX_SOCKET_PATH_BYTES
+        - format!(
+            "/.st{}-{}",
+            std::process::id(),
+            "0".repeat(STAGING_SUFFIX_BYTES)
+        )
+        .len()
 }
 
 /// Resolve the daemon's paths from explicit inputs. Pure.

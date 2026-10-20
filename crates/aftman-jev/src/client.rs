@@ -59,8 +59,9 @@ pub struct SystemOneClient {
 impl std::fmt::Debug for SystemOneClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SystemOneClient")
-            // The key is never rendered, not even a prefix.
-            .field("base_url", &self.settings.base_url)
+            // The key is never rendered, not even a prefix — and neither is any userinfo in
+            // the base URL, which `redact_url` strips.
+            .field("base_url", &crate::redact_url(&self.settings.base_url))
             .field("model", &self.settings.model)
             .field("configured", &self.settings.is_configured())
             .finish()
@@ -268,12 +269,27 @@ impl SystemOneClient {
         };
         let latency = started.elapsed();
 
-        let decoded: SystemOneResponse =
-            serde_json::from_slice(&response.body).map_err(|error| {
+        let decoded: SystemOneResponse = match serde_json::from_slice(&response.body) {
+            Ok(decoded) => decoded,
+            Err(error) => {
                 let excerpt = String::from_utf8_lossy(&response.body);
                 let excerpt: String = excerpt.chars().take(200).collect();
-                ModelError::Malformed(format!("{error}; body began {excerpt:?}"))
-            })?;
+                // Recorded before returning: the call happened and was billed, so it
+                // belongs in the usage log even though the answer was unusable.
+                let error = ModelError::Malformed(format!("{error}; body began {excerpt:?}"));
+                self.record(
+                    context,
+                    Usage::default(),
+                    &settings.model,
+                    attempts,
+                    latency,
+                    None,
+                    &fitted,
+                    Some(error.code()),
+                );
+                return Err(error);
+            }
+        };
 
         // Usage first: a malformed *answer* still cost tokens.
         let usage: Usage = decoded.usage.into();
@@ -281,6 +297,10 @@ impl SystemOneClient {
             .model
             .clone()
             .unwrap_or_else(|| settings.model.clone());
+        // Then validate answers, which may still fail. One record per request, carrying the
+        // error code when there was one: the request happened and was billed, so it belongs
+        // in the log even when the answer was unusable — and `failed_requests` must count it.
+        let answers = crate::wire::parse_answers(&decoded, questions);
         self.record(
             context,
             usage,
@@ -289,11 +309,9 @@ impl SystemOneClient {
             latency,
             None,
             &fitted,
-            None,
+            answers.as_ref().err().map(ModelError::code),
         );
-
-        // Then validate answers, which may still fail.
-        let answers = crate::wire::parse_answers(&decoded, questions)?;
+        let answers = answers?;
         Ok(ModelAnswers {
             model: reported_model,
             usage,
@@ -862,6 +880,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_malformed_body_is_still_billed() -> Result<(), Box<dyn std::error::Error>> {
+        // The body could not be parsed, so the usage is unknown — but the call happened, and
+        // a bill that only counts successful calls is a bill that lies.
+        let dir = tempfile::tempdir()?;
+        let recorder = Arc::new(UsageRecorder::in_state_dir(dir.path()));
+        let transport = Arc::new(FixtureTransport::always(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: b"{not json".to_vec(),
+        }));
+        let error = SystemOneClient::new(
+            settings(),
+            Arc::clone(&transport) as Arc<dyn Transport>,
+            Arc::new(FixedClock::epoch()),
+        )
+        .with_usage(Arc::clone(&recorder))
+        .ask(&context(), &state(), &questions(), &Budget::default())
+        .await
+        .expect_err("malformed body");
+        assert!(matches!(error, ModelError::Malformed(_)), "{error:?}");
+        let entries = recorder.read()?;
+        assert_eq!(entries.len(), 1, "the call was billed");
+        assert_eq!(entries[0].error.as_deref(), Some("malformed"));
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn usage_is_recorded_even_when_the_answers_are_unusable()
     -> Result<(), Box<dyn std::error::Error>> {
         // A malformed reply still cost tokens, and a bill that only counts successful

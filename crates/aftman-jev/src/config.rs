@@ -52,7 +52,12 @@ pub enum SettingsError {
 }
 
 /// What the client needs to talk to a provider.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// The `Debug` impl is written by hand and does **not** print the key. The derived one did,
+/// so a failing `assert_eq!` in a test, or any `{:?}` in a log or an error message, would put
+/// the credential in the output. `PartialEq` is derived and compares the key — comparing
+/// secrets is not printing them.
+#[derive(Clone, PartialEq)]
 pub struct JevSettings {
     /// Absent means the client is unconfigured; `aftman doctor` reports it and a run
     /// refuses to start rather than pretending to supervise.
@@ -63,6 +68,19 @@ pub struct JevSettings {
     pub timeout: Duration,
     pub retry: RetryPolicy,
     pub budget: Budget,
+}
+
+impl std::fmt::Debug for JevSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JevSettings")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("base_url", &redact_url(&self.base_url))
+            .field("model", &self.model)
+            .field("timeout", &self.timeout)
+            .field("retry", &self.retry)
+            .field("budget", &self.budget)
+            .finish()
+    }
 }
 
 impl Default for JevSettings {
@@ -638,6 +656,22 @@ JUNK LINE
             }
             other => panic!("expected NotANumber, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_key_is_never_rendered() {
+        // A derived `Debug` printed it, so a failing `assert_eq!` or any `{:?}` put the
+        // credential in the output.
+        let settings = JevSettings {
+            api_key: Some("ts-super-secret-value".to_owned()),
+            base_url: "https://user:hunter2@api.example.com".to_owned(),
+            ..JevSettings::default()
+        };
+        let rendered = format!("{settings:?}");
+        assert!(!rendered.contains("ts-super-secret-value"), "{rendered}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        // It says the key is there, without saying what it is.
+        assert!(rendered.contains("redacted"), "{rendered}");
     }
 
     #[test]

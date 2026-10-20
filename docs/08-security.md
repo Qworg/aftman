@@ -257,6 +257,10 @@ Attributes and ignores are read **from the index**, not the worktree, so a FIFO 
 worktree files that are opened are the regular files the status walk already identified, never a
 configured path. Tests plant FIFOs at each of those locations and require the cycle to finish.
 
+**The staging directory is not predictable.** It is named `/.st<pid>-<token>`, where the token
+is random per process, so a directory pre-created in a user-chosen socket directory (`/tmp/…`) cannot
+stop the daemon from binding — the name is not guessable from the pid alone.
+
 **What this does not cover, stated plainly:**
 
 - **Submodules** are never reported as changed (`--ignore-submodules=all` semantics).

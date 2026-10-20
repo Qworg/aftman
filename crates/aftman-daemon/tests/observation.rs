@@ -1116,3 +1116,66 @@ async fn a_path_inside_a_repository_is_refused_rather_than_widened() {
     assert!(note.contains("not the root"), "{note}");
     assert!(observation.git.status_short.is_empty());
 }
+
+/// A FIFO at a **tracked** path must not block the observation.
+///
+/// A tracked file is the one place gix opens a path it was given rather than one it chose,
+/// so it is where a planted FIFO would do the most damage. Two things close it:
+///
+/// - the diff path takes the worktree root away for a path that is not a regular file, so
+///   gix has nothing to open and the entry reads as "missing" — a directory, FIFO or device
+///   is never opened;
+/// - the status path skips a file whose size does not match the index, and a FIFO's size is
+///   zero, so a FIFO is never opened there either (a tracked file that was empty in the index
+///   is skipped by the empty-blob check).
+///
+/// What remains is a file swapped for a FIFO *between* the check and the open. That window
+/// cannot be closed without handing gix the bytes ourselves, which its API does not allow;
+/// what bounds it is the per-run observation slot, so a wedged read costs a fixed number of
+/// threads rather than the blocking pool.
+#[tokio::test]
+async fn a_fifo_at_a_tracked_path_cannot_block_the_observation() {
+    if !have_git() {
+        return;
+    }
+    let dir = short_tempdir().expect("tempdir");
+    let repo = make_repo(dir.path());
+    dirty(&repo);
+    // A tracked file replaced by a FIFO: the case where gix would open a path it was given.
+    std::fs::remove_file(repo.join("a.txt")).expect("remove");
+    mkfifo(&repo.join("a.txt"));
+    let observation = tokio::time::timeout(
+        Duration::from_secs(5),
+        observe(&ObservationBuilder::new(false), &repo),
+    )
+    .await;
+    assert!(
+        observation.is_ok(),
+        "the observation hung on a FIFO at a tracked path"
+    );
+}
+
+/// The same for a tracked file that was **empty** in the index: the size check cannot
+/// conclude anything, so the empty-blob check has to.
+#[tokio::test]
+async fn a_fifo_at_an_empty_tracked_path_cannot_block_the_observation() {
+    if !have_git() {
+        return;
+    }
+    let dir = short_tempdir().expect("tempdir");
+    let repo = make_repo(dir.path());
+    std::fs::write(repo.join("empty.txt"), "").expect("write");
+    git(&repo, &["add", "empty.txt"]);
+    git(&repo, &["commit", "-q", "-m", "empty"]);
+    std::fs::remove_file(repo.join("empty.txt")).expect("remove");
+    mkfifo(&repo.join("empty.txt"));
+    let observation = tokio::time::timeout(
+        Duration::from_secs(5),
+        observe(&ObservationBuilder::new(false), &repo),
+    )
+    .await;
+    assert!(
+        observation.is_ok(),
+        "the observation hung on a FIFO at an empty tracked path"
+    );
+}

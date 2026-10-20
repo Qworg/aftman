@@ -1,0 +1,38 @@
+run id      01a1581e-d622-7727-baac-7c2b21954d6c
+created     2026-10-20 7:02:58.339396785 +00:00:00
+repo        /tmp/live2/repo
+status      needs_human
+worker      pi
+last seq    50
+job         Create a file named HELLO.txt containing exactly the word hello. Change nothing else.
+posture     permissions auto-approve, external sandbox false, steering unsupported
+            WARNING: --permissions auto-approve: the agent runs with its approval prompts suppressed, and aftman does not sandbox it. Isolation is yours to provide.
+directive   Escalate (worker limit reached before completion)
+
+open escalation 01a1581f-6f62-7581-abd8-d77f6c9db592 (check)
+  The worker budget is exhausted and the job does not look complete.
+  answer: aftman answer 01a1581e-d622-7727-baac-7c2b21954d6c 01a1581f-6f62-7581-abd8-d77f6c9db592 "<guidance>"   (or --accept --recheck --stop --claim-complete)
+
+timeline
+  > [   2] STATE_CHANGED: -> routing
+  > [   4] STATE_CHANGED: -> running
+  > [   5] STATE_CHANGED: -> assessing
+  * [  10] DIRECTIVE_SELECTED: StartWorker
+          reason: meaningful implementation work remains
+  > [  12] STATE_CHANGED: -> running
+  > [  15] STATE_CHANGED: -> assessing
+  * [  20] DIRECTIVE_SELECTED: StartWorker
+          reason: meaningful implementation work remains
+  > [  22] STATE_CHANGED: -> running
+  > [  25] STATE_CHANGED: -> assessing
+  * [  30] DIRECTIVE_SELECTED: StartWorker
+          reason: meaningful implementation work remains
+  > [  32] STATE_CHANGED: -> running
+  > [  34] STATE_CHANGED: -> assessing
+  * [  38] DIRECTIVE_SELECTED: Continue
+  > [  39] STATE_CHANGED: -> running
+  > [  42] STATE_CHANGED: -> assessing
+  * [  48] DIRECTIVE_SELECTED: Escalate
+          reason: worker limit reached before completion
+  ? [  49] ESCALATION_RAISED
+  > [  50] STATE_CHANGED: -> needs_human

@@ -66,6 +66,13 @@ pub struct StreamDecoder {
     kind: WorkerKind,
     envelope: Envelope,
     buffer: String,
+    /// Assistant prose not yet terminated by a newline.
+    ///
+    /// A backend sends its prose in *deltas* — fragments of a line, sometimes one character
+    /// at a time. Emitting each delta as a line turned the readable log into one word per
+    /// line, which is unreadable for a human and useless to a model. The prose is therefore
+    /// assembled here and emitted a line at a time.
+    prose: String,
     activity: StreamActivity,
 }
 
@@ -85,6 +92,7 @@ impl StreamDecoder {
             kind,
             envelope: envelope_for(kind),
             buffer: String::new(),
+            prose: String::new(),
             activity: StreamActivity::default(),
         }
     }
@@ -117,6 +125,14 @@ impl StreamDecoder {
 
     /// Flush a trailing partial line, and return what the stream said.
     pub fn finish(&mut self, emit: &mut impl FnMut(&str)) -> StreamActivity {
+        // Prose that never got its newline: the agent's last sentence.
+        if !self.prose.is_empty() {
+            let prose = std::mem::take(&mut self.prose);
+            let prose = prose.trim_end_matches(['\n', '\r']);
+            if !prose.is_empty() {
+                emit(prose);
+            }
+        }
         let leftover = std::mem::take(&mut self.buffer);
         let leftover = leftover.trim();
         if !leftover.is_empty() {
@@ -420,7 +436,16 @@ impl StreamDecoder {
     /// fall silent at exactly the point where the agent is most talkative. Only the
     /// summary is capped, because the summary is what reaches a model.
     fn append_assistant(&mut self, text: &str, emit: &mut impl FnMut(&str)) {
-        emit(text);
+        // The prose is assembled and emitted a line at a time. A delta is a fragment of a
+        // line, not a line.
+        self.prose.push_str(text);
+        while let Some(index) = self.prose.find('\n') {
+            let line: String = self.prose.drain(..=index).collect();
+            let line = line.trim_end_matches(['\n', '\r']);
+            if !line.is_empty() {
+                emit(line);
+            }
+        }
         if self.activity.assistant_text.len() >= ASSISTANT_TEXT_CAP {
             self.activity.assistant_text_truncated = true;
             return;
@@ -639,6 +664,57 @@ mod tests {
             logged > ASSISTANT_TEXT_CAP * 2,
             "the log kept {logged} bytes"
         );
+    }
+
+    #[test]
+    fn one_character_deltas_still_make_one_line() {
+        // What the live run actually produced: the agent's prose arriving a character at a
+        // time, which the log rendered as one character per line.
+        let mut stream = String::new();
+        for character in "done".chars() {
+            stream.push_str(&format!(
+                "{{\"type\":\"message_update\",\"assistantMessageEvent\":{{\"type\":\"text_delta\",\"delta\":\"{character}\"}}}}\n"
+            ));
+        }
+        let (lines, activity) = decode_all(WorkerKind::Pi, &stream);
+        assert_eq!(lines, vec!["done"], "four deltas, one line");
+        assert_eq!(activity.assistant_text, "done");
+    }
+
+    #[test]
+    fn assistant_prose_is_emitted_as_readable_lines_not_one_per_delta() {
+        // A backend sends its prose in deltas — sometimes one character at a time. Emitting
+        // each delta as a line made the readable log one word per line, which a human cannot
+        // read and a model cannot use. This is what a live run found.
+        let mut stream = String::new();
+        for chunk in ["Created ", "`HELLO.txt`", " in ", "`/tmp/repo`", "."] {
+            stream.push_str(&format!(
+                "{{\"type\":\"message_update\",\"assistantMessageEvent\":{{\"type\":\"text_delta\",\"delta\":\"{chunk}\"}}}}\n"
+            ));
+        }
+        let (lines, activity) = decode_all(WorkerKind::Pi, &stream);
+        assert_eq!(
+            lines,
+            vec!["Created `HELLO.txt` in `/tmp/repo`."],
+            "the prose must be one readable line"
+        );
+        assert_eq!(
+            activity.assistant_text,
+            "Created `HELLO.txt` in `/tmp/repo`."
+        );
+    }
+
+    #[test]
+    fn prose_with_its_own_newlines_is_emitted_as_several_lines() {
+        let mut stream = String::new();
+        // The deltas carry a real newline, so the JSON must escape it.
+        for chunk in ["first line\\n", "second line\\n", "third"] {
+            stream.push_str(&format!(
+                "{{\"type\":\"message_update\",\"assistantMessageEvent\":{{\"type\":\"text_delta\",\"delta\":\"{chunk}\"}}}}\n"
+            ));
+        }
+        let (lines, _) = decode_all(WorkerKind::Pi, &stream);
+        assert_eq!(lines, vec!["first line", "second line", "third"]);
     }
 
     #[test]

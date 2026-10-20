@@ -20,6 +20,12 @@ use aftman_core::model::Budget;
 
 use crate::retry::RetryPolicy;
 
+/// The most retries a chain may make.
+///
+/// The chain's total budget is `timeout * 4`, so more than a handful of retries is already
+/// unreachable; the bound is here so an operator cannot configure a chain that retries for weeks.
+pub const MAX_RETRIES: u64 = 10;
+
 /// Default endpoint.
 pub const DEFAULT_BASE_URL: &str = "https://api.typesafe.ai";
 /// Default model alias.
@@ -339,11 +345,28 @@ pub fn resolve_with(
     }
 
     if let Some(raw) = lookup("AFTMAN_JEV_TIMEOUT_SECONDS") {
-        settings.timeout = Duration::from_secs(parse_u64("AFTMAN_JEV_TIMEOUT_SECONDS", &raw)?);
+        let seconds = parse_u64("AFTMAN_JEV_TIMEOUT_SECONDS", &raw)?;
+        // Zero was accepted, and it makes every attempt time out — so the request is retried
+        // until the budget is spent, and every cycle fails the same way.
+        if seconds == 0 {
+            return Err(SettingsError::Budget(
+                "AFTMAN_JEV_TIMEOUT_SECONDS must be at least 1".to_owned(),
+            ));
+        }
+        settings.timeout = Duration::from_secs(seconds);
     }
     if let Some(raw) = lookup("AFTMAN_JEV_MAX_RETRIES") {
+        let retries = parse_u64("AFTMAN_JEV_MAX_RETRIES", &raw)?;
+        // `u32::MAX` was accepted, which with the backoff is a supervisor that retries for
+        // weeks. The chain's total budget is `timeout * 4`, so more than a handful of retries
+        // is already unreachable.
+        if retries > MAX_RETRIES {
+            return Err(SettingsError::Budget(format!(
+                "AFTMAN_JEV_MAX_RETRIES must be at most {MAX_RETRIES}"
+            )));
+        }
         settings.retry.max_retries =
-            u32::try_from(parse_u64("AFTMAN_JEV_MAX_RETRIES", &raw)?).unwrap_or(u32::MAX);
+            u32::try_from(retries).unwrap_or(u32::try_from(MAX_RETRIES).unwrap_or(0));
     }
     if let Some(raw) = lookup("AFTMAN_JEV_MAX_RETRY_AFTER_SECONDS") {
         settings.retry.max_retry_after =
@@ -656,6 +679,30 @@ JUNK LINE
             }
             other => panic!("expected NotANumber, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_retry_and_timeout_bounds_are_refused_rather_than_obeyed() {
+        // `u32::MAX` retries with the backoff is a supervisor that retries for weeks, and a
+        // zero timeout makes every attempt time out and be retried.
+        let with = |pairs: &[(&str, &str)]| {
+            let file: BTreeMap<String, String> = pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect();
+            super::resolve_with(&|_| None, Some(&file))
+        };
+        assert!(
+            with(&[("AFTMAN_JEV_MAX_RETRIES", "100000")]).is_err(),
+            "an unbounded retry count must be refused"
+        );
+        assert!(
+            with(&[("AFTMAN_JEV_TIMEOUT_SECONDS", "0")]).is_err(),
+            "a zero timeout must be refused"
+        );
+        // A sane value still works.
+        let settings = with(&[("AFTMAN_JEV_MAX_RETRIES", "3")]).expect("a sane value");
+        assert_eq!(settings.retry.max_retries, 3);
     }
 
     #[test]

@@ -23,6 +23,11 @@ use async_trait::async_trait;
 #[derive(Clone, PartialEq, Eq)]
 pub struct HttpRequest {
     pub url: String,
+    /// The HTTP method. `POST` for a question, `GET` for a listing.
+    ///
+    /// The model listing is `GET /v1/models`; sending it as POST worked against no
+    /// provider, so `aftman doctor`'s listing always failed.
+    pub method: HttpMethod,
     /// Ordered so a test can assert exactly what was sent.
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
@@ -54,7 +59,44 @@ impl std::fmt::Debug for HttpRequest {
     }
 }
 
+/// The HTTP method a request uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HttpMethod {
+    #[default]
+    Post,
+    Get,
+}
+
 impl HttpRequest {
+    /// A `POST` request, which is what a question is.
+    #[must_use]
+    pub fn post(
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            url,
+            method: HttpMethod::Post,
+            headers,
+            body,
+            timeout,
+        }
+    }
+
+    /// A `GET` request, which is what a listing is.
+    #[must_use]
+    pub fn get(url: String, headers: Vec<(String, String)>, timeout: Duration) -> Self {
+        Self {
+            url,
+            method: HttpMethod::Get,
+            headers,
+            body: Vec::new(),
+            timeout,
+        }
+    }
+
     #[must_use]
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers
@@ -145,12 +187,17 @@ impl Default for ReqwestTransport {
 #[async_trait]
 impl Transport for ReqwestTransport {
     async fn send(&self, request: HttpRequest) -> Result<HttpResponse, ModelError> {
-        let method = reqwest::Method::POST;
+        let method = match request.method {
+            HttpMethod::Post => reqwest::Method::POST,
+            HttpMethod::Get => reqwest::Method::GET,
+        };
         let mut builder = self
             .client
             .request(method, &request.url)
-            .timeout(request.timeout)
-            .body(request.body.clone());
+            .timeout(request.timeout);
+        if request.method == HttpMethod::Post {
+            builder = builder.body(request.body.clone());
+        }
         for (name, value) in &request.headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
@@ -308,6 +355,7 @@ mod tests {
     #[test]
     fn the_authorization_header_is_never_rendered() {
         let request = HttpRequest {
+            method: super::HttpMethod::Post,
             url: "https://api.example/v1/systemone".to_owned(),
             headers: vec![
                 (
@@ -332,6 +380,7 @@ mod tests {
 
     fn request() -> HttpRequest {
         HttpRequest {
+            method: super::HttpMethod::Post,
             url: "https://api.example/v1/systemone".to_owned(),
             headers: vec![("X-Test".to_owned(), "yes".to_owned())],
             body: br#"{"state":{}}"#.to_vec(),

@@ -17,13 +17,41 @@ use aftman_core::error::ModelError;
 use async_trait::async_trait;
 
 /// One request.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The `Debug` impl is written by hand and redacts the `Authorization` header. The derived one
+/// printed it, so a `{:?}` in a log line or a test failure put the credential in the output.
+#[derive(Clone, PartialEq, Eq)]
 pub struct HttpRequest {
     pub url: String,
     /// Ordered so a test can assert exactly what was sent.
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
     pub timeout: Duration,
+}
+
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpRequest")
+            .field("url", &self.url)
+            .field(
+                "headers",
+                &self
+                    .headers
+                    .iter()
+                    .map(|(name, value)| {
+                        let redacted = if name.eq_ignore_ascii_case("authorization") {
+                            "<redacted>"
+                        } else {
+                            value.as_str()
+                        };
+                        (name, redacted)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .field("body", &self.body.len())
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 impl HttpRequest {
@@ -276,6 +304,31 @@ mod tests {
     use super::{FixtureResponse, FixtureTransport, HttpRequest, HttpResponse, Transport};
     use aftman_core::error::ModelError;
     use std::time::Duration;
+
+    #[test]
+    fn the_authorization_header_is_never_rendered() {
+        let request = HttpRequest {
+            url: "https://api.example/v1/systemone".to_owned(),
+            headers: vec![
+                (
+                    "Authorization".to_owned(),
+                    "Bearer ts-super-secret".to_owned(),
+                ),
+                ("X-Test".to_owned(), "yes".to_owned()),
+            ],
+            body: b"{}".to_vec(),
+            timeout: Duration::from_secs(1),
+        };
+        let rendered = format!("{request:?}");
+        assert!(!rendered.contains("ts-super-secret"), "{rendered}");
+        assert!(rendered.contains("redacted"), "{rendered}");
+        // The header itself is still there, and still readable.
+        assert_eq!(
+            request.header("authorization"),
+            Some("Bearer ts-super-secret"),
+            "redaction is for display only"
+        );
+    }
 
     fn request() -> HttpRequest {
         HttpRequest {

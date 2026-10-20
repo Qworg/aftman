@@ -150,6 +150,23 @@ impl StreamActivity {
         names
     }
 
+    /// Whether the stream said nothing at all: no prose, no tool calls, and no tokens.
+    ///
+    /// Distinct from "a quiet worker inside a working stream". A `pi` run that picked a model
+    /// returning empty content produced a well-formed stream with `content: []` and
+    /// `"totalTokens": 0` — the worker ran, exited 0, and did nothing, and every other signal
+    /// said success. This is the shape that hid it.
+    #[must_use]
+    pub fn produced_nothing(&self) -> bool {
+        self.assistant_text.trim().is_empty()
+            && self.tool_calls() == 0
+            && self
+                .usage
+                .and_then(|usage| usage.total_tokens())
+                .unwrap_or(0)
+                == 0
+    }
+
     /// Whether the stream looked like the format it was expected to be.
     ///
     /// A backend whose shape changed produces a stream that parses as nothing; a caller
@@ -339,6 +356,47 @@ mod tests {
             !activity.tool_calls[0].failed,
             "the earlier read is untouched"
         );
+    }
+
+    #[test]
+    fn a_run_that_said_nothing_is_recognised() {
+        // A well-formed stream carrying no prose, no tools and no tokens: the worker ran and
+        // did nothing, which every other signal reports as success.
+        assert!(StreamActivity::default().produced_nothing());
+        let silent = StreamActivity {
+            lines: 9,
+            usage: Some(StreamUsage {
+                input_tokens: Some(0),
+                output_tokens: Some(0),
+                cost_usd: None,
+            }),
+            ..StreamActivity::default()
+        };
+        assert!(silent.produced_nothing());
+
+        // Any one of the three means it did something.
+        let spoke = StreamActivity {
+            assistant_text: "ok".into(),
+            ..StreamActivity::default()
+        };
+        assert!(!spoke.produced_nothing());
+        let worked = StreamActivity {
+            tool_calls: vec![ToolCall {
+                name: "read".into(),
+                failed: false,
+            }],
+            ..StreamActivity::default()
+        };
+        assert!(!worked.produced_nothing());
+        let spent = StreamActivity {
+            usage: Some(StreamUsage {
+                input_tokens: Some(12),
+                output_tokens: Some(1),
+                cost_usd: None,
+            }),
+            ..StreamActivity::default()
+        };
+        assert!(!spent.produced_nothing());
     }
 
     #[test]

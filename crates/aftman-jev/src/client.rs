@@ -242,12 +242,8 @@ impl SystemOneClient {
             ModelError::BadRequest(format!("could not encode the request body: {error}"))
         })?;
 
-        let request = HttpRequest {
-            url: settings.endpoint(),
-            headers: self.headers(0),
-            body,
-            timeout: settings.timeout,
-        };
+        let request =
+            HttpRequest::post(settings.endpoint(), self.headers(0), body, settings.timeout);
 
         let started = Instant::now();
         let (response, attempts) = match self.send_with_retries(&request, settings.retry).await {
@@ -403,12 +399,13 @@ impl SystemOneClient {
     pub async fn models(&self) -> Result<Vec<ModelInfo>, ModelError> {
         // Fail before a pointless round trip.
         self.api_key()?;
-        let request = HttpRequest {
-            url: self.settings.models_endpoint(),
-            headers: self.headers(0),
-            body: Vec::new(),
-            timeout: self.settings.timeout,
-        };
+        // `GET /v1/models`: the listing is not a question, and POSTing it worked against no
+        // provider — so `aftman doctor`'s listing always failed.
+        let request = HttpRequest::get(
+            self.settings.models_endpoint(),
+            self.headers(0),
+            self.settings.timeout,
+        );
         let response = self.transport.send(request).await?;
         if !(200..300).contains(&response.status) {
             return Err(classify_status(response.status, &response.body));
@@ -903,6 +900,29 @@ mod tests {
         let entries = recorder.read()?;
         assert_eq!(entries.len(), 1, "the call was billed");
         assert_eq!(entries[0].error.as_deref(), Some("malformed"));
+        Ok(())
+    }
+
+    /// The model listing is `GET /v1/models`. It used to be sent as POST, because the
+    /// transport only knew how to POST — so `aftman doctor`'s listing failed against every
+    /// provider.
+    #[tokio::test(start_paused = true)]
+    async fn the_model_listing_is_a_get() -> Result<(), Box<dyn std::error::Error>> {
+        let transport = Arc::new(FixtureTransport::always(HttpResponse::json(
+            200,
+            json!({ "models": [{ "id": "jev-latest" }] }),
+        )));
+        let client = SystemOneClient::new(
+            settings(),
+            Arc::clone(&transport) as Arc<dyn Transport>,
+            Arc::new(FixedClock::epoch()),
+        );
+        let models = client.models().await?;
+        assert_eq!(models.len(), 1);
+        assert_eq!(
+            transport.requests()[0].method,
+            crate::transport::HttpMethod::Get
+        );
         Ok(())
     }
 

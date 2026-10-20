@@ -641,13 +641,35 @@ async fn a_worker_whose_run_task_is_aborted_dies_and_its_stale_record_is_cleaned
 
 // ---- 10: nothing is created on the way out --------------------------------------------
 
+/// Remove a directory the daemon is still writing to.
+///
+/// The daemon is running when the state directory is removed — that is the point of the
+/// test — so a file can appear between the directory's own listing and the removal, and
+/// `remove_dir_all` fails with `DirectoryNotEmpty`. Retried, because the writes are
+/// transient; the daemon's writes stop when it does.
+fn remove_dir_all_retrying(dir: &std::path::Path) -> Result<(), std::io::Error> {
+    let mut last = None;
+    for _ in 0..50 {
+        match std::fs::remove_dir_all(dir) {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                last = Some(error);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::other("the state directory kept being written to")))
+}
+
 #[tokio::test]
 async fn shutdown_creates_nothing_when_the_data_directory_has_been_removed() -> TestResult {
     let mut h = Harness::start().await?;
     let mut c = h.client().await?;
     let _run = h.start_run(&mut c, |_| {}).await?;
     h.wait_worker_running().await;
-    std::fs::remove_dir_all(&h.state)?;
+    remove_dir_all_retrying(&h.state)?;
 
     h.shutdown_via_future().await;
     assert!(

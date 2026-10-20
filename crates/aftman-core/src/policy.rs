@@ -219,6 +219,24 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
     // A repeated model failure means supervision is blind. This is deliberately a
     // *different* message from "the model thinks a human is needed": conflating
     // them is how a supervisor loses an operator's trust.
+    // A request that cannot be compacted is not a model failure. It is the observation being
+    // too large to send, which is a fact about the repository and the caps, and it needs its
+    // own answer: "reduce the evidence or raise the budget", not "the model is gone".
+    if input.counters.consecutive_budget_failures >= 3 {
+        invariants.push(Invariant::ObservationTooLarge);
+        return PolicyDecision {
+            selected: Directive::Escalate {
+                reason: "observation_too_large: the request cannot be compacted to fit".into(),
+                ask: "The repository evidence does not fit the request budget. Raise \
+                      AFTMAN_JEV_REQUEST_BUDGET_BYTES, or reduce what the observation \
+                      collects."
+                    .into(),
+            },
+            considered: proposals.to_vec(),
+            suppressed,
+            invariants,
+        };
+    }
     if input.counters.consecutive_model_failures >= 3 {
         invariants.push(Invariant::ModelUnavailable);
         return PolicyDecision {

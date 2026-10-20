@@ -86,8 +86,13 @@ pub fn fit(state: &Value, budget: &Budget) -> Result<BudgetFit, ModelError> {
     // ---- Step 2: is the required evidence, now bounded, small enough? -----
     let protected = byte_len(&protected_subset(&work));
     if protected > budget.request_bytes {
+        // The measurements travel with the refusal. "Raise the budget or reduce the
+        // evidence" is only actionable if it says which evidence, and the two refusals fail
+        // for opposite reasons: one is protected evidence that cannot be reduced at all, the
+        // other is reducible evidence that was not reduced enough.
         return Err(ModelError::BudgetExceeded(format!(
-            "required evidence alone is {protected} bytes, over the {} byte request budget",
+            "required evidence alone is {protected} bytes, over the {} byte request budget; \
+             it is protected, so the budget must rise or the evidence must shrink",
             budget.request_bytes
         )));
     }
@@ -109,7 +114,8 @@ pub fn fit(state: &Value, budget: &Budget) -> Result<BudgetFit, ModelError> {
     if size > budget.request_bytes {
         return Err(ModelError::BudgetExceeded(format!(
             "could not compact the observation below {} bytes (reached {size}); \
-             reductions applied: {measurements:?}",
+             reductions applied: {measurements:?}; the request is refused rather than sent \
+             with required evidence missing",
             budget.request_bytes
         )));
     }
@@ -193,6 +199,74 @@ fn reduce(work: &mut Value, target: usize, measurements: &mut BTreeMap<String, u
     if let Some(object) = work.get_mut("worker_output").and_then(Value::as_object_mut) {
         object.insert("output_head".to_owned(), Value::String(String::new()));
         measurements.insert("output_head_dropped".to_owned(), 1);
+    }
+    if byte_len(work) <= target {
+        return;
+    }
+
+    // The unprotected keys the review named. None of these is required evidence — a check
+    // asks for them, but the *request* does not need them to be complete — so they are
+    // reduced before the request is refused. A refusal with a reducible field still in it
+    // is a refusal the operator cannot act on without knowing which field to shrink.
+    for (key, measurement) in [
+        ("changed_files", "changed_files_dropped"),
+        ("test_results", "test_results_dropped"),
+    ] {
+        if byte_len(work) <= target {
+            return;
+        }
+        // Keep the first: a changed-files list reads newest-first in the observation, and the
+        // leading entries are the ones a check asks about. Halved repeatedly, because halving
+        // once is not enough when the list is an order of magnitude over the budget — and a
+        // refusal with a reducible field still in it is a refusal the operator cannot act on.
+        loop {
+            let over = byte_len(work) > target;
+            let Some(array) = work.get_mut(key).and_then(Value::as_array_mut) else {
+                break;
+            };
+            if !over || array.len() <= 1 {
+                break;
+            }
+            let before = array.len();
+            array.truncate(before / 2);
+            let now = array.len();
+            measurements
+                .entry(measurement.to_owned())
+                .and_modify(|dropped| *dropped += before - now)
+                .or_insert(before - now);
+        }
+    }
+    if byte_len(work) <= target {
+        return;
+    }
+    // The distinct tool names in the activity: a sample says "read, bash, edit", and the
+    // count beside it is the signal anyway.
+    if let Some(object) = work
+        .get_mut("worker_activity")
+        .and_then(Value::as_object_mut)
+        && let Some(names) = object.get_mut("tool_names").and_then(Value::as_array_mut)
+    {
+        let before = names.len();
+        names.truncate(before / 2);
+        if names.len() != before {
+            measurements.insert("tool_names_dropped".to_owned(), before - names.len());
+        }
+    }
+    if byte_len(work) <= target {
+        return;
+    }
+    // The repository instructions, halved: the file is a reference, and its head is what
+    // a check reads.
+    if let Some(object) = work
+        .get_mut("agents_md_instructions")
+        .and_then(Value::as_object_mut)
+        && let Some(Value::String(content)) = object.get_mut("content")
+    {
+        let before = content.len();
+        if before > 512 {
+            *content = truncate_middle(content, before / 2);
+            measurements.insert("instructions_truncated".to_owned(), before - content.len());
+        }
     }
     if byte_len(work) <= target {
         return;
@@ -577,6 +651,49 @@ mod tests {
             "the diff is untouched while events remain"
         );
         assert!(byte_len(&fitted.state) <= small_budget().request_bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn a_large_reducible_field_is_reduced_rather_than_refused()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A refusal with a reducible field still in it is a refusal the operator cannot act
+        // on without knowing which field to shrink.
+        let budget = Budget {
+            pair_bytes: 20_000,
+            request_bytes: 40_000,
+            pair_target_bytes: 12_000,
+            request_target_bytes: 20_000,
+        };
+        let state = json!({
+            "job": { "prompt": "add retries" },
+            "factory_status": { "status": "running" },
+            "active_worker": { "status": "running" },
+            "changed_files": (0..6000).map(|i| format!("some/long/path/to/file{i:05}.rs")).collect::<Vec<_>>(),
+            "counters": { "attempts": 1 },
+        });
+        let before = byte_len(&state);
+        assert!(
+            before > budget.request_bytes,
+            "the fixture must start over the budget: {before}"
+        );
+
+        let fitted = fit(&state, &budget)?;
+        assert!(
+            byte_len(&fitted.state) <= budget.request_bytes,
+            "the request must fit after reduction"
+        );
+        let files = fitted.state["changed_files"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0);
+        assert!(files > 0, "some of the list must survive");
+        assert!(files < 6000, "and some of it must have been dropped");
+        assert!(
+            fitted.measurements.contains_key("changed_files_dropped"),
+            "the reduction must be reported: {:?}",
+            fitted.measurements
+        );
         Ok(())
     }
 

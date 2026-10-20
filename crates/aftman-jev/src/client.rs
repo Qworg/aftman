@@ -141,7 +141,15 @@ impl SystemOneClient {
         policy: RetryPolicy,
     ) -> Result<(HttpResponse, u32), ModelError> {
         let mut attempt: u32 = 0;
+        // The total wall-clock budget for the whole chain, as `docs/03-jev.md` §4 promises.
+        // Nothing enforced it: three 10-second timeouts plus two 30-second `Retry-After`
+        // waits came to more than ninety seconds against a promised forty. A supervisor that
+        // blocks for ninety seconds has stopped supervising.
+        let deadline = self.clock.now() + request.timeout * 4;
         loop {
+            if self.clock.now() >= deadline {
+                return Err(ModelError::Timeout(request.timeout * 4));
+            }
             let mut attempt_request = request.clone();
             attempt_request.headers = self.headers(attempt);
 
@@ -152,20 +160,28 @@ impl SystemOneClient {
                 Ok(response) => {
                     let requested =
                         retry_after(&response.headers, self.clock.now(), policy.max_retry_after);
+                    // Classify *first*. A `401` with `retry-after: 600` is an authentication
+                    // failure, not a rate limit, and calling it a rate limit meant the run was
+                    // not failed — it sat retrying a request that could never succeed.
+                    let classified = classify_status(response.status, &response.body);
+                    // A provider asking for longer than we will block for: return the request
+                    // rather than sleeping through it. Only a rate limit is a rate limit; a
+                    // `401` that says "come back in ten minutes" is still an auth failure.
+                    if let RetryAfter::TooLong(delay) = requested {
+                        return Err(match classified {
+                            ModelError::RateLimited { .. } => ModelError::RateLimited {
+                                retry_after: Some(delay),
+                            },
+                            other => other,
+                        });
+                    }
                     let error = with_retry_after(
-                        classify_status(response.status, &response.body),
+                        classified,
                         match requested {
                             RetryAfter::Wait(delay) => Some(delay),
                             RetryAfter::TooLong(_) | RetryAfter::Unspecified => None,
                         },
                     );
-                    // A provider asking for longer than we will block for: return the
-                    // request rather than sleeping through it.
-                    if let RetryAfter::TooLong(delay) = requested {
-                        return Err(ModelError::RateLimited {
-                            retry_after: Some(delay),
-                        });
-                    }
                     if attempt >= policy.max_retries || !error.is_retryable() {
                         return Err(error);
                     }
@@ -626,6 +642,55 @@ mod tests {
             .ask(&context(), &state(), &questions(), &Budget::default())
             .await?;
         assert_eq!(answers.attempts, 2);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_401_with_a_long_retry_after_is_an_auth_failure_not_a_rate_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The `TooLong` check used to run before classification, so *any* status with a long
+        // `Retry-After` came back as `RateLimited` — and a rate limit is retryable, so the run
+        // sat retrying a request that could never succeed.
+        let mut response = HttpResponse::json(401, json!({"error": "bad key"}));
+        response
+            .headers
+            .push(("retry-after".to_owned(), "600".to_owned()));
+        let transport = Arc::new(FixtureTransport::always(response));
+        let error = client(Arc::clone(&transport))
+            .ask(&context(), &state(), &questions(), &Budget::default())
+            .await
+            .expect_err("must fail");
+        assert_eq!(
+            error,
+            ModelError::Auth,
+            "a 401 is an auth failure whatever its Retry-After says"
+        );
+        assert_eq!(transport.call_count(), 1, "auth is never retried");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_429_with_a_long_retry_after_is_still_a_rate_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The other half: a rate limit is a rate limit, and the delay is reported.
+        let mut response = HttpResponse::json(429, json!({"error": "slow down"}));
+        response
+            .headers
+            .push(("retry-after".to_owned(), "600".to_owned()));
+        let transport = Arc::new(FixtureTransport::always(response));
+        let error = client(Arc::clone(&transport))
+            .ask(&context(), &state(), &questions(), &Budget::default())
+            .await
+            .expect_err("must fail");
+        assert!(
+            matches!(
+                error,
+                ModelError::RateLimited {
+                    retry_after: Some(_)
+                }
+            ),
+            "{error:?}"
+        );
         Ok(())
     }
 

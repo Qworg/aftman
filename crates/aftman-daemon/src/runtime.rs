@@ -932,11 +932,25 @@ impl FactoryRuntime {
                         (resolved, answers.model, answers.usage)
                     }
                     Err(error) => {
-                        state.counters.consecutive_model_failures += 1;
+                        // A budget refusal is not a model failure. The request could not be
+                        // built, so the model was never asked; counting it as a model failure
+                        // made a repository too large to describe escalate as "model_unavailable:
+                        // supervision is blind", and it left no usage line, so `aftman usage`
+                        // could not show why.
+                        let refused = matches!(error, ModelError::BudgetExceeded(_));
+                        if refused {
+                            state.counters.consecutive_budget_failures += 1;
+                            state.counters.consecutive_model_failures = 0;
+                        } else {
+                            state.counters.consecutive_model_failures += 1;
+                            state.counters.consecutive_budget_failures = 0;
+                        }
                         // A rate limit is a different operational event from a malformed
                         // answer, and the UI shows them differently, so they are distinct
                         // event kinds rather than one `Error` with a code inside.
-                        let kind = if matches!(error, ModelError::RateLimited { .. }) {
+                        let kind = if refused {
+                            EventKind::BudgetExceeded
+                        } else if matches!(error, ModelError::RateLimited { .. }) {
                             EventKind::RateLimited
                         } else {
                             EventKind::ModelError

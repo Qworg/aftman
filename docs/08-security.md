@@ -230,13 +230,24 @@ records `observation_note` rather than leaving a thread hashing for minutes.
 
 **How worktree files are opened, precisely.** Only the paths this module opens itself — the
 untracked-file excerpts and `AGENTS.md` — use `O_NONBLOCK | O_NOFOLLOW` on a confirmed regular
-file. Tracked files in the diff and status-hash paths are typed by a `symlink_metadata` check and
-then opened by gix's own `File::open`: a worker that swaps a regular file for a FIFO *between* the
-check and the read blocks that read. The type check means a FIFO planted in advance is skipped; it
-does not make the open non-blocking, and it cannot close that window. What bounds the window is the
-observation slot, per run, in `crates/aftman-daemon/src/obs.rs`: a wedged read keeps its slot, so
-after `MAX_CONCURRENT_OBSERVATIONS` of them the run's cycles skip observation with a note instead of
-consuming the blocking pool.
+file. A *tracked* file is opened by gix, so it needs saying what happens there:
+
+- **The diff path never opens a non-regular file.** For a path that is not a regular file the
+  worktree root is taken away before the resource is set, so gix has no path to open and the entry
+  reads as "missing". A directory, FIFO or device at a tracked path is never opened.
+- **The status path never opens a FIFO either.** A FIFO's size is zero, and a tracked file whose
+  size does not match the index is skipped without reading it; a tracked file that *was* empty in
+  the index is skipped by the empty-blob check. So a FIFO planted in advance is skipped in both
+  paths.
+
+What remains is a file swapped for a FIFO *between* the type check and gix's `File::open`. That
+window cannot be closed without handing gix the bytes ourselves, and its API does not allow it:
+`index_as_worktree_with_renames` builds the reader internally, and the diff pipeline opens the path
+itself. What bounds the window is the observation slot, per run, in
+`crates/aftman-daemon/src/obs.rs`: a wedged read keeps its slot, so after
+`MAX_CONCURRENT_OBSERVATIONS` of them the run's cycles skip observation with a note instead of
+consuming the blocking pool. Tests plant a FIFO at a tracked path — including one that was empty in
+the index — and require the cycle to finish.
 
 A blocking task cannot be killed, so the paths gix would open are also closed off by construction.
 Attributes and ignores are read **from the index**, not the worktree, so a FIFO planted at a

@@ -48,7 +48,7 @@ use crate::cli::{Cli, Command};
 pub fn main_entry() -> ExitCode {
     let cli = Cli::parse();
 
-    if matches!(cli.command, Command::Serve { detached: true }) {
+    if matches!(cli.command, Command::Serve { detached: true, .. }) {
         // Synchronously, first, single-threaded. Failure (already a group leader) is
         // not fatal: the daemon then simply keeps the session it has.
         if let Err(error) = autostart::leave_session() {

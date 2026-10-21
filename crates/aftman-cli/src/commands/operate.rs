@@ -654,7 +654,74 @@ async fn daemon_section(ctx: &Ctx, data_dir: &Path) -> Result<(), CliError> {
     if let Some(pid) = aftman_daemon::probe_state_dir(data_dir).await {
         outln!("  state lock  held by pid {pid}")?;
     }
+    web_section();
     Ok(())
+}
+
+/// The `web` section of `doctor`.
+///
+/// It reports the posture this shell *would* serve, not the daemon's: a bind or a token that
+/// only exists in the daemon's environment is exactly the disagreement `doctor` is for, and
+/// the daemon's own view is already in `daemon.status` (`web.bind`, `web.auth`).
+fn web_section() {
+    let env = |key: &str| std::env::var(key).ok();
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".config"))
+        });
+    outln!().ok();
+    outln!("web").ok();
+    let config = match aftman_web::WebConfig::load(config_home.as_deref(), &env) {
+        Ok(config) => config,
+        Err(error) => {
+            outln!("  configuration refused: {error}").ok();
+            return;
+        }
+    };
+    if !config.enabled() {
+        outln!("  enabled     no (set [web] enabled = true, or serve --bind)").ok();
+        return;
+    }
+    outln!("  enabled     yes").ok();
+    outln!(
+        "  bind        {}{}",
+        config.bind(),
+        if aftman_web::config::is_loopback(config.bind()) {
+            " (loopback)"
+        } else {
+            " (not loopback: a token is required)"
+        }
+    )
+    .ok();
+    outln!("  auth        {}", config.auth().as_str()).ok();
+    let roots: Vec<String> = config
+        .allowed_repo_roots()
+        .iter()
+        .map(|root| root.display().to_string())
+        .collect();
+    outln!(
+        "  repo roots  {}",
+        if roots.is_empty() {
+            "(none: POST /v1/runs will refuse every path)".to_owned()
+        } else {
+            roots.join(", ")
+        }
+    )
+    .ok();
+    outln!(
+        "  token       {}",
+        match (config.auth(), config.configured_token()) {
+            (aftman_web::AuthMode::Token, Some(_)) => "configured",
+            (aftman_web::AuthMode::Token, None) => "generated at startup, printed once",
+            _ => "not used",
+        }
+    )
+    .ok();
+    let hosts = config.allowed_hosts();
+    if !hosts.is_empty() {
+        outln!("  hosts       {}", hosts.join(", ")).ok();
+    }
 }
 
 fn describe_mode(path: &Path) -> String {

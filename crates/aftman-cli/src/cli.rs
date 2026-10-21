@@ -297,8 +297,7 @@ pub struct DemoArgs {
 /// # Errors
 /// An unknown status name.
 pub fn parse_status(text: &str) -> Result<FactoryStatus, CliError> {
-    let snake = text.trim().to_ascii_lowercase().replace('-', "_");
-    serde_json::from_value(serde_json::Value::String(snake.clone())).map_err(|_| {
+    FactoryStatus::parse(text).ok_or_else(|| {
         CliError::usage(format!(
             "unknown status `{text}` (queued, routing, running, assessing, stopped, \
              verifying, needs-human, finished, failed, cancelled)"

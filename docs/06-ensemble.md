@@ -317,6 +317,14 @@ pub enum Resolution {
 pub struct ResolvedCheck {
     pub check: CheckKey,
     pub threshold: Option<f32>,
+    /// The margin this check was resolved against.
+    ///
+    /// Persisted, not assumed: `decisive` is `|p − t| >= margin`, so a record without the
+    /// margin it was judged against cannot be re-read — two records with the same `p` and
+    /// `t` mean different things under different margins. A snapshot written before this
+    /// field existed decodes as `DEFAULT_UNCERTAINTY_MARGIN` (`0.15`, the value every
+    /// earlier release used), so an old run still renders.
+    pub margin: f32,
     /// What Jev said, unmodified. This is what a human sees in the log and the
     /// UI, and it is never overwritten by an opinion.
     pub jev_p: Option<f32>,

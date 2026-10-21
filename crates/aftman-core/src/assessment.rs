@@ -167,6 +167,19 @@ pub enum Resolution {
     HumanDecided { decision: HumanDecision },
 }
 
+/// The default uncertainty margin: how close to a threshold a value may sit before policy
+/// refuses to act on it.
+///
+/// It is a constant here because [`ResolvedCheck`] persists it: a record has to name the
+/// margin it was judged against, and a snapshot written before that field existed has to
+/// deserialize to something. It was `0.15` in every release up to and including the one
+/// that added the field.
+pub const DEFAULT_UNCERTAINTY_MARGIN: f32 = 0.15;
+
+fn default_margin_value() -> f32 {
+    DEFAULT_UNCERTAINTY_MARGIN
+}
+
 /// What policy actually reads for one check.
 ///
 /// Jev's number is preserved verbatim in `jev_p`; `permitted` carries the
@@ -177,6 +190,14 @@ pub struct ResolvedCheck {
     pub check: CheckKey,
     /// `None` for a check with no threshold, which therefore has no band.
     pub threshold: Option<f32>,
+    /// The uncertainty margin this check was resolved against.
+    ///
+    /// Stored rather than assumed: `decisive` is `|p - t| >= margin`, so a record without
+    /// the margin it was judged against cannot be re-read. A snapshot written before this
+    /// field existed deserializes as [`DEFAULT_UNCERTAINTY_MARGIN`], which is the value the
+    /// runtime used at the time.
+    #[serde(default = "default_margin_value")]
+    pub margin: f32,
     /// Exactly what the model said. Never overwritten by an opinion.
     pub jev_p: Option<f32>,
     pub side: Option<Side>,
@@ -211,6 +232,7 @@ impl ResolvedCheck {
             return Self {
                 check,
                 threshold: None,
+                margin,
                 jev_p: p,
                 side: None,
                 band: Band::Decisive,
@@ -239,6 +261,7 @@ impl ResolvedCheck {
         Self {
             check,
             threshold: Some(t),
+            margin,
             jev_p: p,
             side,
             band,

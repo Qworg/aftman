@@ -1,0 +1,166 @@
+/* The whole stylesheet. Compiled into the binary, so there is no build step.
+   Two rules matter and are called out where they live:
+   `NeedsHuman` must not look like `Failed`, and an in-band check must not look decisive. */
+
+:root {
+  color-scheme: dark;
+  --bg: #12141a;
+  --panel: #1a1d26;
+  --line: #2a2f3d;
+  --text: #d6dae4;
+  --dim: #8b93a6;
+  --accent: #6aa9ff;
+  --ok: #4fbf7f;
+  --warn: #e8b23a;
+  --bad: #e8665a;
+  --human: #d98cff;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+.bar {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+
+.bar nav {
+  display: flex;
+  gap: 1.25rem;
+  align-items: center;
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0.6rem 1rem;
+}
+
+.bar a {
+  color: var(--dim);
+  text-decoration: none;
+}
+
+.bar a:hover { color: var(--text); }
+.bar .brand { color: var(--text); font-weight: 600; letter-spacing: 0.02em; }
+.bar .brand::before { content: "\25B8 "; color: var(--accent); }
+
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 1.25rem 1rem 4rem;
+}
+
+h1 { font-size: 1.35rem; margin: 0.25rem 0 1rem; }
+h2 { font-size: 1.05rem; margin: 1.5rem 0 0.5rem; color: var(--dim); font-weight: 600; }
+
+a { color: var(--accent); }
+code, .mono { font-family: var(--mono); font-size: 0.86em; }
+.dim { color: var(--dim); }
+.num { text-align: right; }
+
+/* Status badges. NeedsHuman is visually distinct from Failed on purpose: one means
+   "a person must decide", the other means "it broke". */
+.status {
+  display: inline-block;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  border: 1px solid transparent;
+  vertical-align: middle;
+}
+.status-live { color: var(--accent); border-color: var(--accent); }
+.status-finished { color: var(--ok); border-color: var(--ok); }
+.status-failed { color: var(--bad); border-color: var(--bad); background: rgba(232, 102, 90, 0.1); }
+.status-needs-human {
+  color: #1b1520;
+  background: var(--human);
+  border-color: var(--human);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.status-stopped { color: var(--warn); border-color: var(--warn); }
+.status-pending { color: var(--dim); border-color: var(--line); }
+
+table { border-collapse: collapse; width: 100%; margin: 0.5rem 0; }
+th, td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+thead th { color: var(--dim); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }
+
+table.kv th { width: 12rem; color: var(--dim); font-weight: 500; }
+
+.empty { color: var(--dim); font-style: italic; }
+
+.banner { padding: 0.6rem 0.75rem; border-radius: 6px; border: 1px solid; }
+.banner-error { border-color: var(--bad); background: rgba(232, 102, 90, 0.12); color: #ffd9d5; }
+
+.note { color: var(--dim); font-size: 0.85rem; }
+
+/* An open escalation is the loudest thing on the page, because it is the only thing
+   that needs a person. */
+.escalations.open {
+  border: 1px solid var(--human);
+  border-radius: 8px;
+  padding: 0.75rem 1rem;
+  background: rgba(217, 140, 255, 0.07);
+}
+.escalations.open h2 { color: var(--human); margin-top: 0.25rem; }
+.escalation { border-top: 1px solid var(--line); padding-top: 0.75rem; margin-top: 0.75rem; }
+.escalation .ask { font-size: 1.02rem; }
+
+/* Checks: an in-band value is visibly held back. */
+.checks .in-band td { color: var(--warn); }
+.checks .decisive td:first-child { color: var(--text); }
+
+/* Evidence and diffs. A diff is long; it scrolls rather than widening the page. */
+pre {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.6rem 0.75rem;
+  overflow-x: auto;
+  max-height: 32rem;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+pre.diff { border-left: 3px solid var(--accent); }
+pre.stat { color: var(--dim); }
+
+form.stack { display: flex; flex-direction: column; gap: 0.6rem; max-width: 40rem; margin: 0.75rem 0; }
+form.inline { display: inline; }
+label { display: flex; flex-direction: column; gap: 0.25rem; color: var(--dim); font-size: 0.85rem; }
+input, select, textarea {
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 0.4rem 0.5rem;
+  font: inherit;
+}
+input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent); }
+
+button {
+  align-self: flex-start;
+  background: var(--accent);
+  color: #0d1016;
+  border: 0;
+  border-radius: 6px;
+  padding: 0.45rem 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+button.danger { background: var(--bad); color: #1b1010; }
+button:hover { filter: brightness(1.1); }
+
+.events .kind-escalation_raised td { color: var(--human); }
+.events .kind-model_error td, .events .kind-error td, .events .kind-budget_exceeded td { color: var(--bad); }
+
+footer.note { max-width: 1100px; margin: 0 auto; padding: 1rem; }

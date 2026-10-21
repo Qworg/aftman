@@ -1,0 +1,45 @@
+[package]
+name = "aftman-web"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "HTTP and SSE surface for aftman: a second transport in front of the same protocol"
+
+[dependencies]
+aftman-core.workspace = true
+aftman-daemon.workspace = true
+
+axum = { version = "0.8", default-features = false, features = [
+  "http1",
+  "tokio",
+  "query",
+  "form",
+  "json",
+] }
+# The assets are compiled into the binary, so there is no Node step at runtime and no
+# separate deploy. `debug-embed` would re-read them from disk, which reads better while
+# editing but makes the binary depend on the source tree; release builds embed either way.
+rust-embed = "8.13"
+getrandom = "0.2"
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+# `ReceiverStream` for the SSE body: a bounded channel between the hub subscription and the
+# response, so a client that stops reading drops its subscription instead of buffering.
+tokio-stream = "0.1"
+toml.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+aftman-store.workspace = true
+aftman-workers.workspace = true
+async-trait.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

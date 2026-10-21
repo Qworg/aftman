@@ -991,6 +991,7 @@ impl FactoryRuntime {
                             "key": k.to_string(),
                             "jev_p": v.jev_p,
                             "threshold": v.threshold,
+                            "margin": v.margin,
                             "decisive": v.decisive,
                             "contested": v.contested,
                             "permitted": v.permitted,
@@ -2389,7 +2390,7 @@ pub fn steer_was_accepted(outcome: &SteerOutcome) -> bool {
 /// Convenience for building a runtime with a simulation-friendly default set.
 #[must_use]
 pub fn default_margin() -> f32 {
-    0.15
+    aftman_core::assessment::DEFAULT_UNCERTAINTY_MARGIN
 }
 
 #[cfg(test)]

@@ -19,6 +19,7 @@ aftman-store = { path = "crates/aftman-store" }
 aftman-workers = { path = "crates/aftman-workers" }
 aftman-daemon = { path = "crates/aftman-daemon" }
 aftman-jev = { path = "crates/aftman-jev" }
+aftman-web = { path = "crates/aftman-web" }
 
 anyhow = "1.0"
 async-trait = "0.1"

@@ -417,6 +417,21 @@ escalations.
 fails to start; every check value is visible with its threshold and margin; an escalation can be
 answered from the browser and the run continues.
 
+**Done.** All four criteria are tests in `crates/aftman-web/tests/web.rs`, run against a real
+daemon, a real socket and raw HTTP (§ "as built" in [07-surfaces.md §6](07-surfaces.md)).
+
+Two things the work turned up that the design did not:
+
+- **`Last-Event-ID` is not `from_seq`.** The SSE id is the last event the client processed, so the
+  resume starts at the next one; the protocol's `from_seq` is inclusive. Passing one into the
+  other re-delivered an event on every reconnect — invisible in a browser, which dedupes by id,
+  and a duplicated sequence number to anything that counts. The reconnect test found it because it
+  asserted contiguity rather than "the second stream is non-empty".
+- **A check record could not be re-read without its margin.** `decisive` is `|p − t| >= margin`, so
+  the record now carries the margin it was judged against; without it a page has to guess from the
+  daemon's *current* configuration, which may have changed since the run. The field decodes as
+  `0.15` for older snapshots.
+
 ## M5 — Ensemble S1 and S2
 
 *Deliverable:* uncertainty near a threshold triggers a deterministic evidence refresh; a

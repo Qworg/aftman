@@ -75,6 +75,7 @@ impl Web {
         let auth = AuthPolicy::new(
             config.auth(),
             token.clone(),
+            config.bind(),
             config.allowed_hosts().to_vec(),
             config.allowed_origins().to_vec(),
         );

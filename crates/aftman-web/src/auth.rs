@@ -19,7 +19,7 @@
 //! - **Origin.** A state-changing request from another origin is refused even when the peer
 //!   is loopback, which blocks the cross-site form post.
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 
 use axum::http::HeaderMap;
@@ -109,7 +109,10 @@ pub struct AuthPolicy {
     /// The token, when `auth = "token"`. `serve` generates one when the configuration did
     /// not carry one, so this is always `Some` in token mode.
     token: Option<Arc<str>>,
-    /// Host header values accepted besides the loopback literals.
+    /// The address the surface bound, so a client that reaches it by its own LAN address is
+    /// not mistaken for a rebinding attack.
+    bind: SocketAddr,
+    /// Host header values accepted besides the loopback literals and the bind address.
     allowed_hosts: Vec<String>,
     /// Origins allowed to make cross-origin requests.
     allowed_origins: Vec<String>,
@@ -132,12 +135,14 @@ impl AuthPolicy {
     pub fn new(
         mode: AuthMode,
         token: Option<String>,
+        bind: SocketAddr,
         allowed_hosts: Vec<String>,
         allowed_origins: Vec<String>,
     ) -> Self {
         Self {
             mode,
             token: token.map(Arc::from),
+            bind,
             allowed_hosts,
             allowed_origins,
         }
@@ -254,6 +259,19 @@ impl AuthPolicy {
         if host_is_local(host) || self.allowed_hosts.iter().any(|allowed| allowed == host) {
             return Ok(());
         }
+        // A client that reaches a LAN bind by the machine's own address sends that address as
+        // `Host`, and it is not a loopback literal. Refusing it would make the documented
+        // `bind = "0.0.0.0"` + `auth = "token"` posture serve nobody.
+        if host_matches_bind(host, self.bind) {
+            return Ok(());
+        }
+        // A wildcard bind cannot know the address in advance, so the host cannot be checked:
+        // the credential is the guard instead. That is safe because `config` only permits a
+        // wildcard bind with `auth = "token"`, and the mode check that follows refuses a
+        // request without one — a rebinding page has no token to send.
+        if self.bind.ip().is_unspecified() && self.mode == AuthMode::Token {
+            return Ok(());
+        }
         Err(Denied::UnknownHost)
     }
 
@@ -329,10 +347,37 @@ fn cookie(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
+/// Whether a `Host` header names the address the surface bound. The port may differ (a proxy
+/// may rewrite it, and it is not what rebinding attacks), but the address must match.
+#[must_use]
+pub fn host_matches_bind(host: &str, bind: SocketAddr) -> bool {
+    if bind.ip().is_unspecified() || bind.ip().is_loopback() {
+        // A loopback or wildcard bind is handled by the loopback literals and the
+        // token fallback; matching a wildcard against every address would defeat the guard.
+        return false;
+    }
+    let Some(name) = host_name(host) else {
+        return false;
+    };
+    name.parse::<IpAddr>()
+        .is_ok_and(|address| address == bind.ip())
+}
+
 /// Whether a `Host` header names this machine. Port is ignored: a proxy may rewrite it, and
 /// the port is not what rebinding attacks.
 #[must_use]
 pub fn host_is_local(host: &str) -> bool {
+    let Some(name) = host_name(host) else {
+        return false;
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "localhost" | "127.0.0.1" | "::1"
+    )
+}
+
+/// The host part of a `Host` header, without the port.
+fn host_name(host: &str) -> Option<&str> {
     let host = host.trim();
     let name = if let Some(rest) = host.strip_prefix('[') {
         // `[::1]:8787`
@@ -352,10 +397,7 @@ pub fn host_is_local(host: &str) -> bool {
             _ => host,
         }
     };
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "localhost" | "127.0.0.1" | "::1"
-    )
+    (!name.is_empty()).then_some(name)
 }
 
 /// The `host:port` (or bare host) of an `Origin` value.
@@ -412,7 +454,13 @@ mod tests {
     }
 
     fn policy(mode: AuthMode, token: Option<&str>) -> AuthPolicy {
-        AuthPolicy::new(mode, token.map(ToOwned::to_owned), Vec::new(), Vec::new())
+        AuthPolicy::new(
+            mode,
+            token.map(ToOwned::to_owned),
+            "127.0.0.1:8787".parse().expect("parses"),
+            Vec::new(),
+            Vec::new(),
+        )
     }
 
     #[test]
@@ -495,11 +543,61 @@ mod tests {
         let policy = AuthPolicy::new(
             AuthMode::Loopback,
             None,
+            "127.0.0.1:8787".parse().expect("parses"),
             vec!["box.tailnet.ts.net".to_owned()],
             Vec::new(),
         );
         let result = policy.check(loopback(), &headers(&[("host", "box.tailnet.ts.net")]));
         assert_eq!(result, Ok(Principal::Loopback));
+    }
+
+    // The documented LAN posture is `bind = "0.0.0.0"` + `auth = "token"`. A client reaching
+    // the machine by its own address sends that address as `Host`, which is not a loopback
+    // literal — refusing it would make that posture serve nobody.
+    #[test]
+    fn a_lan_client_reaching_the_bind_address_is_accepted() {
+        let policy = AuthPolicy::new(
+            AuthMode::Token,
+            Some("t".to_owned()),
+            "192.168.1.5:8787".parse().expect("parses"),
+            Vec::new(),
+            Vec::new(),
+        );
+        let request = [("host", "192.168.1.5:8787"), ("authorization", "Bearer t")];
+        assert_eq!(
+            policy.check(loopback(), &headers(&request)),
+            Ok(Principal::Token),
+            "the bind address must be an acceptable Host"
+        );
+        // ...and a name that is neither is still refused.
+        let hostile = [("host", "evil.example"), ("authorization", "Bearer t")];
+        assert_eq!(
+            policy.check(loopback(), &headers(&hostile)),
+            Err(Denied::UnknownHost)
+        );
+    }
+
+    #[test]
+    fn a_wildcard_bind_falls_back_to_the_token_not_to_every_host() {
+        // `0.0.0.0` cannot know the address a client will use, so the guard is the credential.
+        let policy = AuthPolicy::new(
+            AuthMode::Token,
+            Some("t".to_owned()),
+            "0.0.0.0:8787".parse().expect("parses"),
+            Vec::new(),
+            Vec::new(),
+        );
+        let authenticated = [("host", "10.1.2.3:8787"), ("authorization", "Bearer t")];
+        assert_eq!(
+            policy.check(loopback(), &headers(&authenticated)),
+            Ok(Principal::Token)
+        );
+        // No credential: refused, so a rebinding page gets nothing.
+        let anonymous = [("host", "10.1.2.3:8787")];
+        assert_eq!(
+            policy.check(loopback(), &headers(&anonymous)),
+            Err(Denied::MissingToken)
+        );
     }
 
     #[test]

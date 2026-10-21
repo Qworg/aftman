@@ -128,6 +128,19 @@ pub enum Command {
         /// session before doing anything else.
         #[arg(long, hide = true)]
         detached: bool,
+        /// Serve the browser UI here, instead of the `[web]` configuration's bind.
+        ///
+        /// Implies `[web] enabled = true`. A bind that is not loopback is refused
+        /// unless `[web] auth = "token"`: this surface starts agents and steers them.
+        #[arg(long, value_name = "ADDR")]
+        bind: Option<std::net::SocketAddr>,
+        /// Print the URL the browser UI would use, and exit without starting anything.
+        ///
+        /// The token is included when `[web] auth = "token"` has one configured. When no
+        /// token is configured the daemon generates one at startup, so this prints the URL
+        /// without it and says so.
+        #[arg(long)]
+        print_url: bool,
     },
     /// Ask the daemon to shut down, and wait until it has.
     Stop,

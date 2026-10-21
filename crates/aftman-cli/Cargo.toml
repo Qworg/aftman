@@ -19,6 +19,7 @@ aftman-core.workspace = true
 aftman-daemon.workspace = true
 aftman-jev.workspace = true
 aftman-store.workspace = true
+aftman-web.workspace = true
 aftman-workers.workspace = true
 
 async-trait.workspace = true

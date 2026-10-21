@@ -283,7 +283,11 @@ pub async fn dispatch(cli: Cli) -> Result<u8, CliError> {
             probe_workers,
             repo,
         } => operate::doctor(&ctx, probe, probe_workers, repo.as_deref()).await,
-        Command::Serve { detached } => serve::serve(&ctx, detached).await,
+        Command::Serve {
+            detached,
+            bind,
+            print_url,
+        } => serve::serve(&ctx, detached, bind, print_url).await,
         Command::Stop => serve::stop(&ctx).await,
         Command::Status => serve::status(&ctx).await,
     }

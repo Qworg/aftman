@@ -344,6 +344,29 @@ Implementation details:
   the UI's own help text.
 - No CORS headers are sent by default. The UI is same-origin; a cross-origin API client must be
   explicitly listed in `web.allowed_origins`.
+- **A loopback bind is still reachable by a *browser*, so two more guards run on every request.**
+  The peer address of a DNS-rebinding request is loopback too, which is why the peer check is not
+  enough on its own:
+  - **`Host` must be loopback** (`127.0.0.1`, `localhost`, `::1`, with any port) **or a name in
+    `web.allowed_hosts`.** A rebinding page sends `Host: evil.example` to `127.0.0.1`; a request
+    whose peer address is loopback is otherwise indistinguishable from a local one. This is the
+    one setting a reverse proxy needs: `tailscale serve` forwards the tailnet name, so a tailnet
+    deployment adds it to `allowed_hosts` (or sets `auth = "token"`).
+  - **`Origin`, when present, must match the `Host`** (or be in `allowed_origins`). That refuses a
+    cross-site form post from a page the user happened to have open. A client that sends no
+    `Origin` — `curl`, a script — is unaffected, because it is already constrained by the peer
+    address or the token.
+  Both are `403`/`421`, and both are checked before the credential so a bad posture cannot be
+  mistaken for a bad password.
+- **The login cookie** is `HttpOnly` and `SameSite=Strict`, and `Secure` only when a proxy reports
+  `X-Forwarded-Proto: https` — a `Secure` cookie on plain loopback HTTP is dropped by the browser,
+  which would silently break the login flow on the default posture.
+- **A `?token=` URL logs the browser in and then redirects**, so the token does not stay in the
+  address bar or in history.
+- **The error codes on the HTTP surface are the transport's own** (`unauthorized`, `forbidden`,
+  `unknown_host`) where a protocol code would be meaningless: a Unix socket has no bearer token to
+  be missing. Every code that comes from the manager passes through unchanged, so the two
+  transports cannot disagree about what a failure means.
 - No plugins, no `eval`, no user-supplied routes.
 - The API cannot read arbitrary files: `/v1/runs` returns observations that aftman *chose* to
   collect, already bounded and scoped to an allowed root. There is no `GET /file?path=`.

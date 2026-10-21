@@ -28,7 +28,7 @@ are *clients* of aftman (via the CLI, the web UI, or by watching panes).
 ## 1. The daemon
 
 ```bash
-aftman serve [--socket <path>]          # foreground; --bind / --print-url arrive with HTTP in M4
+aftman serve [--socket <path>] [--bind <addr>] [--print-url]   # foreground
 ```
 
 - **Socket:** `--socket <path>` (env `AFTMAN_SOCKET`), else `$XDG_RUNTIME_DIR/aftman/aftman.sock`
@@ -36,7 +36,9 @@ aftman serve [--socket <path>]          # foreground; --bind / --print-url arriv
   is the socket path with a `.pid` extension. `serve` prints the socket path and what restart
   recovery did (which orphaned runs it marked `Failed`).
 - **HTTP:** disabled unless `--bind` or `web.enabled = true`. Default bind `127.0.0.1:8787`.
-  (Not built yet: M4.)
+  `--bind` overrides the configured address and implies enabling the surface; `--print-url`
+  prints the URL and starts nothing. The surface is built in [`aftman-web`](../../crates/aftman-web)
+  and is a second transport in front of the same `RunManager` — see §6.
 - **Auto-start:** the first `aftman` subcommand that needs run state (`run`, `ls`, `show`,
   `decisions`, `logs`, `watch`, `steer`, `cancel`, `answer`, `purge`) connects to the socket; if it is absent
   or stale (`ENOENT`, `ECONNREFUSED`) it starts the daemon, polls `connect` until it succeeds
@@ -615,6 +617,34 @@ Design notes:
 - The event stream is resumable, so a laptop sleeping mid-run resumes without gaps.
 - Live updates are SSE, not WebSocket: the traffic is one-directional server→client, resumption is
   built in via `Last-Event-ID`, and it survives proxies that mishandle upgrades.
+
+### As built (M4)
+
+`crates/aftman-web`: an axum router over the same `RunManager` the socket dispatches to, with
+assets compiled in by `rust-embed` (no Node in the runtime path) and one hand-written escaper
+(`html::escape`) — there is no template engine, so there is no second path for untrusted text and
+no `|safe` to forget.
+
+Three details are worth recording because they are easy to get wrong:
+
+- **`Last-Event-ID` is not `from_seq`.** The SSE id is the last event the client *processed*, so
+  the resume starts at the one after it; `from_seq` (on `run.events` and `?from_seq=`) is
+  inclusive. Passing one into the other re-delivers an event — invisible in a browser that
+  dedupes by id, and a duplicated sequence number to anything that counts. The handler translates;
+  the reconnect test asserts contiguity across the cut.
+- **SSE event bodies carry the kind** (`{"seq", "at", "kind", "payload"}`) rather than using the
+  `event:` field, so a client has one message shape to parse. The only named event is `lagged`,
+  which is a control signal: the stream then closes and the browser reconnects, and the daemon
+  replays the gap from the store. A gap is never silent.
+- **`ConnectInfo` is a required extractor, not an `Option`.** A router served without connection
+  info answers 500 rather than treating every caller as local, so forgetting
+  `into_make_service_with_connect_info` cannot open the surface.
+
+The pages are `/`, `/runs/{id}`, `/runs/{id}/decisions`, `/runs/{id}/evidence`, `/new`, `/usage`
+and `/config`, plus the JSON API of §3. The run detail page shows every check with its value,
+threshold, **margin**, `|p−t|`, band and permission, which is what makes "held" legible instead of
+mysterious; the diff comes from the same in-process git walk the supervisor uses
+(`repo_observe::git_snapshot`), bounded and interruptible so a page load cannot pin a thread.
 
 ## 7. Local, LAN, and Tailscale
 

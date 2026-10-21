@@ -347,11 +347,14 @@ Implementation details:
 - **A loopback bind is still reachable by a *browser*, so two more guards run on every request.**
   The peer address of a DNS-rebinding request is loopback too, which is why the peer check is not
   enough on its own:
-  - **`Host` must be loopback** (`127.0.0.1`, `localhost`, `::1`, with any port) **or a name in
-    `web.allowed_hosts`.** A rebinding page sends `Host: evil.example` to `127.0.0.1`; a request
+  - **`Host` must be loopback** (`127.0.0.1`, `localhost`, `::1`, with any port), **the address
+    the surface bound**, **or a name in `web.allowed_hosts`.** A rebinding page sends `Host: evil.example` to `127.0.0.1`; a request
     whose peer address is loopback is otherwise indistinguishable from a local one. This is the
     one setting a reverse proxy needs: `tailscale serve` forwards the tailnet name, so a tailnet
-    deployment adds it to `allowed_hosts` (or sets `auth = "token"`).
+    deployment adds it to `allowed_hosts` (or sets `auth = "token"`). A LAN bind
+    (`bind = "0.0.0.0:8787"` + `auth = "token"`) accepts the address a peer used, and a wildcard
+    bind accepts any `Host` **only because the token is then the guard** — that posture cannot be
+    selected without a token in the first place.
   - **`Origin`, when present, must match the `Host`** (or be in `allowed_origins`). That refuses a
     cross-site form post from a page the user happened to have open. A client that sends no
     `Origin` — `curl`, a script — is unaffected, because it is already constrained by the peer

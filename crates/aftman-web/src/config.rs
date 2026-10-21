@@ -425,8 +425,13 @@ impl WebConfig {
     /// when there is one, and this string is printed exactly once by `serve`.
     #[must_use]
     pub fn url(&self, token: Option<&str>) -> String {
+        // A wildcard bind has no address a person can type, so the URL points at loopback —
+        // which is where the surface is reachable on this machine. A LAN bind is printed with
+        // the address it was given, because that is what a peer would use.
         let host = match self.bind.ip() {
+            std::net::IpAddr::V4(v4) if v4.is_unspecified() => "127.0.0.1".to_owned(),
             std::net::IpAddr::V4(v4) => v4.to_string(),
+            std::net::IpAddr::V6(v6) if v6.is_unspecified() => "[::1]".to_owned(),
             std::net::IpAddr::V6(v6) => format!("[{v6}]"),
         };
         match token {
@@ -894,6 +899,35 @@ mod tests {
         assert_eq!(first.len(), 64);
         assert_ne!(first, second);
         assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn a_wildcard_bind_prints_a_url_a_person_can_open() {
+        // `http://0.0.0.0:8787/` is not something to paste into a browser.
+        let mut config = WebConfig::from_parts(
+            WebParts {
+                bind: "0.0.0.0:8787".parse().expect("parses"),
+                auth: AuthMode::Token,
+                token: Some("t".to_owned()),
+                allowed_repo_roots: vec![PathBuf::from("/home/me")],
+                ..WebParts::default()
+            },
+            Some(Path::new("/home/me")),
+        )
+        .expect("resolves");
+        assert_eq!(config.url(None), "http://127.0.0.1:8787/");
+        config = WebConfig::from_parts(
+            WebParts {
+                bind: "[::]:8787".parse().expect("parses"),
+                auth: AuthMode::Token,
+                token: Some("t".to_owned()),
+                allowed_repo_roots: vec![PathBuf::from("/home/me")],
+                ..WebParts::default()
+            },
+            Some(Path::new("/home/me")),
+        )
+        .expect("resolves");
+        assert_eq!(config.url(None), "http://[::1]:8787/");
     }
 
     #[test]

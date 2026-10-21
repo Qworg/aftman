@@ -90,6 +90,23 @@ pub(crate) fn observe(repo: &Path, caps: ObsCaps, interrupt: &Arc<AtomicBool>) -
     }
 }
 
+/// Git evidence for a surface that wants to show the current diff.
+///
+/// The same walk the supervisor runs, not a second implementation: it exists so the web UI
+/// can show an operator the tree as it is now without assembling a whole observation (and
+/// without a run). `interrupt` is the caller's deadline, exactly as in [`observe`] — a page
+/// load must not pin a blocking thread on a repository that has grown a million files.
+///
+/// # Errors
+/// The note explaining why the repository could not be read.
+pub fn git_snapshot(
+    repo: &Path,
+    caps: ObsCaps,
+    interrupt: &Arc<AtomicBool>,
+) -> Result<GitEvidence, String> {
+    git_evidence(repo, caps, interrupt).map(|(git, _untracked)| git)
+}
+
 /// One tracked entry from the index-vs-worktree walk, detached from the index it borrows.
 struct Tracked {
     path: Vec<u8>,

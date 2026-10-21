@@ -20,6 +20,14 @@ use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
 const PATIENCE: Duration = Duration::from_secs(30);
+
+/// Long enough to outlast a graceful shutdown that actually takes its time.
+///
+/// A test that waits for `stop` is waiting for up to `DEFAULT_SHUTDOWN_GRACE` (60 s) plus the
+/// CLI's own `STOP_WAIT` (75 s), so `PATIENCE` bounds the *wrong* thing: the test asserts at
+/// 30 s that a process has exited when the daemon is permitted to take twice that. It passes
+/// on a fast machine and times out on a loaded one — a flake that reads as a regression.
+pub const SLOW_PATIENCE: Duration = Duration::from_secs(90);
 /// The provider variables, named by the one crate that may (hard rule 2).
 const API_KEY_VAR: &str = aftman_jev::ENV_KEYS[0];
 const BASE_URL_VAR: &str = aftman_jev::ENV_KEYS[1];
@@ -98,6 +106,12 @@ impl Sandbox {
 
     fn finish(&self, spawned: Spawned) -> Out {
         spawned.wait(PATIENCE)
+    }
+
+    /// Run to completion, allowing for a shutdown that takes its time.
+    fn run_patiently(&self, args: &[&str]) -> Out {
+        let spawned = Spawned::start(self.command(args), self.dir.path());
+        spawned.wait(SLOW_PATIENCE)
     }
 
     fn spawn(&self, args: &[&str]) -> Spawned {
@@ -1949,7 +1963,7 @@ fn stop_and_auto_start_during_a_daemon_shutdown_wait_for_it() {
     );
 
     // A second stop does not claim nothing is running; it waits for the first to finish.
-    let second_stop = sb.run(&["stop"]);
+    let second_stop = sb.run_patiently(&["stop"]);
     assert_eq!(second_stop.code, 0, "{}", second_stop.all());
     assert!(
         !second_stop.stdout.contains("is not running"),
@@ -1959,11 +1973,11 @@ fn stop_and_auto_start_during_a_daemon_shutdown_wait_for_it() {
 
     // A command that needs a daemon waits for the old one to finish, then starts a new
     // one (a different pid), instead of failing or racing it.
-    let ls = sb.run(&["ls"]);
+    let ls = sb.run_patiently(&["ls"]);
     assert_eq!(ls.code, 0, "{}", ls.all());
     let new_pid = sb.status_pid().expect("a new daemon");
     assert_ne!(new_pid, pid);
-    let done = first_stop.wait(PATIENCE);
+    let done = first_stop.wait(SLOW_PATIENCE);
     assert_eq!(done.code, 0, "{}", done.all());
     drop(long);
 }

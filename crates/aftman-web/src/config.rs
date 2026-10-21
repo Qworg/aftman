@@ -321,6 +321,13 @@ impl WebConfig {
         auth: AuthMode,
         home: Option<&Path>,
     ) -> Result<(), WebConfigError> {
+        // A surface that is off serves nothing, so its posture cannot be unsafe and it must
+        // not be able to stop the daemon from starting. This matters: `aftman run` starts a
+        // daemon, and a stale `[web]` stanza — a bind, an auth mode, a missing `$HOME` for
+        // the default repo root — must never turn into "the supervisor will not run".
+        if !self.enabled {
+            return Ok(());
+        }
         // The whole point of the module. Note this refuses `loopback` too, not only `none`:
         // a `--bind 0.0.0.0` with the default auth must not serve LAN peers.
         if !is_loopback(bind) && auth != AuthMode::Token {
@@ -706,11 +713,17 @@ mod tests {
     }
 
     #[test]
-    fn loopback_auth_without_home_is_an_error_rather_than_an_empty_allow_list() {
+    fn an_enabled_loopback_surface_without_home_is_an_error_rather_than_an_empty_allow_list() {
         // An empty allow-list would reject every repo at request time, which reads as
-        // "aftman is broken" instead of "your environment is".
-        let error = WebConfig::load(None, &env(&[])).expect_err("must refuse");
+        // "aftman is broken" instead of "your environment is". Only when the surface is on:
+        // a disabled surface accepts every repo because it accepts no requests.
+        let error = WebConfig::load(None, &env(&[("AFTMAN_WEB_ENABLED", "true")]))
+            .expect_err("must refuse");
         assert!(matches!(error, WebConfigError::NoHome), "got {error:?}");
+
+        // With the surface off, the same environment is fine: nothing is listening.
+        let config = WebConfig::load(None, &env(&[])).expect("a disabled surface loads");
+        assert!(!config.enabled());
     }
 
     #[test]
@@ -794,6 +807,39 @@ mod tests {
         let described = config.describe().to_string();
         assert!(!described.contains("s3cret-token"), "{described}");
         assert!(described.contains("configured"), "{described}");
+    }
+
+    // A disabled surface must not veto the daemon. `aftman run` starts one, so a stale
+    // `[web]` stanza would otherwise stop the supervisor from running at all.
+    #[test]
+    fn a_disabled_surface_cannot_stop_the_daemon_from_starting() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = WebConfig::default_path(Some(dir.path())).expect("path");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        // Every posture rule this file has, all violated at once, with the surface off.
+        std::fs::write(
+            &path,
+            "[web]\nenabled = false\nbind = \"0.0.0.0:8787\"\nauth = \"none\"\n\
+             allowed_repo_roots = [\"relative/path\"]\n",
+        )
+        .expect("write");
+        // ...and no HOME, so the loopback default has nowhere to come from either.
+        let config = WebConfig::load(Some(dir.path()), &env(&[]))
+            .expect("a disabled surface must load whatever the posture says");
+        assert!(!config.enabled());
+
+        // The same stanza with the surface on is refused.
+        std::fs::write(
+            &path,
+            "[web]\nenabled = true\nbind = \"0.0.0.0:8787\"\nauth = \"none\"\n",
+        )
+        .expect("write");
+        let error = WebConfig::load(Some(dir.path()), &env(&[("HOME", "/home/me")]))
+            .expect_err("enabled must refuse");
+        assert!(
+            matches!(error, WebConfigError::NonLoopbackRequiresToken { .. }),
+            "got {error:?}"
+        );
     }
 
     #[test]

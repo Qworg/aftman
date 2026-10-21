@@ -280,6 +280,31 @@ pub enum FactoryStatus {
 }
 
 impl FactoryStatus {
+    /// Every status, in lifecycle order.
+    pub const ALL: [Self; 10] = [
+        Self::Queued,
+        Self::Routing,
+        Self::Running,
+        Self::Assessing,
+        Self::Stopped,
+        Self::Verifying,
+        Self::NeedsHuman,
+        Self::Finished,
+        Self::Failed,
+        Self::Cancelled,
+    ];
+
+    /// Parse a status name: `needs-human` and `needs_human` are both accepted, and the
+    /// match is case-insensitive.
+    ///
+    /// One implementation, because the CLI's `--status` and the web API's `?status=` must
+    /// accept the same words.
+    #[must_use]
+    pub fn parse(name: &str) -> Option<Self> {
+        let normalised = name.trim().to_ascii_lowercase().replace('-', "_");
+        Self::ALL.iter().copied().find(|s| s.as_str() == normalised)
+    }
+
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Finished | Self::Failed | Self::Cancelled)

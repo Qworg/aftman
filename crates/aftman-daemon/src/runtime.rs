@@ -491,8 +491,14 @@ impl FactoryRuntime {
         self
     }
 
-    /// Watch each cycle's materialised ensemble inputs (`EnsembleCycle`). For audit and
-    /// replay: the tap observes and cannot influence the run.
+    /// Watch each cycle's materialised ensemble inputs (`EnsembleCycle`).
+    ///
+    /// An **audit API**: it observes and never influences the run. It is called synchronously
+    /// on the run loop, once per resolved cycle, so it **must not block** — copy what it needs
+    /// and return; anything slow belongs on another task. What it is handed includes
+    /// repository text (the observation: the diff, `AGENTS.md`, untracked files, worker
+    /// output), so it must not log or forward it anywhere the run log itself would not go
+    /// (`docs/02-lld.md` §3.3). Used by the replay tests.
     #[must_use]
     pub fn with_ensemble_tap(mut self, tap: EnsembleTap) -> Self {
         self.ensemble_tap = Some(tap);

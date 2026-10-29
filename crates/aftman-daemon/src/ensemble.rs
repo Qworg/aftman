@@ -30,8 +30,14 @@ use aftman_core::policy::PolicyInput;
 use aftman_core::responsibility::{Check, ResponsibilityRegistry};
 use aftman_core::worker::WorkerRecord;
 
-/// Something that watches each cycle's materialised ensemble inputs. It observes; it
-/// never influences anything.
+/// Something that watches each cycle's materialised ensemble inputs.
+///
+/// An **audit API**: it observes and never influences the run. It is called synchronously
+/// on the run loop, once per resolved cycle, so it **must not block** — copy what it needs
+/// and return; anything slow belongs on another task. What it is handed includes
+/// repository text (the observation: the diff, `AGENTS.md`, untracked files, worker
+/// output), so it must not log or forward it anywhere the run log itself would not go
+/// (`docs/02-lld.md` §3.3). Used by the replay tests.
 pub type EnsembleTap = Arc<dyn Fn(&EnsembleCycle) + Send + Sync>;
 
 /// Everything one cycle's ensemble and policy read, owned.

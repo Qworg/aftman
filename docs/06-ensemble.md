@@ -863,11 +863,32 @@ Notes that follow directly from §2:
    spent, has nothing to resolve; its empty check set already yields only conservative directives.
    It emits an `ENSEMBLE_RESOLVED` with no `cycle` and no `checks`, as S0 did.
 
+Three consequences, stated so that nobody has to rediscover them:
+
+- **A refresh's model call is not in this cycle's counters.** The input is materialised before the
+  refresh runs, so this cycle's `AssessmentBudget` invariant reads the count without it. A refresh
+  that spent the last assessment can therefore be followed, in the same cycle, by a directive the
+  invariant would have replaced with the budget escalation had it been current — a `StartWorker`,
+  say, or a `Finish` resting on the fresh value. That is intended: the invariant exists so that the
+  model is not *asked* again past the cap, and the refresh was asked only because the cap had not
+  been reached; acting on an answer already obtained within it spends nothing. The next cycle
+  reads the current count and escalates.
+- **A crash between a cycle's ensemble events and its snapshot loses that cycle's counters** (the
+  refreshes it spent, its in-band and contest streaks, a recheck it consumed). Nothing reads them
+  again: a run is not resumed after its daemon dies — restart recovery ends it `Failed` with reason
+  `daemon restarted` ([07-surfaces.md §9](07-surfaces.md)) — and the log, which has the cycle's
+  `ENSEMBLE_RESOLVED`, is what replay reads. Were runs ever resumed, the stale counters would allow
+  at most one refresh more per check than the cap and delay an escalation by one cycle; neither
+  can permit anything.
+- **The ensemble tap** (`FactoryRuntime::with_ensemble_tap`) is an audit API: it runs on the loop
+  and must not block, and it is handed repository text.
+
 With `enabled = false` the plan triggers nothing, the resolution is the baseline, the counters are
 untouched, and the cycle selects exactly what it selected before the ensemble was wired; the
-`ENSEMBLE_RESOLVED` payload gains only `cycle` and an empty `checks`. A regression test compares a
-disabled run's whole decision trace with one captured from the release before
-(`aftman-daemon/tests/ensemble.rs`, `a_disabled_ensemble_selects_exactly_what_it_did_before`).
+`ENSEMBLE_RESOLVED` payload gains only `cycle` and an empty `checks`. Regression tests compare a
+disabled run's whole decision trace with ones captured from the release before
+(`aftman-daemon/tests/ensemble.rs`: `a_disabled_ensemble_selects_exactly_what_it_did_before`, and
+`a_disabled_ensemble_keeps_the_provisional_finish_path_exactly` for the `before_finish` path).
 
 ## 7. Cost and latency
 

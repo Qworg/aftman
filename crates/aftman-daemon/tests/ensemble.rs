@@ -535,6 +535,41 @@ async fn a_disabled_ensemble_selects_exactly_what_it_did_before() -> TestResult 
     Ok(())
 }
 
+#[tokio::test]
+async fn a_disabled_ensemble_keeps_the_provisional_finish_path_exactly() -> TestResult {
+    // The `before_finish` path with the ensemble off: the first Finish is not applied, the
+    // provider runs, the re-assessed Finish is. The fixture was captured on the commit
+    // before the ensemble was wired (c166964), with the same projection, three times
+    // identically. Real time: the provider is a child process.
+    let fx = Fixture::new(
+        DefinitionSet::bundled()?,
+        EvidencePlan::from_toml(
+            r#"
+[[evidence.commands]]
+id = "audit"
+argv = ["sh", "-c", "echo audited; exit 0"]
+run_when = "before_finish"
+"#,
+            "test",
+        )?,
+    )?;
+    let rt = fx.runtime(
+        config(|c| {
+            c.overall_timeout = Duration::from_secs(30);
+            c.max_workers = 5;
+            c.max_attempts = 2;
+        }),
+        EnsembleSettings::default(),
+        Arc::new(SimulatedModel::new()),
+        Arc::new(SimulatedWorker::instant()),
+    );
+    fx.run(rt).await?;
+    let actual = format!("== before_finish\n{}\n", trace(&fx.events()).join("\n"));
+    let expected = include_str!("fixtures/disabled_before_finish_trace.txt");
+    assert_eq!(actual, expected);
+    Ok(())
+}
+
 // ---- the exit criterion: R0 -------------------------------------------------------
 
 #[tokio::test]

@@ -240,9 +240,13 @@ Every request appends one line to `$XDG_STATE_HOME/aftman/jev-usage.jsonl`:
  "request_id":"...","budget":{"compacted":true,"measurements":{...}}}
 ```
 
-`purpose` is `assessment`, `routing`, or `refresh` (an ensemble evidence refresh, R0: one check asked
+`purpose` is `assessment`, `routing`, `refresh` (an ensemble evidence refresh, R0: one check asked
 again over fresh evidence; it counts against `max_assessments` like an assessment, [06-ensemble.md
-§4](06-ensemble.md)). `aftman usage` aggregates this file; the web UI shows the
+§4](06-ensemble.md)), or `reframe` (an ensemble same-model reframe, R2: one check's independently
+written negation asked over the state its value was measured on; billed, budgeted and counted
+against `max_assessments` exactly like a refresh). A reframe is an ordinary request with one `noul`
+question: nothing about it is specific to System One beyond the purpose recorded here, so the
+client needs no other change for it. `aftman usage` aggregates this file; the web UI shows the
 same numbers. Usage records are written **before** the answer is validated, so a malformed
 response still shows up in the bill.
 

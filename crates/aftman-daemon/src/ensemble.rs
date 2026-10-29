@@ -61,8 +61,9 @@ pub struct EnsembleCycle {
     pub answers: BTreeMap<CheckKey, AnswerValue>,
     /// The ensemble's per-run counters as they stood before this cycle.
     pub ensemble: EnsembleCounters,
-    /// Checks R2 can be asked about. Empty until check definitions carry a negation
-    /// (ensemble stage S2).
+    /// Checks R2 can be asked about: `reframable_checks` over `definitions` — every check
+    /// with a written negation and a threshold, when `reframe_same_model` is a configured
+    /// rung (`docs/06-ensemble.md` §4 R2). Built once per cycle.
     pub reframe_available: BTreeSet<CheckKey>,
     /// A `Finish` selected this cycle will not be executed: `before_finish` providers
     /// exist and have not run, so the runtime runs them and re-assesses instead.

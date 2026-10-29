@@ -393,6 +393,7 @@ fn refreshed(new_p: Option<f32>, provider: &str, exit_code: i32) -> RefreshOutco
         }],
         new_p,
         error: None,
+        state_digest: None,
     }
 }
 
@@ -405,6 +406,7 @@ fn failed_refresh() -> RefreshOutcome {
         }],
         new_p: None,
         error: Some("could not launch".into()),
+        state_digest: None,
     }
 }
 
@@ -1374,6 +1376,7 @@ async fn worked_example_9_4_only_evidence_may_finish() {
             ],
             new_p: Some(0.96),
             error: None,
+            state_digest: None,
         },
     );
     let outcome = s.run_plan(&source).await.unwrap_or_else(|e| panic!("{e}"));
@@ -2427,6 +2430,7 @@ async fn a_refresh_whose_command_never_ran_does_not_permit() {
                 runs: runs.clone(),
                 new_p: Some(0.95),
                 error: Some("command could not be launched".into()),
+                state_digest: None,
             },
         );
         let outcome = s.run_plan(&source).await.unwrap_or_else(|e| panic!("{e}"));
@@ -2467,6 +2471,7 @@ async fn a_run_of_a_provider_that_was_not_requested_does_not_count() {
             }],
             new_p: Some(0.95),
             error: None,
+            state_digest: None,
         },
     );
     let outcome = resolved(&s, &source).await;
@@ -2535,6 +2540,7 @@ async fn refresh_records_are_bounded() {
             runs,
             new_p: Some(0.96),
             error: Some("e".repeat(100_000)),
+            state_digest: None,
         },
     );
     let outcome = s.run_plan(&source).await.unwrap_or_else(|e| panic!("{e}"));
@@ -4261,6 +4267,7 @@ fn requested_event(seq: u64, key: OpinionKey) -> EventEnvelope {
         &super::ReframeRequest {
             opinion: key,
             timeout: Duration::from_secs(120),
+            refreshed: false,
         },
         "jev",
         "model",

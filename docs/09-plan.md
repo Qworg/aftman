@@ -455,8 +455,10 @@ refresh is capped and visible.
 
 *Status:* S1 is wired end to end — the `[ensemble]` table, the runtime's R0 source, the events and
 persisted counters, escalation through policy (`core.ensemble:escalate`, priority 850), the human
-answer per check, and the surfaces (docs/06-ensemble.md §4 R0, §4 R3, §6.1, §12). S2 (the negated
-question for R2) is next; until then no check is reframable.
+answer per check, and the surfaces (docs/06-ensemble.md §4 R0, §4 R3, §6.1, §12). S2 is wired too:
+every thresholded bundled check carries a hand-written negation (docs/05-responsibilities.md §1.3),
+the runtime asks it under `Purpose::Reframe` over the state the value was measured on, the
+irreversible gate is live, and R2 verdicts reach every surface (docs/06-ensemble.md §4 R2).
 
 ## M6 — herdr
 

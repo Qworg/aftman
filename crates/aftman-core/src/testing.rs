@@ -19,7 +19,9 @@ use crate::ensemble::{
 use crate::error::ModelError;
 use crate::event::{EventEnvelope, EventKind};
 use crate::ids::{AssessmentSeq, CheckKey};
-use crate::model::{AskContext, Budget, DecisionModel, ModelAnswers, ModelInfo, Question, Usage};
+use crate::model::{
+    AskContext, Budget, DecisionModel, ModelAnswers, ModelInfo, Purpose, Question, Usage,
+};
 
 /// A model that returns answers from a fixed table.
 ///
@@ -30,6 +32,10 @@ pub struct ScriptedModel {
     /// Probability per check key. A key absent here is omitted, which is an error
     /// the caller can test.
     probabilities: BTreeMap<CheckKey, f32>,
+    /// The answer to a check's negated question (ensemble R2, `Purpose::Reframe`). A key
+    /// absent here is answered with the complement of its probability: a model that is
+    /// consistent under reframing.
+    negated: BTreeMap<CheckKey, f32>,
     /// If set, every call fails with this error.
     fail_with: Option<ModelError>,
     /// If non-zero, calls fail this many times before succeeding.
@@ -38,11 +44,13 @@ pub struct ScriptedModel {
     model_name: String,
 }
 
-/// One recorded call, so a test can assert what was asked.
+/// One recorded call, so a test can assert what was asked: the purpose, the questions
+/// exactly as sent, and the state document.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CallRecord {
     pub context: AskContext,
     pub keys: Vec<CheckKey>,
+    pub questions: BTreeMap<CheckKey, Question>,
     pub state: Value,
 }
 
@@ -58,6 +66,14 @@ impl ScriptedModel {
     #[must_use]
     pub fn with(mut self, key: &str, probability: f32) -> Self {
         self.probabilities.insert(CheckKey::from(key), probability);
+        self
+    }
+
+    /// Answer the check's negated question (R2) with `probability`, instead of the
+    /// complement of its own answer.
+    #[must_use]
+    pub fn with_negated(mut self, key: &str, probability: f32) -> Self {
+        self.negated.insert(CheckKey::from(key), probability);
         self
     }
 
@@ -117,6 +133,7 @@ impl DecisionModel for ScriptedModel {
             calls.push(CallRecord {
                 context: *context,
                 keys: questions.keys().cloned().collect(),
+                questions: questions.clone(),
                 state: state.clone(),
             });
             if self.fail_first > 0 {
@@ -135,8 +152,18 @@ impl DecisionModel for ScriptedModel {
 
         let mut answers = BTreeMap::new();
         for key in questions.keys() {
-            if let Some(p) = self.probabilities.get(key) {
-                answers.insert(key.clone(), AnswerValue::Noul(*p));
+            // An R2 reframe asks the check's negation under the same key: a calibrated
+            // model answers it with the complement, unless the test scripted otherwise.
+            let p = if context.purpose == Purpose::Reframe {
+                self.negated
+                    .get(key)
+                    .copied()
+                    .or_else(|| self.probabilities.get(key).map(|p| 1.0 - p))
+            } else {
+                self.probabilities.get(key).copied()
+            };
+            if let Some(p) = p {
+                answers.insert(key.clone(), AnswerValue::Noul(p));
             }
         }
         Ok(ModelAnswers {
@@ -213,7 +240,7 @@ fn string_at<'a>(state: &'a Value, path: &[&str]) -> Option<&'a str> {
 impl DecisionModel for SimulatedModel {
     async fn ask(
         &self,
-        _context: &AskContext,
+        context: &AskContext,
         state: &Value,
         questions: &BTreeMap<CheckKey, Question>,
         _budget: &Budget,
@@ -319,6 +346,17 @@ impl DecisionModel for SimulatedModel {
         for key in questions.keys() {
             if key.as_str().ends_with("__routing") {
                 fill(key.clone(), 0.75);
+            }
+        }
+
+        // An R2 reframe asks each check's negation under the same key. The simulator is
+        // consistent under reframing: it answers the complement of what it would say to the
+        // question itself.
+        if context.purpose == Purpose::Reframe {
+            for answer in answers.values_mut() {
+                if let AnswerValue::Noul(p) = answer {
+                    *p = 1.0 - *p;
+                }
             }
         }
 

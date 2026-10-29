@@ -39,6 +39,11 @@ pub enum Purpose {
     /// purpose so that `aftman usage` can tell what refreshes cost; it counts against
     /// `max_assessments` like any assessment.
     Refresh,
+    /// A same-model reframe (ensemble R2, `docs/06-ensemble.md` §4): one check's
+    /// independently written negation asked over the state its value was measured on.
+    /// Its own purpose so that `aftman usage` can tell what R2 costs; it counts against
+    /// `max_assessments` and the request budget exactly as a refresh does.
+    Reframe,
 }
 
 /// Token usage for one request, when the provider reports it.

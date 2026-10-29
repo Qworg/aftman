@@ -1878,11 +1878,32 @@ mod tests {
                     }],
                     new_p: Some(0.95),
                     error: None,
+                    state_digest: None,
                 },
                 rejected: None,
             }),
             escalation: Some("is it done?\u{1b}[2J".into()),
             irreversible_guard: None,
+            opinions: vec![aftman_core::ensemble::OpinionRecordedPayload {
+                opinion_id: aftman_core::ensemble::OpinionKey {
+                    cycle: AssessmentSeq(3),
+                    check: "core.verification__tests_sufficient".into(),
+                    rung: Rung::ReframeSameModel,
+                },
+                rung: Rung::ReframeSameModel,
+                verdict: aftman_core::assessment::Verdict::Contest {
+                    side: aftman_core::assessment::Side::Below,
+                },
+                source: "jev".into(),
+                model: "jev-model".into(),
+                p_reported: Some(0.92),
+                excerpt: "the negation was answered 0.92\u{1b}[31m".into(),
+                prompt_hash: "h".into(),
+                state_digest: "d".into(),
+                latency: std::time::Duration::from_millis(12),
+                usage: aftman_core::model::Usage::default(),
+                error: None,
+            }],
         };
         serde_json::to_value(EnsembleResolvedPayload {
             enabled: true,
@@ -1923,6 +1944,12 @@ mod tests {
         );
         assert!(text.contains("limit: refresh cap reached (2/2)"), "{text}");
         assert!(text.contains("escalated: is it done?"), "{text}");
+        // An R2 verdict, with what the model answered and its excerpt.
+        assert!(
+            text.contains("R2 reframe: contest (below), p(not X) = 0.92 from jev-model"),
+            "{text}"
+        );
+        assert!(text.contains("the negation was answered 0.92"), "{text}");
         assert!(!text.contains('\u{1b}'), "escapes are cleaned: {text:?}");
         assert_eq!(notes[0].level, Level::Human);
 
@@ -1932,6 +1959,7 @@ mod tests {
         entry["refresh"] = Value::Null;
         entry["limits"] = json!([]);
         entry["escalation"] = Value::Null;
+        entry["opinions"] = json!([]);
         entry["resolution"] = json!({"resolution": "decisive"});
         let mut state = WatchState::new();
         state.apply(&ev(1, EventKind::EnsembleResolved, quiet));

@@ -191,3 +191,96 @@ run_when = "on_demand"
     );
     Ok(())
 }
+
+#[test]
+fn decisions_show_each_r2_verdict_under_its_check() -> TestResult {
+    // `docs/07-surfaces.md` §4: an opinion is a line under the check it is about, with the
+    // verdict, what the model answered to the negated question, and the excerpt. The text
+    // is the model's, so it reaches the terminal only through `outln!`'s sanitizer.
+    use aftman_core::assessment::{Resolution, Rung, Side, Verdict};
+    use aftman_core::ensemble::{
+        CheckResolvedPayload, EnsembleResolvedPayload, EnsembleTrigger, OpinionKey,
+        OpinionRecordedPayload,
+    };
+    use aftman_core::event::{EventEnvelope, EventKind};
+    use aftman_core::ids::{AssessmentSeq, EventSeq, RunId};
+    let opinion = |check: &str, verdict: Verdict, q: f32| OpinionRecordedPayload {
+        opinion_id: OpinionKey {
+            cycle: AssessmentSeq(5),
+            check: check.into(),
+            rung: Rung::ReframeSameModel,
+        },
+        rung: Rung::ReframeSameModel,
+        verdict,
+        source: "jev".into(),
+        model: "jev-model".into(),
+        p_reported: Some(q),
+        excerpt: format!("the negation of `{check}` was answered {q:.4}"),
+        prompt_hash: "h".into(),
+        state_digest: "d".into(),
+        latency: Duration::from_millis(7),
+        usage: Usage::default(),
+        error: None,
+    };
+    let entry =
+        |check: &str, permitted: bool, opinion: OpinionRecordedPayload| CheckResolvedPayload {
+            check: check.into(),
+            triggers: vec![EnsembleTrigger::Irreversible],
+            jev_p: Some(0.95),
+            decisive: true,
+            contested: !permitted,
+            permitted,
+            suppression: None,
+            resolution: Resolution::Decisive,
+            rungs_used: vec![Rung::ReframeSameModel],
+            limits: Vec::new(),
+            refresh: None,
+            escalation: None,
+            irreversible_guard: None,
+            opinions: vec![opinion],
+        };
+    let payload = EnsembleResolvedPayload {
+        enabled: true,
+        margin: 0.15,
+        unresolved: Vec::new(),
+        rungs: vec![Rung::ReframeSameModel],
+        cycle: Some(AssessmentSeq(5)),
+        checks: vec![
+            entry(
+                "core.completion__ready_to_finish",
+                true,
+                opinion(
+                    "core.completion__ready_to_finish",
+                    Verdict::Confirm { side: Side::Above },
+                    0.05,
+                ),
+            ),
+            entry(
+                TESTS,
+                false,
+                opinion(TESTS, Verdict::Contest { side: Side::Below }, 0.90),
+            ),
+        ],
+    };
+    let event = EventEnvelope::new(
+        EventSeq(12),
+        RunId::new(),
+        time::OffsetDateTime::UNIX_EPOCH,
+        EventKind::EnsembleResolved,
+        serde_json::to_value(payload)?,
+    );
+    let text = decision_lines(&[event]).join("\n");
+    assert!(
+        text.contains("R2 reframe: confirm (above), p(not X) = 0.05 from jev-model"),
+        "{text}"
+    );
+    assert!(
+        text.contains("R2 reframe: contest (below), p(not X) = 0.90 from jev-model"),
+        "{text}"
+    );
+    assert!(
+        text.contains("the negation of `core.verification__tests_sufficient` was answered"),
+        "{text}"
+    );
+    Ok(())
+}

@@ -289,7 +289,8 @@ pub enum   EscalationKind { Check, AssessmentBudget, ModelUnavailable, WorkerBlo
 
 // ---- model layer ------------------------------------------------------
 pub enum   Purpose { Assessment, Routing, Opinion,
-    Refresh }   // an ensemble evidence refresh (R0): one check re-asked over fresh evidence
+    Refresh,    // an ensemble evidence refresh (R0): one check re-asked over fresh evidence
+    Reframe }   // an ensemble same-model reframe (R2): one check's negation, same state
 pub struct Usage { pub input_tokens: Option<u64>, pub output_tokens: Option<u64> }
 pub struct ModelInfo { pub name: String, pub description: String, pub release_date: String }
 pub enum   Question { Noul   { instructions: Json },
@@ -374,6 +375,15 @@ answer with their condition's keys; built-ins with `builtin::RULE_READS`, a per-
 against the code by a test, from which the definitions' "a built-in reads this, so it needs a
 `min_threshold`" rule is also derived. `ResponsibilityRegistry::reads(rule)` looks it up.
 
+A `ReframeRequest` names the opinion (`OpinionKey { cycle, check, rung }`), the timeout, and
+`refreshed: bool` — whether the value under question is this cycle's R0 refresh, so the source asks
+over the state that value was measured on; never a probability. A `RefreshOutcome` carries the
+`state_digest` of the state its fresh question was asked over (`#[serde(default)]`), and a
+`CheckResolvedPayload` the check's `opinions` (`OpinionRecordedPayload`s, omitted when empty), which
+`describe()` renders for the surfaces. `reframable_checks(settings, checks)` is the cycle's
+`reframe_available`. `aftman_core::observation::state_digest(&Value)` is the one digest of a model
+`state` (doc 06 §8); `ASSESSMENT_COMPLETED` records it as `state_digest`.
+
 `aftman_core::testing::RecordedOpinionSource` implements `OpinionSource` from recorded outcomes
 only: `from_events` refuses an incomplete log, an unrecorded call is a `SourceError`, and
 `divergences` reports a recomputed verdict that differs from the recorded one.
@@ -395,6 +405,8 @@ pub struct Check {
     pub question: Question,              // Noul | Choice | Score, with instructions
     pub evidence: Vec<EvidenceId>,       // empty ⇒ default provider set
     pub threshold: Option<f32>,
+    pub negation: Option<Question>,      // "not X", written independently, for R2 (doc 06 §4);
+                                         // only on a thresholded noul check; reframable() ⇔ Some
 }
 
 pub struct Rule {
@@ -672,7 +684,7 @@ Payloads added for the control plane (every payload also carries `schema_version
 | `WorkerCompleted` | `worker_id`, `outcome`, `success` (about the **exit code**), `empty` (about whether it said anything: no prose, no tool calls and no tokens for a structured backend; no output at all for one without a stream). The two are different questions — a worker that exits 0 having done nothing is not a completed job — and a surface should show both. See [10-live-validation.md](10-live-validation.md) step 2 for the case that motivated it. |
 | `WorkerTerminated` | Uniform: `worker_id`, `cause` (`stopped` for a `Stop` directive, `cancelled`, `superseded` for a `Retry`, `run_ended` when the run ended with a worker still live), `reason`. A worker that had already completed when its stop was seen is recorded by `WorkerCompleted` instead. |
 | `EscalationRaised` | `escalation_id` (what `run.answer` needs), `kind`, `reason`, `ask`, and for an ensemble escalation `checks` (the keys it is about; absent otherwise). |
-| `EnsembleTriggered`, `OpinionRequested`, `OpinionRecorded`, `EnsembleResolved` | The `aftman_core::ensemble` payload types (doc 06 §8). One assessed cycle appends, in `seq` order: `AssessmentCompleted`; one `EnsembleTriggered` per triggered check; whatever the ensemble's source appends while it works (`EvidenceCollected` per refreshed provider, `ModelError`/`RateLimited`/`BudgetExceeded` with `purpose: "refresh"` for a failed refresh call, `OpinionRequested`); one `OpinionRecorded` per opinion; one `EnsembleResolved`; then `DirectiveProposed`… and `DirectiveSelected`. A cycle with no answers (a failed or refused model call) appends one `EnsembleResolved` with no `cycle` and no `checks`. |
+| `EnsembleTriggered`, `OpinionRequested`, `OpinionRecorded`, `EnsembleResolved` | The `aftman_core::ensemble` payload types (doc 06 §8). One assessed cycle appends, in `seq` order: `AssessmentCompleted`; one `EnsembleTriggered` per triggered check; whatever the ensemble's source appends while it works (`EvidenceCollected` per refreshed provider, `ModelError`/`RateLimited`/`BudgetExceeded` with `purpose: "refresh"` or `"reframe"` and the `check` for a failed refresh or reframe call, `OpinionRequested` before each reframe); one `OpinionRecorded` per opinion; one `EnsembleResolved`; then `DirectiveProposed`… and `DirectiveSelected`. A cycle with no answers (a failed or refused model call) appends one `EnsembleResolved` with no `cycle` and no `checks`. |
 | `EscalationAnswered` | `escalation_id`, `surface`, `decision` (the serialized `HumanDecision`), `note` (≤ 2000 chars). |
 | `Notification` (`code: "guidance_not_delivered"`) | A `Guidance` answer with no active worker to receive it; recorded, not an error. |
 | `RunFinished` | `status`, counts, and `reason` when something stated one (a cancel's reason, `"stopped by operator"`). |

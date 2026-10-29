@@ -91,6 +91,13 @@ pub struct RefreshOutcome {
     /// treated the same way.
     pub new_p: Option<f32>,
     pub error: Option<String>,
+    /// `state_digest` (BLAKE3, volatile fields included, `docs/06-ensemble.md` §8) of the
+    /// state the fresh question was asked over, when the model was asked. An R2 reframe of
+    /// the refreshed value is asked over exactly that state, so its `OPINION_REQUESTED`
+    /// carries the same digest. `None` when no model call was made, and from a record
+    /// written before it was carried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_digest: Option<String>,
 }
 
 /// R2: ask the same model the negated question about the same state.
@@ -101,6 +108,13 @@ pub struct ReframeRequest {
     pub opinion: OpinionKey,
     /// `opinion_timeout_seconds`. The source enforces it.
     pub timeout: Duration,
+    /// Whether the value under question is this cycle's R0 refresh rather than the
+    /// assessment's: the source must ask over the state the value was measured on, and a
+    /// refreshed value was measured on the refresh's state. Says which measurement, never
+    /// what it was. Only the irreversible gate can ask about a refreshed value; the ladder
+    /// never reframes a check it refreshed.
+    #[serde(default)]
+    pub refreshed: bool,
 }
 
 /// What an R2 call returned, before any verdict is computed.
@@ -636,6 +650,7 @@ async fn resolve_check(
             .reframe_same_model(&ReframeRequest {
                 opinion: key.clone(),
                 timeout: Duration::from_secs(settings.opinion_timeout_seconds),
+                refreshed: matches!(rc.resolution, Resolution::EvidenceRefreshed { .. }),
             })
             .await?;
         let verdict = reframe_verdict(
@@ -844,6 +859,9 @@ fn normalize_refresh(mut outcome: RefreshOutcome, requested: &[EvidenceId]) -> R
     outcome.error = outcome
         .error
         .map(|error| cap_bytes(&error, REFRESH_ERROR_CAP_BYTES));
+    outcome.state_digest = outcome
+        .state_digest
+        .map(|digest| cap_bytes(&digest, OPINION_LABEL_CAP_BYTES));
     outcome
 }
 

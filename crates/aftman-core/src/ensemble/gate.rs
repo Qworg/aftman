@@ -187,6 +187,7 @@ async fn guard(
             .reframe_same_model(&ReframeRequest {
                 opinion: opinion_key.clone(),
                 timeout: Duration::from_secs(settings.opinion_timeout_seconds),
+                refreshed: matches!(rc.resolution, Resolution::EvidenceRefreshed { .. }),
             })
             .await?;
         let verdict = reframe_verdict(

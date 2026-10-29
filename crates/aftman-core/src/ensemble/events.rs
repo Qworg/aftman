@@ -143,6 +143,49 @@ impl From<&KeyedOpinion> for OpinionRecordedPayload {
 }
 
 impl OpinionRecordedPayload {
+    /// One line for a surface: the rung, the verdict and the side it is about, what was
+    /// reported and by which model, then the error or the excerpt.
+    ///
+    /// For R2 `p_reported` is `p(not X)`, the answer to the negated question: shown for
+    /// audit, and used in no computation (`docs/06-ensemble.md` §4). Event text is untrusted
+    /// — the excerpt and the error come from a model call — and is included verbatim:
+    /// every surface sanitizes or escapes what this returns.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        let rung = match self.rung {
+            Rung::ReframeSameModel => "R2 reframe",
+            Rung::IndependentJudge => "R1 judge",
+            Rung::RefreshEvidence => "R0 refresh",
+            Rung::Human => "R3 human",
+        };
+        let side = |side: &crate::assessment::Side| match side {
+            crate::assessment::Side::Above => "above",
+            crate::assessment::Side::Below => "below",
+        };
+        let verdict = match &self.verdict {
+            Verdict::Confirm { side: s } => format!("confirm ({})", side(s)),
+            Verdict::Contest { side: s } => format!("contest ({})", side(s)),
+            Verdict::Abstain => "abstain".to_owned(),
+        };
+        let reported = match (self.rung, self.p_reported) {
+            (Rung::ReframeSameModel, Some(q)) => format!("p(not X) = {q:.2}"),
+            (_, Some(q)) => format!("p = {q:.2}"),
+            (_, None) => "no value".to_owned(),
+        };
+        let model = if self.model.is_empty() {
+            String::new()
+        } else {
+            format!(" from {}", self.model)
+        };
+        let mut line = format!("{rung}: {verdict}, {reported}{model}");
+        if let Some(error) = &self.error {
+            line.push_str(&format!(": {error}"));
+        } else if !self.excerpt.is_empty() {
+            line.push_str(&format!(": {}", self.excerpt));
+        }
+        line
+    }
+
     /// The answer as the source returned it, for a replay to give back.
     #[must_use]
     pub fn answer(&self) -> ReframeAnswer {
@@ -212,6 +255,11 @@ pub struct CheckResolvedPayload {
     /// Set when the final irreversible gate guarded this check.
     #[serde(default)]
     pub irreversible_guard: Option<IrreversibleGuard>,
+    /// Every opinion obtained for this check this cycle, as its `OPINION_RECORDED` carries
+    /// it, so a surface can show an R2 verdict next to the check it is about. Absent from a
+    /// record written before opinions were carried here, and when there were none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub opinions: Vec<OpinionRecordedPayload>,
 }
 
 impl From<&CheckRecord> for CheckResolvedPayload {
@@ -230,6 +278,7 @@ impl From<&CheckRecord> for CheckResolvedPayload {
             refresh: record.refresh.clone(),
             escalation: record.escalation.clone(),
             irreversible_guard: record.irreversible_guard.clone(),
+            opinions: record.opinion_recorded_payloads(),
         }
     }
 }
@@ -381,6 +430,9 @@ impl CheckResolvedPayload {
                 ),
             });
         }
+        for opinion in &self.opinions {
+            lines.push(opinion.describe());
+        }
         if let Some(ask) = &self.escalation {
             lines.push(format!("escalated: {ask}"));
         }
@@ -400,6 +452,7 @@ impl CheckResolvedPayload {
     #[must_use]
     pub fn is_notable(&self) -> bool {
         self.refresh.is_some()
+            || !self.opinions.is_empty()
             || !self.limits.is_empty()
             || self.escalation.is_some()
             || self.irreversible_guard.is_some()

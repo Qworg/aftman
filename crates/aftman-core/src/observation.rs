@@ -640,6 +640,20 @@ pub fn render_log(log: &BoundedLog, tail_chars: usize) -> (String, String) {
     )
 }
 
+/// BLAKE3 over the canonical serialization of a `state` document exactly as it is handed to
+/// the decision model, **volatile fields included** (`docs/06-ensemble.md` §8).
+///
+/// Provenance, not change detection: it proves that two calls were shown the same state —
+/// that an R2 reframe was asked over exactly what Jev saw when it measured the value — so a
+/// timestamp that differs must make it differ. [`Observation::content_digest`] is the
+/// opposite tool, and deliberately removes those fields. Canonical because a `Map`-backed
+/// `Value` serializes in key order.
+#[must_use]
+pub fn state_digest(state: &Value) -> String {
+    let bytes = serde_json::to_vec(state).unwrap_or_default();
+    blake3::hash(&bytes).to_hex().to_string()
+}
+
 /// The default evidence selection, as owned ids.
 #[must_use]
 pub fn default_evidence() -> Vec<String> {

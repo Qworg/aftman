@@ -14,7 +14,7 @@
 //! events are only flushed at a cycle — which is circular, and would have meant the
 //! supervisor slept until the worker exited. See `docs/02-lld.md` §7.1.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1039,6 +1039,10 @@ impl FactoryRuntime {
                 EventKind::AssessmentCompleted,
                 json!({
                     "assessment_seq": ls.assessments,
+                    // What the model was shown for every value below (`docs/06-ensemble.md`
+                    // §8): an R2 reframe of one of them is asked over the same state, and
+                    // its `OPINION_REQUESTED` carries the same digest.
+                    "state_digest": aftman_core::observation::state_digest(&state_json),
                     "model": model_name,
                     "input_tokens": usage.input_tokens,
                     "output_tokens": usage.output_tokens,
@@ -1071,6 +1075,7 @@ impl FactoryRuntime {
             // read by both the ensemble and that step, so the two cannot disagree.
             let finish_is_provisional =
                 !ls.before_finish_ran && !self.deps.evidence.due(RunWhen::BeforeFinish).is_empty();
+            let definitions = registry.checks();
             let cycle = EnsembleCycle {
                 cycle: AssessmentSeq(ls.assessments.into()),
                 settings: self.deps.ensemble.clone(),
@@ -1082,12 +1087,16 @@ impl FactoryRuntime {
                 active_worker: state.active_worker().cloned(),
                 last_directive: ls.last_directive.clone(),
                 steering_grace: self.deps.steering_grace,
-                definitions: registry.checks(),
+                definitions: definitions.clone(),
                 evidence: self.deps.evidence.clone(),
                 answers: answers.clone().unwrap_or_default(),
                 ensemble: state.ensemble.clone(),
-                // R2 is ensemble stage S2: no check carries a negated question yet.
-                reframe_available: BTreeSet::new(),
+                // Every check with an independently written negation, when R2 is a
+                // configured rung: built once, from the definitions the questions came from.
+                reframe_available: aftman_core::ensemble::reframable_checks(
+                    &self.deps.ensemble,
+                    &definitions,
+                ),
                 finish_is_provisional,
                 checks,
             };
@@ -1108,6 +1117,7 @@ impl FactoryRuntime {
                         &mut control,
                         &registry,
                         &questions,
+                        &state_json,
                         &cycle,
                     )
                     .await?,
@@ -2326,6 +2336,7 @@ impl FactoryRuntime {
         control: &mut Option<ControlReceiver>,
         registry: &ResponsibilityRegistry,
         questions: &BTreeMap<CheckKey, Question>,
+        assessed: &serde_json::Value,
         cycle: &EnsembleCycle,
     ) -> Result<Result<EnsembleOutcome, ()>, RuntimeError> {
         let input = cycle.policy_input(&cycle.checks);
@@ -2346,11 +2357,13 @@ impl FactoryRuntime {
                     job,
                     questions,
                     definitions: &cycle.definitions,
+                    assessed,
                     timeout: Duration::from_secs(cycle.settings.opinion_timeout_seconds),
                     scratch: tokio::sync::Mutex::new(Scratch {
                         state: &mut *state,
                         ls: &mut *ls,
                         control: &mut *control,
+                        refreshed: BTreeMap::new(),
                         fatal: None,
                     }),
                 };
@@ -2715,21 +2728,37 @@ impl EscalatedChecks {
 /// Why a refresh produced nothing: the run was cancelled while it worked.
 const CANCELLED: &str = "the run was cancelled; the refresh was abandoned";
 
-/// Why R2 has no answer in this release.
-const REFRAME_UNAVAILABLE: &str =
-    "the same-model reframe (R2) is ensemble stage S2 and is not available in this release";
+/// Why a reframe produced nothing: the run was cancelled before it answered.
+const REFRAME_CANCELLED: &str = "the run was cancelled; the reframe was abandoned";
 
-/// The runtime's [`OpinionSource`] for one cycle (`docs/06-ensemble.md` §4 R0).
+/// How a bounded model call ended (`CycleSource::bounded_ask`).
+enum Asked {
+    /// The call returned, with answers or with an error.
+    Returned(Result<aftman_core::model::ModelAnswers, ModelError>),
+    /// The task ended without returning: it panicked, or was aborted.
+    Lost(String),
+    /// `opinion_timeout_seconds` passed first. The call is abandoned, never dropped part way.
+    TimedOut,
+    /// A cancel arrived first. The call is abandoned the same way.
+    Cancelled,
+}
+
+/// The runtime's [`OpinionSource`] for one cycle (`docs/06-ensemble.md` §4 R0 and R2).
 ///
 /// An evidence refresh runs exactly the providers requested, through the same path as
 /// every other provider ([`FactoryRuntime::run_one_provider`]: the scrubbed environment,
 /// the bounds, one `EVIDENCE_COLLECTED` each), rebuilds the observation with what they
 /// produced, and asks the model that check's question again under
-/// [`Purpose::Refresh`]. The call is billed like any other (the provider writes its usage
-/// line) and counts against `max_assessments` and the request budget. A failed or refused
-/// call, a spent budget, and the `opinion_timeout_seconds` deadline — which bounds the model
-/// call alone; each provider is bounded by its own timeout — are outcomes with no value,
-/// never errors.
+/// [`Purpose::Refresh`]. A reframe asks the check's independently written negation, under
+/// [`Purpose::Reframe`], over the state the value under question was measured on: the
+/// cycle's own assessment state, or — for a value this cycle's refresh produced — the
+/// refresh's. Neither request carries a probability, and nothing the model is shown
+/// contains one from this cycle (`docs/06-ensemble.md` §10).
+///
+/// Every call is billed like any other (the provider writes its usage line) and counts
+/// against `max_assessments` and the request budget. A failed or refused call, a spent
+/// budget, and the `opinion_timeout_seconds` deadline — which bounds the model call alone;
+/// each provider is bounded by its own timeout — are outcomes with no value, never errors.
 ///
 /// It emits from inside the resolution, so it holds the run state behind a lock: one call
 /// at a time, each event appended to the store before it reaches the hub, in `seq` order
@@ -2740,6 +2769,9 @@ struct CycleSource<'a> {
     job: &'a Job,
     questions: &'a BTreeMap<CheckKey, Question>,
     definitions: &'a [aftman_core::responsibility::Check],
+    /// The state document this cycle's assessment was asked over: what Jev saw for every
+    /// value it measured this cycle.
+    assessed: &'a serde_json::Value,
     timeout: Duration,
     scratch: tokio::sync::Mutex<Scratch<'a>>,
 }
@@ -2750,6 +2782,9 @@ struct Scratch<'a> {
     /// Watched while a provider or the model call runs; what arrives is queued in
     /// `ls.pending_control`, and a cancel stops the refresh (`docs/06-ensemble.md` §6.1).
     control: &'a mut Option<ControlReceiver>,
+    /// The state each refresh this cycle asked its question over, by check. A reframe of a
+    /// refreshed value is asked over exactly this.
+    refreshed: BTreeMap<CheckKey, serde_json::Value>,
     fatal: Option<RuntimeError>,
 }
 
@@ -2768,6 +2803,52 @@ impl CycleSource<'_> {
         selection
     }
 
+    /// Ask the model, bounded by `opinion_timeout_seconds` alone, watching the control
+    /// channel.
+    ///
+    /// The call runs as its own task, so the deadline or a cancel abandons the *wait* and
+    /// never a future that writes: the call finishes on its own and the provider client
+    /// records its usage line when it does. Nothing here emits; every event about the call
+    /// is the caller's, after this returns (`docs/02-lld.md` §11).
+    async fn bounded_ask(
+        &self,
+        scratch: &mut Scratch<'_>,
+        context: aftman_core::model::AskContext,
+        state: serde_json::Value,
+        questions: BTreeMap<CheckKey, Question>,
+    ) -> Asked {
+        let model = Arc::clone(&self.rt.deps.model);
+        let budget = self.rt.deps.jev_budget;
+        let call =
+            tokio::spawn(async move { model.ask(&context, &state, &questions, &budget).await });
+        let deadline = tokio::time::sleep(self.timeout);
+        tokio::pin!(call, deadline);
+        let mut closed = scratch.control.is_none();
+        let asked = loop {
+            tokio::select! {
+                joined = &mut call => break match joined {
+                    Ok(returned) => Asked::Returned(returned),
+                    Err(joined) => Asked::Lost(joined.to_string()),
+                },
+                () = &mut deadline => break Asked::TimedOut,
+                message = recv_control(scratch.control), if !closed => match message {
+                    Some(message) => {
+                        let cancel = is_cancel(&message);
+                        scratch.ls.pending_control.push(message);
+                        if cancel {
+                            break Asked::Cancelled;
+                        }
+                    }
+                    None => closed = true,
+                },
+            }
+        };
+        if closed {
+            *scratch.control = None;
+        }
+        asked
+    }
+
     async fn refresh(
         &self,
         scratch: &mut Scratch<'_>,
@@ -2778,6 +2859,7 @@ impl CycleSource<'_> {
             runs: runs.to_vec(),
             new_p: None,
             error: Some(error),
+            state_digest: None,
         };
         // A cancel is waiting: nothing more is started this cycle.
         if scratch.ls.cancel_pending() {
@@ -2860,55 +2942,30 @@ impl CycleSource<'_> {
             )
             .await;
         let state_json = observation.state_for(&self.selection(&request.check));
+        // Kept for a reframe of the value this refresh produces: R2 is asked over the state
+        // that value was measured on.
+        scratch
+            .refreshed
+            .insert(request.check.clone(), state_json.clone());
         let questions = BTreeMap::from([(request.check.clone(), question.clone())]);
 
         scratch.ls.assessments += 1;
         scratch.state.counters.assessments = scratch.ls.assessments;
-        // `opinion_timeout_seconds` bounds the model call, and only the model call. The
-        // call runs as its own task, so a deadline abandons the *wait*, never a future
-        // that writes: the call finishes on its own and the provider client records its
-        // usage line when it does. Every event below is emitted after the wait is over.
-        let model = Arc::clone(&self.rt.deps.model);
         let context =
             aftman_core::model::AskContext::for_run(Purpose::Refresh, run_id, request.cycle);
-        let budget = self.rt.deps.jev_budget;
-        let call =
-            tokio::spawn(
-                async move { model.ask(&context, &state_json, &questions, &budget).await },
-            );
-        // Wait for it, watching the control channel: a cancel stops the wait (the abandoned
-        // call finishes on its own, as on a timeout).
-        let deadline = tokio::time::sleep(self.timeout);
-        tokio::pin!(call, deadline);
-        let mut closed = scratch.control.is_none();
-        let waited = loop {
-            tokio::select! {
-                joined = &mut call => break Ok(joined),
-                () = &mut deadline => break Err(()),
-                message = recv_control(scratch.control), if !closed => match message {
-                    Some(message) => {
-                        let cancel = is_cancel(&message);
-                        scratch.ls.pending_control.push(message);
-                        if cancel {
-                            return Ok(no_value(runs, CANCELLED.into()));
-                        }
-                    }
-                    None => closed = true,
-                },
-            }
-        };
-        if closed {
-            *scratch.control = None;
-        }
-        let answered = match waited {
-            Ok(Ok(answered)) => answered,
-            Ok(Err(joined)) => {
+        let answered = match self
+            .bounded_ask(scratch, context, state_json, questions)
+            .await
+        {
+            Asked::Returned(answered) => answered,
+            Asked::Cancelled => return Ok(no_value(runs, CANCELLED.into())),
+            Asked::Lost(joined) => {
                 return Ok(no_value(
                     runs,
                     format!("the refresh call ended without an answer: {joined}"),
                 ));
             }
-            Err(()) => {
+            Asked::TimedOut => {
                 self.rt
                     .emit(
                         scratch.state,
@@ -2946,6 +3003,7 @@ impl CycleSource<'_> {
                     error: new_p
                         .is_none()
                         .then(|| "the model gave no probability for the check".to_owned()),
+                    state_digest: None,
                 })
             }
             Err(error) => {
@@ -2959,7 +3017,196 @@ impl CycleSource<'_> {
             }
         }
     }
+
+    /// R2: ask the check's negated question over the state its value was measured on
+    /// (`docs/06-ensemble.md` §4 R2).
+    ///
+    /// The request is built from three things only — the check's key, its independently
+    /// written negation, and that state — so nothing in it can be Jev's value for the
+    /// original question, or any earlier opinion: the state was assembled before this
+    /// cycle's value existed, and event summaries carry kinds, never payloads.
+    async fn reframe(
+        &self,
+        scratch: &mut Scratch<'_>,
+        request: &ReframeRequest,
+    ) -> Result<ReframeAnswer, RuntimeError> {
+        let check = &request.opinion.check;
+        let started = tokio::time::Instant::now();
+        let no_value = |prompt_hash: &str, state_digest: &str, error: String| ReframeAnswer {
+            p_negated: None,
+            source: REFRAME_SOURCE.into(),
+            model: String::new(),
+            excerpt: String::new(),
+            prompt_hash: prompt_hash.to_owned(),
+            state_digest: state_digest.to_owned(),
+            latency: started.elapsed(),
+            usage: aftman_core::model::Usage::default(),
+            error: Some(error),
+        };
+        let negation = self
+            .definitions
+            .iter()
+            .find(|definition| definition.key == *check)
+            .and_then(|definition| definition.negation.clone());
+        // The state the value under question was measured on.
+        let state = if request.refreshed {
+            scratch.refreshed.get(check).cloned()
+        } else {
+            Some(self.assessed.clone())
+        };
+        let (Some(negation), Some(state)) = (negation, state) else {
+            // Neither can happen for a plan built over this cycle's `reframe_available`;
+            // the request is answered, and recorded, rather than guessed at.
+            self.rt
+                .emit(
+                    scratch.state,
+                    EventKind::OpinionRequested,
+                    serde_json::to_value(OpinionRequestedPayload::new(
+                        request,
+                        REFRAME_SOURCE,
+                        "",
+                        "",
+                        "",
+                    ))
+                    .unwrap_or(serde_json::Value::Null),
+                )
+                .await?;
+            return Ok(no_value(
+                "",
+                "",
+                "the check has no negated question, or no state to ask it over".into(),
+            ));
+        };
+        let questions = BTreeMap::from([(check.clone(), negation)]);
+        let prompt_hash = aftman_core::observation::state_digest(&json!({
+            "purpose": "reframe",
+            "questions": questions,
+        }));
+        let state_digest = aftman_core::observation::state_digest(&state);
+        self.rt
+            .emit(
+                scratch.state,
+                EventKind::OpinionRequested,
+                serde_json::to_value(OpinionRequestedPayload::new(
+                    request,
+                    REFRAME_SOURCE,
+                    "",
+                    &prompt_hash,
+                    &state_digest,
+                ))
+                .unwrap_or(serde_json::Value::Null),
+            )
+            .await?;
+        if scratch.ls.cancel_pending() {
+            return Ok(no_value(
+                &prompt_hash,
+                &state_digest,
+                REFRAME_CANCELLED.into(),
+            ));
+        }
+        // The reframe is an assessment for the budget's purposes, exactly as a refresh is.
+        if scratch.ls.assessments >= self.rt.deps.config.max_assessments {
+            return Ok(no_value(
+                &prompt_hash,
+                &state_digest,
+                format!(
+                    "the assessment budget ({}) is spent; the negated question was not asked",
+                    self.rt.deps.config.max_assessments
+                ),
+            ));
+        }
+        scratch.ls.assessments += 1;
+        scratch.state.counters.assessments = scratch.ls.assessments;
+        let run_id = scratch.state.header.id;
+        let context = aftman_core::model::AskContext::for_run(
+            Purpose::Reframe,
+            run_id,
+            request.opinion.cycle,
+        );
+        let answered = match self.bounded_ask(scratch, context, state, questions).await {
+            Asked::Returned(answered) => answered,
+            Asked::Cancelled => {
+                return Ok(no_value(
+                    &prompt_hash,
+                    &state_digest,
+                    REFRAME_CANCELLED.into(),
+                ));
+            }
+            Asked::Lost(joined) => {
+                return Ok(no_value(
+                    &prompt_hash,
+                    &state_digest,
+                    format!("the reframe call ended without an answer: {joined}"),
+                ));
+            }
+            Asked::TimedOut => {
+                self.rt
+                    .emit(
+                        scratch.state,
+                        EventKind::ModelError,
+                        json!({
+                            "code": "opinion_timeout",
+                            "message": format!(
+                                "the reframe call did not answer within {}s; it was abandoned",
+                                self.timeout.as_secs()
+                            ),
+                            "retryable": true,
+                            "purpose": "reframe",
+                            "check": check.to_string(),
+                        }),
+                    )
+                    .await?;
+                return Ok(no_value(
+                    &prompt_hash,
+                    &state_digest,
+                    format!(
+                        "the reframe call did not answer within {}s",
+                        self.timeout.as_secs()
+                    ),
+                ));
+            }
+        };
+        match answered {
+            Ok(answers) => {
+                let p_negated = answers
+                    .answers
+                    .get(check)
+                    .and_then(aftman_core::assessment::AnswerValue::as_noul);
+                Ok(ReframeAnswer {
+                    p_negated,
+                    source: REFRAME_SOURCE.into(),
+                    excerpt: p_negated.map_or_else(String::new, |q| {
+                        format!("the negation of `{check}` was answered {q:.4}")
+                    }),
+                    model: answers.model,
+                    prompt_hash,
+                    state_digest,
+                    latency: started.elapsed(),
+                    usage: answers.usage,
+                    error: p_negated.is_none().then(|| {
+                        "the model gave no probability for the negated question".to_owned()
+                    }),
+                })
+            }
+            Err(error) => {
+                let mut payload = model_error_payload(&error);
+                payload["purpose"] = json!("reframe");
+                payload["check"] = json!(check.to_string());
+                self.rt
+                    .emit(scratch.state, model_error_kind(&error), payload)
+                    .await?;
+                Ok(no_value(
+                    &prompt_hash,
+                    &state_digest,
+                    format!("the reframe call failed: {error}"),
+                ))
+            }
+        }
+    }
 }
+
+/// The source an R2 opinion is recorded under: the same model that measured the value.
+const REFRAME_SOURCE: &str = "jev";
 
 #[async_trait::async_trait]
 impl OpinionSource for CycleSource<'_> {
@@ -2974,6 +3221,7 @@ impl OpinionSource for CycleSource<'_> {
                 runs: Vec::new(),
                 new_p: None,
                 error: Some("the run is ending".into()),
+                state_digest: None,
             });
         }
         // Cancellation safety: this future is awaited to completion, never dropped part way
@@ -2984,13 +3232,22 @@ impl OpinionSource for CycleSource<'_> {
         // `opinion_timeout_seconds` around the model call alone (`docs/02-lld.md` §11).
         let mut runs = Vec::new();
         Ok(match self.refresh(scratch, request, &mut runs).await {
-            Ok(outcome) => outcome,
+            // The digest of the state the fresh question was asked over, whenever it was
+            // asked: what a reframe of the refreshed value will be asked over too.
+            Ok(outcome) => RefreshOutcome {
+                state_digest: scratch
+                    .refreshed
+                    .get(&request.check)
+                    .map(aftman_core::observation::state_digest),
+                ..outcome
+            },
             Err(error) => {
                 scratch.fatal = Some(error);
                 RefreshOutcome {
                     runs,
                     new_p: None,
                     error: Some("the run is ending".into()),
+                    state_digest: None,
                 }
             }
         })
@@ -3002,32 +3259,28 @@ impl OpinionSource for CycleSource<'_> {
     ) -> Result<ReframeAnswer, SourceError> {
         let mut guard = self.scratch.lock().await;
         let scratch = &mut *guard;
-        if scratch.fatal.is_none() {
-            let payload = OpinionRequestedPayload::new(request, "jev", "", "", "");
-            if let Err(error) = self
-                .rt
-                .emit(
-                    scratch.state,
-                    EventKind::OpinionRequested,
-                    serde_json::to_value(payload).unwrap_or(serde_json::Value::Null),
-                )
-                .await
-            {
-                scratch.fatal = Some(error);
-            }
-        }
-        // No call is made: an answer with no value, which the resolver reads as an
-        // abstention (or, for an irreversible action, a contest). Never a confirm.
-        Ok(ReframeAnswer {
+        let ending = || ReframeAnswer {
             p_negated: None,
-            source: "jev".into(),
+            source: REFRAME_SOURCE.into(),
             model: String::new(),
             excerpt: String::new(),
             prompt_hash: String::new(),
             state_digest: String::new(),
             latency: Duration::ZERO,
             usage: aftman_core::model::Usage::default(),
-            error: Some(REFRAME_UNAVAILABLE.into()),
+            error: Some("the run is ending".into()),
+        };
+        if scratch.fatal.is_some() {
+            return Ok(ending());
+        }
+        // Cancellation safety, as for a refresh: awaited to completion, never dropped part
+        // way. The only bound is `opinion_timeout_seconds` around the model call itself.
+        Ok(match self.reframe(scratch, request).await {
+            Ok(answer) => answer,
+            Err(error) => {
+                scratch.fatal = Some(error);
+                ending()
+            }
         })
     }
 }

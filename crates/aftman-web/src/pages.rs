@@ -1287,11 +1287,32 @@ mod tests {
                     }],
                     new_p: Some(0.08),
                     error: None,
+                    state_digest: None,
                 },
                 rejected: None,
             }),
             escalation: Some("<script>alert(1)</script> is it done?".into()),
             irreversible_guard: None,
+            opinions: vec![aftman_core::ensemble::OpinionRecordedPayload {
+                opinion_id: aftman_core::ensemble::OpinionKey {
+                    cycle: AssessmentSeq(4),
+                    check: "core.verification__tests_sufficient".into(),
+                    rung: Rung::ReframeSameModel,
+                },
+                rung: Rung::ReframeSameModel,
+                verdict: aftman_core::assessment::Verdict::Contest {
+                    side: aftman_core::assessment::Side::Below,
+                },
+                source: "jev".into(),
+                model: "jev-model".into(),
+                p_reported: Some(0.92),
+                excerpt: "<img src=x onerror=alert(1)> answered 0.92".into(),
+                prompt_hash: "h".into(),
+                state_digest: "d".into(),
+                latency: std::time::Duration::from_millis(12),
+                usage: aftman_core::model::Usage::default(),
+                error: None,
+            }],
         };
         serde_json::to_value(EnsembleResolvedPayload {
             enabled: true,
@@ -1323,6 +1344,13 @@ mod tests {
         assert!(row.contains("limit: refresh cap reached (3/3)"), "{row}");
         assert!(row.contains("escalated: &lt;script&gt;"), "{row}");
         assert!(!row.contains("<script>"), "{row}");
+        // An R2 verdict, with its excerpt escaped like everything else.
+        assert!(
+            row.contains("R2 reframe: contest (below), p(not X) = 0.92 from jev-model"),
+            "{row}"
+        );
+        assert!(row.contains("&lt;img src=x"), "{row}");
+        assert!(!row.contains("<img"), "{row}");
     }
 
     #[test]

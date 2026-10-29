@@ -116,8 +116,7 @@ pub struct EnsembleContext<'a> {
     /// This cycle's raw answers, for the confidence of `Choice`/`Score` checks.
     pub answers: &'a BTreeMap<CheckKey, AnswerValue>,
     pub counters: &'a EnsembleCounters,
-    /// Checks that can be asked the negated question (R2). Empty until check
-    /// definitions carry a negation.
+    /// Checks that can be asked the negated question (R2): see [`reframable_checks`].
     pub reframe_available: &'a BTreeSet<CheckKey>,
     /// Whether a `Finish` selected this cycle will *not* be executed. When `before_finish`
     /// providers exist and have not run, the runtime does not apply a selected `Finish`:

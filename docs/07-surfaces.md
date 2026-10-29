@@ -510,7 +510,13 @@ surface like any other event text. Per triggered check it shows:
   `refresh rejected, no provider ran (tests did not run): <error>`;
 - every **limit** that stopped the ladder: `limit: refresh cap reached (3/3)`,
   `limit: opinion budget spent (20/20)`, `limit: cooldown, …`;
-- the **escalation**: `escalated: <the question>`, and, from S2, the irreversible guard.
+- the **escalation**: `escalated: <the question>`, and the irreversible guard
+  (`guarded for Finish: bought`);
+- each **opinion** (S2): `R2 reframe: contest (below), p(not X) = 0.90 from <model>: <excerpt or
+  error>` — the verdict and the side it is about, the answer to the negated question (shown, used in
+  no computation), and the model's text, which is untrusted like every other event field and is
+  sanitized or escaped by each surface. A check with an opinion is notable, so `aftman watch`
+  shows it.
 
 Where it appears:
 

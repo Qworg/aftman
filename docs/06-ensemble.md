@@ -109,7 +109,7 @@ Two kinds of uncertainty exist, and they are handled by **different mechanisms**
 | `OutcomeRelevant` | Pinning the check to the other side of `t` would change the selected directive | R0 if in-band; R1+R2 if decisive |
 | `HighStakes` | A rule that would fire is marked `stakes = "high"` | R0 if in-band; R1+R2 if decisive |
 | `Irreversible` | The selected directive is `Finish` or `Stop` | R1+R2 if decisive |
-| `RepeatContest` | The same check was held or contested in ≥ `consecutive_contests_before_human` prior cycles (2) | escalate |
+| `RepeatContest` | An in-band check was in band, or a decisive check was contested, in ≥ `consecutive_contests_before_human` consecutive prior cycles (2) | escalate |
 
 `OutcomeRelevant` is cheap because policy is pure: re-run `arbitrate()` with the check forced to
 fire and forced not to fire, and compare the selected directive. If the directive does not change,
@@ -139,7 +139,7 @@ Precisely, for a check `k` with threshold `t` (`aftman_core::ensemble::EnsembleP
 | `OutcomeRelevant` | the selected directive's kind differs between `k` pinned above and `k` pinned below |
 | `HighStakes` | some `stakes = "high"` proposal depends on `k`: for a decisive `k`, one proposed now that would not be proposed were `k` held; for a held `k`, one that either pinned side proposes and the held state does not |
 | `Irreversible` | `k` is decisive, the selected directive is `Finish` or `Stop`, and pinning `k` to the *other* side changes it. Every check is load-bearing for `Finish` through `UnresolvedUncertainty`; this asks whether the irreversible directive rests on `k`'s *side* |
-| `RepeatContest` | `k` ended not permitted in at least `consecutive_contests_before_human` consecutive prior cycles (`EnsembleCounters`) |
+| `RepeatContest` | for an in-band `k`: its measurement was in band in at least `consecutive_contests_before_human` consecutive prior cycles; for a decisive `k`: an opinion **contested** it in at least that many consecutive prior cycles (`EnsembleCounters`). The two counts are separate: in-band cycles never count toward escalating a value that has since become decisive |
 
 Alongside the triggers the plan records whether **a rule would fire** on `k`: some proposal made this
 cycle would disappear if `k` were not permitted. That is the only case in which an opinion — which
@@ -513,13 +513,13 @@ async fn resolve_check(plan: &CheckPlan, sources: &dyn OpinionSource) -> Resolve
     if !plan.wants_opinion() {                                // OutcomeRelevant | HighStakes | Irreversible
         return rc;
     }
-    if plan.has(RepeatContest) && rungs.contains(Rung::Human) {
-        return rc.suppress(Unresolved, UnresolvedInBand { ask, rungs: vec![Rung::Human] });
-    }
     let opinion_rungs = [ReframeSameModel /*, IndependentJudge from S3 */]
         .filter(enabled && available for this check);
     if opinion_rungs.is_empty() {
-        return rc;
+        return rc;                         // no opinion to buy: stands, whatever its history
+    }
+    if plan.has(RepeatContest) && rungs.contains(Rung::Human) {   // consecutive CONTESTS
+        return rc.suppress(Unresolved, UnresolvedInBand { ask, rungs: vec![Rung::Human] });
     }
     if let Some(last) = cooldown_active(&plan.check) {
         // One opinion per check per window. The earlier opinion stands in for this
@@ -558,8 +558,20 @@ opinion-driven `Finish` that no single-cycle test can see.
 
 Every bound that stops the ladder — the refresh cap, the opinion budget, a cooldown — is recorded
 on the check's result (`EnsembleLimit`) and in `EnsembleResolved`, so a held check always says why.
-After every check is resolved, each thresholded check's `consecutive_held` counter is incremented if
-it ended not permitted and reset otherwise; that counter is what `RepeatContest` reads next cycle.
+After every check is resolved, each thresholded check's two repeat counters are updated, and they
+are what `RepeatContest` reads next cycle:
+
+- `consecutive_in_band` counts consecutive cycles whose *measurement* was in band (it resets on a
+  decisive one). It counts the measurement, not the hold, so an escalation does not feed it.
+- `consecutive_contests` counts consecutive cycles in which an opinion *contested* the decisive
+  value. It resets on a cycle that ends permitted, or in band, and is left unchanged by a cycle held
+  for any other reason — a cooldown, the budget, or an escalation — so an escalation does not feed
+  it either.
+
+An earlier revision kept one "held" counter for both. In-band holds then escalated a value that had
+since become decisive, and kept escalating it, because each escalation was itself a hold; without
+the `human` rung the same run finished instead. A decisive, uncontested value with no opinion to
+buy is permitted, whatever its history.
 
 **Ordering, and why it differs from an earlier draft.** An earlier draft of this section checked the
 opinion budget and the cooldown *first*, for every triggered check, and suppressed on either; it
@@ -835,7 +847,8 @@ same things:
   `enabled = false`, so turning the ensemble on cannot reveal a typo accepted while it was off.
 
 The per-run counters the resolver keeps — refreshes per check, opinions used, the last opinion per
-check (for the cooldown), and consecutive held cycles per check (for `RepeatContest`) — are
+check (for the cooldown), and consecutive in-band cycles and consecutive contests per check (for
+`RepeatContest`) — are
 `EnsembleCounters`, stored in `RunState.ensemble` with `#[serde(default)]`. They are deliberately not
 in `Counters`, which is serialized into the model-facing observation.
 

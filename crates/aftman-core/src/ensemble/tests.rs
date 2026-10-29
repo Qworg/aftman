@@ -175,7 +175,16 @@ impl Scenario {
             .checks
             .entry(k(key))
             .or_default()
-            .consecutive_held = cycles;
+            .consecutive_in_band = cycles;
+        self
+    }
+
+    fn contested_for(mut self, key: &str, cycles: u32) -> Self {
+        self.ensemble
+            .checks
+            .entry(k(key))
+            .or_default()
+            .consecutive_contests = cycles;
         self
     }
 
@@ -743,7 +752,7 @@ async fn worked_example_9_2_in_band_without_evidence_escalates_and_asks_no_model
     assert!(source.reframe_calls().is_empty() && source.refresh_calls().is_empty());
     assert_ne!(s.select(&outcome.checks).name(), "Finish");
     assert_eq!(
-        outcome.counters.check(&k(TESTS)).consecutive_held,
+        outcome.counters.check(&k(TESTS)).consecutive_in_band,
         1,
         "held cycles are counted"
     );
@@ -1287,11 +1296,153 @@ async fn the_cooldown_holds_unless_an_earlier_confirm_covers_the_opinion() {
 }
 
 #[tokio::test]
+async fn repeat_contest_does_not_latch_from_in_band_holds() {
+    // Review probe 2: two in-band cycles, then a decisive value. In-band holds must not
+    // escalate a later decisive value, with or without a person to escalate to.
+    for human in [true, false] {
+        let mut counters = EnsembleCounters::default();
+        for (i, ready) in [0.79_f32, 0.79, 0.97, 0.97, 0.97].into_iter().enumerate() {
+            let mut s = Scenario::finish_ready().set(READY, ready);
+            if !human {
+                s = s.without_rung(Rung::Human);
+            }
+            s.cycle = AssessmentSeq(20 + i as u64);
+            s.ensemble = counters.clone();
+            let outcome = s.plan().resolve(&RecordedOpinionSource::new()).await;
+            if ready > 0.9 {
+                assert_eq!(outcome.escalations().count(), 0, "human={human} cycle {i}");
+                assert!(
+                    outcome.checks[&k(READY)].permitted,
+                    "human={human} cycle {i}"
+                );
+                assert_eq!(
+                    s.select(&outcome.checks).name(),
+                    "Finish",
+                    "human={human} cycle {i}"
+                );
+            }
+            counters = outcome.counters;
+        }
+    }
+}
+
+/// Run `tests_sufficient` through a sequence of cycles, each with the given value and
+/// R2 answer (`None` means R2 is not asked about anything that cycle), carrying counters.
+/// Returns, per cycle: (escalated, R2 calls, permitted, counters after).
+async fn tests_sequence(
+    steps: &[(f32, Option<f32>)],
+    cooldown: u64,
+) -> Vec<(bool, usize, bool, CheckCounters)> {
+    let mut counters = EnsembleCounters::default();
+    let mut out = Vec::new();
+    for (i, (p, q)) in steps.iter().enumerate() {
+        let mut s = Scenario::finish_ready().set(TESTS, *p).reframable(&[TESTS]);
+        s.settings.per_check_cooldown_cycles = cooldown;
+        s.cycle = AssessmentSeq(20 + i as u64);
+        s.ensemble = counters.clone();
+        let source =
+            RecordedOpinionSource::new().with_reframe(reframe_key(s.cycle, TESTS), answer(*q));
+        let outcome = s.plan().resolve(&source).await;
+        out.push((
+            outcome.escalations().count() > 0,
+            source.reframe_calls().len(),
+            outcome.checks[&k(TESTS)].permitted,
+            outcome.counters.check(&k(TESTS)),
+        ));
+        counters = outcome.counters;
+    }
+    out
+}
+
+#[tokio::test]
+async fn repeat_contest_counts_consecutive_contests_only() {
+    // p(not X) = 0.75 against p = 0.92 contests; 0.08 confirms.
+    let contest = Some(0.75);
+    let confirm = Some(0.08);
+    // Two contests, then escalation instead of a third call; the escalation does not
+    // feed its own counter.
+    let run = tests_sequence(
+        &[
+            (0.92, contest),
+            (0.92, contest),
+            (0.92, contest),
+            (0.92, contest),
+        ],
+        0,
+    )
+    .await;
+    let escalated: Vec<bool> = run.iter().map(|r| r.0).collect();
+    let calls: Vec<usize> = run.iter().map(|r| r.1).collect();
+    let contests: Vec<u32> = run.iter().map(|r| r.3.consecutive_contests).collect();
+    assert_eq!(escalated, [false, false, true, true]);
+    assert_eq!(calls, [1, 1, 0, 0]);
+    assert_eq!(
+        contests,
+        [1, 2, 2, 2],
+        "an escalation does not feed its own counter"
+    );
+    assert!(
+        run.iter().all(|r| !r.2),
+        "contested or escalated: never permitted"
+    );
+
+    // A confirm in between resets the count.
+    let run = tests_sequence(
+        &[
+            (0.92, contest),
+            (0.92, confirm),
+            (0.92, contest),
+            (0.92, contest),
+        ],
+        0,
+    )
+    .await;
+    let contests: Vec<u32> = run.iter().map(|r| r.3.consecutive_contests).collect();
+    assert_eq!(contests, [1, 0, 1, 2]);
+    assert!(
+        run.iter().all(|r| !r.0),
+        "never two consecutive contests before the last"
+    );
+
+    // So does a cycle in band.
+    let run = tests_sequence(
+        &[
+            (0.92, contest),
+            (0.71, None),
+            (0.92, contest),
+            (0.92, contest),
+        ],
+        0,
+    )
+    .await;
+    let contests: Vec<u32> = run.iter().map(|r| r.3.consecutive_contests).collect();
+    assert_eq!(contests, [1, 0, 1, 2]);
+    assert!(run.iter().all(|r| !r.0));
+}
+
+#[tokio::test]
+async fn consecutive_in_band_cycles_still_escalate() {
+    let run = tests_sequence(
+        &[(0.71, None), (0.71, None), (0.71, None), (0.92, Some(0.08))],
+        0,
+    )
+    .await;
+    let escalated: Vec<bool> = run.iter().map(|r| r.0).collect();
+    let in_band: Vec<u32> = run.iter().map(|r| r.3.consecutive_in_band).collect();
+    assert_eq!(escalated, [false, false, true, false]);
+    assert_eq!(in_band, [1, 2, 3, 0]);
+    assert!(
+        run[3].2,
+        "decisive and confirmed afterwards: permitted, history notwithstanding"
+    );
+}
+
+#[tokio::test]
 async fn a_repeated_contest_escalates_instead_of_asking_again() {
     let s = Scenario::finish_ready()
         .set(TESTS, 0.92)
         .reframable(&[TESTS])
-        .held_for(TESTS, 2);
+        .contested_for(TESTS, 2);
     let source = RecordedOpinionSource::new();
     let outcome = s.plan().resolve(&source).await;
     assert!(source.reframe_calls().is_empty());
@@ -1477,11 +1628,12 @@ fn oracle(c: &Case) -> Expected {
     if !wants {
         return with(done(Kind::Decisive, true));
     }
-    if has(EnsembleTrigger::RepeatContest) && rung(Rung::Human) {
-        return with(done(Kind::Escalated, false));
-    }
+    // No opinion to buy: the decisive value stands, whatever its history.
     if !(rung(Rung::ReframeSameModel) && c.reframe_available) {
         return with(done(Kind::Decisive, true));
+    }
+    if has(EnsembleTrigger::RepeatContest) && rung(Rung::Human) {
+        return with(done(Kind::Escalated, false));
     }
     match c.counters {
         CounterState::CooldownAfterContest => return with(done(Kind::Unresolved, false)),

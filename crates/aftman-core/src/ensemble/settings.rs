@@ -207,8 +207,15 @@ pub struct CheckCounters {
     /// The most recent cycle an opinion was requested for this check.
     pub last_opinion: Option<OpinionMark>,
     /// Consecutive cycles, up to and including the last resolved one, in which this
-    /// check ended not permitted (held in band, contested, or unresolved).
-    pub consecutive_held: u32,
+    /// check's measurement was in band. What `RepeatContest` reads for an in-band value.
+    /// Counts the measurement, not the hold, so an escalation does not feed it.
+    pub consecutive_in_band: u32,
+    /// Consecutive cycles in which an opinion contested this check's decisive value. What
+    /// `RepeatContest` reads for a decisive value. Only a contest increments it; a cycle
+    /// in which the check ends permitted, or in band, resets it; a cycle held for any
+    /// other reason (a cooldown, the budget, an escalation) leaves it unchanged, so an
+    /// escalation does not feed it either.
+    pub consecutive_contests: u32,
 }
 
 /// When an opinion was last bought for a check, and what it established.
@@ -382,7 +389,8 @@ rungs = ["refresh_evidence", "human"]
             serde_json::from_str(r#"{"checks":{"a__b":{"refreshes":2}}}"#)?;
         let check = counters.check(&"a__b".into());
         assert_eq!(check.refreshes, 2);
-        assert_eq!(check.consecutive_held, 0);
+        assert_eq!(check.consecutive_in_band, 0);
+        assert_eq!(check.consecutive_contests, 0);
         assert_eq!(check.last_opinion, None);
         Ok(())
     }

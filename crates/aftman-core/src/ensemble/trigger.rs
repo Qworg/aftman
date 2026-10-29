@@ -275,7 +275,16 @@ fn plan_check(
         }
     }
 
-    if ctx.counters.check(key).consecutive_held >= ctx.settings.consecutive_contests_before_human {
+    // In band, the count is of consecutive in-band measurements; decisive, of consecutive
+    // contests. Holds of one kind never count toward escalating the other: two in-band
+    // cycles are no reason to escalate a value that has since become decisive.
+    let counters = ctx.counters.check(key);
+    let repeated = if rc.decisive {
+        counters.consecutive_contests
+    } else {
+        counters.consecutive_in_band
+    };
+    if repeated >= ctx.settings.consecutive_contests_before_human {
         triggers.insert(EnsembleTrigger::RepeatContest);
     }
 

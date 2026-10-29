@@ -266,11 +266,25 @@ impl EnsemblePlan {
                 if rc.threshold.is_none() {
                     continue;
                 }
+                let contested_now = records.iter().any(|record: &CheckRecord| {
+                    record.check == *key
+                        && record
+                            .opinions
+                            .iter()
+                            .any(|o| matches!(o.opinion.verdict, Verdict::Contest { .. }))
+                });
                 let entry = counters.checks.entry(key.clone()).or_default();
-                entry.consecutive_held = if rc.permitted {
+                entry.consecutive_in_band = if rc.decisive {
                     0
                 } else {
-                    entry.consecutive_held.saturating_add(1)
+                    entry.consecutive_in_band.saturating_add(1)
+                };
+                entry.consecutive_contests = if contested_now {
+                    entry.consecutive_contests.saturating_add(1)
+                } else if rc.permitted || !rc.decisive {
+                    0
+                } else {
+                    entry.consecutive_contests
                 };
             }
         }
@@ -346,18 +360,19 @@ async fn resolve_check(
         return record;
     }
 
-    // A check that keeps being held is a question for a person, not another opinion.
-    if plan.has(EnsembleTrigger::RepeatContest) && settings.has(Rung::Human) {
-        escalate(plan, settings, counters, &mut record);
-        return record;
-    }
-
     let rungs: Vec<Rung> = [Rung::ReframeSameModel]
         .into_iter()
         .filter(|rung| settings.has(*rung))
         .filter(|rung| *rung != Rung::ReframeSameModel || plan.reframe_available)
         .collect();
+    // No opinion to buy: a decisive, uncontested value stands, whatever its history.
     if rungs.is_empty() {
+        return record;
+    }
+
+    // A value that keeps being contested is a question for a person, not another opinion.
+    if plan.has(EnsembleTrigger::RepeatContest) && settings.has(Rung::Human) {
+        escalate(plan, settings, counters, &mut record);
         return record;
     }
 
@@ -550,10 +565,15 @@ fn escalate(
     counters: &EnsembleCounters,
     record: &mut CheckRecord,
 ) {
-    let held_for = counters.check(&plan.check).consecutive_held;
+    let state = counters.check(&plan.check);
+    let repeated = if plan.baseline.decisive {
+        Repeated::Contested(state.consecutive_contests)
+    } else {
+        Repeated::InBand(state.consecutive_in_band)
+    };
     let ask = ask_for(
         plan,
-        Some((held_for, settings.consecutive_contests_before_human)),
+        Some((repeated, settings.consecutive_contests_before_human)),
     );
     record.rungs_used.push(Rung::Human);
     record.escalation = Some(ask.clone());
@@ -568,7 +588,14 @@ fn escalate(
 
 /// The question a held check puts to a person. Built only from the check key and
 /// numbers, never from model or repository text.
-fn ask_for(plan: &CheckPlan, repeated: Option<(u32, u32)>) -> String {
+/// Why a check is being escalated, for the question.
+#[derive(Clone, Copy)]
+enum Repeated {
+    InBand(u32),
+    Contested(u32),
+}
+
+fn ask_for(plan: &CheckPlan, repeated: Option<(Repeated, u32)>) -> String {
     let rc = &plan.baseline;
     let value = rc
         .jev_p
@@ -581,11 +608,16 @@ fn ask_for(plan: &CheckPlan, repeated: Option<(u32, u32)>) -> String {
          not act on it.",
         plan.check, rc.margin
     );
-    if let Some((held, limit)) = repeated {
-        ask.push_str(&format!(
-            " It has been held or contested for {held} consecutive cycles (limit {limit}). Is \
-             the work it describes actually done?"
-        ));
+    match repeated {
+        Some((Repeated::InBand(cycles), limit)) => ask.push_str(&format!(
+            " It has been inside the uncertainty band for {cycles} consecutive cycles (limit \
+             {limit}). Is the work it describes actually done?"
+        )),
+        Some((Repeated::Contested(cycles), limit)) => ask.push_str(&format!(
+            " A second opinion has contested it for {cycles} consecutive cycles (limit \
+             {limit}). Is the work it describes actually done?"
+        )),
+        None => {}
     }
     ask
 }

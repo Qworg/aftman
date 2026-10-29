@@ -1933,11 +1933,14 @@ async fn a_triggered_check_in_band_or_inert_requests_zero_opinions() {
         }
     }
 
-    // Decisive, triggered, but no rule acts on it: still nothing bought. "Inert" is
-    // established here from the proposals alone — holding the check removes no proposal —
-    // not read back from the plan under test. (Not from the selected directive: holding
-    // *any* check blocks a Finish through `UnresolvedUncertainty`, which is exactly the
-    // confusion the counterfactual construction avoids.)
+    // Decisive, but no rule acts on it: the ladder buys nothing. "Inert" is established
+    // here from the proposals alone — holding the check removes no proposal — not read back
+    // from the plan under test. (Not from the selected directive: holding *any* check
+    // blocks a Finish through `UnresolvedUncertainty`, which is exactly the confusion the
+    // counterfactual construction avoids.) The irreversible gate may still buy for such a
+    // check, but only if the selected Finish/Stop rests on it; answers here confirm, so the
+    // gate gets to act.
+    let mut gate_purchases_for_inert_checks = 0;
     for worker in [false, true] {
         for &(key, p) in &[
             (STUCK, 0.05_f32),
@@ -1947,6 +1950,7 @@ async fn a_triggered_check_in_band_or_inert_requests_zero_opinions() {
             (READY, 0.30),
             (TESTS, 0.05),
             (NEEDS_VER, 0.90),
+            (STUCK, 0.97),
         ] {
             let mut s = Scenario::finish_ready().set(key, p).reframable_all();
             if worker {
@@ -1954,14 +1958,30 @@ async fn a_triggered_check_in_band_or_inert_requests_zero_opinions() {
             }
             let baseline = s.baseline();
             let plan = s.plan();
-            let source = answering_all(&plan, Some(0.5));
+            let source = answering_by(&plan, |v| Some(1.0 - v));
             let outcome = s
                 .resolve_plan(&plan, &source)
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
+            let label = format!("{key}={p} worker={worker}");
             let before = s.proposals(&baseline);
+            // The state the gate first saw: every guarded check back as the ladder left it.
+            let mut pre_gate = outcome.checks.clone();
+            for record in &outcome.records {
+                if record.irreversible_guard.is_some() {
+                    pre_gate.insert(record.check.clone(), record.baseline.clone());
+                }
+            }
+            let gate_deps = irreversible_dependencies(&s, &pre_gate);
             for (check, rc) in &baseline {
+                let asked = source
+                    .reframe_calls()
+                    .iter()
+                    .any(|r| r.opinion.check == *check);
+                let guard =
+                    record(&outcome, check.as_str()).and_then(|r| r.irreversible_guard.clone());
                 if !rc.decisive {
+                    assert!(!asked, "{check} is in band but was asked about: {label}");
                     continue;
                 }
                 let mut held = baseline.clone();
@@ -1974,22 +1994,27 @@ async fn a_triggered_check_in_band_or_inert_requests_zero_opinions() {
                 );
                 let after = s.proposals(&held);
                 let inert = before.iter().all(|proposal| after.contains(proposal));
-                if inert {
-                    assert!(
-                        !source
-                            .reframe_calls()
-                            .iter()
-                            .any(|r| r.opinion.check == *check),
-                        "{check} is inert ({key}={p}, worker={worker}) but was asked about"
+                if inert && asked {
+                    gate_purchases_for_inert_checks += 1;
+                    // Only the gate, and only for what the irreversible selection rests on.
+                    assert_eq!(
+                        guard.as_ref().map(|g| g.outcome),
+                        Some(super::GuardOutcome::Bought),
+                        "{check} is inert; only the gate may buy for it: {label}"
                     );
                     assert!(
-                        outcome.checks[check].permitted,
-                        "{check} is inert and decisive: it stands"
+                        gate_deps.contains(check),
+                        "the gate bought for {check}, which the selection does not rest on: \
+                         {label}"
                     );
                 }
             }
         }
     }
+    assert!(
+        gate_purchases_for_inert_checks > 0,
+        "the gate's half was exercised (e.g. needs_human under a Finish)"
+    );
 }
 
 #[tokio::test]

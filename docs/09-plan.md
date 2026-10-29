@@ -446,7 +446,10 @@ framing-consistency check catches a framing-sensitive answer.
 | The two invariant property tests (no fusion; no opinion-driven finish) | `aftman-core` |
 | Replay from `RecordedOpinionSource` | `aftman-core::testing` |
 
-**Exit criteria:** a check in band, or one whose rule would not fire, requests zero opinions; a fake passing test run
+**Exit criteria:** the per-check ladder requests zero opinions for a check in band or one whose rule
+would not fire, and the irreversible gate buys an opinion only for a decisive, permitted check the
+selected `Finish`/`Stop` rests on (a check a rule proposing it reads, or one whose side changes it;
+docs/06-ensemble.md §6) — never for an in-band check; a fake passing test run
 converts a `0.71` into a decisive value; no input can produce an opinion-driven `Finish`; repeated
 refresh is capped and visible.
 

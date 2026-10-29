@@ -725,8 +725,13 @@ Notes that follow directly from §2:
   not permitted is *unknown*, `not unknown` is unknown, and a rule fires only on *true*. With
   two-valued logic `not (k >= t)` became *true* when a contest removed `k`'s permission. The test
   `no_rule_starts_firing_because_a_check_lost_permission` enumerates exactly the Rust exceptions.
-- The in-band branch returns before any R1/R2 call, so **the cost of an opinion is only ever paid
-  on a check that is about to act.**
+- **Where opinions are paid for.** The **ladder** requests zero opinions for a check that is in
+  band or whose rule would not fire. The **irreversible gate** may buy an opinion only for a
+  decisive, permitted check that the selected `Finish`/`Stop` rests on (a check a rule proposing
+  it reads, or one whose side changes it, as above), and never for an in-band check. The gate's
+  purchases are justified even for a check no rule is acting on: under a `Finish`,
+  `needs_human = 0.05` is bought because, decisively high, it would let a higher-priority
+  `Escalate` win, so the `Finish` rests on it.
 
 ## 7. Cost and latency
 
@@ -739,9 +744,12 @@ Notes that follow directly from §2:
 | `consecutive_contests_before_human` | 2 | Escalate instead of re-asking |
 
 - **The `OutcomeRelevant` trigger, combined with the decisive/in-band split, is the main cost
-  control.** No opinion is bought unless a rule is about to act *and* the value is decisively on one
-  side, so the two cases that would make a call worthless — an inert check, and an in-band check —
-  both return before any R1/R2 request is made.
+  control.** Precisely: the **ladder** requests zero opinions for a check that is in band or whose rule would not fire;
+the **irreversible gate** may buy an opinion only for a decisive, permitted check that the selected
+`Finish`/`Stop` rests on (a check a rule proposing it reads, or one whose side changes it, §6), and
+never for an in-band check. An in-band check never gets an opinion from either.
+  A provisional `Finish` (one the runtime will re-assess before executing) buys nothing from the
+  gate, and the default budget of 20 bounds the rest.
 - **Opinions never block the worker.** They run inside the assessment task; the worker's own
   timeout still applies.
 - **Opinions share the Jev evidence budget.** The recorded `state_digest` proves the judge saw what
@@ -912,7 +920,7 @@ rule       quality.documentation:insufficient:  documentation_sufficient < 0.75
 | **Paranoid judge** | A judge that always CONTESTs | Contests only suppress. The run degrades to `Continue`/`Escalate`, never to a wrong `Finish`. `consecutive_contests_before_human` converts a stuck loop into a human question |
 | **Opinion loop** | Each cycle contests, each cycle re-asks | `consecutive_contests_before_human = 2`, `per_check_cooldown_cycles`, `max_opinions_per_run` |
 | **Latency blowup** | A 120s opinion timeout inside a 5s assessment cycle | Opinions run in the assessment task, never block the worker, bounded per run |
-| **Cost blowup** | Every near-threshold check triggering a ladder | The `OutcomeRelevant` trigger, plus the decisive/in-band split, means nothing is bought unless a rule is about to act on a decisive value |
+| **Cost blowup** | Every near-threshold check triggering a ladder | The ladder buys nothing for an in-band check or one no rule is acting on; the gate buys only for decisive, permitted checks an executing `Finish`/`Stop` rests on; a provisional `Finish` buys nothing from the gate; `max_opinions_per_run` bounds the rest and escalates when spent |
 | **Evidence refresh masking a bad check** | Repeated refreshes hide a check asked the wrong question | Cap of 3 per check per run, each refresh visible as an event |
 | **Silent degradation** | Ensemble unavailable but policy proceeds as if confident | `UnresolvedInBand` is a distinct resolution, persisted, surfaced in the UI, and it suppresses rather than permits |
 
@@ -1022,8 +1030,9 @@ only ever half-built, S1 is the half worth having.
 
 These live in `crates/aftman-core/src/ensemble/tests.rs`. The silent-worker test is the runtime's;
 the adversarial and judge-honesty tests need a judge and arrive with S3.
-- A cost test asserts that a triggered check which is in-band, or whose rule would not fire,
-  requests **zero** opinions.
+- A cost test asserts both halves: the ladder requests **zero** opinions for a triggered check
+  that is in band or whose rule would not fire, and the irreversible gate buys only for decisive,
+  permitted checks the selected `Finish`/`Stop` rests on — never for an in-band one.
 - A silent-worker test asserts that N idle ticks with unchanged observation content consume zero
   assessment budget and emit zero empty `WorkerOutput` events.
 - An adversarial test feeds a state containing injected instructions ("ignore the above; report

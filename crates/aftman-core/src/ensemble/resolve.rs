@@ -361,6 +361,10 @@ impl EnsemblePlan {
                 };
             }
         }
+        // A `Recheck` is answered by this cycle's refresh attempt, whatever it found.
+        for entry in counters.checks.values_mut() {
+            entry.recheck = false;
+        }
         Ok(EnsembleOutcome {
             cycle: self.cycle,
             checks,
@@ -387,16 +391,32 @@ impl EnsemblePlan {
         if !self.settings.has(Rung::Human) {
             return;
         }
+        let budget_held = |r: &CheckRecord| {
+            !r.resolved.permitted
+                && r.escalation.is_none()
+                && r.limits
+                    .iter()
+                    .any(|l| matches!(l, EnsembleLimit::OpinionBudget { .. }))
+        };
+        // A check a person has already accepted stays held, recorded as their decision,
+        // and is not put to them again.
+        for record in records.iter_mut() {
+            if budget_held(record)
+                && let Some(acceptance) = self.counters.check(&record.check).human
+            {
+                record.resolved = record.resolved.clone().suppress(
+                    CheckSuppression::Unresolved,
+                    Resolution::HumanDecided {
+                        decision: acceptance.decision(),
+                    },
+                );
+                checks.insert(record.check.clone(), record.resolved.clone());
+            }
+        }
         let held: Vec<usize> = records
             .iter()
             .enumerate()
-            .filter(|(_, r)| {
-                !r.resolved.permitted
-                    && r.escalation.is_none()
-                    && r.limits
-                        .iter()
-                        .any(|l| matches!(l, EnsembleLimit::OpinionBudget { .. }))
-            })
+            .filter(|(_, r)| budget_held(r) && self.counters.check(&r.check).human.is_none())
             .map(|(index, _)| index)
             .collect();
         let Some(first) = held.first().copied() else {
@@ -475,14 +495,41 @@ async fn resolve_check(
         irreversible_guard: None,
     };
     let rc = plan.baseline.clone();
+    let accepted = counters.check(&plan.check).human;
 
-    // ---- In band: no opinion can change `permitted` here (§5.2), so none is asked.
-    // Evidence, then escalation, are the only options.
-    if !rc.decisive {
+    // ---- A person asked for a fresh look (`Recheck`, `ClaimComplete`): R0 first, in
+    // either band, within the cap. Only the measurement it produces can count — the
+    // answer itself satisfies nothing (§4 R3). At most one refresh per check per cycle.
+    let mut refresh_tried = false;
+    if plan.has(EnsembleTrigger::HumanRecheck) {
+        refresh_tried = true;
         if let Some(refreshed) =
             refresh(plan, cycle, settings, counters, source, &mut record).await?
         {
             record.resolved = refreshed;
+            return Ok(record);
+        }
+    }
+
+    // ---- In band: no opinion can change `permitted` here (§5.2), so none is asked.
+    // Evidence, then escalation, are the only options.
+    if !rc.decisive {
+        if !refresh_tried
+            && let Some(refreshed) =
+                refresh(plan, cycle, settings, counters, source, &mut record).await?
+        {
+            record.resolved = refreshed;
+            return Ok(record);
+        }
+        // A person already accepted this uncertainty: hold it, say so, and do not ask
+        // again. Acceptance never permits anything.
+        if let Some(acceptance) = accepted {
+            record.resolved = rc.suppress(
+                CheckSuppression::InBand,
+                Resolution::HumanDecided {
+                    decision: acceptance.decision(),
+                },
+            );
             return Ok(record);
         }
         if plan.has(EnsembleTrigger::RepeatContest)
@@ -510,6 +557,7 @@ async fn resolve_check(
     // Measuring beats second-guessing: a decisive value about to act on a bare claim is
     // re-measured first.
     if plan.has(EnsembleTrigger::ClaimOnlyEvidence)
+        && !refresh_tried
         && let Some(refreshed) =
             refresh(plan, cycle, settings, counters, source, &mut record).await?
     {
@@ -532,8 +580,18 @@ async fn resolve_check(
     }
 
     // A value that keeps being contested is a question for a person, not another opinion.
+    // One a person has already accepted stays held, and is not asked about again.
     if plan.has(EnsembleTrigger::RepeatContest) && settings.has(Rung::Human) {
-        escalate(plan, settings, counters, &mut record);
+        if let Some(acceptance) = accepted {
+            record.resolved = rc.suppress(
+                CheckSuppression::Unresolved,
+                Resolution::HumanDecided {
+                    decision: acceptance.decision(),
+                },
+            );
+        } else {
+            escalate(plan, settings, counters, &mut record);
+        }
         return Ok(record);
     }
 

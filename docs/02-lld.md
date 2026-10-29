@@ -279,6 +279,10 @@ pub struct Escalation { pub id: EscalationId, pub kind: EscalationKind,
     /// `None` when the escalation is not about one check — budget exhaustion and
     /// model unavailability have no check key.
     pub check: Option<CheckKey>,
+    /// Every check an ensemble escalation is about (one cycle's are coalesced into one);
+    /// the answer is recorded against each in `RunState.ensemble` (doc 06 §4 R3).
+    /// Empty for any other escalation. `#[serde(default)]`.
+    pub ensemble_checks: Vec<CheckKey>,
     pub ask: String, pub jev_p: Option<f32>, pub opinions: Vec<Opinion>,
     pub answered: Option<(OffsetDateTime, HumanDecision, String)> }
 pub enum   EscalationKind { Check, AssessmentBudget, ModelUnavailable, WorkerBlocked }
@@ -324,8 +328,10 @@ The ensemble's own API lives in `aftman_core::ensemble` and is specified in
 pub struct EnsembleSettings { /* the [ensemble] table */ }      // validate() -> Result<(), EnsembleSettingsError>
 pub struct EnsembleCounters { pub opinions_used: u32,
     pub checks: BTreeMap<CheckKey, CheckCounters> }              // in RunState.ensemble
+    // CheckCounters also remembers a person's answer: `human` (Accept/Guidance) and
+    // `recheck` (Recheck/ClaimComplete), set by record_human_decision (doc 06 §4 R3)
 pub enum   EnsembleTrigger { NearThreshold, LowConfidence, ClaimOnlyEvidence, OutcomeRelevant,
-    HighStakes, Irreversible, RepeatContest }
+    HighStakes, Irreversible, RepeatContest, HumanRecheck }
 pub struct EnsembleContext<'a> { settings, cycle, policy: &PolicyInput, registry: &ResponsibilityRegistry,
     definitions: &[Check], evidence: &EvidencePlan, answers, counters, reframe_available,
     finish_is_provisional: bool }

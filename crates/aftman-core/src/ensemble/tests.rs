@@ -4457,6 +4457,12 @@ impl Scenario {
         let input = self.input(&outcome.checks);
         arbitrate(&input, &super::propose(&self.registry, &input, outcome))
     }
+
+    fn answered(mut self, keys: &[&str], decision: &crate::assessment::HumanDecision) -> Self {
+        let keys: Vec<CheckKey> = keys.iter().map(|key| k(key)).collect();
+        self.ensemble.record_human_decision(&keys, decision);
+        self
+    }
 }
 
 #[test]
@@ -4580,4 +4586,225 @@ async fn g2_a_spent_budget_selects_one_escalate_and_burns_no_worker() {
         s.rule.as_str() == "core.completion:work-remains"
             && s.reason == crate::directive::SuppressionReason::HigherPriority
     }));
+}
+
+#[tokio::test]
+async fn an_accepted_check_is_held_as_human_decided_and_never_escalated_again() {
+    use crate::assessment::HumanDecision;
+    let mut s = Scenario::finish_ready()
+        .set(TESTS, 0.71)
+        .held_for(TESTS, 2)
+        .answered(&[TESTS], &HumanDecision::Accept);
+    for cycle in 20..26 {
+        s.cycle = AssessmentSeq(cycle);
+        let outcome = s
+            .run_plan(&RecordedOpinionSource::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(outcome.escalations().count(), 0, "cycle {cycle}");
+        let rc = &outcome.checks[&k(TESTS)];
+        assert!(!rc.permitted, "acceptance never permits");
+        assert_eq!(
+            rc.resolution,
+            Resolution::HumanDecided {
+                decision: HumanDecision::Accept
+            }
+        );
+        assert!(
+            record(&outcome, TESTS)
+                .is_some_and(|r| r.triggers.contains(&EnsembleTrigger::RepeatContest)),
+            "still visibly repeated"
+        );
+        assert_ne!(s.decide(&outcome).selected.name(), "Finish");
+        s.ensemble = outcome.counters;
+    }
+
+    // Guidance is Accept plus a steer; its text is not repeated on every cycle.
+    let s = Scenario::finish_ready()
+        .set(TESTS, 0.71)
+        .held_for(TESTS, 2)
+        .answered(
+            &[TESTS],
+            &HumanDecision::Guidance {
+                text: "the flaky test is known".into(),
+            },
+        );
+    let outcome = s
+        .run_plan(&RecordedOpinionSource::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(outcome.escalations().count(), 0);
+    assert_eq!(
+        outcome.checks[&k(TESTS)].resolution,
+        Resolution::HumanDecided {
+            decision: HumanDecision::Guidance {
+                text: String::new()
+            }
+        }
+    );
+
+    // A later decisive measurement is Jev's own, and stands as any other would: the
+    // acceptance changed nothing about it in either direction.
+    let mut s = Scenario::finish_ready()
+        .set(TESTS, 0.95)
+        .answered(&[TESTS], &HumanDecision::Accept);
+    s.ensemble
+        .checks
+        .entry(k(TESTS))
+        .or_default()
+        .consecutive_in_band = 4;
+    let outcome = s
+        .run_plan(&RecordedOpinionSource::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(outcome.checks[&k(TESTS)].permitted);
+}
+
+#[tokio::test]
+async fn an_accepted_budget_hold_is_not_escalated_again() {
+    use crate::assessment::HumanDecision;
+    let mut s = Scenario::finish_ready().reframable_all();
+    s.ensemble.opinions_used = s.settings.max_opinions_per_run;
+    let plan = s.plan();
+    let first = s
+        .resolve_plan(&plan, &answering_by(&plan, |p| Some(1.0 - p)))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let held: Vec<CheckKey> = first
+        .records
+        .iter()
+        .filter(|r| {
+            r.limits
+                .iter()
+                .any(|l| matches!(l, EnsembleLimit::OpinionBudget { .. }))
+        })
+        .map(|r| r.check.clone())
+        .collect();
+    assert!(!held.is_empty());
+    s.ensemble = first.counters.clone();
+    s.ensemble
+        .record_human_decision(&held, &HumanDecision::Accept);
+    s.cycle = AssessmentSeq(CYCLE.get() + 1);
+    let plan = s.plan();
+    let next = s
+        .resolve_plan(&plan, &answering_by(&plan, |p| Some(1.0 - p)))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(next.escalations().count(), 0);
+    assert_ne!(s.decide(&next).selected.name(), "Finish");
+    for key in &held {
+        assert!(matches!(
+            next.checks[key].resolution,
+            Resolution::HumanDecided { .. }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn a_recheck_runs_r0_on_the_next_cycle_within_the_cap() {
+    use crate::assessment::HumanDecision;
+    // Decisively below with no rule acting on it: the ladder alone would never refresh.
+    let s = Scenario::finish_ready()
+        .set(TESTS, 0.30)
+        .selecting(TESTS, &["tests"]);
+    let quiet = RecordedOpinionSource::new();
+    let outcome = s.run_plan(&quiet).await.unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        quiet.refresh_calls().is_empty(),
+        "nothing asked for a refresh"
+    );
+    assert!(!outcome.records.iter().any(|r| r.refresh.is_some()));
+
+    let s = s.answered(&[TESTS], &HumanDecision::Recheck);
+    assert!(s.triggers(TESTS).contains(&EnsembleTrigger::HumanRecheck));
+    let source =
+        RecordedOpinionSource::new().with_refresh(CYCLE, TESTS, refreshed(Some(0.20), "tests", 1));
+    let outcome = s.run_plan(&source).await.unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(source.refresh_calls().len(), 1, "exactly one refresh");
+    assert!(matches!(
+        outcome.checks[&k(TESTS)].resolution,
+        Resolution::EvidenceRefreshed { .. }
+    ));
+    assert!(!outcome.counters.check(&k(TESTS)).recheck, "answered");
+    assert_eq!(outcome.counters.check(&k(TESTS)).refreshes, 1);
+
+    // The cap still applies: with every refresh spent, the recheck refreshes nothing, says
+    // so, and is still consumed.
+    let mut capped = Scenario::finish_ready()
+        .set(TESTS, 0.30)
+        .selecting(TESTS, &["tests"])
+        .answered(&[TESTS], &HumanDecision::ClaimComplete);
+    capped
+        .ensemble
+        .checks
+        .entry(k(TESTS))
+        .or_default()
+        .refreshes = 3;
+    let source = RecordedOpinionSource::new();
+    let outcome = capped
+        .run_plan(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(source.refresh_calls().is_empty());
+    assert!(record(&outcome, TESTS).is_some_and(|r| {
+        r.limits
+            .contains(&EnsembleLimit::RefreshCap { used: 3, cap: 3 })
+    }));
+    assert!(!outcome.counters.check(&k(TESTS)).recheck);
+}
+
+#[tokio::test]
+async fn claim_complete_cannot_satisfy_a_finish_conjunct() {
+    use crate::assessment::HumanDecision;
+    // The person says it is done. The refresh their answer buys lands in band again, so
+    // the conjunct is still held: no Finish, and the question comes back.
+    let s = Scenario::finish_ready()
+        .set(TESTS, 0.71)
+        .selecting(TESTS, &["tests"])
+        .held_for(TESTS, 2)
+        .answered(&[TESTS], &HumanDecision::ClaimComplete);
+    let source =
+        RecordedOpinionSource::new().with_refresh(CYCLE, TESTS, refreshed(Some(0.72), "tests", 0));
+    let outcome = s.run_plan(&source).await.unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(source.refresh_calls().len(), 1, "one refresh, not two");
+    let rc = &outcome.checks[&k(TESTS)];
+    assert!(!rc.permitted, "a fresh value in band is still held");
+    assert!(matches!(
+        rc.resolution,
+        Resolution::EvidenceRefreshed { new_p, .. } if (new_p - 0.72).abs() < f32::EPSILON
+    ));
+    assert_ne!(s.decide(&outcome).selected.name(), "Finish");
+
+    // Only a decisive measurement finishes.
+    let source =
+        RecordedOpinionSource::new().with_refresh(CYCLE, TESTS, refreshed(Some(0.95), "tests", 0));
+    let outcome = s.run_plan(&source).await.unwrap_or_else(|e| panic!("{e}"));
+    assert!(outcome.checks[&k(TESTS)].permitted);
+    assert_eq!(s.decide(&outcome).selected.name(), "Finish");
+}
+
+#[test]
+fn human_answers_are_recorded_per_check_and_old_counters_decode_without_them() -> TestResult {
+    use crate::assessment::HumanDecision;
+    let mut counters = EnsembleCounters::default();
+    let keys = [k(TESTS), k(READY)];
+    counters.record_human_decision(&keys, &HumanDecision::Accept);
+    assert!(keys.iter().all(|key| counters.check(key).human.is_some()));
+    counters.record_human_decision(&keys[..1], &HumanDecision::Recheck);
+    assert_eq!(
+        counters.check(&keys[0]).human,
+        None,
+        "a recheck forgets the accept"
+    );
+    assert!(counters.check(&keys[0]).recheck);
+    counters.record_human_decision(&keys, &HumanDecision::Stop);
+    assert!(
+        counters.check(&keys[1]).human.is_some(),
+        "a stop changes nothing"
+    );
+
+    let old: CheckCounters = serde_json::from_str(r#"{"refreshes":1}"#)?;
+    assert_eq!(old.human, None);
+    assert!(!old.recheck);
+    Ok(())
 }

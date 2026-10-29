@@ -48,6 +48,10 @@ pub enum EnsembleTrigger {
     /// The check was held or contested in at least `consecutive_contests_before_human`
     /// consecutive prior cycles. Escalates rather than asking again.
     RepeatContest,
+    /// A person answered an escalation about this check with `Recheck` or
+    /// `ClaimComplete`: R0 runs for it this cycle, whatever its band, within the refresh
+    /// cap. Never routes to an opinion, and never satisfies anything by itself.
+    HumanRecheck,
 }
 
 impl EnsembleTrigger {
@@ -62,6 +66,7 @@ impl EnsembleTrigger {
             Self::HighStakes => "high_stakes",
             Self::Irreversible => "irreversible",
             Self::RepeatContest => "repeat_contest",
+            Self::HumanRecheck => "human_recheck",
         }
     }
 
@@ -564,6 +569,9 @@ fn plan_check(
     };
     if repeated >= ctx.settings.consecutive_contests_before_human {
         triggers.insert(EnsembleTrigger::RepeatContest);
+    }
+    if counters.recheck {
+        triggers.insert(EnsembleTrigger::HumanRecheck);
     }
 
     Some(CheckPlan {

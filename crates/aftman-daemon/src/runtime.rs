@@ -2260,6 +2260,7 @@ impl FactoryRuntime {
                     kind,
                     raised_at: self.now(),
                     check: None,
+                    ensemble_checks: Vec::new(),
                     ask: ask.clone(),
                     jev_p: None,
                     opinions: Vec::new(),

@@ -110,6 +110,7 @@ Two kinds of uncertainty exist, and they are handled by **different mechanisms**
 | `HighStakes` | A rule that would fire is marked `stakes = "high"` | R0 if in-band; R1+R2 if decisive |
 | `Irreversible` | The selected directive is `Finish` or `Stop` | R1+R2 if decisive |
 | `RepeatContest` | An in-band check was in band, or a decisive check was contested, in ≥ `consecutive_contests_before_human` consecutive prior cycles (2) | escalate |
+| `HumanRecheck` | A person answered an escalation about the check with `Recheck` or `ClaimComplete` (§4 R3) | R0, in either band, within the refresh cap |
 
 `OutcomeRelevant` is cheap because policy is pure: re-run `arbitrate()` with the check forced to
 fire and forced not to fire, and compare the selected directive. If the directive does not change,
@@ -140,6 +141,7 @@ Precisely, for a check `k` with threshold `t` (`aftman_core::ensemble::EnsembleP
 | `HighStakes` | some `stakes = "high"` proposal depends on `k`: for a decisive `k`, one proposed now that would not be proposed were `k` held; for a held `k`, one that either pinned side proposes and the held state does not |
 | `Irreversible` | `k` is decisive, the selected directive is `Stop` or a `Finish` the runtime will execute (not a provisional one, §6), and that directive rests on `k`: a rule proposing it reads `k`, or `k`'s side changes it (`irreversible_dependencies`, §6; the gate uses the same set). Every check is load-bearing for `Finish` through `UnresolvedUncertainty`; this asks whether the directive rests on `k` itself |
 | `RepeatContest` | for an in-band `k`: its measurement was in band in at least `consecutive_contests_before_human` consecutive prior cycles; for a decisive `k`: an opinion **contested** it in at least that many consecutive prior cycles (`EnsembleCounters`). The two counts are separate: in-band cycles never count toward escalating a value that has since become decisive |
+| `HumanRecheck` | `k`'s counters carry `recheck`, set when a person answered `Recheck` or `ClaimComplete` to an escalation naming `k`; cleared by the next resolved cycle, whatever its refresh found |
 
 Alongside the triggers the plan records whether **a rule would fire** on `k`: some proposal made this
 cycle would disappear if `k` were not permitted. That is the only case in which an opinion — which
@@ -463,8 +465,8 @@ Every subsequent step can only lower it:
 | R0 `EvidenceRefreshed` | **recomputed** from a fresh measurement — the only step that can raise it |
 | R1/R2 `Confirm` / `Abstain` | unchanged |
 | R1/R2 `Contest` | `false` |
-| R3 `Accept` / `Guidance` | unchanged |
-| R3 `Recheck` / `ClaimComplete` | **recomputed** from an R0 refresh |
+| R3 `Accept` / `Guidance` | unchanged (a held check stays held, as `HumanDecided`, and is not escalated again) |
+| R3 `Recheck` / `ClaimComplete` | **recomputed** from an R0 refresh on the next cycle (`HumanRecheck`), within the cap |
 | R3 `Stop` | forces `Stop` (a human may always stop work) |
 
 No expression in this module assigns `true` on the basis of an opinion. Only R0 — deterministic
@@ -480,6 +482,7 @@ evidence — can raise it, because only R0 produces a new *measurement*.
 | `Confirm` (R1/R2) | No effect. `permitted` is unchanged. |
 | `Contest` (R1/R2) | `permitted = false`, suppressing every rule that reads the check — `Finish`, `Stop`, `Verify`, `Steer`, `StartWorker`, and `<` rules alike. |
 | `UnresolvedInBand` | `permitted = false`. Contributes to escalation. |
+| `HumanDecided { Accept }` / `{ Guidance }` | `permitted = false` while the value is not decisive; not escalated again. |
 | `HumanDecided { Stop }` | `Stop`. |
 | `HumanDecided { ClaimComplete }` | Runs R0. Cannot itself satisfy a `Finish` conjunct. |
 
@@ -1005,8 +1008,9 @@ same things:
   `enabled = false`, so turning the ensemble on cannot reveal a typo accepted while it was off.
 
 The per-run counters the resolver keeps — refreshes per check, opinions used, the last opinion per
-check (for the cooldown), and consecutive in-band cycles and consecutive contests per check (for
-`RepeatContest`) — are
+check (for the cooldown), consecutive in-band cycles and consecutive contests per check (for
+`RepeatContest`), and a person's standing answer per check (`human`: an acceptance; `recheck`: R0
+asked for on the next cycle; both `#[serde(default)]`, §4 R3) — are
 `EnsembleCounters`, stored in `RunState.ensemble` with `#[serde(default)]`. They are deliberately not
 in `Counters`, which is serialized into the model-facing observation.
 

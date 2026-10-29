@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::assessment::{DEFAULT_UNCERTAINTY_MARGIN, Rung, Side};
+use crate::assessment::{DEFAULT_UNCERTAINTY_MARGIN, HumanDecision, Rung, Side};
 use crate::ids::{AssessmentSeq, CheckKey};
 
 /// Default for [`EnsembleSettings::confidence_floor`].
@@ -196,6 +196,60 @@ impl EnsembleCounters {
     pub fn check(&self, key: &CheckKey) -> CheckCounters {
         self.checks.get(key).copied().unwrap_or_default()
     }
+
+    /// Remember a person's answer to an ensemble escalation about `checks`
+    /// (`docs/06-ensemble.md` §4 R3). Bookkeeping only: what each answer *means* is
+    /// applied by the resolver on later cycles, and nothing here can permit a check.
+    ///
+    /// - `Accept` and `Guidance`: the check is held as `HumanDecided` whenever it is not
+    ///   decisively measured, for the rest of the run, and is not escalated again.
+    /// - `Recheck` and `ClaimComplete`: the next resolved cycle runs R0 for the check,
+    ///   within the refresh cap, and forgets any earlier acceptance. `ClaimComplete` is
+    ///   recorded exactly like `Recheck`: it buys a measurement, never a conjunct.
+    /// - `Stop`: nothing to remember; the run ends.
+    pub fn record_human_decision(&mut self, checks: &[CheckKey], decision: &HumanDecision) {
+        for key in checks {
+            let entry = self.checks.entry(key.clone()).or_default();
+            match decision {
+                HumanDecision::Accept => {
+                    entry.human = Some(HumanAcceptance::Accept);
+                    entry.recheck = false;
+                }
+                HumanDecision::Guidance { .. } => {
+                    entry.human = Some(HumanAcceptance::Guidance);
+                    entry.recheck = false;
+                }
+                HumanDecision::Recheck | HumanDecision::ClaimComplete => {
+                    entry.human = None;
+                    entry.recheck = true;
+                }
+                HumanDecision::Stop => {}
+            }
+        }
+    }
+}
+
+/// A person accepted a check's uncertainty (`Accept`, or `Guidance`, which is `Accept`
+/// plus a steer). Kept for the rest of the run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HumanAcceptance {
+    Accept,
+    Guidance,
+}
+
+impl HumanAcceptance {
+    /// The decision recorded on the check's resolution. The guidance text itself is not
+    /// repeated there: it went to the worker, and `ESCALATION_ANSWERED` records it once.
+    #[must_use]
+    pub fn decision(self) -> HumanDecision {
+        match self {
+            Self::Accept => HumanDecision::Accept,
+            Self::Guidance => HumanDecision::Guidance {
+                text: String::new(),
+            },
+        }
+    }
 }
 
 /// Per-check counters.
@@ -216,6 +270,16 @@ pub struct CheckCounters {
     /// other reason (a cooldown, the budget, an escalation) leaves it unchanged, so an
     /// escalation does not feed it either.
     pub consecutive_contests: u32,
+    /// A person accepted this check's uncertainty. While its measurement is not decisive
+    /// it is held as `HumanDecided` and never escalated again; it is never made
+    /// permitted. Absent from older snapshots, which decode as no answer.
+    #[serde(default)]
+    pub human: Option<HumanAcceptance>,
+    /// A person answered `Recheck` or `ClaimComplete`: the next resolved cycle runs R0
+    /// for this check (the `HumanRecheck` trigger), within the refresh cap. Cleared by
+    /// that cycle.
+    #[serde(default)]
+    pub recheck: bool,
 }
 
 /// When an opinion was last bought for a check, and what it established.

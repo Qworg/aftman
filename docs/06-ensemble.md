@@ -855,7 +855,11 @@ Notes that follow directly from §2:
    errors: the runtime records an `ERROR` (`code: "ensemble_unresolved"`), emits an
    `ENSEMBLE_RESOLVED` with no `cycle`, holds **every** thresholded check, and arbitrates over that.
    It never panics and never falls back to the unresolved baseline.
-6. **No answers, no ensemble.** A cycle whose model call failed or was refused, or whose budget is
+6. **A cancel wins.** A cancel that arrives while a refresh's provider runs, or while its model
+   call is awaited, kills the provider through its process-group path (the run is recorded with
+   `exit_code: None`), abandons the rest of the cycle's refreshes, and the cycle selects and
+   applies nothing; the cancel is then handled. Other messages are queued until after the cycle.
+7. **No answers, no ensemble.** A cycle whose model call failed or was refused, or whose budget is
    spent, has nothing to resolve; its empty check set already yields only conservative directives.
    It emits an `ENSEMBLE_RESOLVED` with no `cycle` and no `checks`, as S0 did.
 

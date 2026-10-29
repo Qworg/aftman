@@ -1380,15 +1380,18 @@ async fn a_cancel_queued_during_the_model_call_is_applied_before_the_next_cycle(
     release.notify_one();
     cancel.await??;
 
-    // The cycle finished (it started a worker), then the cancel was applied before
-    // any second cycle, and that worker is gone.
+    // The cycle finished assessing, but a cancel always wins over what its cycle
+    // selected (docs/02-lld.md §7.1): the worker it would have started never starts, and
+    // there is no second cycle.
     assert_eq!(fx.worker.alive(), 0, "no worker outlives a cancelled run");
     assert_eq!(fx.model.calls(), 2, "routing plus exactly one assessment");
     let state = fx.store.load(fx.run_id).await?;
     assert_eq!(state.status, FactoryStatus::Cancelled);
-    assert_eq!(state.workers.len(), 1);
-    assert_eq!(state.workers[0].status, WorkerStatus::Stopped);
-    assert!(!fx.worker.terminations().is_empty());
+    assert!(
+        state.workers.is_empty(),
+        "the selected StartWorker was not applied"
+    );
+    assert_eq!(fx.worker.starts.load(Ordering::SeqCst), 0);
     let outcome = fx.finish().await?;
     assert_eq!(outcome.reason.as_deref(), Some("queued mid-call"));
     Ok(())
@@ -1507,12 +1510,12 @@ async fn a_simulated_worker_does_not_outlive_a_queued_cancel() -> TestResult {
 
     let outcome = task.await??;
     assert_eq!(outcome.status, FactoryStatus::Cancelled);
+    // The cancel won over the cycle's StartWorker: no worker was ever started, so none
+    // can write after the cancel.
     let state = store.load(run_id).await?;
-    assert_eq!(state.workers[0].status, WorkerStatus::Stopped);
-    let before = state.workers[0].output.total_bytes();
+    assert!(state.workers.is_empty());
     tokio::time::sleep(Duration::from_secs(5)).await;
-    let after = store.load(run_id).await?.workers[0].output.total_bytes();
-    assert_eq!(before, after, "the worker wrote nothing after the cancel");
+    assert!(store.load(run_id).await?.workers.is_empty());
     let events = sink.events();
     assert_eq!(
         events.last().map(|e| e.kind),

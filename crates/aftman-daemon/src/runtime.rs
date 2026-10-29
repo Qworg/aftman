@@ -274,6 +274,11 @@ struct Loop {
     /// `WorkerCompleted` evidence providers have not run yet.
     completed_while_waiting: bool,
     finish_reason: Option<String>,
+    /// Control messages that arrived while a cycle was in progress (during a refresh, an
+    /// evidence collection, or just before apply). Handled, in order, before anything else
+    /// at the top of the next iteration. A cancel among them means the cycle applies
+    /// nothing: **a cancel always wins over what its cycle selected.**
+    pending_control: Vec<ControlMessage>,
 }
 
 impl Loop {
@@ -293,6 +298,7 @@ impl Loop {
             wait_started: None,
             completed_while_waiting: false,
             finish_reason: None,
+            pending_control: Vec::new(),
         }
     }
 
@@ -311,6 +317,33 @@ impl Loop {
         self.last_digest = None;
         self.activity_pending = true;
         self.next_assessment_at = now;
+    }
+
+    /// Whether a cancel is waiting to be handled.
+    fn cancel_pending(&self) -> bool {
+        self.pending_control.iter().any(is_cancel)
+    }
+}
+
+fn is_cancel(message: &ControlMessage) -> bool {
+    matches!(message, ControlMessage::Cancel { .. })
+}
+
+/// Move every control message already queued into `pending`, without waiting. A closed
+/// channel becomes `None`, as in `drain_control`.
+fn queue_control(control: &mut Option<ControlReceiver>, pending: &mut Vec<ControlMessage>) {
+    loop {
+        let Some(receiver) = control.as_mut() else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(message) => pending.push(message),
+            Err(mpsc::error::TryRecvError::Empty) => return,
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                *control = None;
+                return;
+            }
+        }
     }
 }
 
@@ -581,9 +614,14 @@ impl FactoryRuntime {
     /// `control`, `NeedsHuman` ends the run.
     ///
     /// Control messages are observed at the top of every loop iteration and in the
-    /// wait `select!`; a cycle in progress is never interrupted, and a reply is sent
-    /// only after its effect is applied and persisted. Routing is a model call and
-    /// counts as a cycle in progress.
+    /// wait `select!`, and a reply is sent only after its effect is applied and persisted.
+    /// A cycle in progress is not interrupted, with one exception: **a cancel always wins
+    /// over what its cycle selected.** While a cycle runs commands (an evidence refresh,
+    /// `before_finish` collection) or waits for a refresh's model call, the channel is
+    /// watched; a cancel stops the command through its process-group kill and the cycle
+    /// applies nothing, and the loop looks once more just before applying. Every other
+    /// message that arrives mid-cycle is queued and handled, in order, after the cycle.
+    /// Routing is a model call and counts as a cycle in progress.
     ///
     /// # Errors
     /// As [`FactoryRuntime::run`].
@@ -669,7 +707,8 @@ impl FactoryRuntime {
             // Drained without blocking at the top of every iteration, for the same
             // reason the completion channel is (LLD §7.1): a cancel observed only in
             // the wait branch would never be seen by a run whose cycles outlast the
-            // idle interval. It is never observed mid-cycle.
+            // idle interval. Messages queued mid-cycle (`Loop::pending_control`) come
+            // first.
             self.drain_control(state, &job, ls, &mut control).await?;
 
             if let Some(finish) = self.terminal_status(
@@ -1056,8 +1095,16 @@ impl FactoryRuntime {
                     tap(&cycle);
                 }
                 Some(
-                    self.resolve_ensemble(state, &job, ls, &registry, &questions, &cycle)
-                        .await?,
+                    self.resolve_ensemble(
+                        state,
+                        &job,
+                        ls,
+                        &mut control,
+                        &registry,
+                        &questions,
+                        &cycle,
+                    )
+                    .await?,
                 )
             } else {
                 self.emit(
@@ -1082,6 +1129,12 @@ impl FactoryRuntime {
                 None => cycle.checks.clone(),
             };
             let outcome = outcome.and_then(Result::ok);
+
+            // A cancel that arrived while the ensemble was refreshing evidence ends the cycle
+            // here: nothing is selected or applied, and the next iteration handles it.
+            if ls.cancel_pending() {
+                continue;
+            }
 
             // ---- arbitrate ---------------------------------------------------
             //
@@ -1147,13 +1200,22 @@ impl FactoryRuntime {
             // applied: if collecting the evidence fails, the error ends the run here, and
             // nothing below runs.
             let selected = decision.selected.clone();
+            // A cancel always wins over what this cycle selected: look once more, just before
+            // acting. Anything else that arrived waits for the top of the loop, as before.
+            queue_control(&mut control, &mut ls.pending_control);
+            if ls.cancel_pending() {
+                continue;
+            }
             if matches!(selected, Directive::Finish { .. }) && cycle.finish_is_provisional {
                 ls.before_finish_ran = true;
-                self.collect_evidence(
+                // Watching the control channel: a cancel kills the provider through its
+                // process-group path, and the next iteration handles it.
+                self.collect_evidence_watching(
                     state,
                     &job,
                     RunWhen::BeforeFinish,
-                    &mut ls.evidence_outcomes,
+                    ls,
+                    &mut control,
                 )
                 .await?;
                 state.last_directive = Some(selected.clone());
@@ -1282,6 +1344,10 @@ impl FactoryRuntime {
         ls: &mut Loop,
         control: &mut Option<ControlReceiver>,
     ) -> Result<(), RuntimeError> {
+        // What arrived mid-cycle first, in the order it arrived.
+        for message in std::mem::take(&mut ls.pending_control) {
+            self.handle_control(state, job, ls, message).await?;
+        }
         loop {
             let Some(receiver) = control.as_mut() else {
                 return Ok(());
@@ -2107,10 +2173,28 @@ impl FactoryRuntime {
         provider: &CommandProvider,
         outcomes: &mut Vec<EvidenceOutcome>,
     ) -> Result<Option<i32>, RuntimeError> {
+        let outcome = self
+            .run_provider_watching(job, provider, &mut None, &mut Vec::new())
+            .await;
+        self.record_provider(state, outcome, outcomes).await
+    }
+
+    /// Run one provider while watching the control channel. Every message that arrives
+    /// is queued in `pending`, in order; a cancel also stops the provider through
+    /// `run_provider_until`, which kills its whole process group and reports
+    /// `exit_code: None`. The provider future is never dropped part way
+    /// (`docs/02-lld.md` §11). Records nothing: the caller does, once this returns.
+    async fn run_provider_watching(
+        &self,
+        job: &Job,
+        provider: &CommandProvider,
+        control: &mut Option<ControlReceiver>,
+        pending: &mut Vec<ControlMessage>,
+    ) -> EvidenceOutcome {
         // Evidence runs with the same forwarded environment as the worker, so a
         // test command finds the same `python` or `node` the agent did. Without
         // this a provider would run with the daemon's `PATH` and could fail on a
-        // toolchain the worker had no trouble with. `run_provider` builds the child's
+        // toolchain the worker had no trouble with. `run_provider_until` builds the child's
         // environment through `worker_environment()`, which scrubs it again.
         let forwarded: Vec<(String, String)> = self
             .deps
@@ -2118,14 +2202,89 @@ impl FactoryRuntime {
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect();
-        let outcome = aftman_workers::run_provider(
+        let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        let mut cancel_tx = Some(cancel_tx);
+        if pending.iter().any(is_cancel)
+            && let Some(tx) = cancel_tx.take()
+        {
+            let _ = tx.send(());
+        }
+        let cancelled = async move {
+            // A sender dropped without sending is not a cancel.
+            if cancel_rx.await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        };
+        let run = aftman_workers::run_provider_until(
             provider,
             &job.repo,
             &self.deps.evidence_temp_dir,
             &forwarded,
             self.now(),
-        )
-        .await;
+            cancelled,
+        );
+        tokio::pin!(run);
+        let mut closed = control.is_none();
+        let outcome = loop {
+            tokio::select! {
+                outcome = &mut run => break outcome,
+                message = recv_control(control), if !closed => match message {
+                    Some(message) => {
+                        if is_cancel(&message)
+                            && let Some(tx) = cancel_tx.take()
+                        {
+                            let _ = tx.send(());
+                        }
+                        pending.push(message);
+                    }
+                    None => closed = true,
+                },
+            }
+        };
+        if closed {
+            *control = None;
+        }
+        outcome
+    }
+
+    /// Run the providers due for one trigger, as `collect_evidence` does, while watching
+    /// the control channel. After a cancel, no further provider is started.
+    async fn collect_evidence_watching(
+        &self,
+        state: &mut RunState,
+        job: &Job,
+        trigger: RunWhen,
+        ls: &mut Loop,
+        control: &mut Option<ControlReceiver>,
+    ) -> Result<(), RuntimeError> {
+        let due: Vec<CommandProvider> = self
+            .deps
+            .evidence
+            .due(trigger)
+            .into_iter()
+            .cloned()
+            .collect();
+        for provider in due {
+            if ls.cancel_pending() {
+                break;
+            }
+            let outcome = self
+                .run_provider_watching(job, &provider, control, &mut ls.pending_control)
+                .await;
+            self.record_provider(state, outcome, &mut ls.evidence_outcomes)
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Record a provider's outcome: it replaces the provider's previous one in `outcomes`,
+    /// and one `EVIDENCE_COLLECTED` is appended. Returns its exit code.
+    async fn record_provider(
+        &self,
+        state: &mut RunState,
+        outcome: EvidenceOutcome,
+        outcomes: &mut Vec<EvidenceOutcome>,
+    ) -> Result<Option<i32>, RuntimeError> {
         let payload = json!({
             "provider": outcome.provider.to_string(),
             "argv": outcome.argv,
@@ -2152,11 +2311,13 @@ impl FactoryRuntime {
     /// over a different baseline or context, which is an internal error — recorded as an
     /// `ERROR` event; the caller holds every check, so the cycle is conservative. `Err` is
     /// a store failure, fatal as anywhere else.
+    #[allow(clippy::too_many_arguments)]
     async fn resolve_ensemble(
         &self,
         state: &mut RunState,
         job: &Job,
         ls: &mut Loop,
+        control: &mut Option<ControlReceiver>,
         registry: &ResponsibilityRegistry,
         questions: &BTreeMap<CheckKey, Question>,
         cycle: &EnsembleCycle,
@@ -2183,6 +2344,7 @@ impl FactoryRuntime {
                     scratch: tokio::sync::Mutex::new(Scratch {
                         state: &mut *state,
                         ls: &mut *ls,
+                        control: &mut *control,
                         fatal: None,
                     }),
                 };
@@ -2544,6 +2706,9 @@ impl EscalatedChecks {
     }
 }
 
+/// Why a refresh produced nothing: the run was cancelled while it worked.
+const CANCELLED: &str = "the run was cancelled; the refresh was abandoned";
+
 /// Why R2 has no answer in this release.
 const REFRAME_UNAVAILABLE: &str =
     "the same-model reframe (R2) is ensemble stage S2 and is not available in this release";
@@ -2576,6 +2741,9 @@ struct CycleSource<'a> {
 struct Scratch<'a> {
     state: &'a mut RunState,
     ls: &'a mut Loop,
+    /// Watched while a provider or the model call runs; what arrives is queued in
+    /// `ls.pending_control`, and a cancel stops the refresh (`docs/06-ensemble.md` §6.1).
+    control: &'a mut Option<ControlReceiver>,
     fatal: Option<RuntimeError>,
 }
 
@@ -2605,6 +2773,10 @@ impl CycleSource<'_> {
             new_p: None,
             error: Some(error),
         };
+        // A cancel is waiting: nothing more is started this cycle.
+        if scratch.ls.cancel_pending() {
+            return Ok(no_value(runs, CANCELLED.into()));
+        }
         // The refresh's model call is an assessment for the budget's purposes; with the
         // budget spent, running the commands would buy evidence nobody may read.
         if scratch.ls.assessments >= self.rt.deps.config.max_assessments {
@@ -2628,19 +2800,29 @@ impl CycleSource<'_> {
             else {
                 continue;
             };
-            let exit_code = self
+            if scratch.ls.cancel_pending() {
+                break;
+            }
+            let outcome = self
                 .rt
-                .run_one_provider(
-                    scratch.state,
+                .run_provider_watching(
                     self.job,
                     &provider,
-                    &mut scratch.ls.evidence_outcomes,
+                    scratch.control,
+                    &mut scratch.ls.pending_control,
                 )
+                .await;
+            let exit_code = self
+                .rt
+                .record_provider(scratch.state, outcome, &mut scratch.ls.evidence_outcomes)
                 .await?;
             runs.push(ProviderRun {
                 provider: id.clone(),
                 exit_code,
             });
+        }
+        if scratch.ls.cancel_pending() {
+            return Ok(no_value(runs, CANCELLED.into()));
         }
         if !runs.iter().any(|run| run.exit_code.is_some()) {
             return Ok(no_value(
@@ -2688,7 +2870,31 @@ impl CycleSource<'_> {
             tokio::spawn(
                 async move { model.ask(&context, &state_json, &questions, &budget).await },
             );
-        let answered = match tokio::time::timeout(self.timeout, call).await {
+        // Wait for it, watching the control channel: a cancel stops the wait (the abandoned
+        // call finishes on its own, as on a timeout).
+        let deadline = tokio::time::sleep(self.timeout);
+        tokio::pin!(call, deadline);
+        let mut closed = scratch.control.is_none();
+        let waited = loop {
+            tokio::select! {
+                joined = &mut call => break Ok(joined),
+                () = &mut deadline => break Err(()),
+                message = recv_control(scratch.control), if !closed => match message {
+                    Some(message) => {
+                        let cancel = is_cancel(&message);
+                        scratch.ls.pending_control.push(message);
+                        if cancel {
+                            return Ok(no_value(runs, CANCELLED.into()));
+                        }
+                    }
+                    None => closed = true,
+                },
+            }
+        };
+        if closed {
+            *scratch.control = None;
+        }
+        let answered = match waited {
             Ok(Ok(answered)) => answered,
             Ok(Err(joined)) => {
                 return Ok(no_value(
@@ -2696,7 +2902,7 @@ impl CycleSource<'_> {
                     format!("the refresh call ended without an answer: {joined}"),
                 ));
             }
-            Err(_) => {
+            Err(()) => {
                 self.rt
                     .emit(
                         scratch.state,

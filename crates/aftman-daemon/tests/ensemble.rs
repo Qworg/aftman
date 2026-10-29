@@ -1549,6 +1549,292 @@ async fn claim_complete_followed_by_an_in_band_refresh_does_not_finish() -> Test
     Ok(())
 }
 
+// ---- a cancel wins --------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_cancel_during_a_refresh_wins_promptly_and_leaves_no_provider() -> TestResult {
+    // Review probe PD2. A 5 s provider, a cancel sent while it runs. Before the fix the
+    // loop could not see the cancel until the refresh was over, and the refreshed value
+    // then finished the run: `Finished`, not `Cancelled`.
+    let fx = Fixture::new(
+        definitions()?,
+        provider(
+            "on_demand",
+            "sleep 41.73 & sleep 5; echo PROVIDER-PASS; exit 0",
+        )?,
+    )?;
+    let rt = fx.runtime(
+        config(|_| {}),
+        settings(|_| {}),
+        Arc::new(passing_model()),
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let mut run = RunGuard::launch(&fx, rt).await?;
+    until(&fx, "the refresh to start", |events| {
+        events.iter().any(|e| {
+            e.kind == EventKind::EnsembleTriggered
+                && e.payload["check"] == TESTS
+                && e.payload["jev_p"]
+                    .as_f64()
+                    .is_some_and(|p| (0.70..0.72).contains(&p))
+        })
+    })
+    .await;
+    let started = std::time::Instant::now();
+    let outcome = run.cancel().await?;
+    let took = started.elapsed();
+    assert_eq!(outcome.status, FactoryStatus::Cancelled);
+    assert!(took < Duration::from_secs(3), "the cancel waited {took:?}");
+    let left = orphans("41.73").await;
+    assert!(left.is_empty(), "orphaned provider processes: {left:?}");
+    assert!(
+        !fx.of_kind(EventKind::DirectiveSelected)
+            .iter()
+            .any(|e| e.payload["directive"] == "Finish")
+    );
+    // The provider is recorded as launched and stopped, not as never having run.
+    let collected = fx.of_kind(EventKind::EvidenceCollected);
+    assert_eq!(collected.len(), 1);
+    assert_eq!(collected[0].payload["exit_code"], Value::Null);
+    assert!(
+        collected[0].payload["launch_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("cancelled")),
+        "{}",
+        collected[0].payload
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cancel_during_before_finish_collection_wins_over_the_finish() -> TestResult {
+    let fx = Fixture::new(
+        DefinitionSet::bundled()?,
+        EvidencePlan::from_toml(
+            r#"
+[[evidence.commands]]
+id = "audit"
+argv = ["sh", "-c", "sleep 42.61 & sleep 5; exit 0"]
+run_when = "before_finish"
+"#,
+            "test",
+        )?,
+    )?;
+    let rt = fx.runtime(
+        config(|_| {}),
+        settings(|_| {}),
+        Arc::new(SimulatedModel::new()),
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let mut run = RunGuard::launch(&fx, rt).await?;
+    until(&fx, "a provisional Finish", |events| {
+        events
+            .iter()
+            .any(|e| e.kind == EventKind::DirectiveSelected && e.payload["directive"] == "Finish")
+    })
+    .await;
+    let started = std::time::Instant::now();
+    let outcome = run.cancel().await?;
+    assert_eq!(outcome.status, FactoryStatus::Cancelled);
+    assert!(started.elapsed() < Duration::from_secs(3));
+    let left = orphans("42.61").await;
+    assert!(left.is_empty(), "orphaned provider processes: {left:?}");
+    assert!(
+        !fx.of_kind(EventKind::StateChanged)
+            .iter()
+            .any(|e| e.payload["to"] == "finished")
+    );
+    Ok(())
+}
+
+/// `SimulatedModel`, whose `nth` assessment call waits at a gate.
+struct GatedModel {
+    inner: SimulatedModel,
+    nth: usize,
+    calls: std::sync::atomic::AtomicUsize,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl DecisionModel for GatedModel {
+    async fn ask(
+        &self,
+        context: &AskContext,
+        state: &Value,
+        questions: &BTreeMap<CheckKey, Question>,
+        budget: &Budget,
+    ) -> Result<ModelAnswers, ModelError> {
+        if context.purpose == Purpose::Assessment {
+            let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+            if call == self.nth {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+        }
+        self.inner.ask(context, state, questions, budget).await
+    }
+}
+
+#[tokio::test]
+async fn a_cancel_that_arrives_mid_cycle_wins_over_the_finish_it_selected() -> TestResult {
+    // The second assessment selects Finish. The cancel is sent while that assessment is
+    // being made, so the cycle that selects Finish is the one it arrives in: the last look
+    // before apply lets the cancel win. Ensemble off: this is about the loop, not the band.
+    let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let model = GatedModel {
+        inner: SimulatedModel::new(),
+        nth: 2,
+        calls: std::sync::atomic::AtomicUsize::new(0),
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    };
+    let rt = fx.runtime(
+        config(|_| {}),
+        EnsembleSettings::default(),
+        Arc::new(model),
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let mut run = RunGuard::launch(&fx, rt).await?;
+    tokio::time::timeout(PATIENCE, entered.notified()).await?;
+    let control = run.control.clone();
+    let cancel = tokio::spawn(async move { control.cancel("changed my mind").await });
+    // Let the cancel reach the channel, then let the cycle go on.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    release.notify_one();
+    tokio::time::timeout(PATIENCE, cancel).await???;
+    let outcome = run.join().await?;
+    assert_eq!(outcome.status, FactoryStatus::Cancelled);
+    assert!(
+        fx.of_kind(EventKind::DirectiveSelected)
+            .iter()
+            .any(|e| e.payload["directive"] == "Finish"),
+        "the cycle did select Finish"
+    );
+    assert!(
+        !fx.of_kind(EventKind::StateChanged)
+            .iter()
+            .any(|e| e.payload["to"] == "finished"),
+        "and the cancel won over it"
+    );
+    Ok(())
+}
+
+/// A steerable worker that claims its tests passed, then keeps running until stopped.
+#[derive(Default)]
+struct ClaimingWorker {
+    stopped: std::sync::atomic::AtomicBool,
+    steered: Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl Worker for ClaimingWorker {
+    fn kind(&self) -> WorkerKind {
+        WorkerKind::Simulated
+    }
+
+    fn supports_steering(&self) -> bool {
+        true
+    }
+
+    async fn run(
+        &self,
+        ctx: aftman_core::worker::WorkerCtx,
+        sink: aftman_core::worker::WorkerEventSink,
+    ) -> Result<aftman_core::worker::WorkerOutcome, aftman_core::worker::WorkerError> {
+        {
+            let mut output = ctx.output.lock().unwrap_or_else(|e| e.into_inner());
+            output.push(aftman_core::log::Stream::Stdout, "test result: 3 passed\n");
+        }
+        sink.activity();
+        while !self.stopped.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        Ok(aftman_core::worker::WorkerOutcome::Terminated {
+            reason: aftman_core::worker::TerminateReason::Stopped,
+        })
+    }
+
+    async fn steer(
+        &self,
+        message: &str,
+    ) -> Result<aftman_core::worker::SteerOutcome, aftman_core::worker::WorkerError> {
+        self.steered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(message.to_owned());
+        Ok(aftman_core::worker::SteerOutcome::Queued)
+    }
+
+    async fn terminate(
+        &self,
+        _reason: aftman_core::worker::TerminateReason,
+    ) -> Result<(), aftman_core::worker::WorkerError> {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_steer_sent_during_a_refresh_is_delivered_after_the_cycle() -> TestResult {
+    let fx = Fixture::new(
+        definitions()?,
+        provider("on_demand", "sleep 2; echo PROVIDER-PASS; exit 0")?,
+    )?;
+    let worker = Arc::new(ClaimingWorker::default());
+    let rt = fx.runtime(
+        config(|_| {}),
+        settings(|_| {}),
+        Arc::new(passing_model()),
+        Arc::clone(&worker) as Arc<dyn Worker>,
+    );
+    let mut run = RunGuard::launch(&fx, rt).await?;
+    until(&fx, "the refresh to start", |events| {
+        events.iter().any(|e| {
+            e.kind == EventKind::EnsembleTriggered
+                && e.payload["check"] == TESTS
+                && e.payload["jev_p"]
+                    .as_f64()
+                    .is_some_and(|p| (0.70..0.72).contains(&p))
+        })
+    })
+    .await;
+    let control = run.control.clone();
+    let steer = tokio::spawn(async move { control.steer("keep the API stable").await });
+    let reply = tokio::time::timeout(PATIENCE, steer).await??;
+    assert!(reply.is_ok_and(|outcome| outcome.is_accepted()));
+    assert_eq!(
+        worker
+            .steered
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone(),
+        vec!["keep the API stable".to_owned()],
+        "not lost"
+    );
+    // Delivered after the refresh's cycle, not in the middle of it.
+    let resolved = fx
+        .of_kind(EventKind::EnsembleResolved)
+        .into_iter()
+        .find(|e| {
+            serde_json::from_value::<EnsembleResolvedPayload>(e.payload.clone())
+                .is_ok_and(|p| p.checks.iter().any(|c| c.refresh.is_some()))
+        })
+        .ok_or("no refresh cycle")?;
+    let steered = fx
+        .of_kind(EventKind::WorkerSteered)
+        .into_iter()
+        .find(|e| e.payload["source"] == "human")
+        .ok_or("no human steer")?;
+    assert!(steered.seq.get() > resolved.seq.get());
+    let outcome = run.cancel().await?;
+    assert_eq!(outcome.status, FactoryStatus::Cancelled);
+    Ok(())
+}
+
 // ---- replay -----------------------------------------------------------------------
 
 /// The run's registry, rebuilt as the runtime built it: the definitions and what routing

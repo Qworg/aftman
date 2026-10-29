@@ -320,6 +320,18 @@ fn refreshed(new_p: Option<f32>, provider: &str, exit_code: i32) -> RefreshOutco
     }
 }
 
+/// A refresh whose command could not be launched.
+fn failed_refresh() -> RefreshOutcome {
+    RefreshOutcome {
+        runs: vec![ProviderRun {
+            provider: EvidenceId::new("tests"),
+            exit_code: None,
+        }],
+        new_p: None,
+        error: Some("could not launch".into()),
+    }
+}
+
 fn answer(p_negated: Option<f32>) -> ReframeAnswer {
     ReframeAnswer {
         p_negated,
@@ -398,7 +410,10 @@ async fn with_the_ensemble_disabled_nothing_triggers_and_nothing_is_asked() {
     let plan = s.plan();
     assert!(plan.triggered.is_empty());
     let source = RecordedOpinionSource::new();
-    let outcome = plan.resolve(&source).await;
+    let outcome = plan
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(outcome.checks, s.baseline());
     assert_eq!(outcome.counters, EnsembleCounters::default());
     assert!(source.refresh_calls().is_empty() && source.reframe_calls().is_empty());
@@ -694,7 +709,10 @@ async fn worked_example_9_1_thin_evidence_is_measured_not_judged() {
     // The command exits 1; the fresh answer is 0.08.
     let source =
         RecordedOpinionSource::new().with_refresh(CYCLE, TESTS, refreshed(Some(0.08), "tests", 1));
-    let outcome = plan.resolve(&source).await;
+    let outcome = plan
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     let rc = &outcome.checks[&k(TESTS)];
     assert_eq!(
         rc.resolution,
@@ -729,7 +747,11 @@ async fn a_fake_passing_test_run_converts_a_0_71_into_a_decisive_value() {
     assert_ne!(s.select(&s.baseline()).name(), "Finish");
     let source =
         RecordedOpinionSource::new().with_refresh(CYCLE, TESTS, refreshed(Some(0.93), "tests", 0));
-    let outcome = s.plan().resolve(&source).await;
+    let outcome = s
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     let rc = &outcome.checks[&k(TESTS)];
     assert!(rc.decisive && rc.permitted);
     assert_eq!(rc.jev_p, Some(0.93));
@@ -741,7 +763,11 @@ async fn worked_example_9_2_in_band_without_evidence_escalates_and_asks_no_model
     // No command evidence configured for the check, and R2 available: still not asked.
     let s = Scenario::finish_ready().set(TESTS, 0.71).reframable_all();
     let source = RecordedOpinionSource::new();
-    let outcome = s.plan().resolve(&source).await;
+    let outcome = s
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     let rc = &outcome.checks[&k(TESTS)];
     assert!(!rc.permitted);
     assert_eq!(rc.suppression, Some(CheckSuppression::InBand));
@@ -760,7 +786,11 @@ async fn worked_example_9_2_in_band_without_evidence_escalates_and_asks_no_model
     // After `consecutive_contests_before_human` held cycles: escalate, still no model.
     let s = s.held_for(TESTS, 2);
     let source = RecordedOpinionSource::new();
-    let outcome = s.plan().resolve(&source).await;
+    let outcome = s
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     let rc = &outcome.checks[&k(TESTS)];
     assert!(!rc.permitted);
     assert_eq!(rc.suppression, Some(CheckSuppression::Unresolved));
@@ -782,7 +812,11 @@ async fn worked_example_9_2_a_decisive_finish_is_contested() {
     assert_eq!(s.select(&s.baseline()).name(), "Finish");
     let source =
         RecordedOpinionSource::new().with_reframe(reframe_key(CYCLE, TESTS), answer(Some(0.75)));
-    let outcome = s.plan().resolve(&source).await;
+    let outcome = s
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     let rc = &outcome.checks[&k(TESTS)];
     assert!(!rc.permitted && rc.contested);
     assert_eq!(rc.jev_p, Some(0.92), "Jev's value is untouched");
@@ -806,7 +840,11 @@ async fn worked_example_9_3_agreement_below_cannot_stop_a_worker() {
         .set(STUCK, 0.78)
         .reframable_all();
     let source = answering_all(&s.plan(), Some(0.75));
-    let outcome = s.plan().resolve(&source).await;
+    let outcome = s
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     let rc = &outcome.checks[&k(STUCK)];
     assert!(!rc.permitted, "in band: held");
     assert!(
@@ -835,12 +873,20 @@ async fn worked_example_9_4_only_evidence_may_finish() {
         .selecting(READY, &["tests", "audit"])
         .reframable_all();
     // Without a refresh: Finish is impossible, and no judge is asked.
-    let no_refresh = s.plan().resolve(&RecordedOpinionSource::new()).await;
+    let no_refresh = s
+        .plan()
+        .resolve(&RecordedOpinionSource::new().with_refresh(CYCLE, READY, failed_refresh()))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     assert_ne!(s.select(&no_refresh.checks).name(), "Finish");
 
     let s = s.without_rung(Rung::RefreshEvidence);
     let source = answering_all(&s.plan(), Some(0.02));
-    let outcome = s.plan().resolve(&source).await;
+    let outcome = s
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     assert!(source.reframe_calls().is_empty());
     assert!(!outcome.checks[&k(READY)].permitted);
     assert_ne!(s.select(&outcome.checks).name(), "Finish");
@@ -867,7 +913,11 @@ async fn worked_example_9_4_only_evidence_may_finish() {
             error: None,
         },
     );
-    let outcome = s.plan().resolve(&source).await;
+    let outcome = s
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     let rc = &outcome.checks[&k(READY)];
     assert!(rc.permitted && rc.decisive);
     assert_eq!(s.select(&outcome.checks).name(), "Finish");
@@ -887,7 +937,11 @@ async fn worked_example_9_5_a_less_than_rule_is_not_collateral_damage() {
     assert_eq!(plan.as_ref().map(|p| p.rule_would_fire), Some(true));
     // R2 agrees it is below.
     let source = answering_all(&s.plan(), Some(0.70));
-    let outcome = s.plan().resolve(&source).await;
+    let outcome = s
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     let rc = &outcome.checks[&k(DOCS)];
     assert!(
         rc.permitted,
@@ -958,7 +1012,11 @@ async fn an_r2_contest_cannot_enable_a_not_rule() {
     // R2: p(not X) = 0.95 against p(X) = 0.95 is inconsistent, so it contests.
     let source =
         RecordedOpinionSource::new().with_reframe(reframe_key(CYCLE, GUARD), answer(Some(0.95)));
-    let outcome = s.plan().resolve(&source).await;
+    let outcome = s
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     assert!(!outcome.checks[&k(GUARD)].permitted, "contested");
     assert!(
         !s.proposals(&outcome.checks)
@@ -1078,7 +1136,10 @@ async fn a_triggered_check_in_band_or_inert_requests_zero_opinions() {
                 let s = s.set(key, (t + offset).clamp(0.0, 1.0));
                 let plan = s.plan();
                 let source = answering_all(&plan, Some(0.5));
-                let outcome = plan.resolve(&source).await;
+                let outcome = plan
+                    .resolve(&source)
+                    .await
+                    .unwrap_or_else(|e| panic!("{e}"));
                 let asked: Vec<CheckKey> = source
                     .reframe_calls()
                     .into_iter()
@@ -1101,7 +1162,10 @@ async fn a_triggered_check_in_band_or_inert_requests_zero_opinions() {
     let s = Scenario::finish_ready().reframable_all();
     let plan = s.plan();
     let source = answering_all(&plan, Some(0.5));
-    let outcome = plan.resolve(&source).await;
+    let outcome = plan
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     for record in &outcome.records {
         let would_fire = plan
             .triggered
@@ -1142,7 +1206,11 @@ async fn a_refresh_whose_command_never_ran_does_not_permit() {
                 error: Some("command could not be launched".into()),
             },
         );
-        let outcome = s.plan().resolve(&source).await;
+        let outcome = s
+            .plan()
+            .resolve(&source)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         let rc = &outcome.checks[&k(READY)];
         assert!(!rc.permitted, "{runs:?}");
         assert!(
@@ -1175,7 +1243,11 @@ async fn a_refresh_value_that_is_not_a_probability_does_not_permit() {
             READY,
             refreshed(Some(new_p), "audit", 0),
         );
-        let outcome = s.plan().resolve(&source).await;
+        let outcome = s
+            .plan()
+            .resolve(&source)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         assert!(!outcome.checks[&k(READY)].permitted, "{new_p}");
         assert_eq!(
             record(&outcome, READY)
@@ -1205,7 +1277,11 @@ async fn repeated_refresh_is_capped_and_visible() {
     let mut refreshes = 0;
     for cycle in 20..26 {
         s.cycle = AssessmentSeq(cycle);
-        let outcome = s.plan().resolve(&source).await;
+        let outcome = s
+            .plan()
+            .resolve(&source)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         s.ensemble = outcome.counters.clone();
         let record = record(&outcome, TESTS);
         let refreshed_now = record.is_some_and(|r| r.refresh.is_some());
@@ -1253,7 +1329,11 @@ async fn a_cooldown_after_an_abstain_does_not_skip_the_irreversible_guard() {
     assert_eq!(a.select(&a.baseline()).name(), "Verify");
     let failing =
         RecordedOpinionSource::new().with_reframe(reframe_key(a.cycle, NEEDS_VER), answer(None));
-    let out_a = a.plan().resolve(&failing).await;
+    let out_a = a
+        .plan()
+        .resolve(&failing)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(failing.reframe_calls().len(), 1);
     assert!(
         record(&out_a, NEEDS_VER)
@@ -1268,7 +1348,11 @@ async fn a_cooldown_after_an_abstain_does_not_skip_the_irreversible_guard() {
     );
     b.ensemble = out_a.counters.clone();
     let source = RecordedOpinionSource::new();
-    let out_b = b.plan().resolve(&source).await;
+    let out_b = b
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     assert_ne!(
         b.select(&out_b.checks).name(),
         "Finish",
@@ -1287,7 +1371,11 @@ async fn a_cooldown_skips_an_opinion_only_when_an_earlier_confirm_covers_it() {
     let a = verify_cycle();
     let confirming = RecordedOpinionSource::new()
         .with_reframe(reframe_key(a.cycle, NEEDS_VER), answer(Some(0.10)));
-    let out_a = a.plan().resolve(&confirming).await;
+    let out_a = a
+        .plan()
+        .resolve(&confirming)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     assert!(
         record(&out_a, NEEDS_VER).is_some_and(
             |r| r.opinions[0].opinion.verdict == Verdict::Confirm { side: Side::Above }
@@ -1295,7 +1383,11 @@ async fn a_cooldown_skips_an_opinion_only_when_an_earlier_confirm_covers_it() {
     );
     let mut b = finish_after_verify_cycle();
     b.ensemble = out_a.counters.clone();
-    let out_b = b.plan().resolve(&RecordedOpinionSource::new()).await;
+    let out_b = b
+        .plan()
+        .resolve(&RecordedOpinionSource::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     assert_ne!(
         b.select(&out_b.checks).name(),
         "Finish",
@@ -1312,12 +1404,20 @@ async fn a_cooldown_skips_an_opinion_only_when_an_earlier_confirm_covers_it() {
     b1.cycle = AssessmentSeq(20);
     let confirming = RecordedOpinionSource::new()
         .with_reframe(reframe_key(b1.cycle, NEEDS_VER), answer(Some(0.95)));
-    let out_b1 = b1.plan().resolve(&confirming).await;
+    let out_b1 = b1
+        .plan()
+        .resolve(&confirming)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(b1.select(&out_b1.checks).name(), "Finish");
     let mut b2 = finish_after_verify_cycle();
     b2.ensemble = out_b1.counters.clone();
     let source = RecordedOpinionSource::new();
-    let out_b2 = b2.plan().resolve(&source).await;
+    let out_b2 = b2
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     assert!(source.reframe_calls().is_empty());
     assert_eq!(
         b2.select(&out_b2.checks).name(),
@@ -1334,7 +1434,11 @@ async fn a_cooldown_skips_an_opinion_only_when_an_earlier_confirm_covers_it() {
     let mut b3 = finish_after_verify_cycle().set(NEEDS_VER, 0.90);
     b3.counters.verifiers_run = 0;
     b3.ensemble = out_b1.counters.clone();
-    let out_b3 = b3.plan().resolve(&RecordedOpinionSource::new()).await;
+    let out_b3 = b3
+        .plan()
+        .resolve(&RecordedOpinionSource::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     assert!(
         b3.check_plan(NEEDS_VER)
             .is_some_and(|p| p.wants_opinion() && p.rule_would_fire)
@@ -1352,7 +1456,11 @@ async fn the_opinion_budget_holds_rather_than_acting_unchecked() {
         .reframable(&[TESTS]);
     s.ensemble.opinions_used = s.settings.max_opinions_per_run;
     let source = RecordedOpinionSource::new();
-    let outcome = s.plan().resolve(&source).await;
+    let outcome = s
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     let rc = &outcome.checks[&k(TESTS)];
     assert!(!rc.permitted);
     assert_eq!(rc.suppression, Some(CheckSuppression::Unresolved));
@@ -1396,7 +1504,11 @@ async fn the_cooldown_holds_unless_an_earlier_confirm_covers_the_opinion() {
             },
         );
         let source = RecordedOpinionSource::new();
-        let outcome = s.plan().resolve(&source).await;
+        let outcome = s
+            .plan()
+            .resolve(&source)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         let row = format!("{verdict:?} {side:?} irreversible={irreversible}");
         assert!(
             source.reframe_calls().is_empty(),
@@ -1435,7 +1547,11 @@ async fn the_cooldown_holds_unless_an_earlier_confirm_covers_the_opinion() {
     );
     let source =
         RecordedOpinionSource::new().with_reframe(reframe_key(CYCLE, TESTS), answer(Some(0.08)));
-    let outcome = s.plan().resolve(&source).await;
+    let outcome = s
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(source.reframe_calls().len(), 1);
     assert!(outcome.checks[&k(TESTS)].permitted, "consistent: confirmed");
     assert_eq!(
@@ -1463,7 +1579,11 @@ async fn repeat_contest_does_not_latch_from_in_band_holds() {
             }
             s.cycle = AssessmentSeq(20 + i as u64);
             s.ensemble = counters.clone();
-            let outcome = s.plan().resolve(&RecordedOpinionSource::new()).await;
+            let outcome = s
+                .plan()
+                .resolve(&RecordedOpinionSource::new())
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
             if ready > 0.9 {
                 assert_eq!(outcome.escalations().count(), 0, "human={human} cycle {i}");
                 assert!(
@@ -1497,7 +1617,11 @@ async fn tests_sequence(
         s.ensemble = counters.clone();
         let source =
             RecordedOpinionSource::new().with_reframe(reframe_key(s.cycle, TESTS), answer(*q));
-        let outcome = s.plan().resolve(&source).await;
+        let outcome = s
+            .plan()
+            .resolve(&source)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         out.push((
             outcome.escalations().count() > 0,
             source.reframe_calls().len(),
@@ -1599,7 +1723,11 @@ async fn a_repeated_contest_escalates_instead_of_asking_again() {
         .reframable(&[TESTS])
         .contested_for(TESTS, 2);
     let source = RecordedOpinionSource::new();
-    let outcome = s.plan().resolve(&source).await;
+    let outcome = s
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     assert!(source.reframe_calls().is_empty());
     let rc = &outcome.checks[&k(TESTS)];
     assert!(!rc.permitted);
@@ -1610,7 +1738,11 @@ async fn a_repeated_contest_escalates_instead_of_asking_again() {
     let s = s.without_rung(Rung::Human);
     let source =
         RecordedOpinionSource::new().with_reframe(reframe_key(CYCLE, TESTS), answer(Some(0.08)));
-    let outcome = s.plan().resolve(&source).await;
+    let outcome = s
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(source.reframe_calls().len(), 1);
     assert_eq!(outcome.escalations().count(), 0);
 }
@@ -1620,7 +1752,13 @@ async fn an_unusable_opinion_on_an_irreversible_action_holds_it() {
     let s = Scenario::finish_ready()
         .set(TESTS, 0.92)
         .reframable(&[TESTS]);
-    let outcome = s.plan().resolve(&RecordedOpinionSource::new()).await;
+    // The call fails: recorded as an answer with no value.
+    let source = RecordedOpinionSource::new().with_reframe(reframe_key(CYCLE, TESTS), answer(None));
+    let outcome = s
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     let rc = &outcome.checks[&k(TESTS)];
     assert!(rc.contested && !rc.permitted);
     assert_ne!(s.select(&outcome.checks).name(), "Finish");
@@ -1636,7 +1774,11 @@ async fn opinion_text_is_bounded() {
     long.model = "m".repeat(5000);
     long.error = Some("x".repeat(9000));
     let source = RecordedOpinionSource::new().with_reframe(reframe_key(CYCLE, TESTS), long);
-    let outcome = s.plan().resolve(&source).await;
+    let outcome = s
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     let opinion = &record(&outcome, TESTS).map(|r| r.opinions[0].opinion.clone());
     let opinion = opinion.as_ref();
     assert!(opinion.is_some_and(|o| o.excerpt.len() <= 2048 && o.excerpt.len() > 2000));
@@ -1963,7 +2105,10 @@ async fn run_case(c: &Case) {
     let source = RecordedOpinionSource::new()
         .with_refresh(CYCLE, TESTS, refreshed(new_p, "tests", 0))
         .with_reframe(reframe_key(CYCLE, TESTS), answer(p_negated));
-    let outcome = plan.resolve(&source).await;
+    let outcome = plan
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
     let rc = &outcome.checks[&key];
     let expected = oracle(c);
     let label = format!(
@@ -2035,9 +2180,16 @@ async fn monotonic_conservatism_removing_r2_never_shrinks_the_permitted_set() {
                         s = s.with_worker();
                     }
                     let plan = s.plan();
-                    let with = plan.resolve(&answering_all(&plan, q)).await;
+                    let with = plan
+                        .resolve(&answering_all(&plan, q))
+                        .await
+                        .unwrap_or_else(|e| panic!("{e}"));
                     let s = s.without_rung(Rung::ReframeSameModel);
-                    let without = s.plan().resolve(&RecordedOpinionSource::new()).await;
+                    let without = s
+                        .plan()
+                        .resolve(&RecordedOpinionSource::new())
+                        .await
+                        .unwrap_or_else(|e| panic!("{e}"));
                     assert!(
                         permitted_set(&with.checks).is_subset(&permitted_set(&without.checks)),
                         "ready={ready} tests={tests} q={q:?} worker={worker}"
@@ -2119,7 +2271,11 @@ async fn no_opinion_driven_finish_across_cycles() {
                 for (i, state) in sequence.iter().enumerate() {
                     let s = cycle_scenario(*state, 20 + i as u64, &counters)
                         .without_rung(Rung::ReframeSameModel);
-                    let outcome = s.plan().resolve(&RecordedOpinionSource::new()).await;
+                    let outcome = s
+                        .plan()
+                        .resolve(&RecordedOpinionSource::new())
+                        .await
+                        .unwrap_or_else(|e| panic!("{e}"));
                     without.push(s.select(&outcome.checks).name());
                     counters = outcome.counters;
                 }
@@ -2141,7 +2297,10 @@ async fn no_opinion_driven_finish_across_cycles() {
                                     Answers::Consistent => answering_by(&plan, |p| Some(1.0 - p)),
                                     Answers::Inconsistent => answering_by(&plan, Some),
                                 };
-                                let outcome = plan.resolve(&source).await;
+                                let outcome = plan
+                                    .resolve(&source)
+                                    .await
+                                    .unwrap_or_else(|e| panic!("{e}"));
                                 for record in &outcome.records {
                                     if !record.opinions.is_empty() {
                                         let confirmed = record.opinions.iter().all(|o| {
@@ -2214,10 +2373,15 @@ async fn no_fabrication_jev_p_is_unchanged_unless_refreshed() {
                     .reframable_all();
                 let plan = s.plan();
                 let mut source = answering_all(&plan, q);
-                if let Some(p) = refresh {
-                    source = source.with_refresh(CYCLE, TESTS, refreshed(Some(p), "tests", 0));
-                }
-                let outcome = plan.resolve(&source).await;
+                source = source.with_refresh(
+                    CYCLE,
+                    TESTS,
+                    refresh.map_or_else(failed_refresh, |p| refreshed(Some(p), "tests", 0)),
+                );
+                let outcome = plan
+                    .resolve(&source)
+                    .await
+                    .unwrap_or_else(|e| panic!("{e}"));
                 let baseline = s.baseline();
                 for (key, rc) in &outcome.checks {
                     match &rc.resolution {
@@ -2256,7 +2420,10 @@ async fn no_input_produces_an_opinion_driven_finish() {
                                     .reframable_all();
                                 s.counters.verifier_completed = verifier_completed;
                                 let plan = s.plan();
-                                let outcome = plan.resolve(&answering_all(&plan, q)).await;
+                                let outcome = plan
+                                    .resolve(&answering_all(&plan, q))
+                                    .await
+                                    .unwrap_or_else(|e| panic!("{e}"));
                                 let baseline_finishes = s.select(&s.baseline()).name() == "Finish";
                                 // Whatever verdict any opinion could return, folded into
                                 // every check at once, cannot construct a Finish either.
@@ -2315,7 +2482,10 @@ async fn side_guard_a_confirm_below_never_permits_the_rule() {
                 .set(STUCK, p)
                 .reframable_all();
             let plan = s.plan();
-            let outcome = plan.resolve(&answering_all(&plan, q)).await;
+            let outcome = plan
+                .resolve(&answering_all(&plan, q))
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
             let rc = &outcome.checks[&k(STUCK)];
             for verdict in [
                 Verdict::Confirm { side: Side::Below },
@@ -2345,7 +2515,11 @@ async fn direction_guard_less_than_rules_fire_and_every_finish_comparison_is_gat
     // A `<` rule fires on a decisively-below value.
     for &docs in &[0.0_f32, 0.30, 0.59] {
         let s = Scenario::finish_ready().set(DOCS, docs);
-        let outcome = s.plan().resolve(&RecordedOpinionSource::new()).await;
+        let outcome = s
+            .plan()
+            .resolve(&RecordedOpinionSource::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         assert!(outcome.checks[&k(DOCS)].permitted, "docs={docs}");
         assert!(
             s.proposals(&outcome.checks)
@@ -2366,7 +2540,11 @@ async fn direction_guard_less_than_rules_fire_and_every_finish_comparison_is_gat
     ];
     for (key, value) in in_band {
         let s = Scenario::finish_ready().set(key, value);
-        let outcome = s.plan().resolve(&RecordedOpinionSource::new()).await;
+        let outcome = s
+            .plan()
+            .resolve(&RecordedOpinionSource::new())
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         assert!(!outcome.checks[&k(key)].permitted, "{key} in band");
         assert!(
             !s.proposals(&outcome.checks)
@@ -2447,20 +2625,39 @@ async fn a_replay_from_recorded_events_is_bit_identical() -> TestResult {
             .reframable_all(),
         Scenario::finish_ready().set(READY, 0.79).reframable_all(),
     ];
-    let live_source = RecordedOpinionSource::new()
-        .with_refresh(AssessmentSeq(20), TESTS, refreshed(Some(0.08), "tests", 1))
-        .with_reframe(reframe_key(AssessmentSeq(21), TESTS), answer(Some(0.75)))
-        .with_reframe(reframe_key(AssessmentSeq(22), STUCK), answer(Some(0.04)))
-        .with_reframe(reframe_key(AssessmentSeq(22), DOCS), answer(Some(f32::NAN)));
+    // Each cycle answers every opinion it could ask, with these exceptions; the last
+    // cycle's calls all fail.
+    let live_source = |i: usize, plan: &EnsemblePlan| match i {
+        0 => answering_all(plan, Some(0.5)).with_refresh(
+            AssessmentSeq(20),
+            TESTS,
+            refreshed(Some(0.08), "tests", 1),
+        ),
+        1 => answering_all(plan, Some(0.5))
+            .with_reframe(reframe_key(AssessmentSeq(21), TESTS), answer(Some(0.75))),
+        2 => answering_all(plan, Some(0.5))
+            .with_reframe(reframe_key(AssessmentSeq(22), STUCK), answer(Some(0.04)))
+            .with_reframe(reframe_key(AssessmentSeq(22), DOCS), answer(Some(f32::NAN))),
+        _ => answering_all(plan, None),
+    };
 
     let mut counters = EnsembleCounters::default();
     let mut live = Vec::new();
     let mut events = Vec::new();
+    let mut live_refreshes = Vec::new();
+    let mut live_reframes = Vec::new();
     let mut seq = 0;
     for (i, mut s) in cycles.into_iter().enumerate() {
         s.cycle = AssessmentSeq(20 + i as u64);
         s.ensemble = counters.clone();
-        let outcome = s.plan().resolve(&live_source).await;
+        let plan = s.plan();
+        let source = live_source(i, &plan);
+        let outcome = plan
+            .resolve(&source)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        live_refreshes.extend(source.refresh_calls());
+        live_reframes.extend(source.reframe_calls());
         events.extend(events_for(&outcome, &s.settings, &mut seq));
         counters = outcome.counters.clone();
         live.push(outcome);
@@ -2495,7 +2692,16 @@ async fn a_replay_from_recorded_events_is_bit_identical() -> TestResult {
     for (i, mut s) in cycles.into_iter().enumerate() {
         s.cycle = AssessmentSeq(20 + i as u64);
         s.ensemble = counters.clone();
-        let replayed = s.plan().resolve(&replay_source).await;
+        let replayed = s
+            .plan()
+            .resolve(&replay_source)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            replay_source.divergences(&replayed),
+            Vec::new(),
+            "cycle {i}"
+        );
         assert_eq!(replayed, live[i], "cycle {i}");
         assert_eq!(
             serde_json::to_vec(&replayed)?,
@@ -2504,16 +2710,114 @@ async fn a_replay_from_recorded_events_is_bit_identical() -> TestResult {
         );
         counters = replayed.counters;
     }
-    assert_eq!(
-        replay_source.refresh_calls().len(),
-        live_source.refresh_calls().len()
-    );
+    assert_eq!(replay_source.refresh_calls(), live_refreshes);
     assert_eq!(
         replay_source.reframe_calls(),
-        live_source.reframe_calls(),
+        live_reframes,
         "the replay asked exactly what the live run asked"
     );
     Ok(())
+}
+
+/// One cycle with an opinion and its events, for the replay-refusal tests.
+async fn docs_cycle_events() -> (EnsembleOutcome, Vec<EventEnvelope>) {
+    let s = Scenario::finish_ready().set(DOCS, 0.31).reframable_all();
+    let plan = s.plan();
+    let live = plan
+        .resolve(&answering_all(&plan, Some(0.70)))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let mut seq = 0;
+    let events = events_for(&live, &s.settings, &mut seq);
+    (live, events)
+}
+
+#[tokio::test]
+async fn a_replay_refuses_a_log_missing_an_opinion_record() {
+    // Review probe 6: drop one OPINION_RECORDED. The reader must not answer the missing
+    // opinion with an invented abstention.
+    let (live, events) = docs_cycle_events().await;
+    assert!(record(&live, DOCS).is_some_and(|r| !r.opinions.is_empty()));
+    let dropped: Vec<EventEnvelope> = events
+        .into_iter()
+        .filter(|e| e.kind != EventKind::OpinionRecorded)
+        .collect();
+    assert!(matches!(
+        RecordedOpinionSource::from_events(&dropped),
+        Err(super::super::testing::ReplayError::MissingOpinion(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_replay_refuses_a_log_missing_a_refresh_record() {
+    let s = Scenario::finish_ready()
+        .set(TESTS, 0.71)
+        .selecting(TESTS, &["tests"]);
+    let live = s
+        .plan()
+        .resolve(&RecordedOpinionSource::new().with_refresh(
+            CYCLE,
+            TESTS,
+            refreshed(Some(0.08), "tests", 1),
+        ))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let mut seq = 0;
+    let mut events = events_for(&live, &s.settings, &mut seq);
+    for event in &mut events {
+        if let Some(checks) = event
+            .payload
+            .get_mut("checks")
+            .and_then(|c| c.as_array_mut())
+        {
+            for check in checks {
+                check["refresh"] = serde_json::Value::Null;
+            }
+        }
+    }
+    assert!(matches!(
+        RecordedOpinionSource::from_events(&events),
+        Err(super::super::testing::ReplayError::MissingRefresh { .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_replay_reports_a_recomputed_verdict_that_differs_from_the_log() -> TestResult {
+    let (_, mut events) = docs_cycle_events().await;
+    // Tamper with the recorded verdict; the recorded answer still confirms.
+    for event in &mut events {
+        if event.kind == EventKind::OpinionRecorded {
+            event.payload["verdict"] = serde_json::json!({"kind": "contest", "side": "above"});
+        }
+    }
+    let source = RecordedOpinionSource::from_events(&events)?;
+    let replayed = Scenario::finish_ready()
+        .set(DOCS, 0.31)
+        .reframable_all()
+        .plan()
+        .resolve(&source)
+        .await?;
+    let divergences = source.divergences(&replayed);
+    assert!(
+        divergences.iter().any(|d| matches!(
+            d,
+            super::super::testing::ReplayError::VerdictMismatch { .. }
+        )),
+        "{divergences:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_unrecorded_call_is_a_divergence_not_an_answer() {
+    let s = Scenario::finish_ready()
+        .set(TESTS, 0.92)
+        .reframable(&[TESTS]);
+    let result = s.plan().resolve(&RecordedOpinionSource::new()).await;
+    assert!(
+        matches!(result, Err(super::SourceError::NotRecorded(_))),
+        "{result:?}"
+    );
 }
 
 #[test]

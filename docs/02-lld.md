@@ -331,11 +331,14 @@ pub struct EnsembleContext<'a> { settings, cycle, policy: &PolicyInput, propose:
 pub struct EnsemblePlan { cycle, settings, counters, baseline, triggered: Vec<CheckPlan> }
 impl EnsemblePlan {
     pub fn build(ctx: &EnsembleContext) -> Self;                          // pure: triggers
-    pub async fn resolve(&self, source: &dyn OpinionSource) -> EnsembleOutcome; // the ladder
+    pub async fn resolve(&self, source: &dyn OpinionSource)
+        -> Result<EnsembleOutcome, SourceError>;                          // the ladder
 }
 #[async_trait] pub trait OpinionSource: Send + Sync {
-    async fn refresh_evidence(&self, r: &RefreshRequest) -> RefreshOutcome;     // R0
-    async fn reframe_same_model(&self, r: &ReframeRequest) -> ReframeAnswer;    // R2
+    // A failed call is an Ok outcome with no value; Err only when there is no answer at
+    // all (a replay asked something its log does not record).
+    async fn refresh_evidence(&self, r: &RefreshRequest) -> Result<RefreshOutcome, SourceError>; // R0
+    async fn reframe_same_model(&self, r: &ReframeRequest) -> Result<ReframeAnswer, SourceError>; // R2
 }
 pub struct EnsembleOutcome { cycle, checks: BTreeMap<CheckKey, ResolvedCheck>,
     records: Vec<CheckRecord>, counters: EnsembleCounters }
@@ -343,7 +346,9 @@ pub fn reframe_verdict(p, p_negated, threshold, framing_tolerance, irreversible)
 pub fn apply_opinions(rc: ResolvedCheck, opinions: &[Opinion]) -> ResolvedCheck; // suppress-only
 ```
 
-`aftman_core::testing::RecordedOpinionSource` implements `OpinionSource` from recorded outcomes.
+`aftman_core::testing::RecordedOpinionSource` implements `OpinionSource` from recorded outcomes
+only: `from_events` refuses an incomplete log, an unrecorded call is a `SourceError`, and
+`divergences` reports a recomputed verdict that differs from the recorded one.
 
 ## 4. Responsibilities
 

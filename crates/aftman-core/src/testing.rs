@@ -10,10 +10,11 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::assessment::AnswerValue;
+use crate::assessment::{AnswerValue, Rung, Verdict};
 use crate::ensemble::{
-    EnsembleOutcome, EnsembleResolvedPayload, OpinionKey, OpinionRecordedPayload, OpinionSource,
-    ReframeAnswer, ReframeRequest, RefreshOutcome, RefreshRequest,
+    EnsembleOutcome, EnsembleResolvedPayload, OpinionKey, OpinionRecordedPayload,
+    OpinionRequestedPayload, OpinionSource, ReframeAnswer, ReframeRequest, RefreshOutcome,
+    RefreshRequest, SourceError,
 };
 use crate::error::ModelError;
 use crate::event::{EventEnvelope, EventKind};
@@ -342,23 +343,53 @@ impl DecisionModel for SimulatedModel {
     }
 }
 
-/// An [`OpinionSource`] that answers from recorded outcomes.
+/// An [`OpinionSource`] that answers from recorded outcomes, and from nothing else.
 ///
-/// Built from a live run's events ([`RecordedOpinionSource::from_events`]) or from a
+/// Built from a run's events ([`RecordedOpinionSource::from_events`]) or from a
 /// resolution ([`RecordedOpinionSource::record`]), it gives back exactly what was
 /// recorded, so that replaying a run's [`crate::ensemble::EnsemblePlan`]s against it
 /// produces identical resolutions (`docs/06-ensemble.md` §8). Tests also build it by
-/// hand, as a scripted source.
+/// hand, as a scripted source; a test that wants a failed call records one.
 ///
-/// A request with no recording gets an outcome that says so (no value, and an error),
-/// which the resolver treats as it would a failed call. Every request is counted, so a
-/// test can assert that nothing was asked.
+/// **It never invents an answer.** A request with no recording is a divergence, returned
+/// as [`SourceError::NotRecorded`], which aborts the resolution. Verdicts recorded in the
+/// log are kept so that [`RecordedOpinionSource::divergences`] can compare them with the
+/// ones a replay recomputes. Every request is counted, so a test can assert that nothing
+/// was asked.
 #[derive(Debug, Default)]
 pub struct RecordedOpinionSource {
     refreshes: BTreeMap<(AssessmentSeq, CheckKey), RefreshOutcome>,
     reframes: BTreeMap<OpinionKey, ReframeAnswer>,
+    verdicts: BTreeMap<OpinionKey, Verdict>,
     refresh_calls: Mutex<Vec<RefreshRequest>>,
     reframe_calls: Mutex<Vec<ReframeRequest>>,
+}
+
+/// Why a log cannot be replayed, or how a replay differed from it.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum ReplayError {
+    #[error("event {seq} could not be decoded: {message}")]
+    Decode { seq: u64, message: String },
+    /// `ENSEMBLE_RESOLVED` says an opinion was used, or `OPINION_REQUESTED` says one was
+    /// asked, and no `OPINION_RECORDED` records it.
+    #[error("the log does not record opinion {0:?}")]
+    MissingOpinion(OpinionKey),
+    /// `ENSEMBLE_RESOLVED` says a refresh was used and records no outcome for it.
+    #[error("the log does not record the refresh of {check} in cycle {cycle}")]
+    MissingRefresh {
+        cycle: AssessmentSeq,
+        check: CheckKey,
+    },
+    /// The replay computed a different verdict from the recorded answer than the run did.
+    #[error("opinion {key:?}: recorded {recorded:?}, replayed {replayed:?}")]
+    VerdictMismatch {
+        key: OpinionKey,
+        recorded: Verdict,
+        replayed: Verdict,
+    },
+    /// The replay produced an opinion the log never recorded.
+    #[error("the replay produced opinion {0:?}, which the log does not record")]
+    UnrecordedOpinion(OpinionKey),
 }
 
 impl RecordedOpinionSource {
@@ -386,7 +417,7 @@ impl RecordedOpinionSource {
         self
     }
 
-    /// Record everything a resolution asked for and got.
+    /// Record everything a resolution asked for and got, verdicts included.
     pub fn record(&mut self, outcome: &EnsembleOutcome) {
         for record in &outcome.records {
             if let Some(refresh) = &record.refresh {
@@ -398,31 +429,72 @@ impl RecordedOpinionSource {
             for keyed in &record.opinions {
                 self.reframes
                     .insert(keyed.key.clone(), ReframeAnswer::from(&keyed.opinion));
+                self.verdicts
+                    .insert(keyed.key.clone(), keyed.opinion.verdict);
             }
         }
     }
 
     /// Build from a run's events: `OPINION_RECORDED` for opinions, and the per-check
-    /// `refresh` entries of `ENSEMBLE_RESOLVED` for evidence refreshes. Other kinds are
-    /// ignored, and so is an `ENSEMBLE_RESOLVED` written before it carried check entries.
-    pub fn from_events(events: &[EventEnvelope]) -> Result<Self, serde_json::Error> {
+    /// `refresh` entries of `ENSEMBLE_RESOLVED` for evidence refreshes.
+    ///
+    /// # Errors
+    ///
+    /// Refuses an incomplete log: every opinion that `OPINION_REQUESTED` says was asked,
+    /// or that an `ENSEMBLE_RESOLVED` entry lists among its rungs, needs its
+    /// `OPINION_RECORDED`; every refresh an entry lists needs its recorded outcome. An
+    /// `ENSEMBLE_RESOLVED` written before it carried check entries records nothing and is
+    /// skipped.
+    pub fn from_events(events: &[EventEnvelope]) -> Result<Self, ReplayError> {
+        let decode = |event: &EventEnvelope, error: serde_json::Error| ReplayError::Decode {
+            seq: event.seq.get(),
+            message: error.to_string(),
+        };
         let mut source = Self::new();
+        let mut required_opinions: Vec<OpinionKey> = Vec::new();
+        let mut required_refreshes: Vec<(AssessmentSeq, CheckKey)> = Vec::new();
         for event in events {
             match event.kind {
+                EventKind::OpinionRequested => {
+                    let payload: OpinionRequestedPayload =
+                        serde_json::from_value(event.payload.clone())
+                            .map_err(|e| decode(event, e))?;
+                    required_opinions.push(payload.opinion_id);
+                }
                 EventKind::OpinionRecorded => {
                     let payload: OpinionRecordedPayload =
-                        serde_json::from_value(event.payload.clone())?;
+                        serde_json::from_value(event.payload.clone())
+                            .map_err(|e| decode(event, e))?;
+                    source
+                        .verdicts
+                        .insert(payload.opinion_id.clone(), payload.verdict);
                     source
                         .reframes
                         .insert(payload.opinion_id.clone(), payload.answer());
                 }
                 EventKind::EnsembleResolved => {
                     let payload: EnsembleResolvedPayload =
-                        serde_json::from_value(event.payload.clone())?;
+                        serde_json::from_value(event.payload.clone())
+                            .map_err(|e| decode(event, e))?;
                     let Some(cycle) = payload.cycle else {
                         continue;
                     };
                     for check in payload.checks {
+                        for rung in &check.rungs_used {
+                            match rung {
+                                Rung::RefreshEvidence => {
+                                    required_refreshes.push((cycle, check.check.clone()));
+                                }
+                                Rung::ReframeSameModel | Rung::IndependentJudge => {
+                                    required_opinions.push(OpinionKey {
+                                        cycle,
+                                        check: check.check.clone(),
+                                        rung: *rung,
+                                    });
+                                }
+                                Rung::Human => {}
+                            }
+                        }
                         if let Some(refresh) = check.refresh {
                             source
                                 .refreshes
@@ -433,7 +505,41 @@ impl RecordedOpinionSource {
                 _ => {}
             }
         }
+        for key in required_opinions {
+            if !source.reframes.contains_key(&key) {
+                return Err(ReplayError::MissingOpinion(key));
+            }
+        }
+        for (cycle, check) in required_refreshes {
+            if !source.refreshes.contains_key(&(cycle, check.clone())) {
+                return Err(ReplayError::MissingRefresh { cycle, check });
+            }
+        }
         Ok(source)
+    }
+
+    /// Compare a replayed resolution with the recorded verdicts. Empty means the replay
+    /// agrees with the log. An opinion the log does not record is a divergence too.
+    ///
+    /// Only meaningful for a source built from a recording; a hand-scripted source has no
+    /// recorded verdicts and reports every opinion as unrecorded.
+    #[must_use]
+    pub fn divergences(&self, outcome: &EnsembleOutcome) -> Vec<ReplayError> {
+        let mut out = Vec::new();
+        for record in &outcome.records {
+            for keyed in &record.opinions {
+                match self.verdicts.get(&keyed.key) {
+                    Some(recorded) if *recorded == keyed.opinion.verdict => {}
+                    Some(recorded) => out.push(ReplayError::VerdictMismatch {
+                        key: keyed.key.clone(),
+                        recorded: *recorded,
+                        replayed: keyed.opinion.verdict,
+                    }),
+                    None => out.push(ReplayError::UnrecordedOpinion(keyed.key.clone())),
+                }
+            }
+        }
+        out
     }
 
     /// Every refresh requested, in order.
@@ -455,7 +561,10 @@ impl RecordedOpinionSource {
 
 #[async_trait]
 impl OpinionSource for RecordedOpinionSource {
-    async fn refresh_evidence(&self, request: &RefreshRequest) -> RefreshOutcome {
+    async fn refresh_evidence(
+        &self,
+        request: &RefreshRequest,
+    ) -> Result<RefreshOutcome, SourceError> {
         self.refresh_calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -463,14 +572,18 @@ impl OpinionSource for RecordedOpinionSource {
         self.refreshes
             .get(&(request.cycle, request.check.clone()))
             .cloned()
-            .unwrap_or_else(|| RefreshOutcome {
-                runs: Vec::new(),
-                new_p: None,
-                error: Some("no recorded refresh".to_owned()),
+            .ok_or_else(|| {
+                SourceError::NotRecorded(format!(
+                    "the refresh of {} in cycle {}",
+                    request.check, request.cycle
+                ))
             })
     }
 
-    async fn reframe_same_model(&self, request: &ReframeRequest) -> ReframeAnswer {
+    async fn reframe_same_model(
+        &self,
+        request: &ReframeRequest,
+    ) -> Result<ReframeAnswer, SourceError> {
         self.reframe_calls
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -478,17 +591,7 @@ impl OpinionSource for RecordedOpinionSource {
         self.reframes
             .get(&request.opinion)
             .cloned()
-            .unwrap_or_else(|| ReframeAnswer {
-                p_negated: None,
-                source: "recorded".to_owned(),
-                model: String::new(),
-                excerpt: String::new(),
-                prompt_hash: String::new(),
-                state_digest: String::new(),
-                latency: std::time::Duration::ZERO,
-                usage: Usage::default(),
-                error: Some("no recorded opinion".to_owned()),
-            })
+            .ok_or_else(|| SourceError::NotRecorded(format!("opinion {:?}", request.opinion)))
     }
 }
 

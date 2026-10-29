@@ -680,6 +680,14 @@ Properties:
   replayed run produces an identical `EnsembleResolved` sequence. What is recorded is normalised
   first — text capped, a non-finite number dropped — so that what a replay reads back is exactly
   what the live run used.
+- **A replay never invents an answer.** `RecordedOpinionSource::from_events` refuses an incomplete
+  log: every opinion an `OpinionRequested` or an `EnsembleResolved` entry's `rungs_used` names
+  needs its `OpinionRecorded`, and every refresh an entry names needs its recorded outcome. A call
+  the log does not record returns `SourceError::NotRecorded`, which aborts the resolution instead of
+  being folded in as an abstention. After a replayed cycle, `divergences(&outcome)` compares each
+  recomputed verdict with the recorded one and reports any mismatch. This is why `OpinionSource`
+  methods return `Result`: a failed *call* is an outcome (no value), but a source with no answer
+  at all is an error.
 - **No request carries Jev's value.** `RefreshRequest` and `ReframeRequest` name the cycle and the
   check, never `p`, so a source cannot show the model its own first answer.
 - **Reported values are stored and never used.** `p_reported` appears in the log for human

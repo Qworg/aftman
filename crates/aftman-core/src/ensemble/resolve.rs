@@ -142,18 +142,37 @@ impl From<&Opinion> for ReframeAnswer {
 /// providers and the decision model; [`crate::testing::RecordedOpinionSource`]
 /// implements it from a recording.
 ///
-/// Neither method can fail: a failure is an outcome (`new_p: None`, `p_negated: None`)
-/// and the resolver decides what it means, so that a replay of a failure resolves the
-/// same way the failure did.
+/// A failed call is an **outcome**, not an error: `new_p: None`, `p_negated: None`, and
+/// the resolver decides what it means, so that a replay of a failure resolves the same way
+/// the failure did. `Err` is reserved for a source that cannot answer *at all* — a replay
+/// asked something its log does not record — and it aborts the resolution rather than
+/// being folded into it as a value.
 ///
 /// R1 (`independent_judge`) has no method until ensemble stage S3.
 #[async_trait]
 pub trait OpinionSource: Send + Sync {
     /// R0. Run the providers, rebuild the observation, re-ask Jev.
-    async fn refresh_evidence(&self, request: &RefreshRequest) -> RefreshOutcome;
+    async fn refresh_evidence(
+        &self,
+        request: &RefreshRequest,
+    ) -> Result<RefreshOutcome, SourceError>;
 
     /// R2. Ask Jev the check's negated question about the same state.
-    async fn reframe_same_model(&self, request: &ReframeRequest) -> ReframeAnswer;
+    async fn reframe_same_model(
+        &self,
+        request: &ReframeRequest,
+    ) -> Result<ReframeAnswer, SourceError>;
+}
+
+/// A source that cannot answer at all. Never a model or command failure: those are
+/// outcomes.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SourceError {
+    /// A replay was asked something its log does not record. The replay has diverged
+    /// from the run it is replaying.
+    #[error("replay diverged: no recorded outcome for {0}")]
+    NotRecorded(String),
 }
 
 /// A bound that stopped the ladder, recorded so that it is visible in the log.
@@ -251,13 +270,21 @@ impl EnsemblePlan {
     /// Deterministic given the plan and the source's answers: checks are resolved in key
     /// order, and every decision is a function of the plan, the counters, and what the
     /// source returned.
-    pub async fn resolve(&self, source: &dyn OpinionSource) -> EnsembleOutcome {
+    ///
+    /// # Errors
+    ///
+    /// Only if the source cannot answer at all ([`SourceError`]); the resolution is then
+    /// abandoned rather than completed with an invented answer.
+    pub async fn resolve(
+        &self,
+        source: &dyn OpinionSource,
+    ) -> Result<EnsembleOutcome, SourceError> {
         let mut counters = self.counters.clone();
         let mut checks = self.baseline.clone();
         let mut records = Vec::with_capacity(self.triggered.len());
         for plan in &self.triggered {
             let record =
-                resolve_check(plan, self.cycle, &self.settings, &mut counters, source).await;
+                resolve_check(plan, self.cycle, &self.settings, &mut counters, source).await?;
             checks.insert(plan.check.clone(), record.resolved.clone());
             records.push(record);
         }
@@ -288,12 +315,12 @@ impl EnsemblePlan {
                 };
             }
         }
-        EnsembleOutcome {
+        Ok(EnsembleOutcome {
             cycle: self.cycle,
             checks,
             records,
             counters,
-        }
+        })
     }
 }
 
@@ -303,7 +330,7 @@ async fn resolve_check(
     settings: &EnsembleSettings,
     counters: &mut EnsembleCounters,
     source: &dyn OpinionSource,
-) -> CheckRecord {
+) -> Result<CheckRecord, SourceError> {
     let mut record = CheckRecord {
         check: plan.check.clone(),
         triggers: plan.triggers.clone(),
@@ -320,17 +347,18 @@ async fn resolve_check(
     // ---- In band: no opinion can change `permitted` here (§5.2), so none is asked.
     // Evidence, then escalation, are the only options.
     if !rc.decisive {
-        if let Some(refreshed) = refresh(plan, cycle, settings, counters, source, &mut record).await
+        if let Some(refreshed) =
+            refresh(plan, cycle, settings, counters, source, &mut record).await?
         {
             record.resolved = refreshed;
-            return record;
+            return Ok(record);
         }
         if plan.has(EnsembleTrigger::RepeatContest)
             && plan.has(EnsembleTrigger::HighStakes)
             && settings.has(Rung::Human)
         {
             escalate(plan, settings, counters, &mut record);
-            return record;
+            return Ok(record);
         }
         record.resolved = rc.suppress(
             CheckSuppression::InBand,
@@ -339,25 +367,26 @@ async fn resolve_check(
                 rungs: Vec::new(),
             },
         );
-        return record;
+        return Ok(record);
     }
 
     // ---- Decisive. Nothing to guard unless a rule is acting on it.
     if !plan.rule_would_fire {
-        return record;
+        return Ok(record);
     }
 
     // Measuring beats second-guessing: a decisive value about to act on a bare claim is
     // re-measured first.
     if plan.has(EnsembleTrigger::ClaimOnlyEvidence)
-        && let Some(refreshed) = refresh(plan, cycle, settings, counters, source, &mut record).await
+        && let Some(refreshed) =
+            refresh(plan, cycle, settings, counters, source, &mut record).await?
     {
         record.resolved = refreshed;
-        return record;
+        return Ok(record);
     }
 
     if !plan.wants_opinion() {
-        return record;
+        return Ok(record);
     }
 
     let rungs: Vec<Rung> = [Rung::ReframeSameModel]
@@ -367,13 +396,13 @@ async fn resolve_check(
         .collect();
     // No opinion to buy: a decisive, uncontested value stands, whatever its history.
     if rungs.is_empty() {
-        return record;
+        return Ok(record);
     }
 
     // A value that keeps being contested is a question for a person, not another opinion.
     if plan.has(EnsembleTrigger::RepeatContest) && settings.has(Rung::Human) {
         escalate(plan, settings, counters, &mut record);
-        return record;
+        return Ok(record);
     }
 
     let irreversible = plan.has(EnsembleTrigger::Irreversible);
@@ -400,7 +429,7 @@ async fn resolve_check(
                 },
             );
         }
-        return record;
+        return Ok(record);
     }
 
     let needed = u32::try_from(rungs.len()).unwrap_or(u32::MAX);
@@ -417,13 +446,13 @@ async fn resolve_check(
                 rungs: Vec::new(),
             },
         );
-        return record;
+        return Ok(record);
     }
 
     // R1 and R2 both run when both are enabled; neither short-circuits the other (§4).
     // Only R2 exists before S3.
     let (Some(p), Some(threshold)) = (rc.jev_p, rc.threshold) else {
-        return record;
+        return Ok(record);
     };
     for rung in rungs {
         let key = OpinionKey {
@@ -438,7 +467,7 @@ async fn resolve_check(
                 opinion: key.clone(),
                 timeout: Duration::from_secs(settings.opinion_timeout_seconds),
             })
-            .await;
+            .await?;
         let verdict = reframe_verdict(
             p,
             answer.p_negated,
@@ -480,7 +509,7 @@ async fn resolve_check(
         irreversible,
     });
     record.resolved = resolved;
-    record
+    Ok(record)
 }
 
 /// R0, if it applies and its cap allows. `Some` only for a fresh, usable measurement.
@@ -491,9 +520,9 @@ async fn refresh(
     counters: &mut EnsembleCounters,
     source: &dyn OpinionSource,
     record: &mut CheckRecord,
-) -> Option<ResolvedCheck> {
+) -> Result<Option<ResolvedCheck>, SourceError> {
     if !settings.has(Rung::RefreshEvidence) || plan.refresh_providers.is_empty() {
-        return None;
+        return Ok(None);
     }
     let used = counters.check(&plan.check).refreshes;
     if used >= settings.max_evidence_refreshes_per_check {
@@ -501,7 +530,7 @@ async fn refresh(
             used,
             cap: settings.max_evidence_refreshes_per_check,
         });
-        return None;
+        return Ok(None);
     }
     counters
         .checks
@@ -517,7 +546,7 @@ async fn refresh(
                 check: plan.check.clone(),
                 providers: plan.refresh_providers.clone(),
             })
-            .await,
+            .await?,
     );
     let old_p = plan.baseline.jev_p;
     // A measurement needs both halves: a command that actually ran (it exited, so it
@@ -540,10 +569,10 @@ async fn refresh(
         rejected,
     });
     let (Some(run), Some(new_p)) = (ran, outcome.new_p) else {
-        return None;
+        return Ok(None);
     };
     let (provider, exit_code) = (run.provider, run.exit_code);
-    Some(ResolvedCheck::from_refresh(
+    Ok(Some(ResolvedCheck::from_refresh(
         plan.check.clone(),
         plan.baseline.threshold,
         plan.baseline.margin,
@@ -554,7 +583,7 @@ async fn refresh(
             exit_code,
             supersedes: cycle,
         },
-    ))
+    )))
 }
 
 /// Hold the check and ask a person. The hold is what blocks `Finish`; the question is

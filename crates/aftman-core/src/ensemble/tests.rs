@@ -1658,6 +1658,14 @@ async fn the_gate_holds_when_the_budget_is_spent_and_never_refreshes() {
         Some(super::GuardOutcome::BudgetSpent)
     );
     assert_ne!(s.select(&outcome.checks).name(), "Finish");
+    // And, with the human rung configured, it says why.
+    let asks: Vec<&str> = outcome.escalations().map(|(_, ask)| ask).collect();
+    assert_eq!(asks.len(), 1, "{asks:?}");
+    assert!(
+        asks[0].contains("Finish on") && asks[0].contains(TESTS),
+        "{}",
+        asks[0]
+    );
 }
 
 #[tokio::test]
@@ -1784,6 +1792,74 @@ async fn a_provisional_finish_buys_no_irreversible_opinion() {
         .await
         .unwrap_or_else(|e| panic!("{e}"));
     assert_irreversible_guarded(&reassessed, &out, "re-assessed");
+}
+
+#[tokio::test]
+async fn a_spent_budget_escalates_instead_of_holding_finish_silently() {
+    // Round-3 probe G2 (liveness). Every check says done and the opinion budget is spent.
+    // Holding the Finish without a word left policy starting a worker every cycle up to
+    // `max_workers`, then escalating that the job "does not look complete". Now the first
+    // exhausted cycle raises one escalation that says what happened, and no worker is
+    // started for nothing.
+    let mut counters = EnsembleCounters {
+        opinions_used: 20,
+        ..EnsembleCounters::default()
+    };
+    let mut workers = 1;
+    for i in 0..8_u64 {
+        let mut s = Scenario::finish_ready().reframable_all();
+        s.cycle = AssessmentSeq(40 + i);
+        s.ensemble = counters.clone();
+        s.counters.workers_run = workers;
+        let plan = s.plan();
+        let outcome = s
+            .resolve_plan(&plan, &answering_by(&plan, |p| Some(1.0 - p)))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let escalations: Vec<String> = outcome
+            .escalations()
+            .map(|(_, ask)| ask.to_owned())
+            .collect();
+        assert_eq!(i, 0, "escalated on the first exhausted cycle");
+        assert_eq!(
+            escalations.len(),
+            1,
+            "one escalation, not one per check: {escalations:?}"
+        );
+        assert!(
+            escalations[0].contains("opinion budget"),
+            "{}",
+            escalations[0]
+        );
+        assert!(escalations[0].contains("Finish on"), "{}", escalations[0]);
+        assert!(escalations[0].contains(TESTS), "{}", escalations[0]);
+        assert_ne!(s.select(&outcome.checks).name(), "Finish");
+        assert!(record(&outcome, TESTS).is_some_and(|r| {
+            r.limits
+                .iter()
+                .any(|l| matches!(l, EnsembleLimit::OpinionBudget { .. }))
+        }));
+        // The runtime turns the escalation into an Escalate; no worker is burned.
+        if !escalations.is_empty() {
+            break;
+        }
+        workers += 1;
+        counters = outcome.counters;
+    }
+    assert_eq!(workers, 1);
+
+    // Without the `human` rung there is nobody to tell: hold, as before.
+    let mut s = Scenario::finish_ready()
+        .reframable_all()
+        .without_rung(Rung::Human);
+    s.ensemble.opinions_used = 20;
+    let plan = s.plan();
+    let outcome = s
+        .resolve_plan(&plan, &answering_by(&plan, |p| Some(1.0 - p)))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(outcome.escalations().count(), 0);
+    assert_ne!(s.select(&outcome.checks).name(), "Finish");
 }
 
 #[tokio::test]
@@ -2971,6 +3047,10 @@ fn oracle(c: &Case) -> Expected {
         }
         CounterState::CooldownAfterConfirm if !has(EnsembleTrigger::Irreversible) => {
             return with(done(Kind::Decisive, true));
+        }
+        // A spent budget holds; with a person to ask, it says so (one escalation).
+        CounterState::BudgetSpent if rung(Rung::Human) => {
+            return with(done(Kind::Escalated, false));
         }
         CounterState::BudgetSpent => return with(done(Kind::Unresolved, false)),
         CounterState::CooldownAfterContest

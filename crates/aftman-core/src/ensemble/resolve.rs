@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::assessment::{
-    CheckSuppression, Opinion, RefreshMeasurement, Resolution, ResolvedCheck, Rung, Verdict,
+    CheckSuppression, Opinion, RefreshMeasurement, Resolution, ResolvedCheck, Rung, Side, Verdict,
     side_of,
 };
 use crate::ids::{AssessmentSeq, CheckKey, EvidenceId};
@@ -322,6 +322,9 @@ impl EnsemblePlan {
             0
         };
         if self.settings.enabled {
+            self.escalate_spent_budget(&mut checks, &mut records);
+        }
+        if self.settings.enabled {
             for (key, rc) in &checks {
                 if rc.threshold.is_none() {
                     continue;
@@ -355,6 +358,90 @@ impl EnsemblePlan {
             counters,
             gate_rounds,
         })
+    }
+}
+
+impl EnsemblePlan {
+    /// A guard or a ladder opinion refused because `max_opinions_per_run` is spent holds
+    /// its check — and, without a word, that hold would leave policy starting worker after
+    /// worker for a job that looks finished, then escalating that it "does not look
+    /// complete". With the `human` rung configured, the holds this cycle become **one**
+    /// escalation that says what actually happened: which directive on which checks cannot
+    /// be checked. It rides the same channel `RepeatContest` uses (`CheckRecord::escalation`
+    /// on the first held check), so the runtime raises a single `Escalate`.
+    fn escalate_spent_budget(
+        &self,
+        checks: &mut BTreeMap<CheckKey, ResolvedCheck>,
+        records: &mut [CheckRecord],
+    ) {
+        if !self.settings.has(Rung::Human) {
+            return;
+        }
+        let held: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                !r.resolved.permitted
+                    && r.escalation.is_none()
+                    && r.limits
+                        .iter()
+                        .any(|l| matches!(l, EnsembleLimit::OpinionBudget { .. }))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let Some(first) = held.first().copied() else {
+            return;
+        };
+        // Which directive each held check was guarding: the gate's, or the one the ladder's
+        // plan selects with the check on its side.
+        let mut by_directive: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for index in &held {
+            let record = &records[*index];
+            let directive = record.irreversible_guard.as_ref().map_or_else(
+                || {
+                    self.triggered
+                        .iter()
+                        .find(|plan| plan.check == record.check)
+                        .map_or_else(
+                            || "a directive".to_owned(),
+                            |plan| match plan.baseline.side {
+                                Some(Side::Below) => plan.decisive_directives.if_below.clone(),
+                                _ => plan.decisive_directives.if_above.clone(),
+                            },
+                        )
+                },
+                |guard| guard.directive.clone(),
+            );
+            by_directive
+                .entry(directive)
+                .or_default()
+                .push(format!("`{}`", record.check));
+        }
+        let what = by_directive
+            .iter()
+            .map(|(directive, keys)| format!("{directive} on {}", keys.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let ask = cap_bytes(
+            &format!(
+                "The opinion budget for this run ({} opinions) is spent, so {what} cannot be \
+                 checked. Those checks are held until a person decides; the work itself may be \
+                 complete.",
+                self.settings.max_opinions_per_run
+            ),
+            REFRESH_ERROR_CAP_BYTES,
+        );
+        let record = &mut records[first];
+        record.rungs_used.push(Rung::Human);
+        record.escalation = Some(ask.clone());
+        record.resolved = record.resolved.clone().suppress(
+            CheckSuppression::Unresolved,
+            Resolution::UnresolvedInBand {
+                ask,
+                rungs: vec![Rung::Human],
+            },
+        );
+        checks.insert(record.check.clone(), record.resolved.clone());
     }
 }
 

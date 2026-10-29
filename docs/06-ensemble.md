@@ -577,7 +577,7 @@ loop:
         an R2 verdict obtained this cycle under another trigger     → re-read with Irreversible
                                                                       semantics (unusable ⇒ Contest)
         none, R2 available, budget left                             → buy one, Irreversible semantics
-        none, R2 available, budget spent                            → hold (Unresolved)
+        none, R2 available, budget spent                            → hold (Unresolved); see below
         none, R2 not available for k                                → k stands, as in the ladder
         fold; mark k guarded
 ```
@@ -597,6 +597,14 @@ loop:
   (`already_guarded`, `reinterpreted`, `bought`, `unavailable`, `budget_spent`) in its
   `CheckRecord` and in its `EnsembleResolved` entry. A check the gate guarded that the ladder never
   looked at gets a record with no triggers.
+- **A spent budget escalates, truthfully.** A guard (or a ladder opinion for a rule about to act)
+  refused because `max_opinions_per_run` is spent holds its check, which keeps an unchecked
+  `Finish` or `Stop` from executing. A silent hold, though, left policy starting a worker every
+  cycle for a job that looks finished, then escalating that it "does not look complete". With the
+  `human` rung configured, every such hold in a cycle becomes **one** escalation, on the channel
+  `RepeatContest` uses, whose question says what happened: the budget is spent, and which
+  directive on which checks cannot be checked. Each held check also carries
+  `EnsembleLimit::OpinionBudget`. Without the `human` rung the checks are held, as before.
 - **A provisional `Finish` is not irreversible.** When `before_finish` providers exist and have
   not run, the runtime does not apply a selected `Finish`: it runs them and re-assesses. The
   context says so (`EnsembleContext::finish_is_provisional`, set by the runtime), and then neither
@@ -724,7 +732,7 @@ Notes that follow directly from §2:
 
 | Bound | Default | Why |
 | --- | --- | --- |
-| `max_opinions_per_run` | 20 | A run needing more opinions has a broken check, not a hard question. Counts opinion calls only; refreshes are not opinions. A decisive check a rule is about to act on, with the budget spent, is held rather than acted on unchecked |
+| `max_opinions_per_run` | 20 | A run needing more opinions has a broken check, not a hard question. Counts opinion calls only; refreshes are not opinions. A decisive check a rule is about to act on, with the budget spent, is held rather than acted on unchecked, and — with the `human` rung — the cycle raises one escalation saying so (§6) |
 | `max_evidence_refreshes_per_check` | 3 | Same reason. Every attempt counts, including one whose command could not run |
 | `opinion_timeout_seconds` | 120 | An opinion must not outlive the worker it is judging |
 | `per_check_cooldown_cycles` | 10 | One opinion per check per ten cycles, for non-irreversible triggers. Within the window an opinion the last one covers (a confirm, on the same side) is skipped, and one it does not cover holds the check. Never applies to an `Irreversible` trigger, whose opinion is always bought fresh, budget permitting (§6) |

@@ -582,9 +582,11 @@ held that `Finish` for up to `per_check_cooldown_cycles − 1` cycles after near
 `Verify → Finish` would have stalled for the window when the ensemble is on. The cooldown exists to
 stop re-asking the same question; an irreversible action is a different question, asked once.
 
-A plan's fields are private to the ensemble and a plan is only built by `EnsemblePlan::build`, so no
-caller can hand the resolver a baseline with `permitted = true` that `from_measurement` did not
-produce. Every string that reaches an event is capped: opinion excerpts and errors at 2 KiB, labels
+A plan's fields are private to the ensemble and a plan is only built by `EnsemblePlan::build`, which
+**derives** the baseline itself — `from_measurement` over the answers and definitions with the
+settings' `enabled` and `uncertainty_margin` — and refuses (`EnsembleError::BaselineMismatch`) a
+policy input whose checks differ from it. So no caller can hand the resolver a baseline with
+`permitted = true` that `from_measurement`, under these settings, did not produce. Every string that reaches an event is capped: opinion excerpts and errors at 2 KiB, labels
 and provider names at 256 bytes, refresh errors and escalation questions at 2 KiB, and a refresh
 keeps at most one run per requested provider.
 

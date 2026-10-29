@@ -30,6 +30,6 @@ pub use settings::{
     OpinionMark,
 };
 pub use trigger::{
-    CheckPlan, DecisiveDirectives, EnsembleContext, EnsemblePlan, EnsembleTrigger,
+    CheckPlan, DecisiveDirectives, EnsembleContext, EnsembleError, EnsemblePlan, EnsembleTrigger,
     refresh_providers, sees_command_evidence,
 };

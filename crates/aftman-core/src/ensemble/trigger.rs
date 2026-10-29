@@ -94,8 +94,9 @@ pub struct EnsembleContext<'a> {
     pub settings: &'a EnsembleSettings,
     /// The assessment being resolved. A refresh supersedes it; cooldowns count from it.
     pub cycle: AssessmentSeq,
-    /// The policy input for this cycle, with `checks` set to the **baseline**
-    /// resolution (`ResolvedCheck::from_measurement` for every check).
+    /// The policy input for this cycle. Its `checks` must be the baseline the ensemble
+    /// derives itself — `ResolvedCheck::from_measurement` over `answers` and `definitions`
+    /// with the settings' margin and `enabled` — or `build` refuses.
     pub policy: &'a PolicyInput<'a>,
     /// Proposal generation, for example `|input| registry.propose(input)`. Must be the
     /// same pure function the runtime uses, or the counterfactuals answer a different
@@ -289,13 +290,26 @@ impl EnsemblePlan {
 
     /// Compute the triggers for every check. Pure.
     ///
-    /// With the ensemble disabled, nothing is triggered and the baseline stands.
-    #[must_use]
-    pub fn build(ctx: &EnsembleContext<'_>) -> Self {
-        let baseline = ctx.policy.checks.clone();
+    /// The baseline is derived here, from the answers, the definitions and the settings
+    /// (`ResolvedCheck::from_measurement` with `settings.enabled` and
+    /// `settings.uncertainty_margin`), never taken from the caller. With the ensemble
+    /// disabled, nothing is triggered and that baseline stands.
+    ///
+    /// # Errors
+    ///
+    /// [`EnsembleError::BaselineMismatch`] if `ctx.policy.checks` is not that baseline: the
+    /// caller would otherwise be arbitrating over permissions the ensemble did not grant,
+    /// for example a value resolved with a different margin, or with the band switched
+    /// off. Refused as an error rather than a debug assertion so that the refusal itself
+    /// is testable and holds in release builds.
+    pub fn build(ctx: &EnsembleContext<'_>) -> Result<Self, EnsembleError> {
+        let baseline = derive_baseline(ctx);
+        if let Some(check) = first_difference(&baseline, ctx.policy.checks) {
+            return Err(EnsembleError::BaselineMismatch { check });
+        }
         let mut triggered = Vec::new();
         if ctx.settings.enabled {
-            let (proposals, selected) = evaluate(ctx, ctx.policy.checks);
+            let (proposals, selected) = evaluate(ctx, &baseline);
             let world = World {
                 proposals,
                 selected,
@@ -308,14 +322,60 @@ impl EnsemblePlan {
                 }
             }
         }
-        Self {
+        Ok(Self {
             cycle: ctx.cycle,
             settings: ctx.settings.clone(),
             counters: ctx.counters.clone(),
             baseline,
             triggered,
-        }
+        })
     }
+}
+
+/// The baseline the ensemble starts from: Jev's own values, resolved with no opinion.
+fn derive_baseline(ctx: &EnsembleContext<'_>) -> BTreeMap<CheckKey, ResolvedCheck> {
+    ctx.definitions
+        .iter()
+        .map(|check| {
+            let p = ctx.answers.get(&check.key).and_then(AnswerValue::as_noul);
+            (
+                check.key.clone(),
+                ResolvedCheck::from_measurement(
+                    check.key.clone(),
+                    p,
+                    check.threshold,
+                    ctx.settings.uncertainty_margin,
+                    ctx.settings.enabled,
+                ),
+            )
+        })
+        .collect()
+}
+
+/// The first check on which two check sets disagree, if any.
+fn first_difference(
+    a: &BTreeMap<CheckKey, ResolvedCheck>,
+    b: &BTreeMap<CheckKey, ResolvedCheck>,
+) -> Option<CheckKey> {
+    a.keys()
+        .chain(b.keys())
+        .find(|key| a.get(*key) != b.get(*key))
+        .cloned()
+}
+
+/// Why the ensemble could not plan or resolve a cycle.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum EnsembleError {
+    /// The caller's checks are not the baseline the ensemble derives from the answers.
+    #[error(
+        "the policy input's checks differ from the ensemble's baseline at `{check}`; build \
+         them with the same answers, margin and `enabled` as the ensemble settings"
+    )]
+    BaselineMismatch { check: CheckKey },
+    /// The source could not answer at all.
+    #[error(transparent)]
+    Source(#[from] super::resolve::SourceError),
 }
 
 /// What policy does with the baseline checks.

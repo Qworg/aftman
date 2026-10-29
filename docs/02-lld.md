@@ -332,7 +332,8 @@ pub struct EnsemblePlan { /* private; accessors cycle(), settings(), counters(),
     triggered() -> &[CheckPlan] */ }       // only build() makes one, so a caller cannot hand the
                                           // resolver a baseline from_measurement did not produce
 impl EnsemblePlan {
-    pub fn build(ctx: &EnsembleContext) -> Self;                          // pure: triggers
+    pub fn build(ctx: &EnsembleContext) -> Result<Self, EnsembleError>;  // pure: derives the
+                                     // baseline, refuses a caller's checks that differ; triggers
     pub async fn resolve(&self, source: &dyn OpinionSource)
         -> Result<EnsembleOutcome, SourceError>;                          // the ladder
 }

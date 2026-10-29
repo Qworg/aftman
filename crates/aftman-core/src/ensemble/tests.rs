@@ -192,18 +192,31 @@ impl Scenario {
         self.registry.thresholds().into_iter().collect()
     }
 
-    /// The baseline, exactly as `resolve_checks` would build it.
+    /// This cycle's answers: every value as a probability, overridden by any answer a
+    /// test set explicitly.
+    fn answer_map(&self) -> BTreeMap<CheckKey, AnswerValue> {
+        let mut answers: BTreeMap<CheckKey, AnswerValue> = self
+            .values
+            .iter()
+            .filter_map(|(key, p)| p.map(|p| (key.clone(), AnswerValue::Noul(p))))
+            .collect();
+        answers.extend(self.answers.clone());
+        answers
+    }
+
+    /// The baseline, exactly as `resolve_checks` would build it from the answers.
     fn baseline(&self) -> BTreeMap<CheckKey, ResolvedCheck> {
         let thresholds = self.thresholds();
+        let answers = self.answer_map();
         self.values
-            .iter()
-            .map(|(key, p)| {
+            .keys()
+            .map(|key| {
                 let threshold = thresholds.get(key).copied().flatten();
                 (
                     key.clone(),
                     ResolvedCheck::from_measurement(
                         key.clone(),
-                        *p,
+                        answers.get(key).and_then(AnswerValue::as_noul),
                         threshold,
                         self.settings.uncertainty_margin,
                         self.settings.enabled,
@@ -238,8 +251,17 @@ impl Scenario {
     }
 
     fn plan(&self) -> EnsemblePlan {
-        let baseline = self.baseline();
-        let input = self.input(&baseline);
+        self.plan_over(&self.baseline())
+            .unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    /// Plan with the caller's checks set to `checks`.
+    fn plan_over(
+        &self,
+        checks: &BTreeMap<CheckKey, ResolvedCheck>,
+    ) -> Result<EnsemblePlan, super::EnsembleError> {
+        let input = self.input(checks);
+        let answers = self.answer_map();
         let propose = |input: &PolicyInput<'_>| self.registry.propose(input);
         EnsemblePlan::build(&EnsembleContext {
             settings: &self.settings,
@@ -248,7 +270,7 @@ impl Scenario {
             propose: &propose,
             definitions: &self.definitions,
             evidence: &self.evidence,
-            answers: &self.answers,
+            answers: &answers,
             counters: &self.ensemble,
             reframe_available: &self.reframe,
         })
@@ -417,6 +439,34 @@ async fn with_the_ensemble_disabled_nothing_triggers_and_nothing_is_asked() {
     assert_eq!(outcome.checks, s.baseline());
     assert_eq!(outcome.counters, EnsembleCounters::default());
     assert!(source.refresh_calls().is_empty() && source.reframe_calls().is_empty());
+}
+
+#[test]
+fn the_baseline_is_derived_not_taken_from_the_caller() {
+    // Round-2 probe N2: `ready_to_finish = 0.76` is in band, but a caller resolved it with
+    // the band switched off and handed it in as decisive and permitted.
+    let s = Scenario::finish_ready().set(READY, 0.76);
+    let mut forged = s.baseline();
+    forged.insert(
+        k(READY),
+        ResolvedCheck::from_measurement(k(READY), Some(0.76), Some(0.75), 0.15, false),
+    );
+    assert!(forged[&k(READY)].permitted);
+    assert_eq!(
+        s.plan_over(&forged).err(),
+        Some(super::EnsembleError::BaselineMismatch { check: k(READY) })
+    );
+    // A different margin is refused too.
+    let mut other_margin = s.baseline();
+    other_margin.insert(
+        k(TESTS),
+        ResolvedCheck::from_measurement(k(TESTS), Some(0.95), Some(0.75), 0.10, true),
+    );
+    assert!(s.plan_over(&other_margin).is_err());
+    // The derived baseline is what the plan carries.
+    let plan = s.plan();
+    assert_eq!(plan.baseline(), &s.baseline());
+    assert!(!plan.baseline()[&k(READY)].permitted);
 }
 
 #[test]

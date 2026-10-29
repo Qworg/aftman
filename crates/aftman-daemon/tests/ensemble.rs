@@ -893,6 +893,55 @@ async fn an_ensemble_escalation_preempts_starting_a_worker() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn two_finish_conjuncts_in_band_are_put_to_a_person_not_to_more_workers() -> TestResult {
+    // Review probe PD4. `ready_to_finish` and `tests_sufficient` both in band, nothing to
+    // refresh them, the default worker limit. Before the fix neither was high stakes, so
+    // the run burned every worker and ended on "worker limit reached before completion".
+    let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+    let model = StateModel::new(|text| {
+        if text.contains("3 passed") {
+            0.71
+        } else {
+            0.10
+        }
+    })
+    .with("core.completion__ready_to_finish", 0.79);
+    let rt = fx.runtime(
+        config(|c| {
+            c.max_workers = RunConfig::default().max_workers;
+            c.skip_unchanged_assessments = false;
+        }),
+        settings(|_| {}),
+        Arc::new(model),
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let outcome = fx.run(rt).await?;
+    assert_eq!(outcome.status, FactoryStatus::NeedsHuman);
+    let raised = fx.of_kind(EventKind::EscalationRaised);
+    assert_eq!(raised.len(), 1);
+    assert!(
+        raised[0].payload["reason"]
+            .as_str()
+            .is_some_and(|r| r.starts_with("ensemble:")),
+        "{}",
+        raised[0].payload
+    );
+    // `ready_to_finish` is in band from the first cycle, `tests_sufficient` only once the
+    // worker has claimed its tests, so the first is the one that reaches the limit.
+    assert!(
+        raised[0].payload["checks"]
+            .as_array()
+            .is_some_and(|c| c.contains(&serde_json::json!("core.completion__ready_to_finish"))),
+        "{}",
+        raised[0].payload
+    );
+    assert!(
+        (fx.of_kind(EventKind::WorkerStarted).len() as u32) < RunConfig::default().max_workers,
+        "the worker limit was not what ended it"
+    );
+    Ok(())
+}
 /// A worker that talks until it is stopped.
 #[derive(Default)]
 struct LongWorker {

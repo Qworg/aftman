@@ -336,9 +336,11 @@ impl EnsemblePlan {
         if ctx.settings.enabled {
             let (proposals, _) = evaluate(ctx, &baseline);
             let irreversible = irreversible_dependencies(ctx, &baseline);
+            let high_stakes = high_stakes_dependencies(ctx, &baseline);
             let world = World {
                 proposals,
                 irreversible,
+                high_stakes,
             };
             for (key, rc) in &baseline {
                 if let Some(plan) = plan_check(ctx, &world, key, rc)
@@ -443,41 +445,128 @@ struct World {
     proposals: Vec<Proposal>,
     /// What the selected directive rests on, if it is irreversible.
     irreversible: BTreeSet<CheckKey>,
+    /// What a pending high-stakes directive rests on (`high_stakes_dependencies`).
+    high_stakes: BTreeSet<CheckKey>,
+}
+
+/// The checks the proposals `wanted` picks out of `checks` rest on. The single definition
+/// of "a directive depends on a check", shared by the `Irreversible` trigger, the gate and
+/// the `HighStakes` trigger, so that they cannot disagree. The union of
+///
+/// - the **read set**: every check read by the rule of every wanted proposal — so a
+///   directive resting on a disjunction (`a >= t or b >= t`), or proposed by two rules,
+///   rests on every check that could have produced it; and
+/// - the **counterfactual set**: every decisive, permitted check whose side changes
+///   `signature` (computed over the proposals and the selection), each check pinned
+///   decisively above and below — so a check that matters because it would let another
+///   rule win, or make a wanted proposal appear, is included.
+///
+/// Empty when nothing is wanted: no pending directive, nothing rests on anything.
+fn rests_on<S: PartialEq>(
+    ctx: &EnsembleContext<'_>,
+    checks: &BTreeMap<CheckKey, ResolvedCheck>,
+    wanted: impl Fn(&Proposal, &Directive) -> bool,
+    signature: impl Fn(&[Proposal], &Directive) -> S,
+) -> BTreeSet<CheckKey> {
+    let (proposals, selected) = evaluate(ctx, checks);
+    let picked: Vec<&Proposal> = proposals
+        .iter()
+        .filter(|proposal| wanted(proposal, &selected))
+        .collect();
+    if picked.is_empty() {
+        return BTreeSet::new();
+    }
+    let mut deps: BTreeSet<CheckKey> = picked
+        .iter()
+        .flat_map(|proposal| ctx.registry.reads(&proposal.rule))
+        .filter(|key| checks.contains_key(key))
+        .collect();
+    for (key, rc) in checks {
+        if rc.threshold.is_some() && rc.decisive && rc.permitted {
+            let side = |side: Side| {
+                let mut counterfactual = checks.clone();
+                counterfactual.insert(key.clone(), pinned(rc, side));
+                let (proposals, selected) = evaluate(ctx, &counterfactual);
+                signature(&proposals, &selected)
+            };
+            if side(Side::Above) != side(Side::Below) {
+                deps.insert(key.clone());
+            }
+        }
+    }
+    deps
 }
 
 /// The checks an irreversible selection rests on: empty unless `Finish` or `Stop` is
-/// selected over `checks`. The union of
-///
-/// - every check **read** by the rule of every proposal whose directive is the selected
-///   one — so a directive resting on a disjunction (`a >= t or b >= t`), or proposed by
-///   two rules, rests on every check that could have produced it; and
-/// - every decisive, permitted check whose side changes the selected directive (the
-///   `OutcomeRelevant` counterfactual, compared on the whole directive) — so a check that
-///   matters because it would let a higher-priority rule win is included.
+/// selected over `checks` (and is not a provisional `Finish`); otherwise [`rests_on`] the
+/// proposals of the selected directive, the counterfactual compared on the whole selected
+/// directive.
 ///
 /// Used by both the ladder's `Irreversible` trigger and the gate, so the two agree.
 pub(super) fn irreversible_dependencies(
     ctx: &EnsembleContext<'_>,
     checks: &BTreeMap<CheckKey, ResolvedCheck>,
 ) -> BTreeSet<CheckKey> {
-    let (proposals, selected) = evaluate(ctx, checks);
-    if !acts_irreversibly(ctx, &selected) {
-        return BTreeSet::new();
-    }
-    let mut deps: BTreeSet<CheckKey> = proposals
+    rests_on(
+        ctx,
+        checks,
+        |proposal, selected| acts_irreversibly(ctx, selected) && proposal.directive == *selected,
+        |_, selected| selected.clone(),
+    )
+}
+
+/// The checks a **pending** high-stakes directive rests on (`HighStakes`).
+///
+/// [`rests_on`] the `stakes = "high"` proposals, the counterfactual compared on which
+/// high-stakes proposals are made, in these worlds: the baseline; each check held in band
+/// pinned decisively above, and below, alone (the others still held); and all of them
+/// pinned above together, and below together. The pinned worlds are what make a directive
+/// *pending*. Alone, each held worker-health check is one `Stop` away. Together they
+/// matter when one is not enough: with two `Finish` conjuncts in band, neither pinned
+/// alone produces a `Finish`, so a single-check counterfactual found nothing for either and
+/// neither ever escalated — the run started worker after worker instead. Pinned together,
+/// the `Finish` appears, and both rest on it. A check with no value is never pinned: there
+/// is nothing to pin it to.
+fn high_stakes_dependencies(
+    ctx: &EnsembleContext<'_>,
+    checks: &BTreeMap<CheckKey, ResolvedCheck>,
+) -> BTreeSet<CheckKey> {
+    let high = |proposal: &Proposal, _: &Directive| proposal.stakes == Stakes::High;
+    let signature = |proposals: &[Proposal], _: &Directive| -> BTreeSet<(String, String)> {
+        proposals
+            .iter()
+            .filter(|proposal| proposal.stakes == Stakes::High)
+            .map(|proposal| {
+                (
+                    proposal.rule.to_string(),
+                    format!("{:?}", proposal.directive),
+                )
+            })
+            .collect()
+    };
+    let mut deps = rests_on(ctx, checks, high, signature);
+    let held: Vec<&CheckKey> = checks
         .iter()
-        .filter(|proposal| proposal.directive == selected)
-        .flat_map(|proposal| ctx.registry.reads(&proposal.rule))
-        .filter(|key| checks.contains_key(key))
+        .filter(|(_, rc)| rc.threshold.is_some() && !rc.decisive && rc.jev_p.is_some())
+        .map(|(key, _)| key)
         .collect();
-    for (key, rc) in checks {
-        if rc.threshold.is_some()
-            && rc.decisive
-            && rc.permitted
-            && select_with(ctx, checks, key, Side::Above, rc)
-                != select_with(ctx, checks, key, Side::Below, rc)
-        {
-            deps.insert(key.clone());
+    if held.is_empty() {
+        return deps;
+    }
+    // Each held check pinned alone (the others still held), then all of them together.
+    let mut groups: Vec<Vec<&CheckKey>> = held.iter().map(|key| vec![*key]).collect();
+    if held.len() > 1 {
+        groups.push(held.clone());
+    }
+    for group in &groups {
+        for side in [Side::Above, Side::Below] {
+            let mut world = checks.clone();
+            for key in group {
+                if let Some(rc) = checks.get(*key) {
+                    world.insert((*key).clone(), pinned(rc, side));
+                }
+            }
+            deps.extend(rests_on(ctx, &world, high, signature));
         }
     }
     deps
@@ -518,26 +607,18 @@ fn plan_check(
     // relevant to `Finish`. Both counterfactuals are therefore permitted and decisive,
     // and differ only in the side of `t` they sit on. Which of them "fires" a given rule
     // depends on the rule's comparator, which is exactly why both are evaluated.
-    let (above, above_selected) = with_check(ctx, key, pinned(rc, Side::Above));
-    let (below, below_selected) = with_check(ctx, key, pinned(rc, Side::Below));
+    let (_, above_selected) = with_check(ctx, key, pinned(rc, Side::Above));
+    let (_, below_selected) = with_check(ctx, key, pinned(rc, Side::Below));
     let (held, _) = with_check(ctx, key, held(rc));
 
     if above_selected.name() != below_selected.name() {
         triggers.insert(EnsembleTrigger::OutcomeRelevant);
     }
 
-    // Rules that would fire and depend on this check: for a decisive value, those
-    // proposed now; for a held one, those that either decisive side would propose. A
-    // proposal that survives the check being held does not depend on it.
-    let depends: Vec<&Proposal> = if rc.decisive {
-        world.proposals.iter().collect()
-    } else {
-        above.iter().chain(below.iter()).collect()
-    };
-    if depends
-        .iter()
-        .any(|p| p.stakes == Stakes::High && !held.contains(p))
-    {
+    // A high-stakes directive, made now or pending once the held checks are measured,
+    // rests on this check: the same dependency definition the `Irreversible` trigger and
+    // the gate use (`rests_on`).
+    if world.high_stakes.contains(key) {
         triggers.insert(EnsembleTrigger::HighStakes);
     }
 
@@ -627,20 +708,6 @@ pub(super) fn select(
     checks: &BTreeMap<CheckKey, ResolvedCheck>,
 ) -> Directive {
     evaluate(ctx, checks).1
-}
-
-/// The selected directive over `checks` with `key` pinned decisively to `side`. The pinned
-/// value never leaves this call.
-pub(super) fn select_with(
-    ctx: &EnsembleContext<'_>,
-    checks: &BTreeMap<CheckKey, ResolvedCheck>,
-    key: &CheckKey,
-    side: Side,
-    rc: &ResolvedCheck,
-) -> Directive {
-    let mut counterfactual = checks.clone();
-    counterfactual.insert(key.clone(), pinned(rc, side));
-    evaluate(ctx, &counterfactual).1
 }
 
 fn with_check(

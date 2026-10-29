@@ -4808,3 +4808,51 @@ fn human_answers_are_recorded_per_check_and_old_counters_decode_without_them() -
     assert!(!old.recheck);
     Ok(())
 }
+
+#[tokio::test]
+async fn two_finish_conjuncts_in_band_escalate_together() {
+    // Review probe (stage B, finding 3). With one Finish conjunct in band, the check
+    // escalates after `consecutive_contests_before_human` held cycles. With two, neither
+    // pinned alone produced a Finish, so neither was high stakes, neither escalated, and
+    // policy started a worker every cycle until the worker limit. Both rest on the pending
+    // Finish now, and the run asks a person at the same cycle as with one.
+    for inband in [vec![(READY, 0.79_f32)], vec![(READY, 0.79), (TESTS, 0.71)]] {
+        let mut counters = EnsembleCounters::default();
+        let mut escalated_at = None;
+        for i in 0..8u64 {
+            let mut s = Scenario::finish_ready();
+            for (key, p) in &inband {
+                s = s.set(key, *p);
+            }
+            s.cycle = AssessmentSeq(20 + i);
+            s.ensemble = counters.clone();
+            // One worker run per cycle so far: each earlier cycle started one.
+            s.counters.workers_run = u32::try_from(i).unwrap_or(u32::MAX).saturating_add(1);
+            for (key, _) in &inband {
+                assert!(
+                    s.triggers(key).contains(&EnsembleTrigger::HighStakes),
+                    "{key} rests on the pending Finish ({} in band)",
+                    inband.len()
+                );
+            }
+            let outcome = s
+                .run_plan(&RecordedOpinionSource::new())
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let selected = s.decide(&outcome).selected;
+            counters = outcome.counters.clone();
+            if outcome.is_escalation(&selected) {
+                assert_eq!(outcome.escalations().count(), inband.len());
+                escalated_at = Some(i);
+                break;
+            }
+            assert_eq!(selected.name(), "StartWorker");
+        }
+        assert_eq!(
+            escalated_at,
+            Some(2),
+            "{} in band: asked after two held cycles, not after the worker limit",
+            inband.len()
+        );
+    }
+}

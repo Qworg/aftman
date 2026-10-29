@@ -138,7 +138,7 @@ Precisely, for a check `k` with threshold `t` (`aftman_core::ensemble::EnsembleP
 | `LowConfidence` | the answer's `confidence` is below `confidence_floor`, or is not a number |
 | `ClaimOnlyEvidence` | `k`'s evidence selection reached **no command evidence this cycle**: it names no `command:<id>` (or `command_evidence`) whose output is in the observation. A provider `k` names that has not run yet (an `on_demand` one) does not count — what `k` scored was the worker's claim. This is the case in §9.1 |
 | `OutcomeRelevant` | the selected directive's kind differs between `k` pinned above and `k` pinned below |
-| `HighStakes` | some `stakes = "high"` proposal depends on `k`: for a decisive `k`, one proposed now that would not be proposed were `k` held; for a held `k`, one that either pinned side proposes and the held state does not |
+| `HighStakes` | `k` is in what a **pending** `stakes = "high"` directive rests on — the same definition the `Irreversible` trigger and the gate use (`rests_on`: the read set of the high-stakes proposals ∪ every decisive, permitted check whose side changes which high-stakes proposals are made), taken over the baseline, over each in-band check pinned decisively above and below alone, and over all in-band checks pinned above together and below together. The joint pins are what make two `Finish` conjuncts that are both in band each high stakes: neither alone produces a `Finish`, so a single-check counterfactual found nothing, neither escalated, and the run started worker after worker until its limit |
 | `Irreversible` | `k` is decisive, the selected directive is `Stop` or a `Finish` the runtime will execute (not a provisional one, §6), and that directive rests on `k`: a rule proposing it reads `k`, or `k`'s side changes it (`irreversible_dependencies`, §6; the gate uses the same set). Every check is load-bearing for `Finish` through `UnresolvedUncertainty`; this asks whether the directive rests on `k` itself |
 | `RepeatContest` | for an in-band `k`: its measurement was in band in at least `consecutive_contests_before_human` consecutive prior cycles; for a decisive `k`: an opinion **contested** it in at least that many consecutive prior cycles (`EnsembleCounters`). The two counts are separate: in-band cycles never count toward escalating a value that has since become decisive |
 | `HumanRecheck` | `k`'s counters carry `recheck`, set when a person answered `Recheck` or `ClaimComplete` to an escalation naming `k`; cleared by the next resolved cycle, whatever its refresh found |
@@ -679,9 +679,10 @@ loop:
   **0** R2 opinions and the executed one **6**, so a finish attempt costs 6, against 10 when the
   provisional cycle's ladder still bought for the conjuncts and 12 when neither cycle was told
   the first `Finish` was provisional.
-- **What a directive rests on** (`irreversible_dependencies`, shared by the gate and the ladder's
-  `Irreversible` trigger so the two agree) is the union of two sets, because each misses cases the
-  other catches:
+- **What a directive rests on** (`rests_on` in `trigger.rs`: through `irreversible_dependencies`
+  for the gate and the ladder's `Irreversible` trigger, and through `high_stakes_dependencies` for
+  `HighStakes`, so all three agree) is the union of two sets, because each misses cases the other
+  catches:
   - **the read set** — every check read by the rule of every proposal whose directive is the
     selected one: a declarative rule's condition keys, a built-in rule's entry in
     `builtin::RULE_READS` (pinned against the code by a test). A `Stop` on

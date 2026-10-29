@@ -68,6 +68,8 @@ struct Scenario {
     ensemble: EnsembleCounters,
     reframe: BTreeSet<CheckKey>,
     cycle: AssessmentSeq,
+    /// The runtime will run `before_finish` providers instead of executing a Finish.
+    finish_provisional: bool,
 }
 
 impl Scenario {
@@ -123,6 +125,7 @@ impl Scenario {
             ensemble: EnsembleCounters::default(),
             reframe: BTreeSet::new(),
             cycle: CYCLE,
+            finish_provisional: false,
         }
     }
 
@@ -272,6 +275,7 @@ impl Scenario {
             answers: &answers,
             counters: &self.ensemble,
             reframe_available: &self.reframe,
+            finish_is_provisional: self.finish_provisional,
         })
     }
 
@@ -294,6 +298,7 @@ impl Scenario {
             answers: &answers,
             counters: &self.ensemble,
             reframe_available: &self.reframe,
+            finish_is_provisional: self.finish_provisional,
         };
         plan.resolve(&ctx, source).await
     }
@@ -1722,6 +1727,63 @@ async fn a_stop_on_either_of_two_findings_rests_on_both() {
             "{key} was guarded"
         );
     }
+}
+
+#[tokio::test]
+async fn a_provisional_finish_buys_no_irreversible_opinion() {
+    // Round-3 item 2a. With `before_finish` providers pending the runtime will not execute
+    // this Finish; it re-assesses. Nothing is bought to guard it, and nothing is held for
+    // it. The re-assessed Finish, which does execute, is guarded as usual.
+    let mut provisional = Scenario::finish_ready().reframable_all();
+    provisional.finish_provisional = true;
+    provisional.cycle = AssessmentSeq(20);
+    let plan = provisional.plan();
+    assert!(
+        plan.triggered()
+            .iter()
+            .all(|c| !c.has(EnsembleTrigger::Irreversible)),
+        "no Irreversible trigger for a provisional Finish"
+    );
+    let source = answering_by(&plan, |p| Some(1.0 - p));
+    let out = provisional
+        .resolve_plan(&plan, &source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(provisional.select(&out.checks).name(), "Finish");
+    assert!(
+        out.records.iter().all(|r| r.irreversible_guard.is_none()),
+        "the gate stays out"
+    );
+    let provisional_calls = source.reframe_calls().len();
+
+    // The same cycle, executed: the gate guards everything the Finish rests on.
+    let mut executed = Scenario::finish_ready().reframable_all();
+    executed.cycle = AssessmentSeq(20);
+    let plan = executed.plan();
+    let source = answering_by(&plan, |p| Some(1.0 - p));
+    let out = executed
+        .resolve_plan(&plan, &source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(executed.select(&out.checks).name(), "Finish");
+    assert_irreversible_guarded(&executed, &out, "executed");
+    assert!(
+        source.reframe_calls().len() > provisional_calls,
+        "provisional {provisional_calls} vs executed {}",
+        source.reframe_calls().len()
+    );
+
+    // The re-assessment after the provisional Finish is guarded: nothing it bought covers.
+    let mut reassessed = Scenario::finish_ready().reframable_all();
+    reassessed.cycle = AssessmentSeq(21);
+    reassessed.ensemble = out.counters.clone();
+    let plan = reassessed.plan();
+    let source = answering_by(&plan, |p| Some(1.0 - p));
+    let out = reassessed
+        .resolve_plan(&plan, &source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_irreversible_guarded(&reassessed, &out, "re-assessed");
 }
 
 #[tokio::test]

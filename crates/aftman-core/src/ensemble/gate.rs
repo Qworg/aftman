@@ -78,7 +78,7 @@ pub(super) async fn run(
     while rounds < bound {
         rounds += 1;
         let selected = super::trigger::select(ctx, checks);
-        if !selected.is_irreversible() {
+        if !super::trigger::acts_irreversibly(ctx, &selected) {
             break;
         }
         let pending: Vec<CheckKey> = super::trigger::irreversible_dependencies(ctx, checks)

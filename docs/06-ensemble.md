@@ -138,7 +138,7 @@ Precisely, for a check `k` with threshold `t` (`aftman_core::ensemble::EnsembleP
 | `ClaimOnlyEvidence` | `k`'s evidence selection reached **no command evidence this cycle**: it names no `command:<id>` (or `command_evidence`) whose output is in the observation. A provider `k` names that has not run yet (an `on_demand` one) does not count — what `k` scored was the worker's claim. This is the case in §9.1 |
 | `OutcomeRelevant` | the selected directive's kind differs between `k` pinned above and `k` pinned below |
 | `HighStakes` | some `stakes = "high"` proposal depends on `k`: for a decisive `k`, one proposed now that would not be proposed were `k` held; for a held `k`, one that either pinned side proposes and the held state does not |
-| `Irreversible` | `k` is decisive, the selected directive is `Finish` or `Stop`, and that directive rests on `k`: a rule proposing it reads `k`, or `k`'s side changes it (`irreversible_dependencies`, §6; the gate uses the same set). Every check is load-bearing for `Finish` through `UnresolvedUncertainty`; this asks whether the directive rests on `k` itself |
+| `Irreversible` | `k` is decisive, the selected directive is `Stop` or a `Finish` the runtime will execute (not a provisional one, §6), and that directive rests on `k`: a rule proposing it reads `k`, or `k`'s side changes it (`irreversible_dependencies`, §6; the gate uses the same set). Every check is load-bearing for `Finish` through `UnresolvedUncertainty`; this asks whether the directive rests on `k` itself |
 | `RepeatContest` | for an in-band `k`: its measurement was in band in at least `consecutive_contests_before_human` consecutive prior cycles; for a decisive `k`: an opinion **contested** it in at least that many consecutive prior cycles (`EnsembleCounters`). The two counts are separate: in-band cycles never count toward escalating a value that has since become decisive |
 
 Alongside the triggers the plan records whether **a rule would fire** on `k`: some proposal made this
@@ -565,7 +565,7 @@ over the resolved set (`ensemble/gate.rs`):
 ```text
 loop:
     selected = arbitrate(propose(resolved))
-    if selected is not Finish or Stop: done
+    if selected is not Stop, and not a Finish the runtime will execute: done
     deps = (every check READ by the rule of every proposal whose directive is the selected one)
          ∪ (every check whose side changes the selected directive: the OutcomeRelevant
             counterfactual, k pinned decisively above vs below, compared on the whole directive)
@@ -597,6 +597,13 @@ loop:
   (`already_guarded`, `reinterpreted`, `bought`, `unavailable`, `budget_spent`) in its
   `CheckRecord` and in its `EnsembleResolved` entry. A check the gate guarded that the ladder never
   looked at gets a record with no triggers.
+- **A provisional `Finish` is not irreversible.** When `before_finish` providers exist and have
+  not run, the runtime does not apply a selected `Finish`: it runs them and re-assesses. The
+  context says so (`EnsembleContext::finish_is_provisional`, set by the runtime), and then neither
+  the ladder's `Irreversible` trigger nor the gate treats that `Finish` as irreversible: an
+  opinion bought for it would protect nothing, and the re-assessed `Finish` that does execute is
+  guarded as usual (nothing covers an irreversible opinion). This roughly halves the opinions a
+  finish attempt costs.
 - **What a directive rests on** (`irreversible_dependencies`, shared by the gate and the ladder's
   `Irreversible` trigger so the two agree) is the union of two sets, because each misses cases the
   other catches:

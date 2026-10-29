@@ -114,6 +114,13 @@ pub struct EnsembleContext<'a> {
     /// Checks that can be asked the negated question (R2). Empty until check
     /// definitions carry a negation.
     pub reframe_available: &'a BTreeSet<CheckKey>,
+    /// Whether a `Finish` selected this cycle will *not* be executed. When `before_finish`
+    /// providers exist and have not run, the runtime does not apply a selected `Finish`:
+    /// it runs them and re-assesses. Such a `Finish` is not treated as irreversible — not
+    /// by the ladder's `Irreversible` trigger, not by the gate — because no opinion bought
+    /// for it could protect anything. The re-assessed `Finish` that does execute is
+    /// guarded as usual.
+    pub finish_is_provisional: bool,
 }
 
 /// What the resolver needs to know about one triggered check. Plain data: building it
@@ -410,7 +417,7 @@ pub(super) fn irreversible_dependencies(
     checks: &BTreeMap<CheckKey, ResolvedCheck>,
 ) -> BTreeSet<CheckKey> {
     let (proposals, selected) = evaluate(ctx, checks);
-    if !selected.is_irreversible() {
+    if !acts_irreversibly(ctx, &selected) {
         return BTreeSet::new();
     }
     let mut deps: BTreeSet<CheckKey> = proposals
@@ -544,6 +551,16 @@ fn evaluate(
     let proposals = ctx.registry.propose(&input);
     let selected = arbitrate(&input, &proposals).selected;
     (proposals, selected)
+}
+
+/// Whether `directive`, selected this cycle, would take an irreversible action: `Stop`,
+/// or `Finish` unless the runtime will re-assess before executing it.
+pub(super) fn acts_irreversibly(ctx: &EnsembleContext<'_>, directive: &Directive) -> bool {
+    match directive {
+        Directive::Stop { .. } => true,
+        Directive::Finish { .. } => !ctx.finish_is_provisional,
+        _ => false,
+    }
 }
 
 /// The selected directive over a check set.

@@ -221,9 +221,8 @@ pub struct CheckCounters {
 /// When an opinion was last bought for a check, and what it established.
 ///
 /// The cooldown uses this to decide whether the earlier opinion **covers** one it would
-/// otherwise buy: only a confirm does, only about the side Jev is on now, and only one
-/// obtained under an `Irreversible` trigger covers an `Irreversible` cycle. An abstention
-/// covers nothing. A mark from a snapshot written before these fields existed decodes as
+/// otherwise buy: only a confirm does, only about the side Jev is on now, and nothing
+/// covers an opinion an `Irreversible` trigger needs. An abstention covers nothing. A mark from a snapshot written before these fields existed decodes as
 /// an abstention, which covers nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpinionMark {
@@ -241,14 +240,18 @@ pub struct OpinionMark {
 }
 
 impl OpinionMark {
-    /// Whether this earlier opinion stands in for one about a value on `side`, asked
-    /// under an `Irreversible` trigger when `irreversible` is set.
+    /// Whether this earlier opinion stands in for one about a value on `side`.
+    ///
+    /// **Never for an `Irreversible` trigger**: an irreversible action is guarded by an
+    /// opinion about the value it acts on, bought in the cycle that acts. A confirm from an
+    /// earlier cycle was about an earlier measurement — after a `before_finish` refresh,
+    /// a different one. Otherwise only a confirm covers, and only about the same side.
     #[must_use]
     pub fn covers(&self, side: Option<Side>, irreversible: bool) -> bool {
-        self.verdict == MarkVerdict::Confirm
+        !irreversible
+            && self.verdict == MarkVerdict::Confirm
             && self.side.is_some()
             && self.side == side
-            && (self.irreversible || !irreversible)
     }
 }
 

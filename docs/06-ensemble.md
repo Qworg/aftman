@@ -707,9 +707,9 @@ max_evidence_refreshes_per_check = 3
 opinion_timeout_seconds = 120
 per_check_cooldown_cycles = 10
 consecutive_contests_before_human = 2
-rungs = ["refresh_evidence", "reframe_same_model", "independent_judge", "human"]
+rungs = ["refresh_evidence", "reframe_same_model", "human"]
 
-[ensemble.judge]
+[ensemble.judge]                   # stage S3 (M7); not read before then
 backend = "agy"                    # pi | agy | claude | generic
 model = "..."                      # recorded; a same-family judge warns at startup
 tools = "none"                     # enforced; not configurable in v1
@@ -717,6 +717,25 @@ max_output_bytes = 2048
 ```
 
 `enabled = true` with an empty `rungs` list is a config error, not a no-op.
+
+The type is `aftman_core::ensemble::EnsembleSettings` (`deny_unknown_fields`, every key defaulted),
+and `EnsembleSettings::validate()` is the single place these rules live, so every loader refuses the
+same things:
+
+- `enabled = true` with an empty `rungs` list;
+- a rung listed twice;
+- a rung this release does not implement. Until S3 that is `"independent_judge"`: listing it is an
+  error rather than silently ignored, because a configuration that names R1 claims a protection the
+  run would not have. The default list is therefore `["refresh_evidence", "reframe_same_model",
+  "human"]`; S3 adds `"independent_judge"` back;
+- `uncertainty_margin`, `confidence_floor` or `framing_tolerance` outside `0..=1`, and a zero
+  `consecutive_contests_before_human` or `opinion_timeout_seconds`. These are checked even while
+  `enabled = false`, so turning the ensemble on cannot reveal a typo accepted while it was off.
+
+The per-run counters the resolver keeps — refreshes per check, opinions used, the last opinion per
+check (for the cooldown), and consecutive held cycles per check (for `RepeatContest`) — are
+`EnsembleCounters`, stored in `RunState.ensemble` with `#[serde(default)]`. They are deliberately not
+in `Counters`, which is serialized into the model-facing observation.
 
 ## 13. Rollout
 

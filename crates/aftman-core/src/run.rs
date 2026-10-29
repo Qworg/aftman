@@ -11,6 +11,7 @@ use time::OffsetDateTime;
 
 use crate::assessment::{HumanDecision, Opinion, ResolvedCheck};
 use crate::directive::Directive;
+use crate::ensemble::EnsembleCounters;
 use crate::ids::{CheckKey, EscalationId, EventSeq, RunId};
 use crate::job::{FactoryStatus, Job, RunConfig, WorkerKind};
 use crate::observation::Counters;
@@ -53,6 +54,11 @@ pub struct RunState {
     /// observation.
     #[serde(default)]
     pub human_wait_ms: u64,
+    /// The ensemble's per-run counters: refreshes and opinions spent, cooldowns, and
+    /// how long each check has been held. A snapshot written before the ensemble kept
+    /// counters decodes with them at zero. See `docs/06-ensemble.md` §7.
+    #[serde(default)]
+    pub ensemble: EnsembleCounters,
 }
 
 impl RunState {
@@ -68,6 +74,7 @@ impl RunState {
             last_directive: None,
             escalations: Vec::new(),
             human_wait_ms: 0,
+            ensemble: EnsembleCounters::default(),
         }
     }
 
@@ -249,6 +256,21 @@ mod tests {
             .remove("human_wait_ms");
         let loaded: RunState = serde_json::from_value(value)?;
         assert_eq!(loaded.human_wait_ms, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn a_snapshot_without_ensemble_counters_loads_as_zero() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut state = RunState::new(header(), FactoryStatus::Running);
+        state.ensemble.opinions_used = 4;
+        let mut value = serde_json::to_value(&state)?;
+        value.as_object_mut().ok_or("an object")?.remove("ensemble");
+        let loaded: RunState = serde_json::from_value(value)?;
+        assert_eq!(
+            loaded.ensemble,
+            crate::ensemble::EnsembleCounters::default()
+        );
         Ok(())
     }
 

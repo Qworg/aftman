@@ -27,6 +27,7 @@ pub mod clock;
 pub mod condition;
 pub mod definitions;
 pub mod directive;
+pub mod ensemble;
 pub mod error;
 pub mod event;
 pub mod evidence;
@@ -56,6 +57,7 @@ pub use definitions::{
 pub use directive::{
     Directive, Invariant, Proposal, Stakes, SteerKind, Suppression, SuppressionReason,
 };
+pub use ensemble::{EnsembleCounters, EnsembleSettings, EnsembleSettingsError};
 pub use error::{IdError, ModelError, TransitionError};
 pub use event::{EventEnvelope, EventKind};
 pub use evidence::{CommandProvider, EvidenceOutcome, EvidencePlan, ProviderCwd, RunWhen};

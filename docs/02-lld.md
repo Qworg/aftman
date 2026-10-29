@@ -265,7 +265,10 @@ pub struct RunState { pub header: RunHeader, pub status: FactoryStatus,
     /// Milliseconds spent in `NeedsHuman` with a control channel attached (§7.1). Subtracted
     /// from elapsed time wherever `overall_timeout` is evaluated. `#[serde(default)]`; lives
     /// here and not in `Counters`, which is serialized into the model-facing observation.
-    pub human_wait_ms: u64 }
+    pub human_wait_ms: u64,
+    /// The ensemble's per-run counters (doc 06 §12). `#[serde(default)]`; not in `Counters`
+    /// for the same reason as `human_wait_ms`.
+    pub ensemble: EnsembleCounters }
 pub struct RunSummary { pub id: RunId, pub status: FactoryStatus, pub created_at: OffsetDateTime,
     pub elapsed_secs: u64, pub job_excerpt: String, pub repo: PathBuf,
     pub worker: WorkerKind, pub last_directive: Option<String> /* the directive's name */ }
@@ -1151,9 +1154,9 @@ max_evidence_refreshes_per_check = 3
 opinion_timeout_seconds = 120
 per_check_cooldown_cycles = 10
 consecutive_contests_before_human = 2
-rungs = ["refresh_evidence", "reframe_same_model", "independent_judge", "human"]
+rungs = ["refresh_evidence", "reframe_same_model", "human"]   # "independent_judge" is refused until S3
 
-[ensemble.judge]
+[ensemble.judge]            # S3 (M7)
 backend = "agy"
 model = "..."
 tools = "none"              # enforced; not configurable in v1

@@ -1,0 +1,15 @@
+//! The ensemble: what happens when a probability is not good enough to act on.
+//!
+//! Everything here follows from one rule (`docs/06-ensemble.md` §2.2): **nothing a model
+//! produces can enable a directive.** Jev's number is never modified; a check carries a
+//! boolean `permitted` beside it, and the only things that may set it are Jev's own
+//! decisive value ([`crate::assessment::ResolvedCheck::from_measurement`]) and a fresh
+//! measurement from an evidence refresh
+//! ([`crate::assessment::ResolvedCheck::from_refresh`]). Opinions can only take
+//! permission away.
+
+pub mod settings;
+
+pub use settings::{
+    CheckCounters, EnsembleCounters, EnsembleSettings, EnsembleSettingsError, OpinionMark,
+};

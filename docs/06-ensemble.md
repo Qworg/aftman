@@ -254,9 +254,10 @@ error model that aftman does not have.
 For R2 the stored `p_reported` is `p(¬X)`. It enters this one comparison, which yields a verdict, and
 nothing else: `1 − p(¬X)` is never stored, never shown to policy, and never used as a probability.
 
-The comparison is made on the `f32` values, so a pair whose decimal distance is exactly the
-tolerance may contest. A decimally consistent pair (distance below the tolerance) always confirms,
-and a decimally inconsistent one never does.
+The comparison is made on the `f32` values, with the same caveat as the band (§5.2): for answers
+given to two decimals a pair decimally inside the tolerance always confirms and one decimally
+outside it always contests, with only the exact boundary able to go either way; with more digits,
+rounding can fall either side within about `1e-7`.
 
 An R2 answer that is missing, not a number, or outside `0..=1` is unusable: **ABSTAIN**, or
 **CONTEST** for an `Irreversible` trigger, exactly as for R1. An inconsistent answer contests with
@@ -445,12 +446,15 @@ decisive  = |p − t| >= margin      (always true when ensemble.enabled = false)
 permitted = decisive
 ```
 
-The comparison is made on the `f32` values, not on their decimal spellings. A value whose decimal
-distance from `t` is exactly the margin may therefore land on either side — `0.95` against `0.80`
-with a margin of `0.15` computes as `0.14999998` and is **held**. That is the conservative
-direction and it is kept: a value decimally inside the band is never decisive, and one decimally
-outside it is always decisive; only the exact boundary can go either way. Configure thresholds and
-margins with that in mind rather than relying on a value sitting exactly on the line.
+The comparison is made on the `f32` values, not on their decimal spellings. What is guaranteed,
+and what the tests pin, is this: **for values given to two decimals**, a value decimally inside the
+band is never decisive and one decimally outside it is always decisive; only the exact boundary can
+go either way (`0.95` against `0.80` with a margin of `0.15` computes as `0.14999998` and is held).
+Beyond about six significant digits that guarantee does not hold: `0.65000001` against `0.80` is
+decimally inside the band, but its `f32` lies far enough from `0.80` to count as decisive. Rounding
+can fall either side within about `1e-7`. That is immaterial — the margin and the framing tolerance
+are heuristics, not calibrated boundaries, and a difference of `1e-7` in where the line falls
+changes nothing about how much a value can be trusted — so values are not quantized.
 
 Every subsequent step can only lower it:
 

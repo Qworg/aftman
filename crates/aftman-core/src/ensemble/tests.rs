@@ -954,6 +954,27 @@ fn the_f32_boundary_errs_toward_holding() {
 }
 
 #[test]
+fn beyond_two_decimals_the_f32_boundary_can_fall_either_side() {
+    // Round-2 probe P5: the two-decimal guarantee above does not extend to arbitrary
+    // precision. Pinned so that the documentation cannot drift back into claiming it does:
+    // these values are decimally inside the band (|p - t| < 0.15), and at least one of them
+    // is decisive in f32. The error is of the order of 1e-7.
+    let mut decisive = 0;
+    for text in ["0.6500000001", "0.65000001", "0.650000001"] {
+        let p: f32 = text.parse().unwrap_or(0.0);
+        let rc = ResolvedCheck::from_measurement(k(TESTS), Some(p), Some(0.80), 0.15, true);
+        if rc.decisive {
+            decisive += 1;
+            assert!(
+                ((0.80 - p) - 0.15).abs() < 1e-6,
+                "{text}: off by more than rounding"
+            );
+        }
+    }
+    assert!(decisive > 0);
+}
+
+#[test]
 fn an_unusable_reframe_abstains_except_on_an_irreversible_trigger() {
     for unusable in [
         None,

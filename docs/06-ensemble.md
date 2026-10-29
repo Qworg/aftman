@@ -840,21 +840,36 @@ Notes that follow directly from §2:
   when a check loses permission: the `core.completion` fallbacks (`work-remains`,
   `retry-stopped`), which fire because the `Finish` precondition is no longer established; and
   `core.worker-health`, which proposes only the more probable of `stuck` and `off-track`, so
-  holding the winner lets the runner-up through (only if its own check is permitted and above its
-  threshold). R0 is deliberately excluded from all of this: it is a measurement, not an opinion,
-  and may move a rule either way.
+  holding the winner lets the runner-up *propose* (only if its own check is permitted and above
+  its threshold) — but never be selected as a `Stop`, below. R0 is deliberately excluded from all
+  of this: it is a measurement, not an opinion, and may move a rule either way.
 
-  What the claim does **not** say is that the selected directive can only become more cautious.
-  Removing permission from one check can change *which* proposal wins: a contest on `needs_human`
-  removes a priority-1000 `Escalate` and unmasks a priority-900 `Stop` resting on `worker_stuck`; a
-  refresh (or a contest on an inhibitor) can likewise turn the cycle's selection into a `Finish`
-  the ladder never planned for. The per-check ladder, which plans from the selection before it
-  runs, cannot see these. **The irreversible gate is what makes them safe for `Finish` and
-  `Stop`**: whatever the cycle finally selects, an irreversible directive goes ahead only if
-  every decisive, permitted check it rests on — every check a rule proposing it reads, and every
-  check whose side changes it — carries an R2 verdict obtained this cycle under `Irreversible`
-  semantics, **or has no R2 available, in which case it stands, exactly as it would in the
-  ladder.** An unmasked `Stop` or `Finish` is guarded exactly as one selected from the start.
+  **Opinions and in-band values can never unmask an irreversible directive** (§2.2). Removing
+  permission from one check can change *which* proposal wins, and an earlier revision let it: a
+  contest on `needs_human` removed a priority-1000 `Escalate` and unmasked the priority-900 `Stop`
+  resting on `worker_stuck`, and the `Stop` executed — an opinion enabled an irreversible
+  directive. Two invariants close it, and both are policy's (`aftman_core::policy::decide`, which
+  the runtime's final arbitration, the gate and the trigger computation all use):
+
+  - `Finish` is refused while **any** active check is unresolved (`UnresolvedUncertainty`, global
+    and stricter);
+  - `Stop` is refused while any check it **rests on** is not permitted — in band, contested, held
+    for the budget or by a person's decision (`UnresolvedDependency`). What it rests on is the read
+    set of the rules proposing it, plus every unpermitted check whose resolution to either side of
+    its threshold would change the selection. Scoped, so an unrelated check in band never prevents
+    stopping a stuck worker. A `Stop` the overall timeout selects is not a proposal and is not
+    refused; a person's `Stop` never passes through policy.
+
+  With the ensemble off every present check is permitted, and `decide` is exactly `arbitrate`.
+  What an opinion removes, then, can only leave a less final directive selected. A *refresh* is a
+  measurement and may legitimately turn the selection into a `Finish` or a `Stop` the ladder never
+  planned for; the per-check ladder, which plans from the selection before it runs, cannot see
+  that. **The irreversible gate is what makes it safe**: whatever the cycle finally selects, an
+  irreversible directive goes ahead only if every decisive, permitted check it rests on — every
+  check a rule proposing it reads, and every check whose side changes it — carries an R2 verdict
+  obtained this cycle under `Irreversible` semantics, **or has no R2 available, in which case it
+  stands, exactly as it would in the ladder.** A contest the gate obtains holds its check, and the
+  invariants above then refuse the directive: it never hands the run to a runner-up `Stop`.
 
   The declarative half holds because conditions are **three-valued** (Kleene,
   [05-responsibilities.md §2.1](05-responsibilities.md)): a comparison on a check that is missing or

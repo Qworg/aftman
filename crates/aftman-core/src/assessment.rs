@@ -241,6 +241,29 @@ pub struct ResolvedCheck {
 }
 
 impl ResolvedCheck {
+    /// A counterfactual: this check measured decisively on `side`, at the end of the
+    /// probability range, so every comparator on it resolves the way that side does.
+    /// Never stored, logged or returned to a caller outside a counterfactual evaluation.
+    pub(crate) fn pinned(&self, side: Side) -> Self {
+        let p = match side {
+            Side::Above => 1.0,
+            Side::Below => 0.0,
+        };
+        Self {
+            check: self.check.clone(),
+            threshold: self.threshold,
+            margin: self.margin,
+            jev_p: Some(p),
+            side: self.threshold.map(|t| side_of(p, t)),
+            band: Band::Decisive,
+            decisive: true,
+            contested: false,
+            permitted: true,
+            suppression: None,
+            resolution: Resolution::Decisive,
+        }
+    }
+
     /// The baseline: Jev's own value, with no opinion involved.
     ///
     /// This is the **only** place `permitted` can become `true` without a fresh

@@ -11,14 +11,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::assessment::{
-    AnswerValue, Band, CheckSuppression, Resolution, ResolvedCheck, Side, side_of,
-};
+use crate::assessment::{AnswerValue, CheckSuppression, Resolution, ResolvedCheck, Side};
 use crate::directive::{Directive, Proposal, Stakes};
 use crate::evidence::{EvidencePlan, RunWhen};
 use crate::ids::{AssessmentSeq, CheckKey, EvidenceId};
 use crate::observation::Observation;
-use crate::policy::{PolicyInput, arbitrate};
+use crate::policy::PolicyInput;
 use crate::responsibility::{Check, ResponsibilityRegistry};
 
 use super::settings::{EnsembleCounters, EnsembleSettings};
@@ -687,7 +685,8 @@ fn evaluate(
         steering_grace: base.steering_grace,
     };
     let proposals = ctx.registry.propose(&input);
-    let selected = arbitrate(&input, &proposals).selected;
+    // The same decision the runtime makes, invariants that need the rules included.
+    let selected = crate::policy::decide(ctx.registry, &input, &[]).selected;
     (proposals, selected)
 }
 
@@ -724,23 +723,7 @@ fn with_check(
 /// The ends of the probability range, so that every comparator on the check resolves
 /// the way that side does. Private, and only ever passed to `evaluate`.
 fn pinned(rc: &ResolvedCheck, side: Side) -> ResolvedCheck {
-    let p = match side {
-        Side::Above => 1.0,
-        Side::Below => 0.0,
-    };
-    ResolvedCheck {
-        check: rc.check.clone(),
-        threshold: rc.threshold,
-        margin: rc.margin,
-        jev_p: Some(p),
-        side: rc.threshold.map(|t| side_of(p, t)),
-        band: Band::Decisive,
-        decisive: true,
-        contested: false,
-        permitted: true,
-        suppression: None,
-        resolution: Resolution::Decisive,
-    }
+    rc.pinned(side)
 }
 
 /// A counterfactual: the check as it would be if an opinion contested it.

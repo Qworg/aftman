@@ -26,7 +26,7 @@ use crate::job::{FactoryStatus, JobSummary, RunConfig, TaskKind, WorkerKind};
 use crate::log::BoundedLog;
 use crate::model::Usage;
 use crate::observation::{Counters, GitEvidence, Observation};
-use crate::policy::{PolicyInput, arbitrate};
+use crate::policy::PolicyInput;
 use crate::responsibility::{Check, ResponsibilityRegistry};
 use crate::testing::RecordedOpinionSource;
 use crate::worker::WorkerRecord;
@@ -250,7 +250,7 @@ impl Scenario {
 
     fn select(&self, checks: &BTreeMap<CheckKey, ResolvedCheck>) -> Directive {
         let input = self.input(checks);
-        arbitrate(&input, &self.registry.propose(&input)).selected
+        crate::policy::decide(&self.registry, &input, &[]).selected
     }
 
     fn plan(&self) -> EnsemblePlan {
@@ -1716,47 +1716,33 @@ fn builtin_read_lists_match_the_rules() {
 }
 
 #[tokio::test]
-async fn a_contest_cannot_unmask_an_unguarded_stop() {
-    // Round-2 probe N1a. `needs_human` and `worker_stuck` both decisively high, with a
-    // worker that cannot be steered: `Escalate` wins. R2 contests `needs_human`, which
-    // unmasks the `Stop` resting on `worker_stuck` — whose own opinion (bought under
-    // HighStakes, not Irreversible) could not be obtained.
+async fn a_contest_cannot_unmask_a_stop() {
+    // Round-2 probe N1a, as the integrated review settled it. `needs_human` and
+    // `worker_stuck` both decisively high, with a worker that cannot be steered: `Escalate`
+    // wins. R2 contests `needs_human`. An earlier revision let that unmask the `Stop`
+    // resting on `worker_stuck`, guarded it in the gate, and — given a confirm on
+    // `worker_stuck` — let it execute: an opinion turned an escalation into a Stop. The Stop
+    // rests on `needs_human` (resolving it either way changes the selection), so with
+    // `needs_human` held it is refused (`UnresolvedDependency`), whatever `worker_stuck`'s
+    // own opinion says, and the gate has no Stop to guard.
     let s = Scenario::finish_ready()
         .with_worker()
         .set(HUMAN, 0.97)
         .set(STUCK, 0.97)
         .reframable(&[HUMAN, STUCK]);
     assert_eq!(s.select(&s.baseline()).name(), "Escalate");
-    let source = RecordedOpinionSource::new()
-        .with_reframe(reframe_key(CYCLE, HUMAN), answer(Some(0.97)))
-        .with_reframe(reframe_key(CYCLE, STUCK), answer(None));
-    let outcome = resolved(&s, &source).await;
-    assert_ne!(
-        s.select(&outcome.checks).name(),
-        "Stop",
-        "the Stop rests on an unusable opinion"
-    );
-    let stuck = record(&outcome, STUCK);
-    assert_eq!(
-        stuck.and_then(|r| r.irreversible_guard.clone()),
-        Some(super::IrreversibleGuard {
-            directive: "Stop".into(),
-            outcome: super::GuardOutcome::Reinterpreted,
-        }),
-        "the gate re-read the abstention under irreversible semantics"
-    );
-    assert!(
-        stuck.is_some_and(|r| matches!(r.opinions[0].opinion.verdict, Verdict::Contest { .. }))
-    );
-    assert_irreversible_guarded(&s, &outcome, "N1a");
-
-    // With a usable, consistent answer on `worker_stuck`, the Stop goes ahead.
-    let source = RecordedOpinionSource::new()
-        .with_reframe(reframe_key(CYCLE, HUMAN), answer(Some(0.97)))
-        .with_reframe(reframe_key(CYCLE, STUCK), answer(Some(0.03)));
-    let outcome = resolved(&s, &source).await;
-    assert_eq!(s.select(&outcome.checks).name(), "Stop");
-    assert_irreversible_guarded(&s, &outcome, "N1a, confirmed");
+    for stuck in [None, Some(0.03)] {
+        let source = RecordedOpinionSource::new()
+            .with_reframe(reframe_key(CYCLE, HUMAN), answer(Some(0.97)))
+            .with_reframe(reframe_key(CYCLE, STUCK), answer(stuck));
+        let outcome = resolved(&s, &source).await;
+        assert_ne!(s.select(&outcome.checks).name(), "Stop", "{stuck:?}");
+        assert!(
+            record(&outcome, STUCK).is_none_or(|r| r.irreversible_guard.is_none()),
+            "nothing irreversible was selected, so nothing was guarded: {stuck:?}"
+        );
+        assert_irreversible_guarded(&s, &outcome, "N1a");
+    }
 }
 
 #[tokio::test]
@@ -1828,14 +1814,18 @@ async fn the_gate_holds_when_the_budget_is_spent_and_never_refreshes() {
 }
 
 #[tokio::test]
-async fn the_gate_guards_what_each_round_unmasks() {
-    // Round 1: the Stop rests on `worker_stuck`; guarding it contests it. Round 2: the
-    // `repository.instructions` Stop, which lost the tie-break to worker-health before,
-    // now wins and rests on `agents_md_drift`; guarding it contests it too. Round 3:
-    // nothing irreversible is selected.
+async fn a_contest_in_the_gate_cannot_unmask_the_runner_up_stop() {
+    // The gate's rounds, now that a held check refuses every Stop resting on it. The
+    // worker-health Stop on `worker_stuck` is selected, and its irreversible opinion
+    // contests. An earlier revision then let the `repository.instructions` Stop on
+    // `agents_md_drift` — which lost the tie-break before — win, and guarded that in a
+    // further round. But it rests on `worker_stuck` (resolving `worker_stuck` above gives
+    // the worker-health Stop back), so with `worker_stuck` held it is refused: a contest
+    // cannot hand the run to the runner-up. The gate's first round finds nothing
+    // irreversible selected.
     let mut s = Scenario::finish_ready()
         .with_worker()
-        .set(HUMAN, 0.97)
+        .set(HUMAN, 0.03)
         .set(STUCK, 0.97)
         .set(DRIFT, 0.97)
         .reframable(&[HUMAN, STUCK, DRIFT]);
@@ -1844,25 +1834,21 @@ async fn the_gate_guards_what_each_round_unmasks() {
         excerpt: "do it this way".into(),
         truncated: false,
     });
-    assert_eq!(s.select(&s.baseline()).name(), "Escalate");
-    // `needs_human` contests in the ladder; the two Stop findings' opinions fail, which
-    // under their ladder trigger (HighStakes) is an abstention.
-    let source = RecordedOpinionSource::new()
-        .with_reframe(reframe_key(CYCLE, HUMAN), answer(Some(0.97)))
-        .with_reframe(reframe_key(CYCLE, STUCK), answer(None))
-        .with_reframe(reframe_key(CYCLE, DRIFT), answer(None));
+    let baseline = s.select(&s.baseline());
+    assert_eq!(baseline.name(), "Stop");
+    let source = answering_by(&s.plan(), |p| Some(1.0 - p))
+        .with_reframe(reframe_key(CYCLE, STUCK), answer(Some(0.97)));
     let outcome = resolved(&s, &source).await;
-    assert_eq!(outcome.gate_rounds, 3);
-    for key in [STUCK, DRIFT] {
-        assert_eq!(
-            record(&outcome, key)
-                .and_then(|r| r.irreversible_guard.clone())
-                .map(|g| (g.directive, g.outcome)),
-            Some(("Stop".to_owned(), super::GuardOutcome::Reinterpreted)),
-            "{key}"
-        );
-    }
+    assert!(
+        !outcome.checks[&k(STUCK)].permitted,
+        "worker_stuck was contested"
+    );
     assert_ne!(s.select(&outcome.checks).name(), "Stop");
+    assert_eq!(outcome.gate_rounds, 1, "nothing irreversible left to guard");
+    assert!(
+        record(&outcome, DRIFT).is_none_or(|r| r.irreversible_guard.is_none()),
+        "the runner-up was never selected, so never guarded"
+    );
     assert_irreversible_guarded(&s, &outcome, "rounds");
 }
 
@@ -3851,6 +3837,11 @@ async fn no_opinion_driven_finish_across_cycles() {
                             // permitted.
                             assert_eq!(without[i], "Finish", "{label}");
                         }
+                        if selected == "Stop" {
+                            // Nor a Stop: an opinion may only suppress, so a Stop with the
+                            // opinions is a Stop without them (integrated review, blocker 1).
+                            assert_eq!(without[i], "Stop", "{label}");
+                        }
                         if selected == "Finish" || selected == "Stop" {
                             irreversible += 1;
                             assert_ne!(
@@ -4462,7 +4453,8 @@ impl Scenario {
     /// the ensemble's escalation, arbitrated together (`super::propose`).
     fn decide(&self, outcome: &EnsembleOutcome) -> crate::policy::PolicyDecision {
         let input = self.input(&outcome.checks);
-        arbitrate(&input, &super::propose(&self.registry, &input, outcome))
+        let extra: Vec<Proposal> = outcome.escalation_proposal().into_iter().collect();
+        crate::policy::decide(&self.registry, &input, &extra)
     }
 
     fn answered(mut self, keys: &[&str], decision: &crate::assessment::HumanDecision) -> Self {
@@ -4900,5 +4892,125 @@ fn reframe_is_available_for_negated_checks_only_when_its_rung_is_configured() {
     assert_eq!(
         super::reframable_checks(&EnsembleSettings::default(), &negated).len(),
         1
+    );
+}
+
+// ---- an irreversible directive never rests on an unresolved check -------------------
+
+#[tokio::test]
+async fn an_r2_contest_alone_never_turns_an_escalation_into_a_stop() {
+    // Integrated review, blocker 1 (probe `probe_an_r2_contest_alone_turns_an_escalation_
+    // into_an_executed_stop`). A worker that cannot be steered; `needs_human` and
+    // `worker_stuck` both decisively high. Without opinions, `Escalate` (1000) wins. R2
+    // contests `needs_human` (p(not X) = 0.97), which used to unmask the `Stop` (900) resting
+    // on `worker_stuck` — and the `Stop` executed. An opinion may only suppress: the `Stop`
+    // rests on `needs_human` (its side changes it), so with `needs_human` unresolved it is
+    // refused.
+    let s = Scenario::finish_ready()
+        .with_worker()
+        .set(HUMAN, 0.97)
+        .set(STUCK, 0.97)
+        .reframable(&[HUMAN, STUCK]);
+    assert_eq!(s.select(&s.baseline()).name(), "Escalate");
+    let source = RecordedOpinionSource::new()
+        .with_reframe(reframe_key(CYCLE, HUMAN), answer(Some(0.97)))
+        .with_reframe(reframe_key(CYCLE, STUCK), answer(Some(0.03)));
+    let outcome = s.run_plan(&source).await.unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        !outcome.checks[&k(HUMAN)].permitted,
+        "the contest held needs_human"
+    );
+    let decision = s.decide(&outcome);
+    assert_ne!(decision.selected.name(), "Stop", "{:?}", decision.selected);
+    assert!(
+        decision
+            .invariants
+            .contains(&crate::directive::Invariant::UnresolvedDependency),
+        "{:?}",
+        decision.invariants
+    );
+    assert!(
+        decision
+            .suppressed
+            .iter()
+            .any(|s| s.rule.as_str() == "core.worker-health:stuck"
+                && matches!(
+                    s.reason,
+                    crate::directive::SuppressionReason::Invariant(
+                        crate::directive::Invariant::UnresolvedDependency
+                    )
+                ))
+    );
+    // With needs_human decisively low, the Stop it does not rest on goes ahead.
+    let s = Scenario::finish_ready()
+        .with_worker()
+        .set(HUMAN, 0.03)
+        .set(STUCK, 0.97);
+    assert_eq!(s.select(&s.baseline()).name(), "Stop");
+}
+
+#[tokio::test]
+async fn an_in_band_inhibitor_does_not_unmask_a_stop_and_its_escalation_reaches_a_person() {
+    // `needs_human` = 0.75 against 0.80 (in band, held); `worker_stuck` = 0.97 (decisive)
+    // on a worker that cannot be steered. A held inhibitor must block, not permit: the Stop
+    // rests on `needs_human` and is refused, in the baseline already. After two in-band
+    // cycles the high-stakes escalation about `needs_human` is put to a person, and is not
+    // outranked by the Stop (900 > 850) it would otherwise lose to.
+    let s = Scenario::finish_ready()
+        .with_worker()
+        .set(HUMAN, 0.75)
+        .set(STUCK, 0.97)
+        .reframable_all();
+    assert_ne!(s.select(&s.baseline()).name(), "Stop");
+    let s = s.held_for(HUMAN, 2);
+    let outcome = s
+        .run_plan(&answering_by(&s.plan(), |p| Some(1.0 - p)))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        outcome.escalations().any(|(key, _)| *key == k(HUMAN)),
+        "needs_human is escalated"
+    );
+    let decision = s.decide(&outcome);
+    assert!(
+        outcome.is_escalation(&decision.selected),
+        "{:?}",
+        decision.selected
+    );
+}
+
+#[test]
+fn a_stop_with_an_unrelated_check_in_band_still_stops_a_stuck_worker() {
+    // Scoped to what the Stop rests on: `documentation_sufficient` in band has nothing to do
+    // with stopping a stuck worker, and does not prevent it. (It does block `Finish`, which
+    // keeps its global `UnresolvedUncertainty`.)
+    let s = Scenario::finish_ready()
+        .with_worker()
+        .set(HUMAN, 0.03)
+        .set(STUCK, 0.97)
+        .set(DOCS, 0.72);
+    assert!(!s.baseline()[&k(DOCS)].permitted);
+    assert_eq!(s.select(&s.baseline()).name(), "Stop");
+}
+
+#[test]
+fn with_the_ensemble_disabled_the_dependency_invariant_never_fires() {
+    let mut s = Scenario::finish_ready()
+        .with_worker()
+        .set(HUMAN, 0.75)
+        .set(STUCK, 0.97);
+    s.settings.enabled = false;
+    // Disabled, every value is decisive and permitted at `p >= t`: needs_human 0.75 is
+    // below 0.80, so the Stop goes ahead, exactly as before the ensemble.
+    let decision = {
+        let baseline = s.baseline();
+        let input = s.input(&baseline);
+        crate::policy::decide(&s.registry, &input, &[])
+    };
+    assert_eq!(decision.selected.name(), "Stop");
+    assert!(
+        !decision
+            .invariants
+            .contains(&crate::directive::Invariant::UnresolvedDependency)
     );
 }

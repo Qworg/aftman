@@ -41,7 +41,6 @@ use aftman_core::job::{FactoryStatus, Job, RunConfig, TaskKind, WorkerStatus};
 use aftman_core::log::BoundedLog;
 use aftman_core::model::{DecisionModel, Purpose, Question};
 use aftman_core::observation::{EventSummary, Observation};
-use aftman_core::policy::arbitrate;
 use aftman_core::responsibility::ResponsibilityRegistry;
 use aftman_core::routing;
 use aftman_core::run::{AnsweredEscalation, Escalation, EscalationKind, RunHeader, RunState};
@@ -1216,11 +1215,12 @@ impl FactoryRuntime {
             // — not this loop — decides whether it pre-empts what would otherwise run.
             let decision = {
                 let input = cycle.policy_input(&resolved_checks);
-                let proposals = match &outcome {
-                    Some(outcome) => aftman_core::ensemble::propose(&registry, &input, outcome),
-                    None => registry.propose(&input),
-                };
-                arbitrate(&input, &proposals)
+                let extra: Vec<Proposal> = outcome
+                    .as_ref()
+                    .and_then(EnsembleOutcome::escalation_proposal)
+                    .into_iter()
+                    .collect();
+                aftman_core::policy::decide(&registry, &input, &extra)
             };
             let escalated = outcome
                 .as_ref()

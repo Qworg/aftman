@@ -156,6 +156,17 @@ pub enum Invariant {
     /// ([`crate::observation::Observation::observation_note`]), but the wrong direction to be
     /// wrong in is concluding "nothing changed" from "nothing could be seen".
     UnobservedRepository,
+    /// A `Stop` is refused while a check it rests on is not permitted: a check its rule
+    /// reads, or one whose resolution — either side of its threshold — would change the
+    /// selection (`docs/06-ensemble.md` §2.2, §6).
+    ///
+    /// The `Stop` counterpart of [`Invariant::UnresolvedUncertainty`], scoped to what the
+    /// `Stop` rests on rather than every active check, so an unrelated check in band never
+    /// prevents stopping a stuck worker. Without it, an opinion that contested a
+    /// higher-priority inhibitor (`needs_human`'s `Escalate`) unmasked the `Stop` beneath
+    /// it, and an opinion — which may only suppress — enabled an irreversible directive.
+    /// Applied only with the ensemble on: off, every present check is permitted.
+    UnresolvedDependency,
 }
 
 /// Why a proposal was not selected.

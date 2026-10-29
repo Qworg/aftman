@@ -460,7 +460,12 @@ user config directory. The TOML schema is defined in
 ## 5. Policy
 
 Policy is pure: `fn arbitrate(input: PolicyInput) -> PolicyDecision`. Same input, same decision —
-no clock, no randomness, no I/O. That property is what makes runs replayable.
+no clock, no randomness, no I/O. That property is what makes runs replayable. The one invariant
+that needs the rules themselves — a `Stop` is refused while a check it rests on is not permitted
+(`Invariant::UnresolvedDependency`, doc 06 §6) — is applied by
+`fn decide(registry, input, extra: &[Proposal]) -> PolicyDecision`: propose, arbitrate, then
+refuse such a `Stop` and arbitrate again. It is just as pure, it is what the runtime and the
+ensemble call, and with the ensemble off it is exactly `arbitrate`.
 
 ```rust
 pub struct PolicyInput<'a> {

@@ -459,6 +459,110 @@ fn nothing_survived_ask(input: &PolicyInput<'_>, suppressed: &[Suppression]) -> 
     ask
 }
 
+/// The cycle's decision: every responsibility's proposals plus `extra` (the ensemble's
+/// escalation), arbitrated, with the one invariant that needs the rules themselves.
+///
+/// [`arbitrate`] sees proposals, not the rules that made them, so it cannot tell what a
+/// directive *rests on*. [`Invariant::UnresolvedDependency`] needs exactly that: a selected
+/// `Stop` is refused while any check it rests on is not permitted — a check a rule
+/// proposing it reads, or an unpermitted check whose resolution to either side of its
+/// threshold would change the selection. The refused `Stop` proposals are recorded as
+/// suppressed by that invariant and arbitration runs again without them, until what is
+/// selected is not a `Stop` or rests only on permitted checks. A `Stop` selected by a hard
+/// invariant (the overall timeout) is not a proposal and is never refused; nor is a person's
+/// `Stop`, which never passes through here.
+///
+/// Pure, like [`arbitrate`]. The counterfactuals are plain arbitrations — this invariant is
+/// not applied inside them — so it cannot recurse. With the ensemble off it is exactly
+/// [`arbitrate`].
+#[must_use]
+pub fn decide(
+    registry: &crate::responsibility::ResponsibilityRegistry,
+    input: &PolicyInput<'_>,
+    extra: &[Proposal],
+) -> PolicyDecision {
+    let mut proposals = registry.propose(input);
+    proposals.extend(extra.iter().cloned());
+    let mut decision = arbitrate(input, &proposals);
+    if !input.ensemble_enabled {
+        return decision;
+    }
+    let mut refused: Vec<Proposal> = Vec::new();
+    // Each round refuses at least one Stop proposal, so this ends.
+    loop {
+        if !matches!(decision.selected, Directive::Stop { .. }) {
+            break;
+        }
+        let stopping: Vec<&Proposal> = proposals
+            .iter()
+            .filter(|p| p.directive == decision.selected && !refused.contains(p))
+            .collect();
+        if stopping.is_empty() {
+            break;
+        }
+        let reads: Vec<CheckKey> = stopping
+            .iter()
+            .flat_map(|p| registry.reads(&p.rule))
+            .collect();
+        let rests_on_unresolved = input.checks.iter().any(|(key, check)| {
+            !check.permitted
+                && check.threshold.is_some()
+                && (reads.contains(key)
+                    || resolution_changes(registry, input, extra, key, check, &decision.selected))
+        });
+        if !rests_on_unresolved {
+            break;
+        }
+        refused.extend(stopping.into_iter().cloned());
+        let remaining: Vec<Proposal> = proposals
+            .iter()
+            .filter(|p| !refused.contains(p))
+            .cloned()
+            .collect();
+        decision = arbitrate(input, &remaining);
+    }
+    if !refused.is_empty() {
+        decision.considered = proposals;
+        decision.invariants.push(Invariant::UnresolvedDependency);
+        for proposal in &refused {
+            decision.suppressed.push(Suppression {
+                responsibility: proposal.responsibility.clone(),
+                rule: proposal.rule.clone(),
+                reason: SuppressionReason::Invariant(Invariant::UnresolvedDependency),
+            });
+        }
+    }
+    decision
+}
+
+/// Whether resolving `key` — measuring it decisively, on either side of its threshold —
+/// would change the selection from `selected`. A plain arbitration over each side.
+fn resolution_changes(
+    registry: &crate::responsibility::ResponsibilityRegistry,
+    input: &PolicyInput<'_>,
+    extra: &[Proposal],
+    key: &CheckKey,
+    check: &ResolvedCheck,
+    selected: &Directive,
+) -> bool {
+    [
+        crate::assessment::Side::Above,
+        crate::assessment::Side::Below,
+    ]
+    .into_iter()
+    .any(|side| {
+        let mut checks = input.checks.clone();
+        checks.insert(key.clone(), check.pinned(side));
+        let pinned = PolicyInput {
+            checks: &checks,
+            ..*input
+        };
+        let mut proposals = registry.propose(&pinned);
+        proposals.extend(extra.iter().cloned());
+        arbitrate(&pinned, &proposals).selected != *selected
+    })
+}
+
 /// Whether a proposal is refused by a hard invariant. `None` means it survives.
 fn refusal(
     input: &PolicyInput<'_>,

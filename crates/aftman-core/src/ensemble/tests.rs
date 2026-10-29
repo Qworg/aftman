@@ -904,6 +904,161 @@ async fn worked_example_9_5_a_less_than_rule_is_not_collateral_damage() {
     assert_eq!(s.select(&outcome.checks).name(), "StartWorker");
 }
 
+// ---- three-valued conditions ------------------------------------------------
+
+const GUARD: &str = "my.guard__deploy_safe";
+
+/// Review probe 1: a declarative responsibility whose `Stop` reads `not (k >= t)`.
+fn guarded() -> Scenario {
+    let mut s = Scenario::finish_ready().with_worker();
+    let mut definitions = DefinitionSet::bundled().unwrap_or_default();
+    let source = r#"enabled = true
+always = true
+title = "guard"
+[checks.deploy_safe]
+instructions = "Is the deployment proven safe?"
+min_threshold = 0.75
+
+[[rules]]
+id = "my.guard:proceed"
+when = "my.guard__deploy_safe >= 0.75"
+propose = "continue"
+
+[[rules]]
+id = "my.guard:halt"
+when = "not (my.guard__deploy_safe >= 0.75)"
+propose = "stop"
+reason = "deployment not proven safe"
+"#;
+    if let Ok(definition) =
+        crate::definitions::ResponsibilityDefinition::parse("my.guard", source, "test")
+    {
+        definitions
+            .definitions
+            .insert("my.guard".into(), definition);
+    }
+    let ids: Vec<ResponsibilityId> = definitions
+        .definitions
+        .keys()
+        .map(ResponsibilityId::new)
+        .collect();
+    if let Ok(registry) = ResponsibilityRegistry::from_definitions(&definitions, &ids, 30, 1) {
+        s.registry = registry;
+    }
+    s.definitions = s.registry.checks();
+    s.values.insert(k(GUARD), Some(0.95));
+    s.reframable(&[GUARD])
+}
+
+#[tokio::test]
+async fn an_r2_contest_cannot_enable_a_not_rule() {
+    let s = guarded();
+    assert!(s.registry.ids().iter().any(|id| id.as_str() == "my.guard"));
+    assert_ne!(s.select(&s.baseline()).name(), "Stop");
+    // R2: p(not X) = 0.95 against p(X) = 0.95 is inconsistent, so it contests.
+    let source =
+        RecordedOpinionSource::new().with_reframe(reframe_key(CYCLE, GUARD), answer(Some(0.95)));
+    let outcome = s.plan().resolve(&source).await;
+    assert!(!outcome.checks[&k(GUARD)].permitted, "contested");
+    assert!(
+        !s.proposals(&outcome.checks)
+            .iter()
+            .any(|p| p.rule.as_str() == "my.guard:halt"),
+        "a contest removed permission; it must not make `not (k >= t)` true"
+    );
+    assert_ne!(s.select(&outcome.checks).name(), "Stop");
+}
+
+/// The rules that may start firing when a check loses permission, and why each is not an
+/// opinion enabling an action. Everything else — every declarative rule included — may
+/// only stop firing.
+fn may_fire_on_lost_permission(rule: &str, held: &BTreeMap<CheckKey, ResolvedCheck>) -> bool {
+    match rule {
+        // Rust fallbacks of `core.completion`: they fire because the `Finish`
+        // precondition is not established, which is the conservative outcome.
+        "core.completion:work-remains" | "core.completion:retry-stopped" => true,
+        // `core.worker-health` proposes the more probable of two independent findings.
+        // Holding the winner lets the runner-up through only if its own check is itself
+        // permitted and above its threshold: nothing about the held check enables it.
+        "core.worker-health:off-track" => held
+            .get(&k(OFF_TRACK))
+            .is_some_and(|c| c.at_least(c.threshold.unwrap_or(1.0))),
+        "core.worker-health:stuck" => held
+            .get(&k(STUCK))
+            .is_some_and(|c| c.at_least(c.threshold.unwrap_or(1.0))),
+        _ => false,
+    }
+}
+
+#[test]
+fn no_rule_starts_firing_because_a_check_lost_permission() {
+    // Review finding 3: monotonic conservatism, stated over rules. For every check in
+    // every scenario, holding it may remove proposals but may add only the documented
+    // Rust fallbacks.
+    let mut exercised = 0;
+    for guard in [false, true] {
+        for worker in [false, true] {
+            for &(key, values) in &[
+                (READY, &[0.05_f32, 0.30, 0.95][..]),
+                (TESTS, &[0.05, 0.95][..]),
+                (NEEDS_VER, &[0.05, 0.90][..]),
+                (DOCS, &[0.05, 0.95][..]),
+                (STUCK, &[0.05, 0.97][..]),
+                (OFF_TRACK, &[0.05, 0.97][..]),
+                (HUMAN, &[0.05, 0.97][..]),
+                (GUARD, &[0.05, 0.95][..]),
+            ] {
+                for &p in values {
+                    let mut s = if guard {
+                        guarded()
+                    } else {
+                        Scenario::finish_ready()
+                    };
+                    if worker && s.worker.is_none() {
+                        s = s.with_worker();
+                    }
+                    if !worker {
+                        s.worker = None;
+                    }
+                    let s = s.set(key, p).set(OFF_TRACK, 0.90);
+                    let baseline = s.baseline();
+                    let before: BTreeSet<String> = s
+                        .proposals(&baseline)
+                        .iter()
+                        .map(|p| p.rule.to_string())
+                        .collect();
+                    for (held_key, rc) in &baseline {
+                        if !rc.permitted {
+                            continue;
+                        }
+                        let mut held = baseline.clone();
+                        held.insert(
+                            held_key.clone(),
+                            apply_opinions(
+                                rc.clone(),
+                                &[opinion(Verdict::Contest { side: Side::Below })],
+                            ),
+                        );
+                        for proposal in s.proposals(&held) {
+                            let rule = proposal.rule.to_string();
+                            if before.contains(&rule) {
+                                continue;
+                            }
+                            exercised += 1;
+                            assert!(
+                                may_fire_on_lost_permission(&rule, &held),
+                                "holding {held_key} made `{rule}` fire (guard={guard} \
+                                 worker={worker} {key}={p})"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(exercised > 0);
+}
+
 // ---- cost ------------------------------------------------------------------
 
 #[tokio::test]

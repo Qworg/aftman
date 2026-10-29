@@ -222,6 +222,21 @@ unknown check key is a load-time error. A condition term evaluates
 !contested`), so `<` and `>=` behave identically, and an ensemble-suppressed check cannot drive a
 rule in either direction (doc 06 §5.2).
 
+**Evaluation is three-valued (Kleene).** A term whose check is missing or not permitted is
+*unknown*, not false:
+
+| | result |
+| --- | --- |
+| `not unknown` | unknown |
+| `a and b` | false if either is false; otherwise unknown if either is unknown; otherwise true |
+| `a or b` | true if either is true; otherwise unknown if either is unknown; otherwise false |
+
+**A rule fires only when its condition is true.** Unknown never fires. This is what keeps
+`not (...)` honest: with two-valued logic, `not (k >= t)` was *true* for an in-band or contested `k`,
+so an opinion that removed permission could enable the rule (doc 06 §6). With the ensemble disabled
+every present check is permitted and evaluation is unchanged; the one difference is that a term on a
+**missing** check under `not` no longer fires. No bundled definition uses `not`.
+
 Validation rules (all fatal at load, never at assessment time):
 
 - `min_threshold` ∈ [0,1]; a check without one may be referenced by an explicit `[[rules]]` but

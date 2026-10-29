@@ -10,13 +10,21 @@
 //! check_key   := "<responsibility_id>__<check_id>"
 //! ```
 //!
-//! Two properties matter more than the grammar itself:
+//! Three properties matter more than the grammar itself:
 //!
 //! 1. **A comparison reads `permitted` first.** A term is true only when the check's
 //!    measurement is decisive and uncontested *and* the comparison holds. That is what
 //!    makes an in-band value fail both directions, so an uncertain check can never
 //!    drive a rule — in either direction. See `docs/06-ensemble.md` §5.2.
-//! 2. **Mixing `and` with `or` at one level without parentheses is a parse error.**
+//! 2. **Evaluation is three-valued (Kleene).** A comparison on a check that is missing or
+//!    not permitted is *unknown*, not false. `not unknown` is unknown; `and` is false if
+//!    any operand is false, else unknown if any is, else true; `or` is true if any operand
+//!    is true, else unknown if any is, else false. A rule fires only on **true**. With
+//!    two-valued logic `not (k >= t)` was *true* for a held `k`, so an opinion that
+//!    removed permission could enable a rule — a contest turned into a `Stop`. With
+//!    three values, losing permission can only move a condition from true or false to
+//!    unknown, and unknown never fires.
+//! 3. **Mixing `and` with `or` at one level without parentheses is a parse error.**
 //!    Precedence subtleties are how a rule ends up meaning something other than what
 //!    its author read.
 
@@ -101,22 +109,57 @@ impl Condition {
         Ok(condition)
     }
 
-    /// Evaluate against this cycle's resolved checks.
+    /// Whether the rule fires: the condition evaluates to **true**.
     ///
-    /// A term whose check is missing, or is not permitted, is **false**. Missing means
-    /// the rule does not fire, which is the conservative reading: a rule that cannot
-    /// see its evidence has not earned the right to act.
+    /// Unknown does not fire. A rule that cannot see its evidence — a check that is
+    /// missing, in band, or contested — has not earned the right to act, and that holds
+    /// under `not` as well: `not (k >= t)` does not fire on a held `k`.
     #[must_use]
     pub fn evaluate(&self, checks: &BTreeMap<CheckKey, ResolvedCheck>) -> bool {
+        self.evaluate_three_valued(checks) == Some(true)
+    }
+
+    /// Kleene three-valued evaluation. `None` is unknown.
+    ///
+    /// A comparison is unknown when its check is missing or not permitted. Permission
+    /// is read first; the comparator only ever sees a permitted value.
+    #[must_use]
+    pub fn evaluate_three_valued(
+        &self,
+        checks: &BTreeMap<CheckKey, ResolvedCheck>,
+    ) -> Option<bool> {
         match self {
-            Self::Comparison { key, op, value } => checks.get(key).is_some_and(|check| {
-                // Permission first, then the comparison. This ordering is the whole
-                // point: an in-band or contested measurement permits nothing.
-                check.permitted_value().is_some_and(|p| op.holds(p, *value))
-            }),
-            Self::Not(inner) => !inner.evaluate(checks),
-            Self::Conjunction(all) => all.iter().all(|c| c.evaluate(checks)),
-            Self::Disjunction(any) => any.iter().any(|c| c.evaluate(checks)),
+            Self::Comparison { key, op, value } => checks
+                .get(key)
+                .and_then(ResolvedCheck::permitted_value)
+                .map(|p| op.holds(p, *value)),
+            Self::Not(inner) => inner.evaluate_three_valued(checks).map(|v| !v),
+            Self::Conjunction(all) => {
+                let values: Vec<Option<bool>> = all
+                    .iter()
+                    .map(|c| c.evaluate_three_valued(checks))
+                    .collect();
+                if values.contains(&Some(false)) {
+                    Some(false)
+                } else if values.contains(&None) {
+                    None
+                } else {
+                    Some(true)
+                }
+            }
+            Self::Disjunction(any) => {
+                let values: Vec<Option<bool>> = any
+                    .iter()
+                    .map(|c| c.evaluate_three_valued(checks))
+                    .collect();
+                if values.contains(&Some(true)) {
+                    Some(true)
+                } else if values.contains(&None) {
+                    None
+                } else {
+                    Some(false)
+                }
+            }
         }
     }
 
@@ -443,6 +486,53 @@ mod tests {
         // A rule that cannot see its evidence has not earned the right to act.
         assert!(!evaluate("core.completion__ready_to_finish >= 0.75", &[])?);
         assert!(!evaluate("core.completion__ready_to_finish < 0.75", &[])?);
+        // Including under `not`: unknown negated is still unknown.
+        assert!(!evaluate(
+            "not (core.completion__ready_to_finish >= 0.75)",
+            &[]
+        )?);
+        Ok(())
+    }
+
+    #[test]
+    fn a_held_check_is_unknown_and_unknown_never_fires() -> Result<(), Box<dyn std::error::Error>> {
+        // In band at 0.79 against 0.75: not permitted.
+        let held = [("core.completion__ready_to_finish", 0.79)];
+        let decisive = [("core.verification__needs_verification", 0.10)];
+        let both = [held[0], decisive[0]];
+        for text in [
+            "core.completion__ready_to_finish >= 0.75",
+            "core.completion__ready_to_finish < 0.75",
+            "not (core.completion__ready_to_finish >= 0.75)",
+            "not (core.completion__ready_to_finish < 0.75)",
+            "not (not (core.completion__ready_to_finish >= 0.75))",
+        ] {
+            assert!(!evaluate(text, &held)?, "{text}");
+        }
+        // Kleene: false wins an `and`, true wins an `or`, unknown otherwise.
+        let r = "core.completion__ready_to_finish >= 0.75";
+        let t = "core.verification__needs_verification < 0.65";
+        let f = "core.verification__needs_verification >= 0.65";
+        assert!(
+            !evaluate(&format!("{r} and {t}"), &both)?,
+            "unknown and true"
+        );
+        assert!(
+            evaluate(&format!("not ({r} and {f})"), &both)?,
+            "unknown and false is false, so its negation fires"
+        );
+        assert!(
+            evaluate(&format!("{r} or {t}"), &both)?,
+            "unknown or true is true"
+        );
+        assert!(
+            !evaluate(&format!("{r} or {f}"), &both)?,
+            "unknown or false"
+        );
+        assert!(
+            !evaluate(&format!("not ({r} or {f})"), &both)?,
+            "not unknown"
+        );
         Ok(())
     }
 

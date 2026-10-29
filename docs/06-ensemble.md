@@ -143,9 +143,10 @@ Precisely, for a check `k` with threshold `t` (`aftman_core::ensemble::EnsembleP
 
 Alongside the triggers the plan records whether **a rule would fire** on `k`: some proposal made this
 cycle would disappear if `k` were not permitted. That is the only case in which an opinion — which
-can do nothing but remove permission — could change what is proposed. A rule that fires *because* a
-comparison is false (an `else` branch such as `core.completion:work-remains`, or a `not (...)`
-condition) survives `k` being held, so it does not count: contesting `k` would leave it firing.
+can do nothing but remove permission — could change what is proposed. A Rust fallback that fires
+when the `Finish` precondition is not established (`core.completion:work-remains`) survives `k`
+being held, so it does not count: contesting `k` would leave it firing. A declarative `not (...)`
+does not survive: a held `k` makes it unknown, and unknown never fires (§6).
 
 **The line that matters is not "is the value near a threshold" but "is the value decisively on one
 side, and is a rule about to act on it".** An earlier revision requested opinions for in-band checks;
@@ -596,15 +597,28 @@ Notes that follow directly from §2:
 - `ResolvedCheck::from_measurement` is the only place `permitted` can become `true` without new evidence,
   and it is a pure function of `p`, `t`, and `margin` — not of which side of `t` the value is on.
 - **The opinion rungs are monotonically conservative.** Deleting every R1/R2 call can only
-  *increase* the set of permitted checks, and so the set of comparisons that hold; no opinion can
-  make a comparison true that would not otherwise have been. R0 is deliberately excluded from that
-  claim: it is not an opinion, it is a measurement, and it may legitimately move a rule either way.
+  *increase* the set of rules that fire; no opinion can make a rule fire that would not otherwise
+  have. R0 is deliberately excluded from that claim: it is not an opinion, it is a measurement, and
+  it may legitimately move a rule either way.
 
-  The claim is about comparisons, not about every rule. A rule that fires *because* a comparison is
-  false — `core.completion:work-remains`, the `else` of the `Finish` precondition, or a declarative
-  `not (...)` — can start firing when a contest removes permission. That is the intended
-  conservative fallback (`StartWorker` instead of `Finish`), not an opinion enabling an action, and
-  `Finish`, `Stop` and every other comparison-driven rule can only lose their trigger.
+  This holds for declarative rules because conditions are **three-valued** (Kleene,
+  [05-responsibilities.md §2.1](05-responsibilities.md)): a comparison on a check that is missing or
+  not permitted is *unknown*, `not unknown` is unknown, and a rule fires only on *true*. With
+  two-valued logic `not (k >= t)` became *true* when a contest removed `k`'s permission, so a
+  contest could enable a `Stop` — an opinion driving an action.
+
+  The built-in rules are Rust, and two kinds of them may start firing when a check loses
+  permission, neither of which an opinion enables:
+
+  - the `core.completion` fallbacks, `work-remains` and `retry-stopped`, which fire because the
+    `Finish` precondition is not established. `StartWorker` in place of `Finish` is the conservative
+    outcome a contest exists to produce;
+  - `core.worker-health`, which proposes only the more probable of `stuck` and `off-track`. Holding
+    the winner lets the runner-up through, but only if its own check is itself permitted and above
+    its threshold: the runner-up is an independent finding, not one the held check enabled.
+
+  Every other rule, and every declarative rule without exception, can only stop firing. The test
+  `no_rule_starts_firing_because_a_check_lost_permission` enumerates exactly these exceptions.
 - The in-band branch returns before any R1/R2 call, so **the cost of an opinion is only ever paid
   on a check that is about to act.**
 
@@ -885,8 +899,9 @@ only ever half-built, S1 is the half worth having.
     contested check makes the comparison false. This test exists because the previous definition
     hardcoded `>=` and both of these were broken.
 - A replay test asserts bit-identical resolutions from `RecordedOpinionSource`.
-- The monotonic-conservatism property is asserted over permitted checks (and so over every
-  comparison), not over every rule, for the reason given in §6.
+- Monotonic conservatism is asserted at three levels: removing R2 never shrinks the permitted set;
+  replacing each verdict with `Abstain` never removes permission; and holding any permitted check
+  never makes a rule fire, except the Rust fallbacks named in §6.
 
 These live in `crates/aftman-core/src/ensemble/tests.rs`. The silent-worker test is the runtime's;
 the adversarial and judge-honesty tests need a judge and arrive with S3.

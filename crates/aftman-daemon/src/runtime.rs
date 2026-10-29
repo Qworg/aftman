@@ -277,7 +277,8 @@ struct Loop {
     /// Control messages that arrived while a cycle was in progress (during a refresh, an
     /// evidence collection, or just before apply). Handled, in order, before anything else
     /// at the top of the next iteration. A cancel among them means the cycle applies
-    /// nothing: **a cancel always wins over what its cycle selected.**
+    /// nothing: **a cancel seen before the cycle's last look wins over what it selected**
+    /// (see [`FactoryRuntime::drive`] for the window after that look).
     pending_control: Vec<ControlMessage>,
     /// Model calls this run stopped waiting for, aborted when the run ends.
     abandoned: AbandonedCalls,
@@ -666,13 +667,18 @@ impl FactoryRuntime {
     ///
     /// Control messages are observed at the top of every loop iteration and in the
     /// wait `select!`, and a reply is sent only after its effect is applied and persisted.
-    /// A cycle in progress is not interrupted, with one exception: **a cancel always wins
-    /// over what its cycle selected.** While a cycle runs commands (an evidence refresh,
-    /// `before_finish` collection) or waits for a refresh's model call, the channel is
-    /// watched; a cancel stops the command through its process-group kill and the cycle
-    /// applies nothing, and the loop looks once more just before applying. Every other
-    /// message that arrives mid-cycle is queued and handled, in order, after the cycle.
-    /// Routing is a model call and counts as a cycle in progress.
+    /// A cycle in progress is not interrupted, with one exception: **a cancel that arrives
+    /// before the cycle's last look wins over what the cycle selected.** While a cycle runs
+    /// commands (an evidence refresh, `before_finish` collection) or waits for a refresh's or
+    /// a reframe's model call, the channel is watched; a cancel stops the command through
+    /// its process-group kill and the cycle applies nothing; and the loop looks once more
+    /// just before applying. A cancel that arrives after that last look — while the
+    /// directive is being applied — is handled at the top of the next iteration, after the
+    /// directive took effect: a worker it started is then stopped, and a `Finish` or `Stop`
+    /// that ended the run is not undone (the cancel is answered `RunEnded`). A look followed
+    /// by an action always leaves such a window; what holds is that no cancel seen before
+    /// acting is ignored. Every other message that arrives mid-cycle is queued and handled,
+    /// in order, after the cycle. Routing is a model call and counts as a cycle in progress.
     ///
     /// # Errors
     /// As [`FactoryRuntime::run`].
@@ -1267,8 +1273,10 @@ impl FactoryRuntime {
             // applied: if collecting the evidence fails, the error ends the run here, and
             // nothing below runs.
             let selected = decision.selected.clone();
-            // A cancel always wins over what this cycle selected: look once more, just before
-            // acting. Anything else that arrived waits for the top of the loop, as before.
+            // A cancel that has arrived by now wins over what this cycle selected: look once
+            // more, just before acting. One that arrives after this look is handled at the
+            // top of the next iteration, after the directive took effect (`drive`'s docs).
+            // Anything else that arrived waits for the top of the loop, as before.
             queue_control(&mut control, &mut ls.pending_control);
             if ls.cancel_pending() {
                 continue;

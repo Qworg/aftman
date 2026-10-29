@@ -766,12 +766,15 @@ Debounce rules:
   empty output event;
 - a worker-completion event always forces an immediate cycle, regardless of the interval, after
   command evidence providers have run;
-- a cycle in progress is never interrupted, except by a cancel: **a cancel always wins over what
-  its cycle selected.** While a cycle runs command providers (an ensemble refresh, `before_finish`
-  collection) or waits for a refresh's model call it watches the control channel; a cancel stops
-  the provider through its process-group kill (`run_provider_until`, recorded with
-  `exit_code: None`) and the cycle applies nothing, and the loop checks once more just before
-  applying a directive. Any other message arriving mid-cycle (a steer, an answer) is queued and
+- a cycle in progress is never interrupted, except by a cancel: **a cancel that arrives before the
+  cycle's last look wins over what the cycle selected.** While a cycle runs command providers (an
+  ensemble refresh, `before_finish` collection) or waits for a refresh's or a reframe's model call
+  it watches the control channel; a cancel stops the provider through its process-group kill
+  (`run_provider_until`, recorded with `exit_code: None`) and the cycle applies nothing, and the
+  loop checks once more just before applying a directive. A cancel that arrives after that last
+  check, while the directive is being applied, is handled at the top of the next iteration, after
+  the directive took effect: a worker it started is then stopped; a `Finish` or `Stop` that ended
+  the run is not undone, and the cancel is answered `ControlError::RunEnded` (doc 06 §6.1). Any other message arriving mid-cycle (a steer, an answer) is queued and
   handled in order after the cycle, never lost and never applied part way; the next signal
   starts the next cycle;
 - the ticker alone is enough to make progress, so a worker that prints nothing still gets

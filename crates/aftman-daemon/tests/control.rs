@@ -1380,8 +1380,8 @@ async fn a_cancel_queued_during_the_model_call_is_applied_before_the_next_cycle(
     release.notify_one();
     cancel.await??;
 
-    // The cycle finished assessing, but a cancel always wins over what its cycle
-    // selected (docs/02-lld.md §7.1): the worker it would have started never starts, and
+    // The cycle finished assessing, but a cancel that arrived before its last look wins over
+    // what it selected (docs/02-lld.md §7.1): the worker it would have started never starts, and
     // there is no second cycle.
     assert_eq!(fx.worker.alive(), 0, "no worker outlives a cancelled run");
     assert_eq!(fx.model.calls(), 2, "routing plus exactly one assessment");

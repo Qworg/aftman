@@ -904,10 +904,19 @@ Notes that follow directly from §2:
    errors: the runtime records an `ERROR` (`code: "ensemble_unresolved"`), emits an
    `ENSEMBLE_RESOLVED` with no `cycle`, holds **every** thresholded check, and arbitrates over that.
    It never panics and never falls back to the unresolved baseline.
-6. **A cancel wins.** A cancel that arrives while a refresh's provider runs, or while its model
-   call is awaited, kills the provider through its process-group path (the run is recorded with
-   `exit_code: None`), abandons the rest of the cycle's refreshes, and the cycle selects and
-   applies nothing; the cancel is then handled. Other messages are queued until after the cycle.
+6. **A cancel wins — if it arrives before the cycle's last look.** A cancel that arrives while a
+   refresh's provider runs, or while a refresh's or a reframe's model call is awaited, kills the
+   provider through its process-group path (the run is recorded with `exit_code: None`), abandons
+   the call (§4 R0, item 6) and the rest of the cycle's refreshes and reframes, and the cycle
+   selects and applies nothing; the cancel is then handled. After resolving and arbitrating, the
+   runtime looks at the channel once more, just before applying the selected directive, and a
+   cancel found then wins too. What this does **not** cover is a cancel that arrives after that
+   last look, while the directive is being applied: it is handled at the top of the next
+   iteration, after the directive took effect. A worker the directive started is then stopped by
+   the cancel; a `Finish` or a `Stop` that ended the run is not undone, and the cancel is answered
+   `ControlError::RunEnded`. A look followed by an action always leaves such a window; the
+   guarantee is that no cancel seen before acting is ignored, not that every cancel beats every
+   directive. Other messages are queued until after the cycle.
 7. **No answers, no ensemble.** A cycle whose model call failed or was refused, or whose budget is
    spent, has nothing to resolve; its empty check set already yields only conservative directives.
    It emits an `ENSEMBLE_RESOLVED` with no `cycle` and no `checks`, as S0 did.

@@ -200,6 +200,38 @@ telling you its evidence selection is wrong, not that it needs a fourth run.
 This rung exists because the most common reason a probability is near a threshold is that the
 evidence is thin. Making more evidence beats asking another model to guess about thin evidence.
 
+**As built (S1).** The runtime's `OpinionSource` (`aftman-daemon`, `runtime::CycleSource`) answers
+a `RefreshRequest` so:
+
+1. **Budget first.** With `max_assessments` spent nothing runs: the outcome has no runs and no value
+   (`rejected: no_provider_ran`), because evidence nobody may be asked about is not worth a command.
+2. **Exactly the requested providers**, in order, through the one path every command provider takes
+   (`run_one_provider`: the environment built by `worker_environment()`, the provider's own timeout
+   and output cap, and one `EVIDENCE_COLLECTED` each). Each is reported with its real exit code, or
+   `None` if it could not be launched or was killed. Its output replaces the provider's previous
+   result in the run's evidence, so the cycles that follow see it too.
+3. If none exited, no model call: no value.
+4. **The observation is rebuilt** exactly as a cycle builds it, with the fresh evidence, and the
+   model is asked that one check's question again over `state_for(selection)`, where `selection`
+   is the cycle's own (`default_evidence`) plus the check's evidence selection — so command output
+   the check names (`command:<id>`) is in the state, as `command_evidence`.
+5. The call is made under `Purpose::Refresh` ([03-jev.md §7](03-jev.md)): its own purpose so that
+   `aftman usage` can tell what refreshes cost, billed by the same usage line every call writes,
+   sent under the same request budget (`jev_budget`), and **counted against `max_assessments`** —
+   a refresh is an assessment of one check. A model error or a budget refusal is a failed refresh
+   (no value, `rejected: no_measurement`), recorded as `MODEL_ERROR` / `RATE_LIMITED` /
+   `BUDGET_EXCEEDED` with `purpose: "refresh"` and the check; it does not count toward the cycle's
+   consecutive-failure invariants, which are about the cycle's own call.
+6. The whole call is bounded by `opinion_timeout_seconds`; a refresh that outlives it answers with
+   whatever had run and no value.
+
+The source writes events from inside the resolution. It holds the run state behind one lock for the
+duration and appends through the runtime's own `emit`, so every event is appended to the store
+before it reaches the hub, in `seq` order ([02-lld.md §11](02-lld.md)). A store failure ends the
+run, as anywhere else: the source answers with no value, and the runtime returns the error once the
+resolution is done. The source never returns `Err`: that is reserved for a replay that has no
+recording.
+
 ### R1 — Independent judge (cross-model, suppress-only)
 
 A *different model from a different family* than the one serving Jev answers the **same question
@@ -266,6 +298,12 @@ An R2 answer that is missing, not a number, or outside `0..=1` is unusable: **AB
 the side `1 − p(¬X)` points to; a consistent one confirms Jev's side.
 
 Cost: one additional Jev call, same provider, same budget.
+
+**Not yet built (S2).** No check definition carries a negated question yet, so the runtime hands
+the resolver an empty `reframe_available` and R2 is never planned. Should the resolver ask anyway,
+the runtime's source records an `OPINION_REQUESTED` and answers with no value and an error saying
+R2 is unavailable; the resolver reads that as an abstention, or, for an `Irreversible` trigger, a
+contest — never a confirm.
 
 **R2 does not short-circuit R1.** An earlier revision ran R2 first and skipped R1 when R2 confirmed.
 That is backwards for the failure mode R1 exists to catch: a model that is hallucinating, or that
@@ -755,13 +793,58 @@ Notes that follow directly from §2:
   `needs_human = 0.05` is bought because, decisively high, it would let a higher-priority
   `Escalate` win, so the `Finish` rests on it.
 
+### 6.1 How the runtime runs one cycle (S1, as built)
+
+1. **One materialised input.** After `ASSESSMENT_COMPLETED`, the runtime builds every value policy
+   will read, once, into an `EnsembleCycle` (`aftman-daemon`, `ensemble.rs`): status, counters,
+   configuration, observation, clock, active worker, last directive, steering grace, the registry's
+   checks, the answers, the counters, `reframe_available` (empty until S2), `finish_is_provisional`,
+   and the baseline (`resolve_checks` with the settings' margin and `enabled`). The plan's context,
+   the resolution's context and the final arbitration's `PolicyInput` are all derived from that one
+   value; nothing is re-read from the run in between. The same registry is passed to `build` and
+   `resolve`. The cycle id is the cycle's `assessment_seq`; a refresh's model call takes an
+   assessment number too, so ids increase but need not be consecutive, and a cooldown measured in
+   them is never longer than the same number of cycles.
+2. **`finish_is_provisional` is exactly** `!before_finish_ran && !evidence.due(BeforeFinish).is_empty()`
+   for this cycle — the same expression, computed once, that the apply step reads to decide whether a
+   selected `Finish` is executed or replaced by running the `before_finish` providers and
+   re-assessing. It is never "`before_finish` providers are configured": once they have run it is
+   false. In a cycle where it is true a selected `Finish` is never applied; if collecting that
+   evidence fails, the error ends the run there.
+3. **`build`, then `ENSEMBLE_TRIGGERED`** for each triggered check, then **`resolve`** against the
+   runtime's source (§4 R0), then `OPINION_RECORDED` per opinion and one `ENSEMBLE_RESOLVED`
+   (`outcome.resolved_payload`). The outcome's counters are stored in `RunState.ensemble` and
+   snapshotted with the run.
+4. **Policy decides over `outcome.checks`.** `aftman_core::ensemble::propose` returns every
+   responsibility's proposals plus, if the cycle escalated anything, **one** `Escalate` proposal
+   for all of it (`EnsembleOutcome::escalation_proposal`: rule `core.ensemble:escalate`, priority
+   `ESCALATE_ENSEMBLE` = 850, its question listing each check's), and `arbitrate` selects. Why 850,
+   and what it pre-empts and does not, is in [05-responsibilities.md §6.3](05-responsibilities.md).
+   The gate's re-arbitration inside `resolve` does not include that proposal, and does not need to:
+   an escalated check is held, so `UnresolvedUncertainty` already refuses `Finish`, and a `Stop` (900)
+   outranks the escalation either way. When the escalation is selected, the `Escalation` it raises
+   names its checks, so the answer can be applied to them (§4 R3).
+5. **An unresolvable cycle is conservative.** `BaselineMismatch` and `ContextMismatch` are internal
+   errors: the runtime records an `ERROR` (`code: "ensemble_unresolved"`), emits an
+   `ENSEMBLE_RESOLVED` with no `cycle`, holds **every** thresholded check, and arbitrates over that.
+   It never panics and never falls back to the unresolved baseline.
+6. **No answers, no ensemble.** A cycle whose model call failed or was refused, or whose budget is
+   spent, has nothing to resolve; its empty check set already yields only conservative directives.
+   It emits an `ENSEMBLE_RESOLVED` with no `cycle` and no `checks`, as S0 did.
+
+With `enabled = false` the plan triggers nothing, the resolution is the baseline, the counters are
+untouched, and the cycle selects exactly what it selected before the ensemble was wired; the
+`ENSEMBLE_RESOLVED` payload gains only `cycle` and an empty `checks`. A regression test compares a
+disabled run's whole decision trace with one captured from the release before
+(`aftman-daemon/tests/ensemble.rs`, `a_disabled_ensemble_selects_exactly_what_it_did_before`).
+
 ## 7. Cost and latency
 
 | Bound | Default | Why |
 | --- | --- | --- |
 | `max_opinions_per_run` | 20 | A run needing more opinions has a broken check, not a hard question. Counts opinion calls only; refreshes are not opinions. A decisive check a rule is about to act on, with the budget spent, is held rather than acted on unchecked, and — with the `human` rung — the cycle raises one escalation saying so (§6) |
 | `max_evidence_refreshes_per_check` | 3 | Same reason. Every attempt counts, including one whose command could not run |
-| `opinion_timeout_seconds` | 120 | An opinion must not outlive the worker it is judging |
+| `opinion_timeout_seconds` | 120 | An opinion must not outlive the worker it is judging. The runtime applies the same bound to one evidence refresh (its commands and its model call together) |
 | `per_check_cooldown_cycles` | 10 | One opinion per check per ten cycles, for non-irreversible triggers. Within the window an opinion the last one covers (a confirm, on the same side) is skipped, and one it does not cover holds the check. Never applies to an `Irreversible` trigger, whose opinion is always bought fresh, budget permitting (§6) |
 | `consecutive_contests_before_human` | 2 | Escalate instead of re-asking |
 
@@ -787,7 +870,7 @@ never for an in-band check. An in-band check never gets an opinion from either.
 | `OpinionRequested` | opinion id, rung, source, model, `prompt_hash`, `state_digest`, `timeout_seconds`. Emitted by the source before the call, since only it knows the prompt |
 | `OpinionRecorded` | opinion id, rung, verdict, `p_reported`, excerpt (≤2 KiB), source, model, `prompt_hash`, `state_digest`, latency, usage, error |
 | `EnsembleResolved` | one per cycle: `enabled`, `margin`, `unresolved`, `rungs`, `cycle`, and `checks` — per triggered check: `jev_p` (unmodified), `triggers`, `decisive`, `contested`, `permitted`, `suppression`, `resolution`, `rungs_used`, `limits`, `refresh` (providers, `old_p`, every run and its exit code, the fresh value), `escalation`, `irreversible_guard` (per triggered or gate-guarded check) |
-| `EscalationRaised` | question, context, opinions so far, `context_digest` |
+| `EscalationRaised` | question, context, opinions so far, `context_digest`; as built: `escalation_id`, `kind` (`check`), `reason` (`ensemble: …`), `ask`, and `checks` — every check the coalesced escalation is about |
 | `EscalationAnswered` | human identity/surface, `HumanDecision`, free text |
 
 The payload types are `aftman_core::ensemble::{EnsembleTriggeredPayload, OpinionRequestedPayload,

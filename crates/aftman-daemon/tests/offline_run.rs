@@ -174,8 +174,7 @@ fn runtime(
         evidence_temp_dir: test_evidence_dir(harness),
         clock: Arc::new(SystemClock),
         sink: Arc::clone(&harness.sink) as Arc<dyn aftman_daemon::EventSink>,
-        ensemble_enabled: false,
-        uncertainty_margin: 0.15,
+        ensemble: Default::default(),
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
 
@@ -442,8 +441,10 @@ async fn an_ensemble_enabled_run_still_reaches_the_same_verdict()
         evidence_temp_dir: test_evidence_dir(&h),
         clock: Arc::new(SystemClock),
         sink: Arc::clone(&h.sink) as Arc<dyn aftman_daemon::EventSink>,
-        ensemble_enabled: true,
-        uncertainty_margin: 0.15,
+        ensemble: aftman_core::ensemble::EnsembleSettings {
+            enabled: true,
+            ..Default::default()
+        },
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
 
@@ -565,8 +566,7 @@ async fn skipped_cycles_do_not_reach_the_model() -> Result<(), Box<dyn std::erro
         evidence_temp_dir: test_evidence_dir(&h),
         clock: Arc::new(SystemClock),
         sink: Arc::clone(&h.sink) as Arc<dyn aftman_daemon::EventSink>,
-        ensemble_enabled: false,
-        uncertainty_margin: 0.15,
+        ensemble: Default::default(),
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
 
@@ -647,8 +647,7 @@ fn runtime_with(
         evidence_temp_dir: test_evidence_dir(harness),
         clock: Arc::new(SystemClock),
         sink: Arc::clone(&harness.sink) as Arc<dyn aftman_daemon::EventSink>,
-        ensemble_enabled: false,
-        uncertainty_margin: 0.15,
+        ensemble: Default::default(),
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
 
@@ -954,8 +953,7 @@ async fn a_forwarded_variable_reaches_the_worker_and_its_value_is_never_recorded
         evidence_temp_dir: test_evidence_dir(&h),
         clock: Arc::new(SystemClock),
         sink: Arc::clone(&h.sink) as Arc<dyn aftman_daemon::EventSink>,
-        ensemble_enabled: false,
-        uncertainty_margin: 0.15,
+        ensemble: Default::default(),
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
         forwarded_env: forwarded,
@@ -1045,8 +1043,7 @@ async fn an_evidence_provider_sees_the_forwarded_environment()
         evidence_temp_dir: test_evidence_dir(&h),
         clock: Arc::new(SystemClock),
         sink: Arc::clone(&h.sink) as Arc<dyn aftman_daemon::EventSink>,
-        ensemble_enabled: false,
-        uncertainty_margin: 0.15,
+        ensemble: Default::default(),
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
         forwarded_env: std::collections::BTreeMap::from([("PATH".to_owned(), forwarded_path)]),

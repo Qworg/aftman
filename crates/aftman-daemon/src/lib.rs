@@ -14,6 +14,7 @@
 
 pub mod control;
 pub mod daemon;
+pub mod ensemble;
 pub mod hub;
 pub mod lifecycle;
 pub mod manager;
@@ -26,6 +27,7 @@ pub mod sink;
 
 pub use control::{ControlError, ControlReceiver, RunControl};
 pub use daemon::{Daemon, DaemonConfig, shutdown_signal};
+pub use ensemble::{EnsembleCycle, EnsembleTap};
 pub use hub::{Abandoned, EventHub, HubConfig, Lagged, SubscribeError, Subscription};
 pub use lifecycle::{
     DaemonPaths, DaemonPresence, LifecycleError, PathInputs, probe, probe_state_dir, resolve_paths,
@@ -37,8 +39,7 @@ pub use manager::{
 };
 pub use obs::{ObsCaps, ObservationBuilder, parse_test_summaries};
 pub use runtime::{
-    FactoryRuntime, RunOutcome, RuntimeDeps, RuntimeError, StartedRun, code_mission,
-    default_margin, verify_mission,
+    FactoryRuntime, RunOutcome, RuntimeDeps, RuntimeError, StartedRun, code_mission, verify_mission,
 };
 pub use server::{ProtocolServer, ServerConfig};
 pub use sink::{EventSink, MultiSink, NullSink, VecSink};

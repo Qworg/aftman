@@ -480,8 +480,7 @@ fn real_runtime(dir: &Path, store: Arc<dyn RunStore>, model: Arc<DialModel>) -> 
         evidence_temp_dir: temp,
         clock: Arc::new(SystemClock),
         sink: Arc::new(NullSink),
-        ensemble_enabled: false,
-        uncertainty_margin: 0.15,
+        ensemble: Default::default(),
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
 

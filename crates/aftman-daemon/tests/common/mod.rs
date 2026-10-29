@@ -589,8 +589,7 @@ impl RuntimeFactory for TestFactory {
             evidence_temp_dir: temp,
             clock: context.clock,
             sink: context.sink,
-            ensemble_enabled: false,
-            uncertainty_margin: 0.15,
+            ensemble: Default::default(),
             steering_grace: Duration::from_secs(30),
             launch: [
                 (

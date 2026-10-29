@@ -333,8 +333,10 @@ impl CliFactory {
             evidence_temp_dir,
             clock: context.clock,
             sink: context.sink,
-            ensemble_enabled: params.ensemble,
-            uncertainty_margin: aftman_daemon::default_margin(),
+            ensemble: aftman_core::ensemble::EnsembleSettings {
+                enabled: params.ensemble,
+                ..Default::default()
+            },
             steering_grace: std::time::Duration::from_secs(30),
             launch,
             // The client's allowlisted environment, already validated for supervisor

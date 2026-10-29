@@ -51,7 +51,7 @@ use aftman_daemon::protocol::{
 };
 use aftman_daemon::{
     BuiltRun, Daemon, DaemonConfig, DaemonPaths, FactoryRuntime, RuntimeContext, RuntimeDeps,
-    RuntimeFactory, default_margin,
+    RuntimeFactory,
 };
 use aftman_store::FileRunStore;
 
@@ -180,8 +180,7 @@ impl RuntimeFactory for TestFactory {
             evidence_temp_dir: self.scratch.clone(),
             clock: context.clock,
             sink: context.sink,
-            ensemble_enabled: false,
-            uncertainty_margin: default_margin(),
+            ensemble: Default::default(),
             steering_grace: Duration::from_secs(30),
             launch: [
                 ("permissions", "auto-approve"),

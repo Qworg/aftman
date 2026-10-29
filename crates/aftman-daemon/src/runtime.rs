@@ -14,7 +14,7 @@
 //! events are only flushed at a cycle — which is circular, and would have meant the
 //! supervisor slept until the worker exited. See `docs/02-lld.md` §7.1.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -24,19 +24,24 @@ use time::OffsetDateTime;
 use tokio::sync::{mpsc, oneshot};
 
 use aftman_core::activity::StreamActivity;
-use aftman_core::assessment::{HumanDecision, ResolvedCheck, Rung};
+use aftman_core::assessment::{HumanDecision, ResolvedCheck};
 use aftman_core::clock::Clock;
 use aftman_core::definitions::DefinitionSet;
 use aftman_core::directive::{Directive, Invariant, Proposal, SuppressionReason};
+use aftman_core::ensemble::{
+    EnsembleOutcome, EnsemblePlan, EnsembleResolvedPayload, EnsembleSettings,
+    OpinionRequestedPayload, OpinionSource, ProviderRun, ReframeAnswer, ReframeRequest,
+    RefreshOutcome, RefreshRequest, SourceError,
+};
 use aftman_core::error::{ModelError, TransitionError};
 use aftman_core::event::{EventEnvelope, EventKind};
-use aftman_core::evidence::{EvidenceOutcome, EvidencePlan, RunWhen};
-use aftman_core::ids::{CheckKey, EscalationId, EventSeq, RunId, WorkerId};
+use aftman_core::evidence::{CommandProvider, EvidenceOutcome, EvidencePlan, RunWhen};
+use aftman_core::ids::{AssessmentSeq, CheckKey, EscalationId, EventSeq, RunId, WorkerId};
 use aftman_core::job::{FactoryStatus, Job, RunConfig, TaskKind, WorkerStatus};
 use aftman_core::log::BoundedLog;
 use aftman_core::model::{DecisionModel, Purpose, Question};
 use aftman_core::observation::{EventSummary, Observation};
-use aftman_core::policy::{PolicyInput, arbitrate};
+use aftman_core::policy::arbitrate;
 use aftman_core::responsibility::ResponsibilityRegistry;
 use aftman_core::routing;
 use aftman_core::run::{AnsweredEscalation, Escalation, EscalationKind, RunHeader, RunState};
@@ -47,6 +52,7 @@ use aftman_core::worker::{
 use aftman_store::{RunClaim, RunStore, StoreError};
 
 use crate::control::{ControlError, ControlMessage, ControlReceiver};
+use crate::ensemble::{EnsembleCycle, EnsembleTap};
 use crate::obs::ObservationBuilder;
 use crate::sink::EventSink;
 
@@ -66,10 +72,10 @@ pub struct RuntimeDeps {
     pub evidence_temp_dir: PathBuf,
     pub clock: Arc<dyn Clock>,
     pub sink: Arc<dyn EventSink>,
-    /// Whether the uncertainty band holds a rule. Off by default, which restores
-    /// plain threshold behaviour exactly.
-    pub ensemble_enabled: bool,
-    pub uncertainty_margin: f32,
+    /// The `[ensemble]` settings, already validated (`EnsembleSettings::validate`). Off
+    /// by default, which restores plain threshold behaviour exactly; `uncertainty_margin`
+    /// is the band every check is resolved against. See `docs/06-ensemble.md` §12.
+    pub ensemble: EnsembleSettings,
     pub steering_grace: Duration,
     /// The request budget the provider was configured with.
     ///
@@ -440,6 +446,7 @@ fn lost_worker_outcome() -> WorkerOutcome {
 pub struct FactoryRuntime {
     deps: RuntimeDeps,
     builder: ObservationBuilder,
+    ensemble_tap: Option<EnsembleTap>,
 }
 
 impl FactoryRuntime {
@@ -451,10 +458,22 @@ impl FactoryRuntime {
         self
     }
 
+    /// Watch each cycle's materialised ensemble inputs (`EnsembleCycle`). For audit and
+    /// replay: the tap observes and cannot influence the run.
+    #[must_use]
+    pub fn with_ensemble_tap(mut self, tap: EnsembleTap) -> Self {
+        self.ensemble_tap = Some(tap);
+        self
+    }
+
     #[must_use]
     pub fn new(deps: RuntimeDeps) -> Self {
         let builder = ObservationBuilder::for_worker(deps.config.worker);
-        Self { deps, builder }
+        Self {
+            deps,
+            builder,
+            ensemble_tap: None,
+        }
     }
 
     /// Run one job to a terminal state, with no control channel attached.
@@ -608,11 +627,7 @@ impl FactoryRuntime {
         // costs a dimension of supervision, not an action.
         let routing_outcome = routing::route(
             self.deps.model.as_ref(),
-            &aftman_core::model::AskContext::for_run(
-                Purpose::Routing,
-                run_id,
-                aftman_core::ids::AssessmentSeq(0),
-            ),
+            &aftman_core::model::AskContext::for_run(Purpose::Routing, run_id, AssessmentSeq(0)),
             &self.deps.definitions,
             &job.prompt,
             &self.deps.jev_budget,
@@ -899,9 +914,10 @@ impl FactoryRuntime {
                 )
                 .await?;
             }
-            let (checks, model_name, usage) = if budget_spent {
+            let (checks, answers, model_name, usage) = if budget_spent {
                 (
                     BTreeMap::new(),
+                    None,
                     "budget_exhausted".to_owned(),
                     usage_default(),
                 )
@@ -913,7 +929,7 @@ impl FactoryRuntime {
                         &aftman_core::model::AskContext::for_run(
                             Purpose::Assessment,
                             run_id,
-                            aftman_core::ids::AssessmentSeq(ls.assessments.into()),
+                            AssessmentSeq(ls.assessments.into()),
                         ),
                         &state_json,
                         &questions,
@@ -926,10 +942,15 @@ impl FactoryRuntime {
                         let resolved = aftman_core::model::resolve_checks(
                             &answers,
                             &keys,
-                            self.deps.uncertainty_margin,
-                            self.deps.ensemble_enabled,
+                            self.deps.ensemble.uncertainty_margin,
+                            self.deps.ensemble.enabled,
                         );
-                        (resolved, answers.model, answers.usage)
+                        (
+                            resolved,
+                            Some(answers.answers),
+                            answers.model,
+                            answers.usage,
+                        )
                     }
                     Err(error) => {
                         // A budget refusal is not a model failure. The request could not be
@@ -948,26 +969,16 @@ impl FactoryRuntime {
                         // A rate limit is a different operational event from a malformed
                         // answer, and the UI shows them differently, so they are distinct
                         // event kinds rather than one `Error` with a code inside.
-                        let kind = if refused {
-                            EventKind::BudgetExceeded
-                        } else if matches!(error, ModelError::RateLimited { .. }) {
-                            EventKind::RateLimited
-                        } else {
-                            EventKind::ModelError
-                        };
-                        self.emit(
-                            state,
-                            kind,
-                            json!({
-                                "code": error.code(),
-                                "message": error.to_string(),
-                                "retryable": error.is_retryable(),
-                            }),
-                        )
-                        .await?;
+                        self.emit(state, model_error_kind(&error), model_error_payload(&error))
+                            .await?;
                         // No guesses: an empty check set can only produce conservative
                         // directives.
-                        (BTreeMap::new(), "unavailable".to_owned(), usage_default())
+                        (
+                            BTreeMap::new(),
+                            None,
+                            "unavailable".to_owned(),
+                            usage_default(),
+                        )
                     }
                 }
             };
@@ -1002,56 +1013,94 @@ impl FactoryRuntime {
             )
             .await?;
 
-            // ---- arbitrate ---------------------------------------------------
-            // Policy reads `state.counters`, so the elapsed figure its timeout invariant
-            // compares must be current there too (supervised time: human waits excluded).
+            // ---- materialise the cycle ----------------------------------------
+            //
+            // Everything policy reads, once (`docs/06-ensemble.md` §6). The plan
+            // fingerprints this input — clock, counters, observation — so the plan, the
+            // resolution and the final arbitration must all read this one value. Policy
+            // reads `state.counters`, so the elapsed figure its timeout invariant compares
+            // must be current there first (supervised time: human waits excluded).
             state.counters.elapsed_secs = state.supervised_elapsed(self.now()).as_secs();
-            let proposals = {
-                let input = PolicyInput {
-                    status: state.status,
-                    counters: &state.counters,
-                    config: &self.deps.config,
-                    checks: &checks,
-                    observation: &observation,
-                    now: self.now(),
-                    active_worker: state.active_worker(),
-                    last_directive: ls.last_directive.as_ref(),
-                    ensemble_enabled: self.deps.ensemble_enabled,
-                    steering_grace: self.deps.steering_grace,
-                };
-                registry.propose(&input)
+            // Exactly when the apply step below will not execute a `Finish`: it runs the
+            // `before_finish` providers and re-assesses instead. Computed once, here, and
+            // read by both the ensemble and that step, so the two cannot disagree.
+            let finish_is_provisional =
+                !ls.before_finish_ran && !self.deps.evidence.due(RunWhen::BeforeFinish).is_empty();
+            let cycle = EnsembleCycle {
+                cycle: AssessmentSeq(ls.assessments.into()),
+                settings: self.deps.ensemble.clone(),
+                status: state.status,
+                counters: state.counters.clone(),
+                config: self.deps.config.clone(),
+                observation,
+                now: self.now(),
+                active_worker: state.active_worker().cloned(),
+                last_directive: ls.last_directive.clone(),
+                steering_grace: self.deps.steering_grace,
+                definitions: registry.checks(),
+                evidence: self.deps.evidence.clone(),
+                answers: answers.clone().unwrap_or_default(),
+                ensemble: state.ensemble.clone(),
+                // R2 is ensemble stage S2: no check carries a negated question yet.
+                reframe_available: BTreeSet::new(),
+                finish_is_provisional,
+                checks,
             };
 
+            // ---- resolve the ensemble ----------------------------------------
+            //
+            // Only over a real assessment. A failed or refused model call has no answers to
+            // resolve, and its empty check set already yields only conservative directives.
+            let outcome = if answers.is_some() {
+                if let Some(tap) = &self.ensemble_tap {
+                    tap(&cycle);
+                }
+                Some(
+                    self.resolve_ensemble(state, &job, ls, &registry, &questions, &cycle)
+                        .await?,
+                )
+            } else {
+                self.emit(
+                    state,
+                    EventKind::EnsembleResolved,
+                    serde_json::to_value(EnsembleResolvedPayload {
+                        enabled: cycle.settings.enabled,
+                        margin: cycle.settings.uncertainty_margin,
+                        unresolved: Vec::new(),
+                        rungs: Vec::new(),
+                        cycle: None,
+                        checks: Vec::new(),
+                    })
+                    .unwrap_or(serde_json::Value::Null),
+                )
+                .await?;
+                None
+            };
+            let resolved_checks = match &outcome {
+                Some(Ok(outcome)) => outcome.checks.clone(),
+                Some(Err(())) => cycle.held(),
+                None => cycle.checks.clone(),
+            };
+            let outcome = outcome.and_then(Result::ok);
+
+            // ---- arbitrate ---------------------------------------------------
+            //
+            // Over the resolved checks and the same materialised input. An ensemble
+            // escalation enters as one more proposal (`core.ensemble:escalate`), so policy
+            // — not this loop — decides whether it pre-empts what would otherwise run.
             let decision = {
-                let input = PolicyInput {
-                    status: state.status,
-                    counters: &state.counters,
-                    config: &self.deps.config,
-                    checks: &checks,
-                    observation: &observation,
-                    now: self.now(),
-                    active_worker: state.active_worker(),
-                    last_directive: ls.last_directive.as_ref(),
-                    ensemble_enabled: self.deps.ensemble_enabled,
-                    steering_grace: self.deps.steering_grace,
+                let input = cycle.policy_input(&resolved_checks);
+                let proposals = match &outcome {
+                    Some(outcome) => aftman_core::ensemble::propose(&registry, &input, outcome),
+                    None => registry.propose(&input),
                 };
                 arbitrate(&input, &proposals)
             };
-
-            // S0: the ensemble is types-and-plumbing only. Every check keeps its
-            // baseline resolution, and the invariant list is still reported so the
-            // log shows what the band would have done.
-            self.emit(
-                state,
-                EventKind::EnsembleResolved,
-                json!({
-                    "enabled": self.deps.ensemble_enabled,
-                    "margin": self.deps.uncertainty_margin,
-                    "unresolved": checks.iter().filter(|(_, v)| v.is_unresolved()).map(|(k, _)| k.to_string()).collect::<Vec<_>>(),
-                    "rungs": Vec::<Rung>::new(),
-                }),
-            )
-            .await?;
+            let escalated = outcome
+                .as_ref()
+                .filter(|outcome| outcome.is_escalation(&decision.selected))
+                .map(EscalatedChecks::from_outcome)
+                .unwrap_or_default();
 
             for proposal in &decision.considered {
                 self.emit(
@@ -1086,7 +1135,7 @@ impl FactoryRuntime {
             )
             .await?;
 
-            state.checks = checks;
+            state.checks = resolved_checks;
             state.counters.assessments = ls.assessments;
             state.last_directive = Some(decision.selected.clone());
 
@@ -1094,12 +1143,11 @@ impl FactoryRuntime {
             //
             // A `Finish` selected on evidence that has not been refreshed is exactly the
             // case `run_when = "before_finish"` exists for. Run those providers and judge
-            // again, rather than finishing on a claim.
+            // again, rather than finishing on a claim. A provisional `Finish` is never
+            // applied: if collecting the evidence fails, the error ends the run here, and
+            // nothing below runs.
             let selected = decision.selected.clone();
-            if matches!(selected, Directive::Finish { .. })
-                && !ls.before_finish_ran
-                && !self.deps.evidence.due(RunWhen::BeforeFinish).is_empty()
-            {
+            if matches!(selected, Directive::Finish { .. }) && cycle.finish_is_provisional {
                 ls.before_finish_ran = true;
                 self.collect_evidence(
                     state,
@@ -1120,7 +1168,14 @@ impl FactoryRuntime {
             }
 
             ls.worker = self
-                .apply(state, &job, selected, ls.worker.take(), &observation)
+                .apply(
+                    state,
+                    &job,
+                    selected,
+                    ls.worker.take(),
+                    &cycle.observation,
+                    &escalated,
+                )
                 .await?;
             // A directive that neither ended the run nor parked it leaves the run
             // supervising, so return to `Running`.
@@ -2006,7 +2061,7 @@ impl FactoryRuntime {
         trigger: RunWhen,
         outcomes: &mut Vec<EvidenceOutcome>,
     ) -> Result<(), RuntimeError> {
-        let due: Vec<aftman_core::evidence::CommandProvider> = self
+        let due: Vec<CommandProvider> = self
             .deps
             .evidence
             .due(trigger)
@@ -2014,39 +2069,168 @@ impl FactoryRuntime {
             .cloned()
             .collect();
         for provider in due {
-            // Evidence runs with the same forwarded environment as the worker, so a
-            // test command finds the same `python` or `node` the agent did. Without
-            // this a provider would run with the daemon's `PATH` and could fail on a
-            // toolchain the worker had no trouble with.
-            let forwarded: Vec<(String, String)> = self
-                .deps
-                .forwarded_env
-                .iter()
-                .map(|(name, value)| (name.clone(), value.clone()))
-                .collect();
-            let outcome = aftman_workers::run_provider(
-                &provider,
-                &job.repo,
-                &self.deps.evidence_temp_dir,
-                &forwarded,
-                self.now(),
-            )
-            .await;
-            let payload = json!({
-                "provider": outcome.provider.to_string(),
-                "argv": outcome.argv,
-                "exit_code": outcome.exit_code,
-                "success": outcome.success,
-                "duration_ms": outcome.duration.as_millis() as u64,
-                "truncated": outcome.truncated,
-                "launch_error": outcome.launch_error,
-                "summary": outcome.summary(),
-            });
-            keep_latest(outcomes, outcome);
-            self.emit(state, EventKind::EvidenceCollected, payload)
+            self.run_one_provider(state, job, &provider, outcomes)
                 .await?;
         }
         Ok(())
+    }
+
+    /// Run one provider and record it: its outcome replaces the provider's previous one in
+    /// `outcomes`, and one `EVIDENCE_COLLECTED` is appended. Returns its exit code, `None`
+    /// when it could not be launched or was killed.
+    ///
+    /// The only way the runtime runs a command provider, for a trigger and for an evidence
+    /// refresh alike, so both get the same scrubbed environment and bounds.
+    async fn run_one_provider(
+        &self,
+        state: &mut RunState,
+        job: &Job,
+        provider: &CommandProvider,
+        outcomes: &mut Vec<EvidenceOutcome>,
+    ) -> Result<Option<i32>, RuntimeError> {
+        // Evidence runs with the same forwarded environment as the worker, so a
+        // test command finds the same `python` or `node` the agent did. Without
+        // this a provider would run with the daemon's `PATH` and could fail on a
+        // toolchain the worker had no trouble with. `run_provider` builds the child's
+        // environment through `worker_environment()`, which scrubs it again.
+        let forwarded: Vec<(String, String)> = self
+            .deps
+            .forwarded_env
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        let outcome = aftman_workers::run_provider(
+            provider,
+            &job.repo,
+            &self.deps.evidence_temp_dir,
+            &forwarded,
+            self.now(),
+        )
+        .await;
+        let payload = json!({
+            "provider": outcome.provider.to_string(),
+            "argv": outcome.argv,
+            "exit_code": outcome.exit_code,
+            "success": outcome.success,
+            "duration_ms": outcome.duration.as_millis() as u64,
+            "truncated": outcome.truncated,
+            "launch_error": outcome.launch_error,
+            "summary": outcome.summary(),
+        });
+        let exit_code = outcome.exit_code;
+        keep_latest(outcomes, outcome);
+        self.emit(state, EventKind::EvidenceCollected, payload)
+            .await?;
+        Ok(exit_code)
+    }
+
+    /// Plan and resolve this cycle's ensemble over `cycle`, emitting its events in `seq`
+    /// order: `ENSEMBLE_TRIGGERED` per triggered check, whatever the source emits while it
+    /// works (`EVIDENCE_COLLECTED`, `OPINION_REQUESTED`), then `OPINION_RECORDED` per
+    /// opinion and one `ENSEMBLE_RESOLVED`. Stores the updated counters in `state`.
+    ///
+    /// `Ok(Err(()))` is a cycle the ensemble could not resolve — a plan refused as built
+    /// over a different baseline or context, which is an internal error — recorded as an
+    /// `ERROR` event; the caller holds every check, so the cycle is conservative. `Err` is
+    /// a store failure, fatal as anywhere else.
+    async fn resolve_ensemble(
+        &self,
+        state: &mut RunState,
+        job: &Job,
+        ls: &mut Loop,
+        registry: &ResponsibilityRegistry,
+        questions: &BTreeMap<CheckKey, Question>,
+        cycle: &EnsembleCycle,
+    ) -> Result<Result<EnsembleOutcome, ()>, RuntimeError> {
+        let input = cycle.policy_input(&cycle.checks);
+        let ctx = cycle.context(&input, registry);
+        let resolved = match EnsemblePlan::build(&ctx) {
+            Ok(plan) => {
+                for triggered in plan.triggered() {
+                    self.emit(
+                        state,
+                        EventKind::EnsembleTriggered,
+                        serde_json::to_value(triggered.triggered_payload())
+                            .unwrap_or(serde_json::Value::Null),
+                    )
+                    .await?;
+                }
+                let source = CycleSource {
+                    rt: self,
+                    job,
+                    questions,
+                    definitions: &cycle.definitions,
+                    timeout: Duration::from_secs(cycle.settings.opinion_timeout_seconds),
+                    scratch: tokio::sync::Mutex::new(Scratch {
+                        state: &mut *state,
+                        ls: &mut *ls,
+                        fatal: None,
+                    }),
+                };
+                let resolved = plan.resolve(&ctx, &source).await;
+                if let Some(error) = source.scratch.into_inner().fatal {
+                    return Err(error);
+                }
+                resolved
+            }
+            Err(error) => Err(error),
+        };
+        let margin = cycle.settings.uncertainty_margin;
+        match resolved {
+            Ok(outcome) => {
+                for record in &outcome.records {
+                    for payload in record.opinion_recorded_payloads() {
+                        self.emit(
+                            state,
+                            EventKind::OpinionRecorded,
+                            serde_json::to_value(payload).unwrap_or(serde_json::Value::Null),
+                        )
+                        .await?;
+                    }
+                }
+                self.emit(
+                    state,
+                    EventKind::EnsembleResolved,
+                    serde_json::to_value(outcome.resolved_payload(cycle.settings.enabled, margin))
+                        .unwrap_or(serde_json::Value::Null),
+                )
+                .await?;
+                state.ensemble = outcome.counters.clone();
+                Ok(Ok(outcome))
+            }
+            Err(error) => {
+                tracing::error!(run_id = %state.header.id, %error, "the ensemble could not resolve a cycle");
+                self.emit(
+                    state,
+                    EventKind::Error,
+                    json!({
+                        "code": "ensemble_unresolved",
+                        "message": error.to_string(),
+                    }),
+                )
+                .await?;
+                let held = cycle.held();
+                self.emit(
+                    state,
+                    EventKind::EnsembleResolved,
+                    serde_json::to_value(EnsembleResolvedPayload {
+                        enabled: cycle.settings.enabled,
+                        margin,
+                        unresolved: held
+                            .iter()
+                            .filter(|(_, rc)| rc.is_unresolved())
+                            .map(|(key, _)| key.clone())
+                            .collect(),
+                        rungs: Vec::new(),
+                        cycle: None,
+                        checks: Vec::new(),
+                    })
+                    .unwrap_or(serde_json::Value::Null),
+                )
+                .await?;
+                Ok(Err(()))
+            }
+        }
     }
 
     /// Spawn a worker as an independent task.
@@ -2151,6 +2335,7 @@ impl FactoryRuntime {
         directive: Directive,
         worker: Option<WorkerHandle>,
         observation: &Observation,
+        escalated: &EscalatedChecks,
     ) -> Result<Option<WorkerHandle>, RuntimeError> {
         match directive {
             Directive::Continue => Ok(worker),
@@ -2255,34 +2440,332 @@ impl FactoryRuntime {
             Directive::Escalate { reason, ask } => {
                 let escalation_id = EscalationId::new();
                 let kind = escalation_kind(&reason);
+                // An ensemble escalation names its checks, so that the answer can be
+                // recorded against each (`docs/06-ensemble.md` §4 R3). Any other has none.
+                let check = escalated.checks.first().cloned();
+                let jev_p = check
+                    .as_ref()
+                    .and_then(|key| state.checks.get(key))
+                    .and_then(|rc| rc.jev_p);
                 let escalation = Escalation {
                     id: escalation_id,
                     kind,
                     raised_at: self.now(),
-                    check: None,
-                    ensemble_checks: Vec::new(),
+                    check,
+                    ensemble_checks: escalated.checks.clone(),
                     ask: ask.clone(),
-                    jev_p: None,
-                    opinions: Vec::new(),
+                    jev_p,
+                    opinions: escalated.opinions.clone(),
                     answered: None,
                 };
                 state.escalations.push(escalation);
-                self.emit(
-                    state,
-                    EventKind::EscalationRaised,
-                    json!({
-                        // The id a surface needs to answer with (`run.answer`).
-                        "escalation_id": escalation_id.to_string(),
-                        "kind": kind,
-                        "reason": reason,
-                        "ask": ask,
-                    }),
-                )
-                .await?;
+                let mut payload = json!({
+                    // The id a surface needs to answer with (`run.answer`).
+                    "escalation_id": escalation_id.to_string(),
+                    "kind": kind,
+                    "reason": reason,
+                    "ask": ask,
+                });
+                if !escalated.checks.is_empty() {
+                    payload["checks"] = json!(
+                        escalated
+                            .checks
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                    );
+                }
+                self.emit(state, EventKind::EscalationRaised, payload)
+                    .await?;
                 self.transition(state, FactoryStatus::NeedsHuman).await?;
                 Ok(worker)
             }
         }
+    }
+}
+
+/// The event kind for a failed model call. A rate limit is a different operational
+/// event from a malformed answer, and a budget refusal is neither, so they are distinct
+/// kinds rather than one `Error` with a code inside.
+fn model_error_kind(error: &ModelError) -> EventKind {
+    if matches!(error, ModelError::BudgetExceeded(_)) {
+        EventKind::BudgetExceeded
+    } else if matches!(error, ModelError::RateLimited { .. }) {
+        EventKind::RateLimited
+    } else {
+        EventKind::ModelError
+    }
+}
+
+fn model_error_payload(error: &ModelError) -> serde_json::Value {
+    json!({
+        "code": error.code(),
+        "message": error.to_string(),
+        "retryable": error.is_retryable(),
+    })
+}
+
+/// What an `Escalate` selected this cycle is about, when it is the ensemble's.
+#[derive(Debug, Default)]
+struct EscalatedChecks {
+    checks: Vec<CheckKey>,
+    opinions: Vec<aftman_core::assessment::Opinion>,
+}
+
+impl EscalatedChecks {
+    fn from_outcome(outcome: &EnsembleOutcome) -> Self {
+        let checks = outcome.escalated_checks();
+        let opinions = outcome
+            .records
+            .iter()
+            .filter(|record| checks.contains(&record.check))
+            .flat_map(|record| record.opinions.iter().map(|keyed| keyed.opinion.clone()))
+            .collect();
+        Self { checks, opinions }
+    }
+}
+
+/// Why R2 has no answer in this release.
+const REFRAME_UNAVAILABLE: &str =
+    "the same-model reframe (R2) is ensemble stage S2 and is not available in this release";
+
+/// The runtime's [`OpinionSource`] for one cycle (`docs/06-ensemble.md` §4 R0).
+///
+/// An evidence refresh runs exactly the providers requested, through the same path as
+/// every other provider ([`FactoryRuntime::run_one_provider`]: the scrubbed environment,
+/// the bounds, one `EVIDENCE_COLLECTED` each), rebuilds the observation with what they
+/// produced, and asks the model that check's question again under
+/// [`Purpose::Refresh`]. The call is billed like any other (the provider writes its usage
+/// line) and counts against `max_assessments` and the request budget. A failed or refused
+/// call, a spent budget, and the `opinion_timeout_seconds` deadline are outcomes with no
+/// value, never errors.
+///
+/// It emits from inside the resolution, so it holds the run state behind a lock: one call
+/// at a time, each event appended to the store before it reaches the hub, in `seq` order
+/// (`docs/02-lld.md` §11). A store failure is fatal to the run; it is kept in `fatal`, the
+/// call answers with no value, and the runtime returns the error once `resolve` is done.
+struct CycleSource<'a> {
+    rt: &'a FactoryRuntime,
+    job: &'a Job,
+    questions: &'a BTreeMap<CheckKey, Question>,
+    definitions: &'a [aftman_core::responsibility::Check],
+    timeout: Duration,
+    scratch: tokio::sync::Mutex<Scratch<'a>>,
+}
+
+struct Scratch<'a> {
+    state: &'a mut RunState,
+    ls: &'a mut Loop,
+    fatal: Option<RuntimeError>,
+}
+
+impl CycleSource<'_> {
+    /// What the model is shown when a check's question is asked again: the cycle's usual
+    /// selection plus the check's own, so command evidence it names is in the state.
+    fn selection(&self, check: &CheckKey) -> Vec<String> {
+        let mut selection = aftman_core::observation::default_evidence();
+        if let Some(definition) = self.definitions.iter().find(|c| c.key == *check) {
+            for entry in aftman_core::observation::evidence_selection(definition) {
+                if !selection.contains(&entry) {
+                    selection.push(entry);
+                }
+            }
+        }
+        selection
+    }
+
+    async fn refresh(
+        &self,
+        scratch: &mut Scratch<'_>,
+        request: &RefreshRequest,
+        runs: &mut Vec<ProviderRun>,
+    ) -> Result<RefreshOutcome, RuntimeError> {
+        let no_value = |runs: &[ProviderRun], error: String| RefreshOutcome {
+            runs: runs.to_vec(),
+            new_p: None,
+            error: Some(error),
+        };
+        // The refresh's model call is an assessment for the budget's purposes; with the
+        // budget spent, running the commands would buy evidence nobody may read.
+        if scratch.ls.assessments >= self.rt.deps.config.max_assessments {
+            return Ok(no_value(
+                runs,
+                format!(
+                    "the assessment budget ({}) is spent; nothing was run",
+                    self.rt.deps.config.max_assessments
+                ),
+            ));
+        }
+        for id in &request.providers {
+            let Some(provider) = self
+                .rt
+                .deps
+                .evidence
+                .providers()
+                .iter()
+                .find(|provider| provider.id == *id)
+                .cloned()
+            else {
+                continue;
+            };
+            let exit_code = self
+                .rt
+                .run_one_provider(
+                    scratch.state,
+                    self.job,
+                    &provider,
+                    &mut scratch.ls.evidence_outcomes,
+                )
+                .await?;
+            runs.push(ProviderRun {
+                provider: id.clone(),
+                exit_code,
+            });
+        }
+        if !runs.iter().any(|run| run.exit_code.is_some()) {
+            return Ok(no_value(
+                runs,
+                "no requested provider ran, so there is no fresh evidence to ask about".into(),
+            ));
+        }
+        let Some(question) = self.questions.get(&request.check) else {
+            return Ok(no_value(runs, "the check has no question".into()));
+        };
+
+        // The observation, rebuilt with the fresh evidence, exactly as a cycle builds it.
+        let run_id = scratch.state.header.id;
+        let summaries = self
+            .rt
+            .recent_event_summaries(run_id, scratch.state.last_seq)
+            .await;
+        let most_recent = scratch.state.workers.last().cloned();
+        let observation = self
+            .rt
+            .builder
+            .build(
+                scratch.state,
+                self.job,
+                most_recent.as_ref(),
+                summaries,
+                &scratch.ls.evidence_outcomes,
+                self.rt.now(),
+            )
+            .await;
+        let state_json = observation.state_for(&self.selection(&request.check));
+        let questions = BTreeMap::from([(request.check.clone(), question.clone())]);
+
+        scratch.ls.assessments += 1;
+        scratch.state.counters.assessments = scratch.ls.assessments;
+        match self
+            .rt
+            .deps
+            .model
+            .ask(
+                &aftman_core::model::AskContext::for_run(Purpose::Refresh, run_id, request.cycle),
+                &state_json,
+                &questions,
+                &self.rt.deps.jev_budget,
+            )
+            .await
+        {
+            Ok(answers) => {
+                let new_p = answers
+                    .answers
+                    .get(&request.check)
+                    .and_then(aftman_core::assessment::AnswerValue::as_noul);
+                Ok(RefreshOutcome {
+                    runs: runs.clone(),
+                    new_p,
+                    error: new_p
+                        .is_none()
+                        .then(|| "the model gave no probability for the check".to_owned()),
+                })
+            }
+            Err(error) => {
+                let mut payload = model_error_payload(&error);
+                payload["purpose"] = json!("refresh");
+                payload["check"] = json!(request.check.to_string());
+                self.rt
+                    .emit(scratch.state, model_error_kind(&error), payload)
+                    .await?;
+                Ok(no_value(runs, format!("the refresh call failed: {error}")))
+            }
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl OpinionSource for CycleSource<'_> {
+    async fn refresh_evidence(
+        &self,
+        request: &RefreshRequest,
+    ) -> Result<RefreshOutcome, SourceError> {
+        let mut guard = self.scratch.lock().await;
+        let scratch = &mut *guard;
+        if scratch.fatal.is_some() {
+            return Ok(RefreshOutcome {
+                runs: Vec::new(),
+                new_p: None,
+                error: Some("the run is ending".into()),
+            });
+        }
+        let mut runs = Vec::new();
+        let result =
+            tokio::time::timeout(self.timeout, self.refresh(scratch, request, &mut runs)).await;
+        Ok(match result {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(error)) => {
+                scratch.fatal = Some(error);
+                RefreshOutcome {
+                    runs,
+                    new_p: None,
+                    error: Some("the run is ending".into()),
+                }
+            }
+            Err(_) => RefreshOutcome {
+                runs,
+                new_p: None,
+                error: Some(format!(
+                    "the refresh did not finish within {}s",
+                    self.timeout.as_secs()
+                )),
+            },
+        })
+    }
+
+    async fn reframe_same_model(
+        &self,
+        request: &ReframeRequest,
+    ) -> Result<ReframeAnswer, SourceError> {
+        let mut guard = self.scratch.lock().await;
+        let scratch = &mut *guard;
+        if scratch.fatal.is_none() {
+            let payload = OpinionRequestedPayload::new(request, "jev", "", "", "");
+            if let Err(error) = self
+                .rt
+                .emit(
+                    scratch.state,
+                    EventKind::OpinionRequested,
+                    serde_json::to_value(payload).unwrap_or(serde_json::Value::Null),
+                )
+                .await
+            {
+                scratch.fatal = Some(error);
+            }
+        }
+        // No call is made: an answer with no value, which the resolver reads as an
+        // abstention (or, for an irreversible action, a contest). Never a confirm.
+        Ok(ReframeAnswer {
+            p_negated: None,
+            source: "jev".into(),
+            model: String::new(),
+            excerpt: String::new(),
+            prompt_hash: String::new(),
+            state_digest: String::new(),
+            latency: Duration::ZERO,
+            usage: aftman_core::model::Usage::default(),
+            error: Some(REFRAME_UNAVAILABLE.into()),
+        })
     }
 }
 
@@ -2292,7 +2775,9 @@ fn round4(value: f32) -> f64 {
 }
 
 fn escalation_kind(reason: &str) -> EscalationKind {
-    if reason.contains("model_unavailable") {
+    if reason.starts_with(aftman_core::ensemble::ESCALATION_REASON_PREFIX) {
+        EscalationKind::Check
+    } else if reason.contains("model_unavailable") {
         EscalationKind::ModelUnavailable
     } else if reason.contains("budget") {
         EscalationKind::AssessmentBudget
@@ -2386,12 +2871,6 @@ pub fn render_proposals(proposals: &[Proposal]) -> Vec<String> {
 #[must_use]
 pub fn steer_was_accepted(outcome: &SteerOutcome) -> bool {
     outcome.is_accepted()
-}
-
-/// Convenience for building a runtime with a simulation-friendly default set.
-#[must_use]
-pub fn default_margin() -> f32 {
-    aftman_core::assessment::DEFAULT_UNCERTAINTY_MARGIN
 }
 
 #[cfg(test)]

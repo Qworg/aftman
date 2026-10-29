@@ -669,7 +669,8 @@ Payloads added for the control plane (every payload also carries `schema_version
 | `WorkerSteered` | `source` (`supervisor` \| `human`), `worker_id`, `outcome`, `accepted`, and for a human steer `excerpt` (≤ 200 chars). |
 | `WorkerCompleted` | `worker_id`, `outcome`, `success` (about the **exit code**), `empty` (about whether it said anything: no prose, no tool calls and no tokens for a structured backend; no output at all for one without a stream). The two are different questions — a worker that exits 0 having done nothing is not a completed job — and a surface should show both. See [10-live-validation.md](10-live-validation.md) step 2 for the case that motivated it. |
 | `WorkerTerminated` | Uniform: `worker_id`, `cause` (`stopped` for a `Stop` directive, `cancelled`, `superseded` for a `Retry`, `run_ended` when the run ended with a worker still live), `reason`. A worker that had already completed when its stop was seen is recorded by `WorkerCompleted` instead. |
-| `EscalationRaised` | `escalation_id` (what `run.answer` needs), `kind`, `reason`, `ask`. |
+| `EscalationRaised` | `escalation_id` (what `run.answer` needs), `kind`, `reason`, `ask`, and for an ensemble escalation `checks` (the keys it is about; absent otherwise). |
+| `EnsembleTriggered`, `OpinionRequested`, `OpinionRecorded`, `EnsembleResolved` | The `aftman_core::ensemble` payload types (doc 06 §8). One assessed cycle appends, in `seq` order: `AssessmentCompleted`; one `EnsembleTriggered` per triggered check; whatever the ensemble's source appends while it works (`EvidenceCollected` per refreshed provider, `ModelError`/`RateLimited`/`BudgetExceeded` with `purpose: "refresh"` for a failed refresh call, `OpinionRequested`); one `OpinionRecorded` per opinion; one `EnsembleResolved`; then `DirectiveProposed`… and `DirectiveSelected`. A cycle with no answers (a failed or refused model call) appends one `EnsembleResolved` with no `cycle` and no `checks`. |
 | `EscalationAnswered` | `escalation_id`, `surface`, `decision` (the serialized `HumanDecision`), `note` (≤ 2000 chars). |
 | `Notification` (`code: "guidance_not_delivered"`) | A `Guidance` answer with no active worker to receive it; recorded, not an error. |
 | `RunFinished` | `status`, counts, and `reason` when something stated one (a cancel's reason, `"stopped by operator"`). |
@@ -1021,7 +1022,11 @@ indistinguishable duplicates. A second `subscription.open` replaces the first
 The exactly-once guarantee rests on one precondition that binds **every writer of a run's
 events** — the runtime, the daemon's failure marking, restart recovery, and the embedded
 `--no-daemon` path alike: an event is appended to the store *before* it is emitted to the hub, and
-a run's events are emitted in `seq` order with none skipped. A subscriber is registered for live
+a run's events are emitted in `seq` order with none skipped. The ensemble's evidence refresh
+(doc 06 §4 R0) writes from inside a resolution; it holds the run state behind one lock for the
+whole resolution and appends through the runtime's own `emit`, so it is the same writer, one
+event at a time, and a store failure there ends the run as it would anywhere else. A subscriber
+is registered for live
 delivery before its backlog is read, so anything it does not find in the log arrives live, and the
 overlap is dropped by `seq`. A writer that emitted before appending, or appended an event it never
 emitted, would produce a gap no client could detect from the stream alone.

@@ -418,8 +418,7 @@ fn runtime_for(
         evidence_temp_dir: temp,
         clock: Arc::new(TokioClock::new()),
         sink: sink as Arc<dyn aftman_daemon::EventSink>,
-        ensemble_enabled: false,
-        uncertainty_margin: 0.15,
+        ensemble: Default::default(),
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
 
@@ -1883,8 +1882,7 @@ async fn a_finish_that_lands_after_the_timeout_is_not_failed() -> TestResult {
             jump_secs: Arc::clone(&jump),
         }),
         sink: Arc::new(JumpOnFinish { jump_secs: jump }),
-        ensemble_enabled: false,
-        uncertainty_margin: 0.15,
+        ensemble: Default::default(),
         steering_grace: Duration::from_secs(30),
         launch: Default::default(),
 

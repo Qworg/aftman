@@ -968,6 +968,23 @@ fn purge_responsibilities_usage_and_doctor() {
     let show = sb.run(&["responsibilities", "show", "core.completion"]);
     assert_eq!(show.code, 0, "{}", show.all());
     assert!(show.stdout.contains("ready_to_finish"), "{}", show.stdout);
+    // Which checks R2 can reframe is visible per check.
+    assert!(
+        show.stdout
+            .lines()
+            .any(|l| l.contains("ready_to_finish") && l.contains("reframable")),
+        "{}",
+        show.stdout
+    );
+    let health = sb.run(&["responsibilities", "show", "core.worker-health"]);
+    assert!(
+        health
+            .stdout
+            .lines()
+            .any(|l| l.contains("meaningful_progress") && !l.contains("reframable")),
+        "{}",
+        health.stdout
+    );
     assert_eq!(sb.run(&["responsibilities", "show", "no.such"]).code, 2);
     let usage = sb.run(&["usage", "--since", "7d"]);
     assert_eq!(usage.code, 0, "{}", usage.all());
@@ -978,6 +995,13 @@ fn purge_responsibilities_usage_and_doctor() {
     assert_eq!(doctor.code, 2, "{}", doctor.all());
     assert!(doctor.stdout.contains("daemon"), "{}", doctor.stdout);
     assert!(doctor.stdout.contains(sb.socket.to_str().expect("utf-8")));
+    assert!(
+        doctor
+            .stdout
+            .contains("reframable  10 of 10 thresholded checks (R2)"),
+        "{}",
+        doctor.stdout
+    );
     assert!(
         doctor.stdout.contains("reachable   no"),
         "{}",

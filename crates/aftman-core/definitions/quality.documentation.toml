@@ -17,6 +17,10 @@ When documentation is required by the original job, is the relevant documentatio
 accurate, and consistent with the implemented behavior?
 """
 min_threshold = 0.75
+negation = """
+Is documentation that the original job requires missing, incomplete, inaccurate, or out of step
+with the behavior that was implemented?
+"""
 
 # This responsibility has no runtime-aware logic, so its rule is expressed here. That is
 # the declarative path's purpose: a rule over check results, with no facts a condition

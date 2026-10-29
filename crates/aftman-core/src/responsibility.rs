@@ -33,6 +33,12 @@ pub struct Check {
     /// The threshold its band is measured against. `None` means the check cannot
     /// drive a threshold rule.
     pub threshold: Option<f32>,
+    /// The negated question, for ensemble R2 (`docs/06-ensemble.md` §4 R2): "not X",
+    /// written independently of `question`. `None` means the check cannot be reframed.
+    /// Always a `Noul` question, and only on a thresholded check (the definitions refuse
+    /// anything else).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub negation: Option<Question>,
 }
 
 impl Check {
@@ -50,7 +56,22 @@ impl Check {
             question,
             evidence: Vec::new(),
             threshold,
+            negation: None,
         }
+    }
+
+    /// With an independently written negated question, for R2.
+    #[must_use]
+    pub fn with_negation(mut self, instructions: impl Into<String>) -> Self {
+        self.negation = Some(Question::noul(instructions));
+        self
+    }
+
+    /// Whether R2 can be asked about this check: it has a negated question and a
+    /// threshold to compare against.
+    #[must_use]
+    pub fn reframable(&self) -> bool {
+        self.negation.is_some() && self.threshold.is_some()
     }
 
     #[must_use]

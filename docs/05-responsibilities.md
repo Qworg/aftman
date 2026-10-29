@@ -54,18 +54,30 @@ instructions = """
 Is the implementation work required by the original job complete?
 """
 min_threshold = 0.75
+negation = """
+Does implementation work that the original job requires remain unfinished: missing, partly
+done, or stubbed out?
+"""
 
 [checks.requirements_satisfied]
 instructions = """
 Does the current repository satisfy the original free-form job as a whole?
 """
 min_threshold = 0.75
+negation = """
+Does the current repository fall short of the original free-form job in some respect that
+matters: a requirement missing, only partly met, or contradicted by what was built?
+"""
 
 [checks.ready_to_finish]
 instructions = """
 Given all evidence, is the factory job ready to be declared complete?
 """
 min_threshold = 0.75
+negation = """
+Given all evidence, does the factory job still need more work before it can be declared
+complete?
+"""
 ```
 
 ```toml
@@ -78,12 +90,18 @@ instructions = """
 Does the work have sufficient relevant test coverage and passing verification?
 """
 min_threshold = 0.75
+negation = """
+Is the work missing relevant test coverage, or is its verification failing or absent?
+"""
 
 [checks.needs_verification]
 instructions = """
 Does the current state warrant an independent verification pass before finishing?
 """
 min_threshold = 0.65
+negation = """
+Could the work be closed safely as it stands, with no independent verification pass first?
+"""
 ```
 
 ```toml
@@ -101,12 +119,20 @@ instructions = """
 Does the active or most recent worker appear stuck, looping, or unable to advance?
 """
 min_threshold = 0.80
+negation = """
+Is the active or most recent worker moving forward, each step building on the last rather than
+repeating itself or stalling? Answer yes when no worker has run.
+"""
 
 [checks.work_off_track]
 instructions = """
 Is the current work drifting from the original job or making unrelated changes?
 """
 min_threshold = 0.80
+negation = """
+Is every change in the current work in service of the original job, with nothing unrelated
+added? Answer yes when no work has been done yet.
+"""
 
 [settings]
 steering_enabled       = true
@@ -124,6 +150,10 @@ instructions = """
 Does this situation require human judgment, credentials, clarification, or permission?
 """
 min_threshold = 0.80
+negation = """
+Can the work go on to completion without a person: no credential, permission, clarification,
+or judgment call that only a human can supply?
+"""
 ```
 
 ```toml
@@ -138,6 +168,11 @@ repository work materially inconsistent with those repository instructions? Answ
 AGENTS.md instructions are present or the evidence is insufficient.
 """
 min_threshold = 0.80
+negation = """
+Is the active or most recent worker's behavior and repository work consistent with the
+repository's AGENTS.md instructions? Answer yes when no AGENTS.md instructions are present or
+the evidence is insufficient to show a material inconsistency.
+"""
 
 [settings]
 instruction_files = ["AGENTS.override.md", "AGENTS.md"]
@@ -159,6 +194,10 @@ When documentation is required by the original job, is the relevant documentatio
 accurate, and consistent with the implemented behavior?
 """
 min_threshold = 0.75
+negation = """
+Is documentation that the original job requires missing, incomplete, inaccurate, or out of step
+with the behavior that was implemented?
+"""
 ```
 
 ### 1.2 Why `agents_md_drift` is phrased that way
@@ -169,6 +208,30 @@ but to emit an uninformative middling probability, which then sits near the 0.80
 produces spurious steering. Phrasing a check so that "not applicable" resolves decisively is a
 general rule for this system: **every check must have a well-defined answer when its evidence is
 absent.**
+
+### 1.3 Negations, and why each is written by hand
+
+Every thresholded bundled check carries a `negation`: the opposite claim, asked as a question of its
+own, for the ensemble's same-model reframe (R2, [06-ensemble.md §4](06-ensemble.md)). R2 asks Jev
+the negation over the same state and contests the check when `p(X)` and `1 − p(¬X)` disagree by
+more than `framing_tolerance`: an answer that moves when only the phrasing moved is not one to act
+on irreversibly.
+
+That only works if the negation really is a different question. It is therefore never generated
+— not by prefixing "is it false that", not by any string manipulation — because a model reads a
+wrapped question as the same question with a sign flipped, and gives the same answer the same
+way. Each negation asks the opposite claim in its own words (`ready_to_finish`: "does the factory
+job still need more work before it can be declared complete?"), and each keeps the original's
+not-applicable case pointing the opposite way (`agents_md_drift`: "answer **yes** when no AGENTS.md
+instructions are present"), so the two answers stay complementary when the evidence is absent
+(§1.2). A negation must not add a condition the question does not have: `tests_sufficient`'s does
+not ask whether the evidence is a claim — that is R0's question, not a framing one.
+
+`aftman responsibilities show <id>` marks each reframable check, and `aftman doctor` reports how
+many thresholded checks are reframable (`reframable  10 of 10 thresholded checks (R2)` for the
+bundled set) and names any that are not. An operator's overriding definition that drops a negation
+makes that check unreframable: R2 then stands aside for it, exactly as it does when the rung is not
+configured.
 
 ## 2. TOML schema
 
@@ -187,6 +250,7 @@ min_threshold = 0.75      # optional; omitted ⇒ check cannot drive a threshold
 primitive = "noul"        # noul (default) | choice | score
 criteria = { ... }        # required for choice; ordered array for score
 evidence = ["git_diff"]   # optional; empty ⇒ default provider set
+negation = "..."          # optional; "not X", written independently, for ensemble R2 (§2.2)
 
 [[rules]]                 # optional; advanced responsibilities
 id = "stop-when-stuck"
@@ -248,6 +312,12 @@ Validation rules (all fatal at load, never at assessment time):
 - `always = false` requires non-empty `routing_instructions`;
 - `evidence` entries must be unique, non-empty, and must name a known provider;
 - a `choice` check requires at least one criterion; a `score` check requires at least one level;
+- a question is bounded: `instructions` and `negation`, once normalized, are at most
+  `MAX_QUESTION_BYTES` (4,096) bytes each;
+- a `negation` (§1.3) is allowed only on a `noul` check that declares `min_threshold` — R2 compares
+  two probabilities against a threshold, and nothing else has one — must not be empty, and must
+  not contain the check's own `instructions` (a question wrapped in "not" is the same question).
+  Only a check with a negation is reframable by R2;
 - `propose` must be one of the directive names; `stakes = "high"` opts the rule into
   [06-ensemble.md](06-ensemble.md);
 - unknown keys anywhere are errors (`deny_unknown_fields`), so a typo fails loudly;

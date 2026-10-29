@@ -8,9 +8,15 @@ instructions = """
 Does the work have sufficient relevant test coverage and passing verification?
 """
 min_threshold = 0.75
+negation = """
+Is the work missing relevant test coverage, or is its verification failing or absent?
+"""
 
 [checks.needs_verification]
 instructions = """
 Does the current state warrant an independent verification pass before finishing?
 """
 min_threshold = 0.65
+negation = """
+Could the work be closed safely as it stands, with no independent verification pass first?
+"""

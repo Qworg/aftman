@@ -182,7 +182,21 @@ pub struct CheckDefinition {
     /// Evidence providers this check selects. Empty means the default set.
     #[serde(default)]
     evidence: Option<Vec<String>>,
+    /// The negated question for ensemble R2 (`docs/06-ensemble.md` §4 R2): a separate,
+    /// independently written question for "not X", as text or structured JSON like
+    /// `instructions`. Never derived from `instructions` — no string manipulation can
+    /// produce a question that is independently phrased, and the point of R2 is to catch an
+    /// answer that depends on the phrasing. Optional; only a `noul` check with a
+    /// `min_threshold` may declare one, and a check without one cannot be reframed.
+    #[serde(default)]
+    negation: Option<DeclaredValue>,
 }
+
+/// The most bytes a check's question text may have, once normalized: its `instructions`,
+/// and its `negation`. Both reach the model verbatim, and every field that does is
+/// bounded (`AGENTS.md` rule 5). Enforced at load, so a definition that exceeds it fails
+/// loudly rather than being cut mid-sentence.
+pub const MAX_QUESTION_BYTES: usize = 4096;
 
 /// One rule, as declared.
 #[derive(Debug, Clone, Deserialize)]
@@ -339,6 +353,20 @@ impl ResponsibilityDefinition {
                     )));
                 }
             }
+            let question = check.instructions.as_ref().map(instruction_text);
+            if let Some(text) = &question
+                && text.len() > MAX_QUESTION_BYTES
+            {
+                return Err(invalid(format!(
+                    "check `{check_id}`: instructions are {} bytes; the most a question may \
+                     have is {MAX_QUESTION_BYTES}",
+                    text.len()
+                )));
+            }
+            if let Some(negation) = &check.negation {
+                validate_negation(check_id, primitive, check, question.as_deref(), negation)
+                    .map_err(invalid)?;
+            }
             if let Some(evidence) = &check.evidence {
                 if evidence.is_empty() || evidence.iter().any(|e| e.trim().is_empty()) {
                     return Err(invalid(format!(
@@ -432,6 +460,10 @@ impl ResponsibilityDefinition {
                 if let Some(evidence) = &definition.evidence {
                     check.evidence = evidence.iter().map(EvidenceId::new).collect();
                 }
+                check.negation = definition
+                    .negation
+                    .as_ref()
+                    .map(|negation| Question::noul(instruction_text(negation)));
                 check
             })
             .collect()
@@ -473,6 +505,56 @@ impl ResponsibilityDefinition {
                     .collect()
             })
     }
+}
+
+/// What a check's `negation` must be (`docs/05-responsibilities.md` §2).
+///
+/// R2 compares `p(X)` with `1 − p(¬X)`, so the negation only means something for a
+/// probability (`noul`) compared against a threshold. It must be its own question: not
+/// empty, within the bound every question has, not the question itself, and not the
+/// question wrapped in a "not" — a negation that contains the question verbatim was built
+/// from it, and a model reads it as the same question with a sign flipped.
+fn validate_negation(
+    check_id: &str,
+    primitive: &str,
+    check: &CheckDefinition,
+    question: Option<&str>,
+    negation: &DeclaredValue,
+) -> Result<(), String> {
+    if primitive != "noul" {
+        return Err(format!(
+            "check `{check_id}`: a `negation` is only meaningful for a `noul` check; R2 \
+             compares two probabilities, and a {primitive} answer is not one"
+        ));
+    }
+    if check.min_threshold.is_none() {
+        return Err(format!(
+            "check `{check_id}`: a `negation` needs a `min_threshold`; R2 guards a value a \
+             rule acts on, and a check with no threshold has no rule"
+        ));
+    }
+    let text = instruction_text(negation);
+    if text.trim().is_empty() {
+        return Err(format!("check `{check_id}`: `negation` is empty"));
+    }
+    if text.len() > MAX_QUESTION_BYTES {
+        return Err(format!(
+            "check `{check_id}`: `negation` is {} bytes; the most a question may have is \
+             {MAX_QUESTION_BYTES}",
+            text.len()
+        ));
+    }
+    if let Some(question) = question.map(str::to_lowercase)
+        && !question.trim().is_empty()
+        && text.to_lowercase().contains(question.trim())
+    {
+        return Err(format!(
+            "check `{check_id}`: `negation` contains the check's own question; write the \
+             opposite claim as its own question, with its own instructions, rather than \
+             negating the original"
+        ));
+    }
+    Ok(())
 }
 
 /// Settings each built-in understands. An unknown key is an error, so a typo does not
@@ -853,6 +935,92 @@ mod tests {
                 .is_none()
         );
         Ok(())
+    }
+
+    #[test]
+    fn every_thresholded_bundled_check_has_its_own_negation() -> TestResult {
+        // R2 (`docs/06-ensemble.md` §4) needs an independently written "not X" for every
+        // check a rule can act on. Each is its own question: never the question, never
+        // the question wrapped in a "not", never a bare "is it false that".
+        let set = DefinitionSet::bundled()?;
+        let mut reframable = 0;
+        for (id, definition) in &set.definitions {
+            for check in definition.checks(id) {
+                if check.threshold.is_none() {
+                    assert!(check.negation.is_none(), "{} has no threshold", check.key);
+                    continue;
+                }
+                assert!(check.reframable(), "{} has no negation", check.key);
+                let (
+                    crate::model::Question::Noul {
+                        instructions: question,
+                    },
+                    Some(crate::model::Question::Noul {
+                        instructions: negation,
+                    }),
+                ) = (&check.question, &check.negation)
+                else {
+                    panic!("{}: both questions must be noul", check.key);
+                };
+                assert_ne!(question, negation, "{}", check.key);
+                assert!(!negation.to_lowercase().contains(&question.to_lowercase()));
+                for lazy in ["is it false", "is it not the case", "not true that"] {
+                    assert!(
+                        !negation.to_lowercase().contains(lazy),
+                        "{}: {negation}",
+                        check.key
+                    );
+                }
+                assert!(negation.len() <= super::MAX_QUESTION_BYTES);
+                reframable += 1;
+            }
+        }
+        assert_eq!(reframable, 10, "the ten thresholded bundled checks");
+        Ok(())
+    }
+
+    #[test]
+    fn a_negation_is_refused_where_r2_cannot_use_it() {
+        let parse = |check: &str| {
+            ResponsibilityDefinition::parse("user.x", &format!("[checks.c]\n{check}\n"), "t")
+        };
+        // The good case loads, and carries the text.
+        let good = parse(
+            "instructions = \"Is the work done?\"\nmin_threshold = 0.7\n\
+             negation = \"Does work remain?\"",
+        );
+        assert!(good.is_ok(), "{good:?}");
+        let refused = [
+            // No threshold: nothing for R2 to guard.
+            "instructions = \"Is the work done?\"\nnegation = \"Does work remain?\"",
+            // Not a probability.
+            "instructions = \"Which?\"\nprimitive = \"choice\"\ncriteria = { a = \"A\" }\n\
+             min_threshold = 0.5\nnegation = \"Which not?\"",
+            // Empty.
+            "instructions = \"Is the work done?\"\nmin_threshold = 0.7\nnegation = \"  \"",
+            // Built from the question by string manipulation.
+            "instructions = \"Is the work done?\"\nmin_threshold = 0.7\n\
+             negation = \"Is it false that: is the work done?\"",
+            // A typo in the key is still an unknown field.
+            "instructions = \"Is the work done?\"\nmin_threshold = 0.7\nnegaton = \"x\"",
+        ];
+        for body in refused {
+            assert!(parse(body).is_err(), "should be refused: {body}");
+        }
+        // Bounded like the question, and the question is bounded too.
+        let long = "word ".repeat(super::MAX_QUESTION_BYTES / 4);
+        assert!(
+            parse(&format!(
+                "instructions = \"Is the work done?\"\nmin_threshold = 0.7\nnegation = \"{long}\""
+            ))
+            .is_err()
+        );
+        assert!(
+            parse(&format!(
+                "instructions = \"{long}\"\nmin_threshold = 0.7\nnegation = \"Does work remain?\""
+            ))
+            .is_err()
+        );
     }
 
     #[test]

@@ -38,5 +38,5 @@ pub use settings::{
 };
 pub use trigger::{
     CheckPlan, DecisiveDirectives, EnsembleContext, EnsembleError, EnsemblePlan, EnsembleTrigger,
-    refresh_providers, sees_command_evidence,
+    reframable_checks, refresh_providers, sees_command_evidence,
 };

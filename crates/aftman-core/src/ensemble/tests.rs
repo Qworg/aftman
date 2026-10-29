@@ -4859,3 +4859,39 @@ async fn two_finish_conjuncts_in_band_escalate_together() {
         );
     }
 }
+
+// ---- which checks are reframable ------------------------------------------------
+
+#[test]
+fn reframe_is_available_for_negated_checks_only_when_its_rung_is_configured() {
+    let checks = ResponsibilityRegistry::builtin().checks();
+    let on = super::reframable_checks(&EnsembleSettings::default(), &checks);
+    // Every thresholded bundled check carries a negation; `meaningful_progress` has no
+    // threshold and is not reframable.
+    let thresholded: BTreeSet<CheckKey> = checks
+        .iter()
+        .filter(|c| c.threshold.is_some())
+        .map(|c| c.key.clone())
+        .collect();
+    assert_eq!(on, thresholded);
+    assert!(!on.contains(&k(PROGRESS)));
+    // Without the rung, nothing is: a run that did not configure R2 never plans it.
+    let mut settings = EnsembleSettings::default();
+    settings
+        .rungs
+        .retain(|rung| *rung != Rung::ReframeSameModel);
+    assert!(super::reframable_checks(&settings, &checks).is_empty());
+    // A check without a negation is not reframable, whatever the rungs.
+    let plain = vec![Check::new(
+        &ResponsibilityId::new("user.x"),
+        "c",
+        crate::model::Question::noul("Is it done?"),
+        Some(0.7),
+    )];
+    assert!(super::reframable_checks(&EnsembleSettings::default(), &plain).is_empty());
+    let negated = vec![plain[0].clone().with_negation("Does work remain?")];
+    assert_eq!(
+        super::reframable_checks(&EnsembleSettings::default(), &negated).len(),
+        1
+    );
+}

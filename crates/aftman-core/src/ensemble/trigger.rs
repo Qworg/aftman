@@ -783,6 +783,23 @@ pub fn sees_command_evidence(selection: &[String], observation: &Observation) ->
     })
 }
 
+/// The checks R2 can be asked about (`EnsembleContext::reframe_available`): every check
+/// that carries an independently written negation and a threshold
+/// ([`Check::reframable`]), provided `reframe_same_model` is among the configured rungs.
+/// Empty otherwise: a run that has not configured R2 must not plan it. The runtime builds
+/// this once per cycle, from the same definitions it asks the questions from.
+#[must_use]
+pub fn reframable_checks(settings: &EnsembleSettings, checks: &[Check]) -> BTreeSet<CheckKey> {
+    if !settings.has(crate::assessment::Rung::ReframeSameModel) {
+        return BTreeSet::new();
+    }
+    checks
+        .iter()
+        .filter(|check| check.reframable())
+        .map(|check| check.key.clone())
+        .collect()
+}
+
 /// The providers an evidence refresh would run for a check: the ones its selection
 /// names (or all of them, for `command_evidence`) whose `run_when` is `on_demand` or
 /// `before_finish`, in configuration order.

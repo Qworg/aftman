@@ -13,15 +13,27 @@ instructions = """
 Is the implementation work required by the original job complete?
 """
 min_threshold = 0.75
+negation = """
+Does implementation work that the original job requires remain unfinished: missing, partly
+done, or stubbed out?
+"""
 
 [checks.requirements_satisfied]
 instructions = """
 Does the current repository satisfy the original free-form job as a whole?
 """
 min_threshold = 0.75
+negation = """
+Does the current repository fall short of the original free-form job in some respect that
+matters: a requirement missing, only partly met, or contradicted by what was built?
+"""
 
 [checks.ready_to_finish]
 instructions = """
 Given all evidence, is the factory job ready to be declared complete?
 """
 min_threshold = 0.75
+negation = """
+Given all evidence, does the factory job still need more work before it can be declared
+complete?
+"""

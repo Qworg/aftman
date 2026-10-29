@@ -80,12 +80,19 @@ pub fn responsibilities_show(ctx: &Ctx, id: &str) -> Result<u8, CliError> {
     }
     outln!("checks")?;
     for check in definition.checks(id) {
+        // `reframable`: the check carries an independently written negation, so the
+        // ensemble's same-model reframe (R2) can be asked about it (docs/06-ensemble.md §4).
         outln!(
-            "  {:<24} threshold {}",
+            "  {:<24} threshold {:<5} {}",
             check.id.as_str(),
             check
                 .threshold
-                .map_or_else(|| "-".to_owned(), |t| format!("{t:.2}"))
+                .map_or_else(|| "-".to_owned(), |t| format!("{t:.2}")),
+            if check.reframable() {
+                "reframable"
+            } else {
+                "-"
+            }
         )?;
     }
     if !definition.rules.is_empty() {
@@ -336,11 +343,50 @@ fn ensemble_section(ctx: &Ctx, problems: &mut bool) -> Result<(), CliError> {
                 s.per_check_cooldown_cycles,
                 s.consecutive_contests_before_human
             )?;
+            reframable_line(ctx, &s)?;
         }
         Err(error) => {
             outln!("  INVALID     {error}")?;
             *problems = true;
         }
+    }
+    Ok(())
+}
+
+/// Which checks the same-model reframe (R2) can be asked about, as a run would see them:
+/// every thresholded check with a negation, from the bundled definitions and any overlay,
+/// when `reframe_same_model` is a configured rung (`docs/06-ensemble.md` §4 R2). A
+/// thresholded check without one is named, because R2 stands aside for it.
+fn reframable_line(
+    ctx: &Ctx,
+    settings: &aftman_core::ensemble::EnsembleSettings,
+) -> Result<(), CliError> {
+    let set = match load_definitions_from(ctx.inputs.responsibilities_dir.as_deref()) {
+        Ok(set) => set,
+        Err(error) => {
+            outln!("  reframable  unknown: the definitions do not load ({error})")?;
+            return Ok(());
+        }
+    };
+    if !settings.has(aftman_core::assessment::Rung::ReframeSameModel) {
+        outln!("  reframable  none (reframe_same_model is not a configured rung)")?;
+        return Ok(());
+    }
+    let checks: Vec<aftman_core::responsibility::Check> = set
+        .enabled()
+        .flat_map(|(id, definition)| definition.checks(id))
+        .collect();
+    let thresholded = checks.iter().filter(|c| c.threshold.is_some()).count();
+    let reframable = aftman_core::ensemble::reframable_checks(settings, &checks);
+    outln!(
+        "  reframable  {} of {thresholded} thresholded checks (R2)",
+        reframable.len()
+    )?;
+    for check in checks
+        .iter()
+        .filter(|c| c.threshold.is_some() && !reframable.contains(&c.key))
+    {
+        outln!("              {} has no negation", check.key)?;
     }
     Ok(())
 }

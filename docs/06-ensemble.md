@@ -308,8 +308,10 @@ the side `1 − p(¬X)` points to; a consistent one confirms Jev's side.
 
 Cost: one additional Jev call, same provider, same budget.
 
-**Not yet built (S2).** No check definition carries a negated question yet, so the runtime hands
-the resolver an empty `reframe_available` and R2 is never planned. Should the resolver ask anyway,
+**Not yet built (S2).** Check definitions carry their negated questions
+([05-responsibilities.md §1.3](05-responsibilities.md): every thresholded bundled check has one,
+and `aftman_core::ensemble::reframable_checks` names them), but the runtime does not ask them yet:
+it hands the resolver an empty `reframe_available`, and R2 is never planned. Should the resolver ask anyway,
 the runtime's source records an `OPINION_REQUESTED` and answers with no value and an error saying
 R2 is unavailable; the resolver reads that as an abstention, or, for an `Irreversible` trigger, a
 contest — never a confirm.

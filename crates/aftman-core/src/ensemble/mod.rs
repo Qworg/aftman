@@ -22,8 +22,8 @@ pub use events::{
 };
 pub use resolve::{
     CheckRecord, EnsembleLimit, EnsembleOutcome, KeyedOpinion, OpinionKey, OpinionSource,
-    ProviderRun, ReframeAnswer, ReframeRequest, RefreshOutcome, RefreshRecord, RefreshRequest,
-    apply_opinions, reframe_verdict,
+    ProviderRun, ReframeAnswer, ReframeRequest, RefreshOutcome, RefreshRecord, RefreshRejection,
+    RefreshRequest, apply_opinions, reframe_verdict,
 };
 pub use settings::{
     CheckCounters, EnsembleCounters, EnsembleSettings, EnsembleSettingsError, OpinionMark,

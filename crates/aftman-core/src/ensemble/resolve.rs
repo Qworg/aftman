@@ -70,13 +70,21 @@ pub struct ProviderRun {
 }
 
 /// What a refresh produced.
+///
+/// For the source's implementer: report every provider attempted in `runs`, with
+/// `exit_code: None` for one that could not be launched or was killed. Return `new_p:
+/// None` when no provider exited — re-asking the model about evidence that was never
+/// produced is not a refresh. The resolver enforces this anyway: a refresh counts as a
+/// measurement only if at least one run has an exit code **and** `new_p` is a finite
+/// probability in `0..=1`. Anything else is recorded as a rejected attempt, still counts
+/// against the cap, and leaves the check held.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RefreshOutcome {
-    /// The providers that ran, in the order they ran.
+    /// The providers attempted, in the order they ran.
     pub runs: Vec<ProviderRun>,
-    /// Jev's answer for this check on the fresh evidence. `None` if the call failed or
-    /// the answer was not a probability; a non-finite or out-of-range value is treated
-    /// the same way.
+    /// Jev's answer for this check on the fresh evidence. `None` if nothing ran, the call
+    /// failed, or the answer was not a probability; a non-finite or out-of-range value is
+    /// treated the same way.
     pub new_p: Option<f32>,
     pub error: Option<String>,
 }
@@ -172,6 +180,22 @@ pub struct RefreshRecord {
     /// The value it set out to replace. For the log only.
     pub old_p: Option<f32>,
     pub outcome: RefreshOutcome,
+    /// Why the attempt produced no measurement, when it did not. `None` means the fresh
+    /// value was used.
+    #[serde(default)]
+    pub rejected: Option<RefreshRejection>,
+}
+
+/// Why an evidence refresh did not count as a measurement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefreshRejection {
+    /// No provider actually ran: none was launched, or every one was killed before it
+    /// exited. A model answer with no command behind it is not fresh evidence.
+    NoProviderRan,
+    /// A provider ran, but there was no fresh value: the model call failed, or what it
+    /// returned was not a probability in `0..=1`.
+    NoMeasurement,
 }
 
 /// One opinion, with its key.
@@ -466,18 +490,29 @@ async fn refresh(
             .await,
     );
     let old_p = plan.baseline.jev_p;
+    // A measurement needs both halves: a command that actually ran (it exited, so it
+    // produced evidence), and a fresh probability. The provider reported is the first that
+    // exited; none is ever invented.
+    let ran = outcome
+        .runs
+        .iter()
+        .find(|run| run.exit_code.is_some())
+        .cloned();
+    let rejected = match (&ran, outcome.new_p) {
+        (None, _) => Some(RefreshRejection::NoProviderRan),
+        (Some(_), None) => Some(RefreshRejection::NoMeasurement),
+        (Some(_), Some(_)) => None,
+    };
     record.refresh = Some(RefreshRecord {
         providers: plan.refresh_providers.clone(),
         old_p,
         outcome: outcome.clone(),
+        rejected,
     });
-    let new_p = outcome.new_p?;
-    // The provider reported on the resolution is the first that ran; the record keeps
-    // them all.
-    let (provider, exit_code) = match outcome.runs.first() {
-        Some(run) => (run.provider.clone(), run.exit_code),
-        None => (plan.refresh_providers.first()?.clone(), None),
+    let (Some(run), Some(new_p)) = (ran, outcome.new_p) else {
+        return None;
     };
+    let (provider, exit_code) = (run.provider, run.exit_code);
     Some(ResolvedCheck::from_refresh(
         plan.check.clone(),
         plan.baseline.threshold,

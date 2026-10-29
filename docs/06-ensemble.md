@@ -176,10 +176,16 @@ Not an opinion. This is the rung that actually resolves things, and the only one
    then evaluated normally.
 
 Outcome: `EvidenceRefreshed { old_p, new_p, provider, exit_code }` (plus `supersedes`). When
-several providers run, `provider` and `exit_code` are the first that ran; the check's entry in
-`EnsembleResolved` records every run. A refresh whose command could not run, or whose fresh answer
-is missing or not a probability, produces no measurement: it still counts against the cap, and the
-ladder continues as if it had not been available.
+several providers run, `provider` and `exit_code` are the first that **exited**; the check's entry
+in `EnsembleResolved` records every attempt.
+
+A refresh is a measurement only if **at least one provider actually ran** (it has an exit code) **and**
+the fresh answer is a finite probability in `0..=1`. A model answer with no command behind it is
+not fresh evidence, however confident, and no provider is ever invented to stand in for one.
+Anything else is a rejected attempt, recorded as `rejected: no_provider_ran` or
+`rejected: no_measurement`: it still counts against the cap, the check stays held, and the ladder
+continues as if R0 had not been available. The source should return no `new_p` when nothing ran;
+the resolver enforces it regardless.
 
 Cost: one command execution plus one Jev call. Bounded to
 `max_evidence_refreshes_per_check` (default 3) per run — a check that keeps needing a refresh is

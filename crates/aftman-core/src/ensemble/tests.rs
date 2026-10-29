@@ -940,6 +940,73 @@ async fn a_triggered_check_in_band_or_inert_requests_zero_opinions() {
     assert!(!asked.contains(&k(STUCK)) && !asked.contains(&k(DRIFT)));
 }
 
+#[tokio::test]
+async fn a_refresh_whose_command_never_ran_does_not_permit() {
+    // Review probe 4: a fresh answer with no command behind it is not a measurement.
+    for runs in [
+        Vec::new(),
+        vec![ProviderRun {
+            provider: EvidenceId::new("audit"),
+            exit_code: None,
+        }],
+    ] {
+        let s = Scenario::finish_ready()
+            .set(READY, 0.79)
+            .selecting(READY, &["audit"]);
+        let source = RecordedOpinionSource::new().with_refresh(
+            CYCLE,
+            READY,
+            RefreshOutcome {
+                runs: runs.clone(),
+                new_p: Some(0.95),
+                error: Some("command could not be launched".into()),
+            },
+        );
+        let outcome = s.plan().resolve(&source).await;
+        let rc = &outcome.checks[&k(READY)];
+        assert!(!rc.permitted, "{runs:?}");
+        assert!(
+            !matches!(rc.resolution, Resolution::EvidenceRefreshed { .. }),
+            "{runs:?}"
+        );
+        assert_ne!(s.select(&outcome.checks).name(), "Finish", "{runs:?}");
+        let refresh = record(&outcome, READY).and_then(|r| r.refresh.clone());
+        assert_eq!(
+            refresh.and_then(|r| r.rejected),
+            Some(super::RefreshRejection::NoProviderRan),
+            "the failed refresh is visible"
+        );
+        assert_eq!(
+            outcome.counters.check(&k(READY)).refreshes,
+            1,
+            "and it counts"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_refresh_value_that_is_not_a_probability_does_not_permit() {
+    for new_p in [1.5_f32, -0.2, f32::NAN, f32::INFINITY] {
+        let s = Scenario::finish_ready()
+            .set(READY, 0.79)
+            .selecting(READY, &["audit"]);
+        let source = RecordedOpinionSource::new().with_refresh(
+            CYCLE,
+            READY,
+            refreshed(Some(new_p), "audit", 0),
+        );
+        let outcome = s.plan().resolve(&source).await;
+        assert!(!outcome.checks[&k(READY)].permitted, "{new_p}");
+        assert_eq!(
+            record(&outcome, READY)
+                .and_then(|r| r.refresh.clone())
+                .and_then(|r| r.rejected),
+            Some(super::RefreshRejection::NoMeasurement),
+            "{new_p}"
+        );
+    }
+}
+
 // ---- bounds ----------------------------------------------------------------
 
 #[tokio::test]

@@ -336,7 +336,7 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
             Directive::Escalate {
                 reason: "nothing can make progress: no proposal survived and no worker is running"
                     .into(),
-                ask: "No worker is running and every proposal was refused.".into(),
+                ask: nothing_survived_ask(input, &suppressed),
             }
         } else {
             Directive::Continue
@@ -380,6 +380,83 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
         suppressed,
         invariants,
     }
+}
+
+/// The most unresolved checks the "nothing can make progress" question names one by one.
+pub const NAMED_UNRESOLVED_CHECKS: usize = 8;
+
+/// The most bytes that question may have, like an ensemble escalation's
+/// (`docs/06-ensemble.md` §6).
+pub const NOTHING_SURVIVED_ASK_CAP_BYTES: usize = 2048;
+
+/// The question when nothing can make progress.
+///
+/// When a `Finish` was refused because an active check is unresolved
+/// (`Invariant::UnresolvedUncertainty`), a person cannot answer without knowing which check
+/// is holding it — typically one in the band that no rule reads, so nothing else names it.
+/// The question lists every unresolved check, its key, Jev's value and its threshold, and why
+/// it is held; at most [`NAMED_UNRESOLVED_CHECKS`] of them, then how many more, and never
+/// more than [`NOTHING_SURVIVED_ASK_CAP_BYTES`]. The values are Jev's own, unmodified.
+fn nothing_survived_ask(input: &PolicyInput<'_>, suppressed: &[Suppression]) -> String {
+    const GENERIC: &str = "No worker is running and every proposal was refused.";
+    let held_finish = suppressed.iter().any(|s| {
+        matches!(
+            s.reason,
+            SuppressionReason::Invariant(Invariant::UnresolvedUncertainty)
+        )
+    });
+    let unresolved: Vec<(&CheckKey, &ResolvedCheck)> = input
+        .checks
+        .iter()
+        .filter(|(_, check)| check.is_unresolved())
+        .collect();
+    if !held_finish || unresolved.is_empty() {
+        return GENERIC.to_owned();
+    }
+    let named: Vec<String> = unresolved
+        .iter()
+        .take(NAMED_UNRESOLVED_CHECKS)
+        .map(|(key, check)| {
+            let value = check
+                .jev_p
+                .map_or_else(|| "no value".to_owned(), |p| format!("{p:.2}"));
+            let threshold = check
+                .threshold
+                .map_or_else(|| "no threshold".to_owned(), |t| format!("{t:.2}"));
+            let why = match check.suppression {
+                Some(crate::assessment::CheckSuppression::InBand) => "in the uncertainty band",
+                Some(crate::assessment::CheckSuppression::Contested) => "contested",
+                Some(crate::assessment::CheckSuppression::Unresolved) => "unresolved",
+                Some(crate::assessment::CheckSuppression::NoThreshold) => "no threshold",
+                None => "not usable",
+            };
+            format!("`{key}` = {value} (threshold {threshold}, {why})")
+        })
+        .collect();
+    let more = unresolved.len().saturating_sub(named.len());
+    let mut ask = format!(
+        "No worker is running and every proposal was refused. Finish is held because {} \
+         unresolved: {}{}. Is the work they describe done?",
+        if unresolved.len() == 1 {
+            "this check is"
+        } else {
+            "these checks are"
+        },
+        named.join("; "),
+        if more > 0 {
+            format!("; and {more} more")
+        } else {
+            String::new()
+        }
+    );
+    if ask.len() > NOTHING_SURVIVED_ASK_CAP_BYTES {
+        let mut end = NOTHING_SURVIVED_ASK_CAP_BYTES;
+        while !ask.is_char_boundary(end) {
+            end -= 1;
+        }
+        ask.truncate(end);
+    }
+    ask
 }
 
 /// Whether a proposal is refused by a hard invariant. `None` means it survives.
@@ -691,6 +768,80 @@ mod tests {
             s.reason,
             SuppressionReason::Invariant(Invariant::UnresolvedUncertainty)
         )));
+    }
+
+    #[test]
+    fn nothing_can_make_progress_names_the_unresolved_checks_holding_finish() {
+        // Stage B review SB4. An in-band check that no rule reads holds `Finish` through
+        // `UnresolvedUncertainty`, nothing else is proposed, and no worker is running: the
+        // generic escalation must say which check, with its value, or a person cannot
+        // answer it.
+        let o = observation();
+        let counters = Counters {
+            workers_run: 1,
+            verifier_completed: true,
+            ..Counters::default()
+        };
+        let config = RunConfig::default();
+        let mut checks = checks(&[
+            ("core.completion", "ready_to_finish", 0.95),
+            ("core.completion", "requirements_satisfied", 0.95),
+            ("core.verification", "tests_sufficient", 0.95),
+        ]);
+        let held = key("user.audit", "licence_clean");
+        checks.insert(
+            held.clone(),
+            ResolvedCheck::from_measurement(held, Some(0.71), Some(0.75), 0.15, true),
+        );
+        let decision = arbitrate(&input(&o, &counters, &config, &checks), &[finish()]);
+        let Directive::Escalate { reason, ask } = &decision.selected else {
+            panic!("expected an escalation, got {:?}", decision.selected);
+        };
+        assert!(reason.starts_with("nothing can make progress"), "{reason}");
+        assert!(
+            ask.contains(
+                "`user.audit__licence_clean` = 0.71 (threshold 0.75, in the uncertainty band)"
+            ),
+            "{ask}"
+        );
+        assert!(
+            ask.contains("Finish is held because this check is unresolved"),
+            "{ask}"
+        );
+        // The checks that are permitted are not named.
+        assert!(!ask.contains("ready_to_finish"), "{ask}");
+
+        // Bounded: many held checks, with long keys, are named up to a count, and the
+        // question stays within its cap.
+        let mut many = checks.clone();
+        for i in 0..40 {
+            let k = key(&format!("user.{}", "x".repeat(200)), &format!("c{i:02}"));
+            many.insert(
+                k.clone(),
+                ResolvedCheck::from_measurement(k, Some(0.70), Some(0.75), 0.15, true),
+            );
+        }
+        let decision = arbitrate(&input(&o, &counters, &config, &many), &[finish()]);
+        let Directive::Escalate { ask, .. } = &decision.selected else {
+            panic!("expected an escalation, got {:?}", decision.selected);
+        };
+        assert!(
+            ask.len() <= super::NOTHING_SURVIVED_ASK_CAP_BYTES,
+            "{}",
+            ask.len()
+        );
+        assert!(ask.matches("` = ").count() <= super::NAMED_UNRESOLVED_CHECKS);
+
+        // When Finish was not what uncertainty held, the question is the generic one.
+        let decision = arbitrate(&input(&o, &counters, &config, &checks), &[]);
+        assert_eq!(
+            decision.selected,
+            Directive::Escalate {
+                reason: "nothing can make progress: no proposal survived and no worker is running"
+                    .into(),
+                ask: "No worker is running and every proposal was refused.".into(),
+            }
+        );
     }
 
     #[test]

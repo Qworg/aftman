@@ -539,6 +539,41 @@ fn nothing_covers_an_irreversible_opinion() {
 }
 
 #[tokio::test]
+async fn resolve_refuses_different_answers_or_settings_under_the_same_policy_input() {
+    // The fingerprint covers the policy input, not the answers or the settings; the
+    // derived baseline and the settings are compared separately.
+    let s = Scenario::finish_ready()
+        .set(TESTS, 0.92)
+        .reframable(&[TESTS]);
+    let plan = s.plan();
+    let mut other_answer = Scenario::finish_ready()
+        .set(TESTS, 0.71)
+        .reframable(&[TESTS]);
+    other_answer.observation = s.observation.clone();
+    assert_eq!(other_answer.fingerprint(), s.fingerprint());
+    let result = other_answer
+        .resolve_plan(&plan, &RecordedOpinionSource::new())
+        .await;
+    assert!(
+        matches!(result, Err(super::EnsembleError::ContextMismatch(_))),
+        "{result:?}"
+    );
+    let mut other_settings = Scenario::finish_ready()
+        .set(TESTS, 0.92)
+        .reframable(&[TESTS]);
+    other_settings.observation = s.observation.clone();
+    other_settings.settings.framing_tolerance = 0.30;
+    assert_eq!(other_settings.fingerprint(), s.fingerprint());
+    let result = other_settings
+        .resolve_plan(&plan, &RecordedOpinionSource::new())
+        .await;
+    assert!(
+        matches!(result, Err(super::EnsembleError::ContextMismatch(_))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
 async fn resolve_refuses_a_different_policy_input() {
     // Round-3 probe N2b: a plan built with no worker, resolved with one. The baseline is
     // identical, so only the fingerprint can tell.

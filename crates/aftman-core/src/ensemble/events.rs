@@ -21,6 +21,7 @@ use crate::assessment::{CheckSuppression, Resolution, Rung, Verdict};
 use crate::ids::{AssessmentSeq, CheckKey};
 use crate::model::Usage;
 
+use super::gate::IrreversibleGuard;
 use super::resolve::{
     CheckRecord, EnsembleLimit, EnsembleOutcome, KeyedOpinion, OpinionKey, ReframeAnswer,
     ReframeRequest, RefreshRecord,
@@ -208,6 +209,9 @@ pub struct CheckResolvedPayload {
     pub refresh: Option<RefreshRecord>,
     #[serde(default)]
     pub escalation: Option<String>,
+    /// Set when the final irreversible gate guarded this check.
+    #[serde(default)]
+    pub irreversible_guard: Option<IrreversibleGuard>,
 }
 
 impl From<&CheckRecord> for CheckResolvedPayload {
@@ -225,6 +229,7 @@ impl From<&CheckRecord> for CheckResolvedPayload {
             limits: record.limits.clone(),
             refresh: record.refresh.clone(),
             escalation: record.escalation.clone(),
+            irreversible_guard: record.irreversible_guard.clone(),
         }
     }
 }

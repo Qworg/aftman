@@ -101,7 +101,9 @@ pub struct EnsembleContext<'a> {
     /// Proposal generation, for example `|input| registry.propose(input)`. Must be the
     /// same pure function the runtime uses, or the counterfactuals answer a different
     /// question from the one policy will be asked.
-    pub propose: &'a dyn Fn(&PolicyInput<'_>) -> Vec<Proposal>,
+    /// `Sync` so that a resolution, which holds the context across the source's awaits,
+    /// can run in a spawned task.
+    pub propose: &'a (dyn Fn(&PolicyInput<'_>) -> Vec<Proposal> + Sync),
     /// The active check definitions, for their evidence selections.
     pub definitions: &'a [Check],
     /// The configured command providers.
@@ -274,16 +276,17 @@ impl EnsemblePlan {
         cycle: AssessmentSeq,
         settings: EnsembleSettings,
         counters: EnsembleCounters,
+        mut baseline: BTreeMap<CheckKey, ResolvedCheck>,
         triggered: Vec<CheckPlan>,
     ) -> Self {
+        for plan in &triggered {
+            baseline.insert(plan.check.clone(), plan.baseline.clone());
+        }
         Self {
             cycle,
             settings,
             counters,
-            baseline: triggered
-                .iter()
-                .map(|plan| (plan.check.clone(), plan.baseline.clone()))
-                .collect(),
+            baseline,
             triggered,
         }
     }
@@ -333,7 +336,7 @@ impl EnsemblePlan {
 }
 
 /// The baseline the ensemble starts from: Jev's own values, resolved with no opinion.
-fn derive_baseline(ctx: &EnsembleContext<'_>) -> BTreeMap<CheckKey, ResolvedCheck> {
+pub(super) fn derive_baseline(ctx: &EnsembleContext<'_>) -> BTreeMap<CheckKey, ResolvedCheck> {
     ctx.definitions
         .iter()
         .map(|check| {
@@ -373,6 +376,11 @@ pub enum EnsembleError {
          them with the same answers, margin and `enabled` as the ensemble settings"
     )]
     BaselineMismatch { check: CheckKey },
+    /// `resolve` was handed a context that is not the one the plan was built from: a
+    /// different cycle, or answers, definitions or settings that derive a different
+    /// baseline.
+    #[error("the context does not match the plan: {0}")]
+    ContextMismatch(String),
     /// The source could not answer at all.
     #[error(transparent)]
     Source(#[from] super::resolve::SourceError),
@@ -503,6 +511,28 @@ fn evaluate(
     let proposals = (ctx.propose)(&input);
     let selected = arbitrate(&input, &proposals).selected;
     (proposals, selected)
+}
+
+/// The selected directive over a check set.
+pub(super) fn select(
+    ctx: &EnsembleContext<'_>,
+    checks: &BTreeMap<CheckKey, ResolvedCheck>,
+) -> Directive {
+    evaluate(ctx, checks).1
+}
+
+/// The selected directive over `checks` with `key` pinned decisively to `side`. The pinned
+/// value never leaves this call.
+pub(super) fn select_with(
+    ctx: &EnsembleContext<'_>,
+    checks: &BTreeMap<CheckKey, ResolvedCheck>,
+    key: &CheckKey,
+    side: Side,
+    rc: &ResolvedCheck,
+) -> Directive {
+    let mut counterfactual = checks.clone();
+    counterfactual.insert(key.clone(), pinned(rc, side));
+    evaluate(ctx, &counterfactual).1
 }
 
 fn with_check(

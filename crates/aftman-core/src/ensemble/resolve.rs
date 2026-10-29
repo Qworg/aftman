@@ -29,8 +29,11 @@ use crate::assessment::{
 use crate::ids::{AssessmentSeq, CheckKey, EvidenceId};
 use crate::model::Usage;
 
+use super::gate::IrreversibleGuard;
 use super::settings::{EnsembleCounters, EnsembleSettings, MarkVerdict, OpinionMark};
-use super::trigger::{CheckPlan, EnsemblePlan, EnsembleTrigger};
+use super::trigger::{
+    CheckPlan, EnsembleContext, EnsembleError, EnsemblePlan, EnsembleTrigger, derive_baseline,
+};
 
 /// Cap on an opinion's stored excerpt, and on its error text.
 pub const OPINION_EXCERPT_CAP_BYTES: usize = 2048;
@@ -241,6 +244,11 @@ pub struct CheckRecord {
     pub limits: Vec<EnsembleLimit>,
     /// Set when the check was escalated to a person: the question to ask.
     pub escalation: Option<String>,
+    /// Set when the final irreversible gate guarded this check: which directive rested on
+    /// it, and what the gate did. A check the gate guarded but the ladder never looked at
+    /// has a record with no triggers.
+    #[serde(default)]
+    pub irreversible_guard: Option<IrreversibleGuard>,
 }
 
 /// The ensemble's result for one cycle.
@@ -254,6 +262,9 @@ pub struct EnsembleOutcome {
     pub records: Vec<CheckRecord>,
     /// The counters to store for the next cycle.
     pub counters: EnsembleCounters,
+    /// How many rounds the irreversible gate took; at most the number of checks plus one.
+    #[serde(default)]
+    pub gate_rounds: u32,
 }
 
 impl EnsembleOutcome {
@@ -272,14 +283,30 @@ impl EnsemblePlan {
     /// order, and every decision is a function of the plan, the counters, and what the
     /// source returned.
     ///
+    /// After the ladder, the irreversible gate (`gate.rs`) checks the selection the
+    /// cycle actually arrives at, so `ctx` must be the context the plan was built from.
+    ///
     /// # Errors
     ///
-    /// Only if the source cannot answer at all ([`SourceError`]); the resolution is then
-    /// abandoned rather than completed with an invented answer.
+    /// [`EnsembleError::Source`] if the source cannot answer at all; the resolution is
+    /// then abandoned rather than completed with an invented answer.
+    /// [`EnsembleError::ContextMismatch`] if `ctx` is not the plan's.
     pub async fn resolve(
         &self,
+        ctx: &EnsembleContext<'_>,
         source: &dyn OpinionSource,
-    ) -> Result<EnsembleOutcome, SourceError> {
+    ) -> Result<EnsembleOutcome, EnsembleError> {
+        if ctx.cycle != self.cycle {
+            return Err(EnsembleError::ContextMismatch(format!(
+                "context cycle {}, plan cycle {}",
+                ctx.cycle, self.cycle
+            )));
+        }
+        if *ctx.settings != self.settings || derive_baseline(ctx) != self.baseline {
+            return Err(EnsembleError::ContextMismatch(
+                "the context derives a different baseline or carries different settings".to_owned(),
+            ));
+        }
         let mut counters = self.counters.clone();
         let mut checks = self.baseline.clone();
         let mut records = Vec::with_capacity(self.triggered.len());
@@ -289,6 +316,11 @@ impl EnsemblePlan {
             checks.insert(plan.check.clone(), record.resolved.clone());
             records.push(record);
         }
+        let gate_rounds = if self.settings.enabled {
+            super::gate::run(self, ctx, source, &mut checks, &mut records, &mut counters).await?
+        } else {
+            0
+        };
         if self.settings.enabled {
             for (key, rc) in &checks {
                 if rc.threshold.is_none() {
@@ -321,6 +353,7 @@ impl EnsemblePlan {
             checks,
             records,
             counters,
+            gate_rounds,
         })
     }
 }
@@ -342,6 +375,7 @@ async fn resolve_check(
         opinions: Vec::new(),
         limits: Vec::new(),
         escalation: None,
+        irreversible_guard: None,
     };
     let rc = plan.baseline.clone();
 
@@ -752,7 +786,7 @@ pub fn apply_opinions(rc: ResolvedCheck, opinions: &[Opinion]) -> ResolvedCheck 
 
 /// Build the stored opinion from an answer: bounded, and with no non-finite number, so
 /// that what is recorded is exactly what a replay reads back.
-fn opinion_from(rung: Rung, verdict: Verdict, answer: ReframeAnswer) -> Opinion {
+pub(super) fn opinion_from(rung: Rung, verdict: Verdict, answer: ReframeAnswer) -> Opinion {
     Opinion {
         rung,
         source: cap_bytes(&answer.source, OPINION_LABEL_CAP_BYTES),

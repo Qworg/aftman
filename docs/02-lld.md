@@ -326,7 +326,7 @@ pub struct EnsembleCounters { pub opinions_used: u32,
     pub checks: BTreeMap<CheckKey, CheckCounters> }              // in RunState.ensemble
 pub enum   EnsembleTrigger { NearThreshold, LowConfidence, ClaimOnlyEvidence, OutcomeRelevant,
     HighStakes, Irreversible, RepeatContest }
-pub struct EnsembleContext<'a> { settings, cycle, policy: &PolicyInput, propose: &dyn Fn(&PolicyInput) -> Vec<Proposal>,
+pub struct EnsembleContext<'a> { settings, cycle, policy: &PolicyInput, propose: &(dyn Fn(&PolicyInput) -> Vec<Proposal> + Sync),
     definitions: &[Check], evidence: &EvidencePlan, answers, counters, reframe_available }
 pub struct EnsemblePlan { /* private; accessors cycle(), settings(), counters(), baseline(),
     triggered() -> &[CheckPlan] */ }       // only build() makes one, so a caller cannot hand the
@@ -334,8 +334,9 @@ pub struct EnsemblePlan { /* private; accessors cycle(), settings(), counters(),
 impl EnsemblePlan {
     pub fn build(ctx: &EnsembleContext) -> Result<Self, EnsembleError>;  // pure: derives the
                                      // baseline, refuses a caller's checks that differ; triggers
-    pub async fn resolve(&self, source: &dyn OpinionSource)
-        -> Result<EnsembleOutcome, SourceError>;                          // the ladder
+    pub async fn resolve(&self, ctx: &EnsembleContext, source: &dyn OpinionSource)
+        -> Result<EnsembleOutcome, EnsembleError>;   // the ladder, then the irreversible gate
+                                                     // (ctx must be the one build() was given)
 }
 #[async_trait] pub trait OpinionSource: Send + Sync {
     // A failed call is an Ok outcome with no value; Err only when there is no answer at
@@ -344,7 +345,9 @@ impl EnsemblePlan {
     async fn reframe_same_model(&self, r: &ReframeRequest) -> Result<ReframeAnswer, SourceError>; // R2
 }
 pub struct EnsembleOutcome { cycle, checks: BTreeMap<CheckKey, ResolvedCheck>,
-    records: Vec<CheckRecord>, counters: EnsembleCounters }
+    records: Vec<CheckRecord>,     // each may carry irreversible_guard { directive, outcome }
+    counters: EnsembleCounters, gate_rounds: u32 }
+pub enum EnsembleError { BaselineMismatch { check }, ContextMismatch(String), Source(SourceError) }
 pub fn reframe_verdict(p, p_negated, threshold, framing_tolerance, irreversible) -> Verdict;
 pub fn apply_opinions(rc: ResolvedCheck, opinions: &[Opinion]) -> ResolvedCheck; // suppress-only
 ```

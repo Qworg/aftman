@@ -555,6 +555,47 @@ async fn resolve_check(plan: &CheckPlan, sources: &dyn OpinionSource) -> Resolve
 }
 ```
 
+Then, after every triggered check has been through the ladder, the **irreversible gate** runs once
+over the resolved set (`ensemble/gate.rs`):
+
+```text
+loop:
+    selected = arbitrate(propose(resolved))
+    if selected is not Finish or Stop: done
+    deps = checks k, decisive and permitted, such that the selected directive differs between
+           k pinned decisively above and k pinned decisively below (the OutcomeRelevant
+           counterfactual, compared on the whole directive, not only its kind)
+    pending = deps not yet guarded this cycle
+    if pending is empty: done
+    for k in pending:
+        an R2 verdict obtained this cycle under Irreversible        → already guarded
+        an R2 verdict obtained this cycle under another trigger     → re-read with Irreversible
+                                                                      semantics (unusable ⇒ Contest)
+        none, R2 available, budget left                             → buy one, Irreversible semantics
+        none, R2 available, budget spent                            → hold (Unresolved)
+        none, R2 not available for k                                → k stands, as in the ladder
+        fold; mark k guarded
+```
+
+- **Why it exists.** The ladder plans its opinions from the selection *before* it runs, but the
+  ladder itself changes the selection: an R0 refresh can turn `StartWorker` into `Finish` while the
+  conjunct it now rests on was never asked about, and a contest on one check can unmask a `Stop`
+  resting on another whose opinion failed and, under a non-irreversible trigger, merely abstained.
+  The gate guards the irreversible directive the cycle actually arrives at.
+- **Termination.** Each round either stops or guards at least one check not yet guarded this
+  cycle, and no check is guarded twice; guarding only removes permission. So the gate takes at
+  most *checks + 1* rounds (`EnsembleOutcome::gate_rounds`, asserted by the tests).
+- **No refreshes.** Refreshes happen only in the ladder. The gate buys at most one opinion per
+  check per cycle, never a second one for a check the ladder already asked about — it re-reads
+  that answer instead — so `OpinionKey { cycle, check, rung }` stays unique and replay is exact.
+- **Visible.** Every check the gate guarded carries an `irreversible_guard { directive, outcome }`
+  (`already_guarded`, `reinterpreted`, `bought`, `unavailable`, `budget_spent`) in its
+  `CheckRecord` and in its `EnsembleResolved` entry. A check the gate guarded that the ladder never
+  looked at gets a record with no triggers.
+- **Whole directive, not kind.** `core.worker-health` proposes the more probable of two findings,
+  so a `Stop` may rest on either; with kinds alone neither would be a dependency and the `Stop`
+  would go unguarded.
+
 **What a cooldown may skip.** The cooldown applies only to opinions a *non-irreversible* trigger
 (`OutcomeRelevant`, `HighStakes`) would buy. **An opinion an `Irreversible` trigger needs is never
 skipped, never covered, and never held by the cooldown**: it is always bought fresh, in that cycle,
@@ -624,29 +665,33 @@ Notes that follow directly from §2:
 - **There is no `promote`.** No `ε`. No arithmetic on `p` anywhere in this module.
 - `ResolvedCheck::from_measurement` is the only place `permitted` can become `true` without new evidence,
   and it is a pure function of `p`, `t`, and `margin` — not of which side of `t` the value is on.
-- **The opinion rungs are monotonically conservative.** Deleting every R1/R2 call can only
-  *increase* the set of rules that fire; no opinion can make a rule fire that would not otherwise
-  have. R0 is deliberately excluded from that claim: it is not an opinion, it is a measurement, and
-  it may legitimately move a rule either way.
+- **The opinion rungs are monotonically conservative, at the level of comparisons and declarative
+  rules, with two named Rust exceptions — and not at the level of the selected directive.**
+  Deleting every R1/R2 call can only *increase* the set of permitted checks, so every comparison
+  that holds without opinions still holds with them gone, and every declarative rule that fires
+  with them fires without them. The exceptions are two built-in rules that may *start* firing
+  when a check loses permission: the `core.completion` fallbacks (`work-remains`,
+  `retry-stopped`), which fire because the `Finish` precondition is no longer established; and
+  `core.worker-health`, which proposes only the more probable of `stuck` and `off-track`, so
+  holding the winner lets the runner-up through (only if its own check is permitted and above its
+  threshold). R0 is deliberately excluded from all of this: it is a measurement, not an opinion,
+  and may move a rule either way.
 
-  This holds for declarative rules because conditions are **three-valued** (Kleene,
+  What the claim does **not** say is that the selected directive can only become more cautious.
+  Removing permission from one check can change *which* proposal wins: a contest on `needs_human`
+  removes a priority-1000 `Escalate` and unmasks a priority-900 `Stop` resting on `worker_stuck`; a
+  refresh (or a contest on an inhibitor) can likewise turn the cycle's selection into a `Finish`
+  the ladder never planned for. The per-check ladder, which plans from the selection before it
+  runs, cannot see these. **The irreversible gate is what makes them safe for `Finish` and
+  `Stop`**: whatever the cycle finally selects, an irreversible directive goes ahead only if
+  every check it rests on carries an R2 verdict obtained this cycle under `Irreversible`
+  semantics, so an unmasked `Stop` or `Finish` is guarded exactly as one selected from the start.
+
+  The declarative half holds because conditions are **three-valued** (Kleene,
   [05-responsibilities.md §2.1](05-responsibilities.md)): a comparison on a check that is missing or
   not permitted is *unknown*, `not unknown` is unknown, and a rule fires only on *true*. With
-  two-valued logic `not (k >= t)` became *true* when a contest removed `k`'s permission, so a
-  contest could enable a `Stop` — an opinion driving an action.
-
-  The built-in rules are Rust, and two kinds of them may start firing when a check loses
-  permission, neither of which an opinion enables:
-
-  - the `core.completion` fallbacks, `work-remains` and `retry-stopped`, which fire because the
-    `Finish` precondition is not established. `StartWorker` in place of `Finish` is the conservative
-    outcome a contest exists to produce;
-  - `core.worker-health`, which proposes only the more probable of `stuck` and `off-track`. Holding
-    the winner lets the runner-up through, but only if its own check is itself permitted and above
-    its threshold: the runner-up is an independent finding, not one the held check enabled.
-
-  Every other rule, and every declarative rule without exception, can only stop firing. The test
-  `no_rule_starts_firing_because_a_check_lost_permission` enumerates exactly these exceptions.
+  two-valued logic `not (k >= t)` became *true* when a contest removed `k`'s permission. The test
+  `no_rule_starts_firing_because_a_check_lost_permission` enumerates exactly the Rust exceptions.
 - The in-band branch returns before any R1/R2 call, so **the cost of an opinion is only ever paid
   on a check that is about to act.**
 
@@ -678,7 +723,7 @@ Notes that follow directly from §2:
 | `EnsembleTriggered` | check, `triggers`, `reason` (the triggers joined), `jev_p`, threshold, margin, `decisive_directives` (`if_above`, `if_below`: directive names) |
 | `OpinionRequested` | opinion id, rung, source, model, `prompt_hash`, `state_digest`, `timeout_seconds`. Emitted by the source before the call, since only it knows the prompt |
 | `OpinionRecorded` | opinion id, rung, verdict, `p_reported`, excerpt (≤2 KiB), source, model, `prompt_hash`, `state_digest`, latency, usage, error |
-| `EnsembleResolved` | one per cycle: `enabled`, `margin`, `unresolved`, `rungs`, `cycle`, and `checks` — per triggered check: `jev_p` (unmodified), `triggers`, `decisive`, `contested`, `permitted`, `suppression`, `resolution`, `rungs_used`, `limits`, `refresh` (providers, `old_p`, every run and its exit code, the fresh value), `escalation` |
+| `EnsembleResolved` | one per cycle: `enabled`, `margin`, `unresolved`, `rungs`, `cycle`, and `checks` — per triggered check: `jev_p` (unmodified), `triggers`, `decisive`, `contested`, `permitted`, `suppression`, `resolution`, `rungs_used`, `limits`, `refresh` (providers, `old_p`, every run and its exit code, the fresh value), `escalation`, `irreversible_guard` (per triggered or gate-guarded check) |
 | `EscalationRaised` | question, context, opinions so far, `context_digest` |
 | `EscalationAnswered` | human identity/surface, `HumanDecision`, free text |
 

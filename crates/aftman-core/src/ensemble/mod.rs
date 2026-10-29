@@ -9,7 +9,15 @@
 //! permission away.
 
 pub mod settings;
+pub mod trigger;
+
+#[cfg(test)]
+mod tests;
 
 pub use settings::{
     CheckCounters, EnsembleCounters, EnsembleSettings, EnsembleSettingsError, OpinionMark,
+};
+pub use trigger::{
+    CheckPlan, DecisiveDirectives, EnsembleContext, EnsemblePlan, EnsembleTrigger,
+    refresh_providers, sees_command_evidence,
 };

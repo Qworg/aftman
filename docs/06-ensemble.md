@@ -115,12 +115,47 @@ Two kinds of uncertainty exist, and they are handled by **different mechanisms**
 fire and forced not to fire, and compare the selected directive. If the directive does not change,
 the uncertainty does not matter.
 
+**What "forced to fire" and "forced not to fire" mean.** `permitted` is direction-agnostic (§5.2),
+so the two counterfactuals cannot be "permitted" and "not permitted". A not-permitted check is
+unresolved, and any unresolved check suppresses `Finish` (`UnresolvedUncertainty`), so that
+comparison would mark *every* check relevant whenever `Finish` is selected — `agents_md_drift`
+included, with no worker running. And "permitted" alone does not say which way a rule goes: a `>=`
+rule fires on a value above `t`, a `<` rule on one below it. Both counterfactuals are therefore
+**permitted and decisive**, and differ only in the side of `t`: the check pinned decisively above,
+and pinned decisively below. Whichever of the two "fires" a given rule depends on its comparator,
+which is exactly why both are evaluated. The pinned values are the ends of the range, `1.0` and
+`0.0`, so every comparator on the check resolves the way its side does. They exist only inside the
+trigger computation: built, handed to `propose()` and `arbitrate()`, and dropped. None is returned,
+stored, or logged; `EnsembleTriggered` records the two selected directive *names*
+(`decisive_directives: { if_above, if_below }`), never a value.
+
+Precisely, for a check `k` with threshold `t` (`aftman_core::ensemble::EnsemblePlan::build`):
+
+| Trigger | Computed as |
+| --- | --- |
+| `NearThreshold` | `k` has a value and is not decisive |
+| `LowConfidence` | the answer's `confidence` is below `confidence_floor`, or is not a number |
+| `ClaimOnlyEvidence` | `k`'s evidence selection reached **no command evidence this cycle**: it names no `command:<id>` (or `command_evidence`) whose output is in the observation. A provider `k` names that has not run yet (an `on_demand` one) does not count — what `k` scored was the worker's claim. This is the case in §9.1 |
+| `OutcomeRelevant` | the selected directive's kind differs between `k` pinned above and `k` pinned below |
+| `HighStakes` | some `stakes = "high"` proposal depends on `k`: for a decisive `k`, one proposed now that would not be proposed were `k` held; for a held `k`, one that either pinned side proposes and the held state does not |
+| `Irreversible` | `k` is decisive, the selected directive is `Finish` or `Stop`, and pinning `k` to the *other* side changes it. Every check is load-bearing for `Finish` through `UnresolvedUncertainty`; this asks whether the irreversible directive rests on `k`'s *side* |
+| `RepeatContest` | `k` ended not permitted in at least `consecutive_contests_before_human` consecutive prior cycles (`EnsembleCounters`) |
+
+Alongside the triggers the plan records whether **a rule would fire** on `k`: some proposal made this
+cycle would disappear if `k` were not permitted. That is the only case in which an opinion — which
+can do nothing but remove permission — could change what is proposed. A rule that fires *because* a
+comparison is false (an `else` branch such as `core.completion:work-remains`, or a `not (...)`
+condition) survives `k` being held, so it does not count: contesting `k` would leave it firing.
+
 **The line that matters is not "is the value near a threshold" but "is the value decisively on one
 side, and is a rule about to act on it".** An earlier revision requested opinions for in-band checks;
 since an in-band check is never permitted, `Confirm` and `Contest` had identical effects there, so
 those calls could not change any outcome. They have been removed from the in-band path.
 
-The ensemble is never triggered by a check with no threshold and no referencing rule.
+The ensemble is never triggered by a check with no threshold. Such a check has no band and no
+side, and the definitions refuse a rule that reads one (every key a `when` reads must declare a
+`min_threshold`, [05-responsibilities.md](05-responsibilities.md)), so it is also never the check a
+rule references.
 
 ## 4. The opinion ladder
 

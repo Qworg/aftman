@@ -279,6 +279,13 @@ pub struct EnsembleOutcome {
     /// How many rounds the irreversible gate took; at most the number of checks plus one.
     #[serde(default)]
     pub gate_rounds: u32,
+    /// When this cycle raised a spent-budget escalation: how many opinions checking what
+    /// it held takes — every check the held directive needs an opinion on, not only those
+    /// the budget happened to hold, because an irreversible opinion is always bought afresh.
+    /// What a `Recheck` or `ClaimComplete` answer grants
+    /// ([`EnsembleCounters::record_budget_answer`]). Zero otherwise.
+    #[serde(default)]
+    pub opinion_topup: u32,
 }
 
 impl EnsembleOutcome {
@@ -345,9 +352,11 @@ impl EnsemblePlan {
         } else {
             0
         };
-        if self.settings.enabled {
-            self.escalate_spent_budget(&mut checks, &mut records);
-        }
+        let opinion_topup = if self.settings.enabled {
+            self.escalate_spent_budget(&mut checks, &mut records, &counters)
+        } else {
+            0
+        };
         if self.settings.enabled {
             for (key, rc) in &checks {
                 if rc.threshold.is_none() {
@@ -385,25 +394,32 @@ impl EnsemblePlan {
             records,
             counters,
             gate_rounds,
+            opinion_topup,
         })
     }
 }
 
 impl EnsemblePlan {
-    /// A guard or a ladder opinion refused because `max_opinions_per_run` is spent holds
-    /// its check — and, without a word, that hold would leave policy starting worker after
+    /// A guard or a ladder opinion refused because the opinion budget is spent holds its
+    /// check — and, without a word, that hold would leave policy starting worker after
     /// worker for a job that looks finished, then escalating that it "does not look
     /// complete". With the `human` rung configured, the holds this cycle become **one**
-    /// escalation that says what actually happened: which directive on which checks cannot
-    /// be checked. It rides the same channel `RepeatContest` uses (`CheckRecord::escalation`
-    /// on the first held check), so the runtime raises a single `Escalate`.
+    /// escalation that says what actually happened, which checks it would take, and what
+    /// each answer does. It rides the same channel `RepeatContest` uses
+    /// (`CheckRecord::escalation` on the first held check), so the runtime raises a single
+    /// `Escalate`. Returns the top-up a `Recheck` or `ClaimComplete` would grant: every check
+    /// the held directive needs an opinion on this cycle — the held ones, and, when it is
+    /// irreversible, every reframable check it rests on, because an irreversible opinion is
+    /// always bought afresh and the next attempt needs them all again. Zero when nothing
+    /// was escalated.
     fn escalate_spent_budget(
         &self,
         checks: &mut BTreeMap<CheckKey, ResolvedCheck>,
         records: &mut [CheckRecord],
-    ) {
+        counters: &EnsembleCounters,
+    ) -> u32 {
         if !self.settings.has(Rung::Human) {
-            return;
+            return 0;
         }
         // A budget hold is on a decisive value, which an earlier `Accept` does not touch:
         // a person accepted an *uncertainty*, not the loss of the check that should have
@@ -421,7 +437,7 @@ impl EnsemblePlan {
             .map(|(index, _)| index)
             .collect();
         let Some(first) = held.first().copied() else {
-            return;
+            return 0;
         };
         // Which directive each held check was guarding: the gate's, or the one the ladder's
         // plan selects with the check on its side.
@@ -448,17 +464,41 @@ impl EnsemblePlan {
                 .or_default()
                 .push(format!("`{}`", record.check));
         }
+        // What checking it takes: the held checks, and every reframable, decisive check an
+        // irreversible directive this cycle rests on (the ladder's `Irreversible` trigger,
+        // or the gate's guard).
+        let needed: BTreeSet<CheckKey> = records
+            .iter()
+            .enumerate()
+            .filter(|(index, r)| {
+                held.contains(index)
+                    || ((r.triggers.contains(&EnsembleTrigger::Irreversible)
+                        || r.irreversible_guard.is_some())
+                        && r.baseline.decisive
+                        && self.reframe_available.contains(&r.check))
+            })
+            .map(|(_, r)| r.check.clone())
+            .collect();
+        let topup = u32::try_from(needed.len()).unwrap_or(u32::MAX);
         let what = by_directive
             .iter()
             .map(|(directive, keys)| format!("{directive} on {}", keys.join(", ")))
             .collect::<Vec<_>>()
             .join("; ");
+        let listed = needed
+            .iter()
+            .map(|key| format!("`{key}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
         let ask = cap_bytes(
             &format!(
                 "The opinion budget for this run ({} opinions) is spent, so {what} cannot be \
-                 checked. Those checks are held until a person decides; the work itself may be \
-                 complete.",
-                self.settings.max_opinions_per_run
+                 checked; checking it takes an opinion on each of {topup}: {listed}. Those \
+                 checks are held; the work itself may be complete. Recheck or ClaimComplete \
+                 authorises {topup} more opinions, once, and the next cycle asks them afresh: \
+                 it finishes or stops nothing by itself, and any of them may still contest. \
+                 Accept keeps them held, and this is asked again. Stop ends the run.",
+                counters.opinion_budget(&self.settings)
             ),
             REFRESH_ERROR_CAP_BYTES,
         );
@@ -473,6 +513,7 @@ impl EnsemblePlan {
             },
         );
         checks.insert(record.check.clone(), record.resolved.clone());
+        topup
     }
 }
 
@@ -617,11 +658,11 @@ async fn resolve_check(
     }
 
     let needed = u32::try_from(rungs.len()).unwrap_or(u32::MAX);
-    if counters.opinions_used.saturating_add(needed) > settings.max_opinions_per_run {
+    if counters.opinions_used.saturating_add(needed) > counters.opinion_budget(settings) {
         // Unable to check a decisive value a rule is about to act on: hold it.
         record.limits.push(EnsembleLimit::OpinionBudget {
             used: counters.opinions_used,
-            cap: settings.max_opinions_per_run,
+            cap: counters.opinion_budget(settings),
         });
         record.resolved = rc.suppress(
             CheckSuppression::Unresolved,

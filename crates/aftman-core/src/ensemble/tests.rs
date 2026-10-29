@@ -5095,3 +5095,116 @@ async fn no_opinion_is_bought_for_a_finish_that_is_outranked_or_refused() {
         );
     }
 }
+
+// ---- a spent budget is not a dead end -------------------------------------------------
+
+/// One cycle of `s` over `counters`, every opinion answered consistently.
+async fn budget_cycle(
+    s: &mut Scenario,
+    cycle: u64,
+    counters: &EnsembleCounters,
+) -> (EnsembleOutcome, Directive, usize) {
+    s.cycle = AssessmentSeq(cycle);
+    s.ensemble = counters.clone();
+    let plan = s.plan();
+    let source = answering_by(&plan, |p| Some(1.0 - p));
+    let outcome = s
+        .resolve_plan(&plan, &source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let selected = s.decide(&outcome).selected;
+    (outcome, selected, source.reframe_calls().len())
+}
+
+#[tokio::test]
+async fn recheck_on_a_spent_budget_authorises_enough_opinions_to_check_the_finish() {
+    // Integrated review, blocker 2(b). With the budget spent, an executed Finish is held and
+    // put to a person. A person may authorise cost, never an outcome: `Recheck` (or
+    // `ClaimComplete`) tops the budget up by the number of checks the escalation lists —
+    // every check the Finish needs an opinion on — once. The Finish still needs a fresh,
+    // confirming opinion on each; §2.2 is untouched. `Accept` keeps holding.
+    let mut s = Scenario::finish_ready().reframable_all();
+    let spent = EnsembleCounters {
+        opinions_used: s.settings.max_opinions_per_run,
+        ..EnsembleCounters::default()
+    };
+    let (outcome, selected, bought) = budget_cycle(&mut s, 20, &spent).await;
+    assert_eq!(bought, 0);
+    assert!(outcome.is_escalation(&selected), "{selected:?}");
+    assert_eq!(outcome.opinion_topup, 6, "every check the Finish rests on");
+    let (_, ask) = outcome
+        .escalations()
+        .next()
+        .unwrap_or_else(|| panic!("an ask"));
+    assert!(
+        ask.contains("Recheck or ClaimComplete authorises 6 more opinions"),
+        "{ask}"
+    );
+    assert!(ask.contains("Accept keeps them held"), "{ask}");
+
+    // Accept: held, asked again, nothing bought, nothing granted.
+    let mut accepted = outcome.counters.clone();
+    let checks = outcome.escalated_checks();
+    accepted.record_human_decision(&checks, &crate::assessment::HumanDecision::Accept);
+    assert_eq!(
+        accepted.record_budget_answer(
+            outcome.opinion_topup,
+            &crate::assessment::HumanDecision::Accept
+        ),
+        0
+    );
+    let (again, selected, bought) = budget_cycle(&mut s, 21, &accepted).await;
+    assert_eq!(bought, 0);
+    assert!(again.is_escalation(&selected));
+
+    // Recheck: six more opinions, once; the next cycle checks the Finish and it finishes.
+    for decision in [
+        crate::assessment::HumanDecision::Recheck,
+        crate::assessment::HumanDecision::ClaimComplete,
+    ] {
+        let mut answered = outcome.counters.clone();
+        answered.record_human_decision(&checks, &decision);
+        assert_eq!(
+            answered.record_budget_answer(outcome.opinion_topup, &decision),
+            6
+        );
+        assert_eq!(
+            answered.opinion_budget(&s.settings),
+            s.settings.max_opinions_per_run + 6
+        );
+        let (checked, selected, bought) = budget_cycle(&mut s, 21, &answered).await;
+        assert_eq!(bought, 6, "{decision:?}");
+        assert_eq!(selected.name(), "Finish", "{decision:?}");
+        assert_irreversible_guarded(&s, &checked, "topped up");
+    }
+}
+
+#[tokio::test]
+async fn a_top_up_of_only_the_held_checks_would_never_let_the_finish_through() {
+    // Why the top-up is every check the held directive needs, not only those the budget
+    // happened to hold. An irreversible opinion is always bought afresh, so a Finish needs
+    // all six again on the cycle after the answer. Topping up by the held count alone (4,
+    // the read set the ladder held; then 2, the inhibitors the gate held; then 2…) leaves
+    // the next attempt short every time: the run would ask a person forever.
+    let mut s = Scenario::finish_ready().reframable_all();
+    let mut counters = EnsembleCounters {
+        opinions_used: s.settings.max_opinions_per_run,
+        ..EnsembleCounters::default()
+    };
+    for cycle in 20..28 {
+        let (outcome, selected, _) = budget_cycle(&mut s, cycle, &counters).await;
+        assert_ne!(selected.name(), "Finish", "cycle {cycle}");
+        let held = outcome
+            .records
+            .iter()
+            .filter(|r| {
+                r.limits
+                    .iter()
+                    .any(|l| matches!(l, EnsembleLimit::OpinionBudget { .. }))
+            })
+            .count();
+        assert!(held > 0 && held < 6, "cycle {cycle}: {held} held");
+        counters = outcome.counters;
+        counters.opinion_topup += u32::try_from(held).unwrap_or(u32::MAX);
+    }
+}

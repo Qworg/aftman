@@ -3337,3 +3337,73 @@ async fn a_refused_finish_spends_no_opinions_while_a_person_keeps_accepting() ->
     assert_eq!(asked, vec![CheckKey::from(DOCS)], "{asked:?}");
     Ok(())
 }
+
+#[tokio::test]
+async fn a_spent_budget_answered_with_recheck_is_topped_up_once_and_the_finish_is_checked()
+-> TestResult {
+    // Integrated review, blocker 2(b), through the runtime. A budget of one opinion: the
+    // first goes to documentation's rule on cycle 1, so the executed Finish cannot be
+    // checked and is put to a person, saying what each answer does. `Accept` keeps holding:
+    // asked again, nothing bought. `Recheck` authorises the six opinions checking the Finish
+    // takes, once — visible as a notification — and the next cycle asks all six afresh,
+    // confirms, and finishes.
+    for recheck_first in [false, true] {
+        let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+        let model = Arc::new(R2Model::finish_ready());
+        let rt = fx.runtime(
+            config(|_| {}),
+            settings(|s| s.max_opinions_per_run = 1),
+            Arc::clone(&model) as Arc<dyn DecisionModel>,
+            Arc::new(SimulatedWorker::instant()),
+        );
+        let mut run = RunGuard::launch(&fx, rt).await?;
+        let first = escalation(&fx, 1).await?;
+        let raised = fx.of_kind(EventKind::EscalationRaised);
+        assert_eq!(raised[0].payload["opinion_topup"], FINISH_GUARDS);
+        let ask = raised[0].payload["ask"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(ask.contains("opinion budget"), "{ask}");
+        assert!(
+            ask.contains("Recheck or ClaimComplete authorises 6 more opinions"),
+            "{ask}"
+        );
+        let bought_before = model.calls(Purpose::Reframe).len();
+        assert_eq!(bought_before, 1, "documentation's, on cycle 1");
+        if recheck_first {
+            run.answer(first, HumanDecision::Recheck).await?;
+            let outcome = run.join().await?;
+            assert_eq!(outcome.status, FactoryStatus::Finished);
+            let topped: Vec<_> = fx
+                .of_kind(EventKind::Notification)
+                .into_iter()
+                .filter(|e| e.payload["code"] == "opinion_budget_topped_up")
+                .collect();
+            assert_eq!(topped.len(), 1);
+            assert_eq!(topped[0].payload["added"], FINISH_GUARDS);
+            assert_eq!(topped[0].payload["budget"], 1 + FINISH_GUARDS);
+            assert_eq!(
+                model.calls(Purpose::Reframe).len(),
+                bought_before + FINISH_GUARDS,
+                "every check the Finish rests on, asked afresh"
+            );
+        } else {
+            run.answer(first, HumanDecision::Accept).await?;
+            let _ = escalation(&fx, 2).await?;
+            assert_eq!(
+                model.calls(Purpose::Reframe).len(),
+                bought_before,
+                "nothing bought"
+            );
+            assert!(
+                fx.of_kind(EventKind::Notification)
+                    .iter()
+                    .all(|e| e.payload["code"] != "opinion_budget_topped_up"),
+                "Accept authorises nothing"
+            );
+            run.cancel().await?;
+        }
+    }
+    Ok(())
+}

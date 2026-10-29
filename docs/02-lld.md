@@ -283,6 +283,9 @@ pub struct Escalation { pub id: EscalationId, pub kind: EscalationKind,
     /// the answer is recorded against each in `RunState.ensemble` (doc 06 §4 R3).
     /// Empty for any other escalation. `#[serde(default)]`.
     pub ensemble_checks: Vec<CheckKey>,
+    /// For a spent-budget ensemble escalation: what Recheck/ClaimComplete authorises
+    /// (doc 06 §6). `#[serde(default)]`.
+    pub opinion_topup: u32,
     pub ask: String, pub jev_p: Option<f32>, pub opinions: Vec<Opinion>,
     pub answered: Option<(OffsetDateTime, HumanDecision, String)> }
 pub enum   EscalationKind { Check, AssessmentBudget, ModelUnavailable, WorkerBlocked }
@@ -329,7 +332,10 @@ The ensemble's own API lives in `aftman_core::ensemble` and is specified in
 ```rust
 pub struct EnsembleSettings { /* the [ensemble] table */ }      // validate() -> Result<(), EnsembleSettingsError>
 pub struct EnsembleCounters { pub opinions_used: u32,
-    pub checks: BTreeMap<CheckKey, CheckCounters> }              // in RunState.ensemble
+    pub checks: BTreeMap<CheckKey, CheckCounters>,               // in RunState.ensemble
+    pub opinion_topup: u32 }        // opinions a person authorised past max_opinions_per_run
+    // opinion_budget(settings) = max_opinions_per_run + opinion_topup;
+    // record_budget_answer(topup, decision) grants `topup` on Recheck/ClaimComplete only
     // CheckCounters also remembers a person's answer: `human` (Accept/Guidance) and
     // `recheck` (Recheck/ClaimComplete), set by record_human_decision (doc 06 §4 R3)
 impl EnsembleSettings { pub fn from_config_toml(source: &str)    // the [ensemble] table of
@@ -688,7 +694,8 @@ Payloads added for the control plane (every payload also carries `schema_version
 | `WorkerSteered` | `source` (`supervisor` \| `human`), `worker_id`, `outcome`, `accepted`, and for a human steer `excerpt` (≤ 200 chars). |
 | `WorkerCompleted` | `worker_id`, `outcome`, `success` (about the **exit code**), `empty` (about whether it said anything: no prose, no tool calls and no tokens for a structured backend; no output at all for one without a stream). The two are different questions — a worker that exits 0 having done nothing is not a completed job — and a surface should show both. See [10-live-validation.md](10-live-validation.md) step 2 for the case that motivated it. |
 | `WorkerTerminated` | Uniform: `worker_id`, `cause` (`stopped` for a `Stop` directive, `cancelled`, `superseded` for a `Retry`, `run_ended` when the run ended with a worker still live), `reason`. A worker that had already completed when its stop was seen is recorded by `WorkerCompleted` instead. |
-| `EscalationRaised` | `escalation_id` (what `run.answer` needs), `kind`, `reason`, `ask`, and for an ensemble escalation `checks` (the keys it is about; absent otherwise). |
+| `EscalationRaised` | `escalation_id` (what `run.answer` needs), `kind`, `reason`, `ask`, and for an ensemble escalation `checks` (the keys it is about; absent otherwise) and, when the opinion budget is spent, `opinion_topup` (what `Recheck`/`ClaimComplete` authorises, doc 06 §6). |
+| `Notification` (`code: "opinion_budget_topped_up"`) | A person's `Recheck`/`ClaimComplete` to a spent-budget escalation authorised more opinions: `escalation_id`, `added`, `budget` (the run's budget now). |
 | `EnsembleTriggered`, `OpinionRequested`, `OpinionRecorded`, `EnsembleResolved` | The `aftman_core::ensemble` payload types (doc 06 §8). One assessed cycle appends, in `seq` order: `AssessmentCompleted`; one `EnsembleTriggered` per triggered check; whatever the ensemble's source appends while it works (`EvidenceCollected` per refreshed provider, `ModelError`/`RateLimited`/`BudgetExceeded` with `purpose: "refresh"` or `"reframe"` and the `check` for a failed refresh or reframe call, `OpinionRequested` before each reframe); one `OpinionRecorded` per opinion; one `EnsembleResolved`; then `DirectiveProposed`… and `DirectiveSelected`. A cycle with no answers (a failed or refused model call) appends one `EnsembleResolved` with no `cycle` and no `checks`. |
 | `EscalationAnswered` | `escalation_id`, `surface`, `decision` (the serialized `HumanDecision`), `note` (≤ 2000 chars). |
 | `Notification` (`code: "guidance_not_delivered"`) | A `Guidance` answer with no active worker to receive it; recorded, not an error. |

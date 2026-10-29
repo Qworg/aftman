@@ -230,13 +230,47 @@ pub const fn rung_name(rung: Rung) -> &'static str {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct EnsembleCounters {
-    /// Opinion calls made so far this run, against `max_opinions_per_run`.
+    /// Opinion calls made so far this run, against `max_opinions_per_run` plus
+    /// `opinion_topup`.
     pub opinions_used: u32,
     /// Keyed by check. A check appears once the ensemble has looked at it.
     pub checks: BTreeMap<CheckKey, CheckCounters>,
+    /// Opinions a person has authorised beyond `max_opinions_per_run`, by answering a
+    /// spent-budget escalation with `Recheck` or `ClaimComplete`
+    /// ([`EnsembleCounters::record_budget_answer`]). Cost, never an outcome: every opinion it
+    /// pays for is still asked, and may still contest.
+    pub opinion_topup: u32,
 }
 
 impl EnsembleCounters {
+    /// The opinion budget for this run: `max_opinions_per_run`, plus what a person has
+    /// authorised since.
+    #[must_use]
+    pub fn opinion_budget(&self, settings: &EnsembleSettings) -> u32 {
+        settings
+            .max_opinions_per_run
+            .saturating_add(self.opinion_topup)
+    }
+
+    /// Apply a person's answer to a spent-budget escalation that would take `topup`
+    /// opinions to check what it held (`EnsembleOutcome::opinion_topup`), and return how
+    /// many were granted (`docs/06-ensemble.md` §4 R3, §6).
+    ///
+    /// A person may authorise **cost**, never an **outcome**: `Recheck` and
+    /// `ClaimComplete` add `topup` to the budget, once for that escalation, so the next
+    /// cycle can ask every check the held directive rests on afresh — and the directive
+    /// still goes ahead only if each of those opinions confirms. `Accept`, `Guidance` and
+    /// `Stop` grant nothing: the checks stay held, and a later cycle asks again.
+    pub fn record_budget_answer(&mut self, topup: u32, decision: &HumanDecision) -> u32 {
+        match decision {
+            HumanDecision::Recheck | HumanDecision::ClaimComplete => {
+                self.opinion_topup = self.opinion_topup.saturating_add(topup);
+                topup
+            }
+            HumanDecision::Accept | HumanDecision::Guidance { .. } | HumanDecision::Stop => 0,
+        }
+    }
+
     /// The counters for one check, or zeros.
     #[must_use]
     pub fn check(&self, key: &CheckKey) -> CheckCounters {

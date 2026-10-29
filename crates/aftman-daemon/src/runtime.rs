@@ -1690,6 +1690,27 @@ impl FactoryRuntime {
                 .ensemble
                 .record_human_decision(&ensemble_checks, &decision);
         }
+        // A spent opinion budget: a person may authorise the cost of checking what it held,
+        // never the outcome (`docs/06-ensemble.md` §6). Core decides what is granted.
+        let topup = state.escalations[index].opinion_topup;
+        let granted = state.ensemble.record_budget_answer(topup, &decision);
+        if granted > 0 {
+            let budget = state.ensemble.opinion_budget(&self.deps.ensemble);
+            self.emit(
+                state,
+                EventKind::Notification,
+                json!({
+                    "code": "opinion_budget_topped_up",
+                    "message": format!(
+                        "{granted} more opinions authorised; the opinion budget is now {budget}"
+                    ),
+                    "escalation_id": escalation_id.to_string(),
+                    "added": granted,
+                    "budget": budget,
+                }),
+            )
+            .await?;
+        }
         match decision {
             HumanDecision::Stop => {
                 self.cancel_run(state, ls, "stopped by operator").await?;
@@ -2712,6 +2733,7 @@ impl FactoryRuntime {
                     raised_at: self.now(),
                     check,
                     ensemble_checks: escalated.checks.clone(),
+                    opinion_topup: escalated.opinion_topup,
                     ask: ask.clone(),
                     jev_p,
                     opinions: escalated.opinions.clone(),
@@ -2725,6 +2747,9 @@ impl FactoryRuntime {
                     "reason": reason,
                     "ask": ask,
                 });
+                if escalated.opinion_topup > 0 {
+                    payload["opinion_topup"] = json!(escalated.opinion_topup);
+                }
                 if !escalated.checks.is_empty() {
                     payload["checks"] = json!(
                         escalated
@@ -2769,6 +2794,8 @@ fn model_error_payload(error: &ModelError) -> serde_json::Value {
 struct EscalatedChecks {
     checks: Vec<CheckKey>,
     opinions: Vec<aftman_core::assessment::Opinion>,
+    /// What a `Recheck` or `ClaimComplete` answer would authorise, for a spent budget.
+    opinion_topup: u32,
 }
 
 impl EscalatedChecks {
@@ -2780,7 +2807,11 @@ impl EscalatedChecks {
             .filter(|record| checks.contains(&record.check))
             .flat_map(|record| record.opinions.iter().map(|keyed| keyed.opinion.clone()))
             .collect();
-        Self { checks, opinions }
+        Self {
+            checks,
+            opinions,
+            opinion_topup: outcome.opinion_topup,
+        }
     }
 }
 

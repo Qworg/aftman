@@ -121,6 +121,11 @@ pub struct Escalation {
     /// for any other escalation, and in snapshots written before it existed.
     #[serde(default)]
     pub ensemble_checks: Vec<CheckKey>,
+    /// For an ensemble escalation raised because the opinion budget is spent: the opinions a
+    /// `Recheck` or `ClaimComplete` answer authorises (`EnsembleOutcome::opinion_topup`).
+    /// Zero for any other escalation, and in snapshots written before it existed.
+    #[serde(default)]
+    pub opinion_topup: u32,
     pub ask: String,
     pub jev_p: Option<f32>,
     pub opinions: Vec<Opinion>,
@@ -289,6 +294,7 @@ mod tests {
             raised_at: datetime!(2026-01-01 00:00:00 UTC),
             check: Some(CheckKey::from("core.completion__ready_to_finish")),
             ensemble_checks: Vec::new(),
+            opinion_topup: 0,
             ask: "is it done?".into(),
             jev_p: Some(0.71),
             opinions: Vec::new(),
@@ -313,6 +319,7 @@ mod tests {
             raised_at: datetime!(2026-01-01 00:00:00 UTC),
             check: None,
             ensemble_checks: Vec::new(),
+            opinion_topup: 0,
             ask: "budget exhausted".into(),
             jev_p: None,
             opinions: Vec::new(),

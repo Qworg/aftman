@@ -425,6 +425,10 @@ records it, the resolver applies it):
 | `Guidance` | `Accept`, and the text is delivered to the worker as a human steer (or recorded as `guidance_not_delivered` when no worker is running). The check records `HumanDecided { Guidance }`; the text itself is not repeated in every `ENSEMBLE_RESOLVED` — `ESCALATION_ANSWERED` has it once. |
 | `Recheck` | The next resolved cycle runs R0 for the check (the `HumanRecheck` trigger), in either band, **within the refresh cap**: a spent cap records `limit: refresh_cap` and refreshes nothing. Forgets an earlier acceptance. The blanket M3 re-run of providers is not done: the refresh is the check's own. The `before_finish` gate is re-armed. |
 | `ClaimComplete` | Exactly `Recheck`. It buys a measurement and **satisfies no conjunct**: a refresh that lands in the band again leaves the check held, and the run does not finish. Only a decisive fresh value can. |
+
+To an escalation raised because the opinion budget is spent, `Recheck` and `ClaimComplete` also
+authorise the opinions checking the held directive takes, once (§6, "…and is not a dead end");
+`Accept` and `Guidance` authorise nothing.
 | `Stop` | Ends the run as `Cancelled` (below). |
 
 Why acceptance holds only while the value is not decisive: "I accept this uncertainty" is about
@@ -725,12 +729,27 @@ loop:
   `Finish` or `Stop` from executing. A silent hold, though, left policy starting a worker every
   cycle for a job that looks finished, then escalating that it "does not look complete". With the
   `human` rung configured, every such hold in a cycle becomes **one** escalation, on the channel
-  `RepeatContest` uses, whose question says what happened: the budget is spent, and which
-  directive on which checks cannot be checked. Each held check also carries
-  `EnsembleLimit::OpinionBudget`. Without the `human` rung the checks are held, as before. The
-  escalation reaches policy as the cycle's `core.ensemble:escalate` proposal, at priority 850
+  `RepeatContest` uses, whose question says what happened — the budget is spent, which directive
+  on which checks cannot be checked, how many opinions checking it takes — and what each answer
+  does. Each held check also carries `EnsembleLimit::OpinionBudget`. Without the `human` rung the
+  checks are held, as before. The escalation reaches policy as the cycle's
+  `core.ensemble:escalate` proposal, at priority 850
   ([05-responsibilities.md §6.3](05-responsibilities.md)), which beats
   `StartWorker`, so no worker is started that cycle.
+- **…and is not a dead end.** A person may authorise **cost**, never an **outcome**. Answering a
+  spent-budget escalation with `Recheck` or `ClaimComplete` tops the budget up, once for that
+  escalation, by the number of opinions the escalation says checking takes
+  (`EnsembleOutcome::opinion_topup`, `Escalation::opinion_topup`,
+  `EnsembleCounters::record_budget_answer`; the counters keep it as `opinion_topup`, and a
+  `Notification` with `code: "opinion_budget_topped_up"`, `added` and `budget` records it). That
+  number is every check the held directive needs an opinion on this cycle — the held ones and,
+  for a `Finish` or `Stop`, every reframable, decisive check it rests on — not only the ones the
+  budget happened to hold: an irreversible opinion is always bought afresh, so the next attempt
+  needs them all again, and topping up by the held count alone left every later attempt short
+  (`a_top_up_of_only_the_held_checks_would_never_let_the_finish_through`). The directive still
+  needs a fresh confirm from each of those opinions, any of which may contest, so §2.2 is
+  untouched. `Accept` (or `Guidance`) authorises nothing: the checks stay held and the next
+  cycle asks again. `Stop` ends the run.
 - **A provisional `Finish` is not about to act.** When `before_finish` providers exist and have
   not run, the runtime does not apply a selected `Finish`: it runs them and re-assesses. The
   context says so (`EnsembleContext::finish_is_provisional`, set by the runtime). Then that

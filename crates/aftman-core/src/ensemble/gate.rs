@@ -173,7 +173,7 @@ async fn guard(
         }
     } else if !(settings.has(Rung::ReframeSameModel) && plan.reframe_available.contains(key)) {
         GuardOutcome::Unavailable
-    } else if counters.opinions_used.saturating_add(1) > settings.max_opinions_per_run {
+    } else if counters.opinions_used.saturating_add(1) > counters.opinion_budget(settings) {
         GuardOutcome::BudgetSpent
     } else {
         let opinion_key = OpinionKey {
@@ -209,7 +209,7 @@ async fn guard(
         GuardOutcome::BudgetSpent => {
             record.limits.push(EnsembleLimit::OpinionBudget {
                 used: counters.opinions_used,
-                cap: settings.max_opinions_per_run,
+                cap: counters.opinion_budget(settings),
             });
             rc.suppress(
                 CheckSuppression::Unresolved,

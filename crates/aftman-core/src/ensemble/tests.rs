@@ -639,6 +639,30 @@ fn the_plan_records_what_the_ladder_could_use() {
     assert!(!s.settings.has(Rung::ReframeSameModel));
 }
 
+// ---- built-in thresholds ----------------------------------------------------
+
+#[test]
+fn the_finish_disjunct_reads_needs_verification_against_its_own_threshold() {
+    // docs/05 §6.2: `needs_verification < 0.65`. `core.completion` used to look the
+    // threshold up among its own checks, found none, and compared against 0.75. With
+    // the ensemble off (no band), 0.70 then satisfied the disjunct and finished.
+    let mut s = Scenario::finish_ready().set(NEEDS_VER, 0.70);
+    s.settings.enabled = false;
+    assert_eq!(s.thresholds()[&k(NEEDS_VER)], Some(0.65));
+    assert!(
+        !s.proposals(&s.baseline())
+            .iter()
+            .any(|p| p.rule.as_str() == "core.completion:thresholds-satisfied"),
+        "0.70 is not below 0.65"
+    );
+    let s = s.set(NEEDS_VER, 0.60);
+    assert!(
+        s.proposals(&s.baseline())
+            .iter()
+            .any(|p| p.rule.as_str() == "core.completion:thresholds-satisfied")
+    );
+}
+
 // ---- the R2 consistency rule ----------------------------------------------
 
 #[test]

@@ -466,6 +466,26 @@ pub mod builtin {
         checks.iter().find(|check| check.id.as_str() == id)
     }
 
+    /// The threshold a built-in rule compares a check against: the check's own, as
+    /// resolved from its definition this cycle.
+    ///
+    /// Looking it up among the *rule's* responsibility's checks was wrong for a check owned
+    /// by another responsibility: `core.completion` reads `core.verification`'s
+    /// `needs_verification` (0.65), found nothing among its own checks, and compared
+    /// against the 0.75 fallback. The definitions refuse to drop the threshold of a check a
+    /// built-in reads (`THRESHOLD_READS`), so the fallback is reached only for a check
+    /// that is absent, which no comparison can satisfy anyway.
+    fn rule_threshold(input: &PolicyInput<'_>, checks: &[Check], key: &CheckKey) -> f32 {
+        input
+            .checks
+            .get(key)
+            .and_then(|check| check.threshold)
+            .unwrap_or_else(|| {
+                key.split()
+                    .map_or(0.75, |(_, id)| threshold_for(checks, id))
+            })
+    }
+
     fn threshold_for(checks: &[Check], id: &str) -> f32 {
         // The definition owns the threshold; the logic only needs a default for the
         // case where a check declares none.
@@ -501,15 +521,19 @@ pub mod builtin {
             }
             let ready = input.check_ge(
                 &key(COMPLETION, "ready_to_finish"),
-                threshold_for(&self.checks, "ready_to_finish"),
+                rule_threshold(input, &self.checks, &key(COMPLETION, "ready_to_finish")),
             );
             let requirements = input.check_ge(
                 &key(COMPLETION, "requirements_satisfied"),
-                threshold_for(&self.checks, "requirements_satisfied"),
+                rule_threshold(
+                    input,
+                    &self.checks,
+                    &key(COMPLETION, "requirements_satisfied"),
+                ),
             );
             let tests = input.check_ge(
                 &key(VERIFICATION, "tests_sufficient"),
-                threshold_for(&self.checks, "tests_sufficient"),
+                rule_threshold(input, &self.checks, &key(VERIFICATION, "tests_sufficient")),
             );
             // `needs_verification < t` is a *less-than*, so it goes through `check_lt`:
             // the direction-agnostic `permitted` matters here, and an in-band
@@ -517,7 +541,11 @@ pub mod builtin {
             let verification_resolved = input.counters.verifier_completed
                 || input.check_lt(
                     &key(VERIFICATION, "needs_verification"),
-                    threshold_for(&self.checks, "needs_verification"),
+                    rule_threshold(
+                        input,
+                        &self.checks,
+                        &key(VERIFICATION, "needs_verification"),
+                    ),
                 );
 
             if ready && requirements && tests && verification_resolved {
@@ -582,11 +610,19 @@ pub mod builtin {
             }
             let needed = input.check_ge(
                 &key(VERIFICATION, "needs_verification"),
-                threshold_for(&self.checks, "needs_verification"),
+                rule_threshold(
+                    input,
+                    &self.checks,
+                    &key(VERIFICATION, "needs_verification"),
+                ),
             );
             let implemented = input.check_ge(
                 &key(COMPLETION, "implementation_complete"),
-                threshold_for(&self.checks, "implementation_complete"),
+                rule_threshold(
+                    input,
+                    &self.checks,
+                    &key(COMPLETION, "implementation_complete"),
+                ),
             );
             if needed && implemented {
                 return vec![proposal(
@@ -643,7 +679,8 @@ pub mod builtin {
             }
 
             let mut candidates: Vec<(f32, &str, &str)> = Vec::new();
-            let off_track = threshold_for(&self.checks, "work_off_track");
+            let off_track =
+                rule_threshold(input, &self.checks, &key(WORKER_HEALTH, "work_off_track"));
             if let Some(p) = input.check_value(&key(WORKER_HEALTH, "work_off_track"))
                 && input.check_ge(&key(WORKER_HEALTH, "work_off_track"), off_track)
             {
@@ -653,7 +690,7 @@ pub mod builtin {
                     "active worker appears off track",
                 ));
             }
-            let stuck = threshold_for(&self.checks, "worker_stuck");
+            let stuck = rule_threshold(input, &self.checks, &key(WORKER_HEALTH, "worker_stuck"));
             if let Some(p) = input.check_value(&key(WORKER_HEALTH, "worker_stuck"))
                 && input.check_ge(&key(WORKER_HEALTH, "worker_stuck"), stuck)
             {
@@ -711,7 +748,7 @@ pub mod builtin {
         fn propose(&self, input: &PolicyInput<'_>) -> Vec<Proposal> {
             if !input.check_ge(
                 &key(HUMAN_ESCALATION, "needs_human"),
-                threshold_for(&self.checks, "needs_human"),
+                rule_threshold(input, &self.checks, &key(HUMAN_ESCALATION, "needs_human")),
             ) {
                 return Vec::new();
             }
@@ -754,7 +791,11 @@ pub mod builtin {
             }
             if !input.check_ge(
                 &key(REPOSITORY_INSTRUCTIONS, "agents_md_drift"),
-                threshold_for(&self.checks, "agents_md_drift"),
+                rule_threshold(
+                    input,
+                    &self.checks,
+                    &key(REPOSITORY_INSTRUCTIONS, "agents_md_drift"),
+                ),
             ) {
                 return Vec::new();
             }

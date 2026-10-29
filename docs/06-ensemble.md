@@ -598,12 +598,19 @@ Notes that follow directly from §2:
 
 | Event | Payload |
 | --- | --- |
-| `EnsembleTriggered` | check, reason, `jev_p`, threshold, margin, `decisive_directives` (before/after) |
-| `OpinionRequested` | opinion id, rung, source, model, `prompt_hash`, `state_digest`, timeout |
-| `OpinionRecorded` | opinion id, verdict, reported `p`, raw excerpt (≤2 KiB), latency, usage, error |
-| `EnsembleResolved` | check, `jev_p` (unmodified), `decisive`, `contested`, `permitted`, `suppression`, rungs used |
+| `EnsembleTriggered` | check, `triggers`, `reason` (the triggers joined), `jev_p`, threshold, margin, `decisive_directives` (`if_above`, `if_below`: directive names) |
+| `OpinionRequested` | opinion id, rung, source, model, `prompt_hash`, `state_digest`, `timeout_seconds`. Emitted by the source before the call, since only it knows the prompt |
+| `OpinionRecorded` | opinion id, rung, verdict, `p_reported`, excerpt (≤2 KiB), source, model, `prompt_hash`, `state_digest`, latency, usage, error |
+| `EnsembleResolved` | one per cycle: `enabled`, `margin`, `unresolved`, `rungs`, `cycle`, and `checks` — per triggered check: `jev_p` (unmodified), `triggers`, `decisive`, `contested`, `permitted`, `suppression`, `resolution`, `rungs_used`, `limits`, `refresh` (providers, `old_p`, every run and its exit code, the fresh value), `escalation` |
 | `EscalationRaised` | question, context, opinions so far, `context_digest` |
 | `EscalationAnswered` | human identity/surface, `HumanDecision`, free text |
+
+The payload types are `aftman_core::ensemble::{EnsembleTriggeredPayload, OpinionRequestedPayload,
+OpinionRecordedPayload, EnsembleResolvedPayload}`. The opinion id is `OpinionKey { cycle, check,
+rung }`: deterministic, so a replay asks for the same key the live run recorded. An evidence refresh
+has no event kind of its own; it is visible as the provider's `EvidenceCollected` and as the check's
+`EnsembleResolved` entry (`resolution: evidence_refreshed`, plus the `refresh` record), which is also
+what replay reads.
 
 Properties:
 
@@ -618,9 +625,14 @@ Properties:
   the other is a change detector.
 - **`prompt_hash`** covers the judge's full prompt, so a stored verdict is attributable to an exact
   template revision.
-- **Replay:** `RecordedOpinionSource` reads `OpinionRecorded` events and answers from them. Because
-  `resolve()` is pure and the opinion verdicts are recorded, a replayed run produces an identical
-  `EnsembleResolved` sequence.
+- **Replay:** `RecordedOpinionSource` reads `OpinionRecorded` events (opinions) and the `refresh`
+  records in `EnsembleResolved` (evidence refreshes) and answers from them. It returns the recorded
+  *answers*, and the resolver recomputes each verdict from them, so with the same settings a
+  replayed run produces an identical `EnsembleResolved` sequence. What is recorded is normalised
+  first — text capped, a non-finite number dropped — so that what a replay reads back is exactly
+  what the live run used.
+- **No request carries Jev's value.** `RefreshRequest` and `ReframeRequest` name the cycle and the
+  check, never `p`, so a source cannot show the model its own first answer.
 - **Reported values are stored and never used.** `p_reported` appears in the log for human
   inspection and in no arithmetic.
 

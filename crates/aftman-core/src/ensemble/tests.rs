@@ -17,8 +17,11 @@ use crate::assessment::{
 };
 use crate::definitions::DefinitionSet;
 use crate::directive::{Directive, Proposal};
+use crate::event::{EventEnvelope, EventKind};
 use crate::evidence::{CommandProvider, EvidencePlan, ProviderCwd, RunWhen};
-use crate::ids::{AssessmentSeq, CheckKey, EvidenceId, ResponsibilityId, RunId, WorkerId};
+use crate::ids::{
+    AssessmentSeq, CheckKey, EventSeq, EvidenceId, ResponsibilityId, RunId, WorkerId,
+};
 use crate::job::{FactoryStatus, JobSummary, RunConfig, TaskKind, WorkerKind};
 use crate::log::BoundedLog;
 use crate::model::Usage;
@@ -27,6 +30,8 @@ use crate::policy::{PolicyInput, arbitrate};
 use crate::responsibility::{Check, ResponsibilityRegistry};
 use crate::testing::RecordedOpinionSource;
 use crate::worker::WorkerRecord;
+
+type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const IMPL: &str = "core.completion__implementation_complete";
 const REQS: &str = "core.completion__requirements_satisfied";
@@ -1696,6 +1701,150 @@ async fn direction_guard_less_than_rules_fire_and_every_finish_comparison_is_gat
             "{key} contested still proposed Finish"
         );
     }
+}
+
+// ---- replay ----------------------------------------------------------------
+
+/// The events a runtime would write for one cycle's resolution.
+fn events_for(
+    outcome: &EnsembleOutcome,
+    settings: &EnsembleSettings,
+    seq: &mut u64,
+) -> Vec<EventEnvelope> {
+    let run = RunId::new();
+    let at = datetime!(2026-01-01 00:00:00 UTC);
+    let mut out = Vec::new();
+    let mut push = |kind, payload| {
+        *seq += 1;
+        out.push(EventEnvelope::new(EventSeq(*seq), run, at, kind, payload));
+    };
+    for record in &outcome.records {
+        for payload in record.opinion_recorded_payloads() {
+            push(
+                EventKind::OpinionRecorded,
+                serde_json::to_value(payload).unwrap_or_default(),
+            );
+        }
+    }
+    push(
+        EventKind::EnsembleResolved,
+        serde_json::to_value(
+            outcome.resolved_payload(settings.enabled, settings.uncertainty_margin),
+        )
+        .unwrap_or_default(),
+    );
+    out
+}
+
+#[tokio::test]
+async fn a_replay_from_recorded_events_is_bit_identical() -> TestResult {
+    // Four cycles touching every rung: a refresh, a contest, a confirm, a failed call,
+    // an escalation, and a cap.
+    let cycles: Vec<Scenario> = vec![
+        Scenario::finish_ready()
+            .set(TESTS, 0.71)
+            .selecting(TESTS, &["tests"])
+            .reframable_all(),
+        Scenario::finish_ready().set(TESTS, 0.92).reframable_all(),
+        Scenario::finish_ready()
+            .set(DOCS, 0.31)
+            .with_worker()
+            .set(STUCK, 0.97)
+            .reframable_all(),
+        Scenario::finish_ready().set(READY, 0.79).reframable_all(),
+    ];
+    let live_source = RecordedOpinionSource::new()
+        .with_refresh(AssessmentSeq(20), TESTS, refreshed(Some(0.08), "tests", 1))
+        .with_reframe(reframe_key(AssessmentSeq(21), TESTS), answer(Some(0.75)))
+        .with_reframe(reframe_key(AssessmentSeq(22), STUCK), answer(Some(0.04)))
+        .with_reframe(reframe_key(AssessmentSeq(22), DOCS), answer(Some(f32::NAN)));
+
+    let mut counters = EnsembleCounters::default();
+    let mut live = Vec::new();
+    let mut events = Vec::new();
+    let mut seq = 0;
+    for (i, mut s) in cycles.into_iter().enumerate() {
+        s.cycle = AssessmentSeq(20 + i as u64);
+        s.ensemble = counters.clone();
+        let outcome = s.plan().resolve(&live_source).await;
+        events.extend(events_for(&outcome, &s.settings, &mut seq));
+        counters = outcome.counters.clone();
+        live.push(outcome);
+    }
+    assert!(
+        live.iter()
+            .any(|o| o.records.iter().any(|r| r.refresh.is_some()))
+    );
+    assert!(
+        live.iter()
+            .any(|o| o.records.iter().any(|r| !r.opinions.is_empty()))
+    );
+
+    // Replay: the same inputs, answered only from the log.
+    let log = serde_json::to_string(&events)?;
+    let events: Vec<EventEnvelope> = serde_json::from_str(&log)?;
+    let replay_source = RecordedOpinionSource::from_events(&events)?;
+    let cycles: Vec<Scenario> = vec![
+        Scenario::finish_ready()
+            .set(TESTS, 0.71)
+            .selecting(TESTS, &["tests"])
+            .reframable_all(),
+        Scenario::finish_ready().set(TESTS, 0.92).reframable_all(),
+        Scenario::finish_ready()
+            .set(DOCS, 0.31)
+            .with_worker()
+            .set(STUCK, 0.97)
+            .reframable_all(),
+        Scenario::finish_ready().set(READY, 0.79).reframable_all(),
+    ];
+    let mut counters = EnsembleCounters::default();
+    for (i, mut s) in cycles.into_iter().enumerate() {
+        s.cycle = AssessmentSeq(20 + i as u64);
+        s.ensemble = counters.clone();
+        let replayed = s.plan().resolve(&replay_source).await;
+        assert_eq!(replayed, live[i], "cycle {i}");
+        assert_eq!(
+            serde_json::to_vec(&replayed)?,
+            serde_json::to_vec(&live[i])?,
+            "cycle {i} is not byte-identical"
+        );
+        counters = replayed.counters;
+    }
+    assert_eq!(
+        replay_source.refresh_calls().len(),
+        live_source.refresh_calls().len()
+    );
+    assert_eq!(
+        replay_source.reframe_calls(),
+        live_source.reframe_calls(),
+        "the replay asked exactly what the live run asked"
+    );
+    Ok(())
+}
+
+#[test]
+fn an_s0_ensemble_resolved_event_is_skipped_by_the_replay_reader() -> TestResult {
+    let event = EventEnvelope::new(
+        EventSeq(1),
+        RunId::new(),
+        datetime!(2026-01-01 00:00:00 UTC),
+        EventKind::EnsembleResolved,
+        serde_json::json!({"enabled": false, "margin": 0.15, "unresolved": [], "rungs": []}),
+    );
+    let source = RecordedOpinionSource::from_events(&[event])?;
+    assert!(source.refresh_calls().is_empty());
+    Ok(())
+}
+
+#[test]
+fn the_triggered_payload_names_the_triggers_and_records_no_counterfactual_value() {
+    let s = Scenario::finish_ready().set(READY, 0.79);
+    let payload = s.check_plan(READY).map(|p| p.triggered_payload());
+    let payload = payload.as_ref();
+    assert_eq!(payload.and_then(|p| p.jev_p), Some(0.79));
+    assert!(payload.is_some_and(|p| p.reason.contains("near_threshold")));
+    let json = serde_json::to_string(&payload).unwrap_or_default();
+    assert!(!json.contains("1.0") && !json.contains(":0.0"), "{json}");
 }
 
 fn opinion(verdict: Verdict) -> Opinion {

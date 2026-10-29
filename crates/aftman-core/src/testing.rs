@@ -12,10 +12,11 @@ use serde_json::Value;
 
 use crate::assessment::AnswerValue;
 use crate::ensemble::{
-    EnsembleOutcome, OpinionKey, OpinionSource, ReframeAnswer, ReframeRequest, RefreshOutcome,
-    RefreshRequest,
+    EnsembleOutcome, EnsembleResolvedPayload, OpinionKey, OpinionRecordedPayload, OpinionSource,
+    ReframeAnswer, ReframeRequest, RefreshOutcome, RefreshRequest,
 };
 use crate::error::ModelError;
+use crate::event::{EventEnvelope, EventKind};
 use crate::ids::{AssessmentSeq, CheckKey};
 use crate::model::{AskContext, Budget, DecisionModel, ModelAnswers, ModelInfo, Question, Usage};
 
@@ -343,7 +344,8 @@ impl DecisionModel for SimulatedModel {
 
 /// An [`OpinionSource`] that answers from recorded outcomes.
 ///
-/// Built from a resolution ([`RecordedOpinionSource::record`]), it gives back exactly what was
+/// Built from a live run's events ([`RecordedOpinionSource::from_events`]) or from a
+/// resolution ([`RecordedOpinionSource::record`]), it gives back exactly what was
 /// recorded, so that replaying a run's [`crate::ensemble::EnsemblePlan`]s against it
 /// produces identical resolutions (`docs/06-ensemble.md` §8). Tests also build it by
 /// hand, as a scripted source.
@@ -398,6 +400,40 @@ impl RecordedOpinionSource {
                     .insert(keyed.key.clone(), ReframeAnswer::from(&keyed.opinion));
             }
         }
+    }
+
+    /// Build from a run's events: `OPINION_RECORDED` for opinions, and the per-check
+    /// `refresh` entries of `ENSEMBLE_RESOLVED` for evidence refreshes. Other kinds are
+    /// ignored, and so is an `ENSEMBLE_RESOLVED` written before it carried check entries.
+    pub fn from_events(events: &[EventEnvelope]) -> Result<Self, serde_json::Error> {
+        let mut source = Self::new();
+        for event in events {
+            match event.kind {
+                EventKind::OpinionRecorded => {
+                    let payload: OpinionRecordedPayload =
+                        serde_json::from_value(event.payload.clone())?;
+                    source
+                        .reframes
+                        .insert(payload.opinion_id.clone(), payload.answer());
+                }
+                EventKind::EnsembleResolved => {
+                    let payload: EnsembleResolvedPayload =
+                        serde_json::from_value(event.payload.clone())?;
+                    let Some(cycle) = payload.cycle else {
+                        continue;
+                    };
+                    for check in payload.checks {
+                        if let Some(refresh) = check.refresh {
+                            source
+                                .refreshes
+                                .insert((cycle, check.check), refresh.outcome);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(source)
     }
 
     /// Every refresh requested, in order.

@@ -15,7 +15,7 @@ agent appear. Every milestone ends with the full offline suite green.
 | M2 — responsibilities, policy, a real worker | **complete** | `d3730f5`, `6d4b2a9`, `450b1a6` |
 | M3 — daemon, protocol, CLI, TUI | **complete** | `cdb5b0c`, `eab59ac`, `d673a67`, `76810fe`, `160ebdc`, `d74327f`, `1169b5c` |
 | M4 — web UI | **complete** | `826e737`, `55233b3`, `36c8742`, `fc38d02`, `8ff5ede`, `425e4a8`, `82e9c50` |
-| M5 — ensemble S1 and S2 | not started | — |
+| M5 — ensemble S1 and S2 | in progress: core triggers, the R0/R2 resolver and replay (`aftman_core::ensemble`); daemon wiring and the negation question not started | — |
 | M6 — herdr | not started | — |
 | M7 — ensemble S3 and S4 | not started | — |
 | M8 — backend hardening and verifier missions | in progress: in-process repository observation, its denial-of-service bound, and the observation-note invariant | — |

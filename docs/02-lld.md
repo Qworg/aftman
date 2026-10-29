@@ -1248,7 +1248,7 @@ here having an effect until the milestone that builds it lands.
 | Jev client | `wiremock` HTTP fixture: happy path, 429 with `retry-after-ms`, 500, timeout, missing answer, extra unknown answer type, malformed float |
 | Workers | Fake executables (shell scripts) that emit known stdout/stderr and exit codes; assert argv, env scrubbing, streaming, graceful termination |
 | Runtime | `tokio::time::pause` + `SimulatedWorker` + `ScriptedDecisionModel`; assert event sequence and directives |
-| Ensemble | `RecordedOpinionSource` (scripted, or recorded from a resolution) → deterministic resolutions: an exhaustive decision table over triggers × rungs × verdicts, the §14 invariant properties over value grids, and the §9 worked examples (doc 06 §14) |
+| Ensemble | `RecordedOpinionSource` (scripted or rebuilt from events) → deterministic resolutions: an exhaustive decision table over triggers × rungs × verdicts, the §14 invariant properties over value grids, the §9 worked examples, and a bit-identical replay (doc 06 §14) |
 | Store | Crash-consistency: truncate `events.jsonl` mid-line and assert recovery behaviour |
 | Protocol | In-process client against a real socket; HTTP mirror against the same handler |
 | End-to-end | One offline scenario per surface: CLI run, daemon run with two clients, web SSE reconnect |

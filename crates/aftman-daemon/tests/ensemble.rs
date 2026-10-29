@@ -2147,6 +2147,8 @@ struct R2Model {
     /// call. A check absent here is answered consistently: `1 − p`.
     negated: BTreeMap<CheckKey, Vec<Option<f32>>>,
     asked: Mutex<BTreeMap<CheckKey, usize>>,
+    /// From the `n`th assessment on, the check is answered with this value instead.
+    later: BTreeMap<CheckKey, (usize, f32)>,
     calls: Mutex<Vec<CallRecord>>,
 }
 
@@ -2170,8 +2172,15 @@ impl R2Model {
             refresh: BTreeMap::new(),
             negated: BTreeMap::new(),
             asked: Mutex::new(BTreeMap::new()),
+            later: BTreeMap::new(),
             calls: Mutex::new(Vec::new()),
         }
+    }
+
+    /// From the `nth` assessment on (1-based), say `p` for `key`.
+    fn later_at(mut self, nth: usize, key: &str, p: f32) -> Self {
+        self.later.insert(CheckKey::from(key), (nth, p));
+        self
     }
 
     /// Everything finished, with `tests_sufficient` too.
@@ -2218,21 +2227,31 @@ impl DecisionModel for R2Model {
         questions: &BTreeMap<CheckKey, Question>,
         _budget: &Budget,
     ) -> Result<ModelAnswers, ModelError> {
-        self.calls
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(CallRecord {
+        let assessments = {
+            let mut calls = self.calls.lock().unwrap_or_else(|e| e.into_inner());
+            calls.push(CallRecord {
                 context: *context,
                 keys: questions.keys().cloned().collect(),
                 questions: questions.clone(),
                 state: state.clone(),
             });
-        // `SimulatedWorker` reports "3 passed": a worker has run.
-        let table = if state.to_string().contains("3 passed") {
-            &self.assess
-        } else {
-            &self.early
+            calls
+                .iter()
+                .filter(|c| c.context.purpose == Purpose::Assessment)
+                .count()
         };
+        // `SimulatedWorker` reports "3 passed": a worker has run.
+        let mut table = if state.to_string().contains("3 passed") {
+            self.assess.clone()
+        } else {
+            self.early.clone()
+        };
+        for (key, (nth, p)) in &self.later {
+            if assessments >= *nth {
+                table.insert(key.clone(), *p);
+            }
+        }
+        let table = &table;
         let mut answers = BTreeMap::new();
         for key in questions.keys() {
             let p = match context.purpose {
@@ -2893,60 +2912,15 @@ async fn n4_no_earlier_confirm_covers_an_executed_finish() -> TestResult {
     assert_eq!(tests.opinions[0].opinion_id.cycle.get(), executed);
     assert_ne!(fx.selected_after(seq).as_deref(), Some("Finish"));
 
-    // 2. A confirm bought earlier, on the same side and within the cooldown, covers nothing
-    //    irreversible either. Before any work the model already calls the job done, apart
-    //    from documentation: documentation's rule starts the first worker, and the Finish
-    //    proposed beside it (refused: no work attempted) is a pending high-stakes directive,
-    //    so the ladder buys a non-irreversible opinion on `tests_sufficient`, which confirms.
-    //    The executed Finish after the worker asks again, fresh, and that answer contests.
-    let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
-    let mut model = R2Model::finish_ready()
-        .with(TESTS, 0.92)
-        .negated(TESTS, &[Some(0.08), Some(0.92)]);
-    for (key, p) in [
-        (READY, 0.95),
-        (REQS, 0.95),
-        (IMPL, 0.95),
-        (TESTS, 0.92),
-        (NEEDS_VER, 0.10),
-    ] {
-        model.early.insert(CheckKey::from(key), p);
-    }
-    let model = Arc::new(model);
-    let rt = fx.runtime(
-        config(|c| c.max_workers = 3),
-        settings(|_| {}),
-        Arc::clone(&model) as Arc<dyn DecisionModel>,
-        Arc::new(SimulatedWorker::instant()),
-    );
-    let outcome = fx.run(rt).await?;
-    assert_ne!(outcome.status, FactoryStatus::Finished);
-    let selected = selected_by_cycle(&fx);
-    let mut asked: Vec<(String, &'static str, bool)> = Vec::new();
-    for (_, payload) in fx.resolutions() {
-        let cycle = payload.cycle.map(|c| c.get()).unwrap_or(0);
-        if let Ok(e) = entry(&payload, TESTS) {
-            let irreversible = e.irreversible_guard.is_some()
-                || e.triggers.contains(&EnsembleTrigger::Irreversible);
-            for verdict in verdicts(e) {
-                let directive = selected.get(&cycle).cloned().unwrap_or_default();
-                asked.push((directive, verdict, irreversible));
-            }
-        }
-    }
-    assert_eq!(
-        asked.first(),
-        Some(&("StartWorker".to_owned(), "confirm", false)),
-        "the earlier, non-irreversible confirm: {asked:?}"
-    );
-    assert_eq!(
-        asked
-            .get(1)
-            .map(|(_, verdict, irreversible)| (*verdict, *irreversible)),
-        Some(("contest", true)),
-        "the executed Finish asked again rather than lean on it: {asked:?}"
-    );
-    assert_ne!(asked[1].0, "Finish");
+    // No second half. An earlier revision also showed a non-irreversible confirm, bought on
+    // the first cycle for a Finish refused there (no work attempted), not covering the
+    // executed one. The integrated review found that purchase was itself the defect: a
+    // refused Finish is not about to act, and buys nothing. Through the runtime no rule but
+    // the Finish's reads a Finish conjunct on the side the Finish needs — the Verify needs
+    // `needs_verification` above, the Finish below — so an earlier same-side,
+    // non-irreversible confirm cannot arise here. The cover rule itself is pinned in core:
+    // `nothing_covers_an_irreversible_opinion` and
+    // `a_confirm_does_not_cover_the_before_finish_reassessment`.
     Ok(())
 }
 
@@ -3273,5 +3247,93 @@ async fn a_model_call_the_opinion_timeout_abandoned_does_not_outlive_its_run() -
         "{:?}",
         ready.opinions[0].error
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_documentation_job_spends_no_opinion_on_an_outranked_finish() -> TestResult {
+    // Integrated review, blocker 2 (probe `probe_a_documentation_job_spends_the_budget_on_
+    // outranked_finishes`). Everything is done except documentation, which stays at 0.30
+    // for fifteen assessments: its rule starts worker after worker (750) over the Finish
+    // (700) proposed beside it. That Finish is outranked, so not about to act, and buys
+    // nothing. The run used to spend its whole budget there (20 reframes, 16 on an
+    // outranked Finish) and end asking a person; now it finishes once documentation is done.
+    let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+    let model = Arc::new(
+        R2Model::finish_ready()
+            .with(DOCS, 0.30)
+            .later_at(16, DOCS, 0.95),
+    );
+    let rt = fx.runtime(
+        config(|_| {}),
+        EnsembleSettings {
+            enabled: true,
+            ..EnsembleSettings::default()
+        },
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let outcome = fx.run(rt).await?;
+    assert_eq!(outcome.status, FactoryStatus::Finished);
+    let selected = selected_by_cycle(&fx);
+    let conjuncts = [READY, REQS, TESTS, NEEDS_VER].map(CheckKey::from);
+    for (_, requested) in opinions_requested(&fx) {
+        let cycle = requested.opinion_id.cycle.get();
+        if selected.get(&cycle).map(String::as_str) == Some("StartWorker") {
+            assert!(
+                !conjuncts.contains(&requested.opinion_id.check),
+                "cycle {cycle}: an opinion on {} for an outranked Finish",
+                requested.opinion_id.check
+            );
+        }
+    }
+    // The measured cost of the run: documentation's own rule, about to act, asked about
+    // when its cooldown allows, and the executed Finish's six guards.
+    let total = model.calls(Purpose::Reframe).len();
+    let docs = opinions_requested(&fx)
+        .iter()
+        .filter(|(_, r)| r.opinion_id.check == CheckKey::from(DOCS))
+        .count();
+    assert_eq!(
+        total,
+        docs - 1 + FINISH_GUARDS,
+        "docs {docs}, total {total}"
+    );
+    assert_eq!(
+        docs, 3,
+        "documentation's rule, once per cooldown window, and once guarded"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_refused_finish_spends_no_opinions_while_a_person_keeps_accepting() -> TestResult {
+    // Integrated review, blocker 2 (probe `probe_refused_finish_spends_the_opinion_budget_
+    // then_blocks_the_real_finish`). `needs_human` sits in the band, so every Finish is
+    // refused by `UnresolvedUncertainty`, and a person answers `Accept` to whatever is asked.
+    // The refused Finish is not about to act: nothing is bought for it, so the budget is
+    // intact for the Finish that can happen.
+    let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+    let model = Arc::new(R2Model::finish_ready().with(HUMAN, 0.75));
+    let rt = fx.runtime(
+        config(|_| {}),
+        settings(|_| {}),
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let mut run = RunGuard::launch(&fx, rt).await?;
+    for nth in 1..=4 {
+        let id = escalation(&fx, nth).await?;
+        run.answer(id, HumanDecision::Accept).await?;
+    }
+    let _ = escalation(&fx, 5).await?;
+    run.cancel().await?;
+    // Documentation's rule started the first worker (it was about to act, and was asked
+    // about once); nothing was ever bought for the Finish or what holds it.
+    let asked: Vec<CheckKey> = opinions_requested(&fx)
+        .into_iter()
+        .map(|(_, r)| r.opinion_id.check)
+        .collect();
+    assert_eq!(asked, vec![CheckKey::from(DOCS)], "{asked:?}");
     Ok(())
 }

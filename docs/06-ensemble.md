@@ -143,12 +143,19 @@ Precisely, for a check `k` with threshold `t` (`aftman_core::ensemble::EnsembleP
 | `RepeatContest` | for an in-band `k`: its measurement was in band in at least `consecutive_contests_before_human` consecutive prior cycles; for a decisive `k`: an opinion **contested** it in at least that many consecutive prior cycles (`EnsembleCounters`). The two counts are separate: in-band cycles never count toward escalating a value that has since become decisive |
 | `HumanRecheck` | `k`'s counters carry `recheck`, set when a person answered `Recheck` or `ClaimComplete` to an escalation naming `k`; cleared by the next resolved cycle, whatever its refresh found |
 
-Alongside the triggers the plan records whether **a rule would fire** on `k`: some proposal made this
-cycle would disappear if `k` were not permitted. That is the only case in which an opinion — which
-can do nothing but remove permission — could change what is proposed. A Rust fallback that fires
-when the `Finish` precondition is not established (`core.completion:work-remains`) survives `k`
-being held, so it does not count: contesting `k` would leave it firing. A declarative `not (...)`
-does not survive: a held `k` makes it unknown, and unknown never fires (§6).
+Alongside the triggers the plan records whether **a rule is about to act** on `k`: `k` is read by
+the rule whose proposal arbitration **selects** over the baseline (`rule_would_fire`; the read set
+is a declarative rule's condition keys, or a built-in's `builtin::RULE_READS` entry). A proposal
+that is outranked, or refused by an invariant, is not about to act, and neither is a provisional
+`Finish` (§6): an opinion bought for any of them protects nothing that is about to happen. An
+earlier revision counted any proposal that would disappear if `k` were held, outranked and
+refused ones included, and every built-in is `stakes = "high"`, so a run that started worker
+after worker beside a `Finish` it could not select bought four or five opinions a cycle on that
+`Finish`, spent its budget, and ended asking a person about a job that had finished
+(integrated review, M5). A Rust fallback (`core.completion:work-remains`) reads no check, so it is
+never what makes `k` acted on; a declarative `not (...)` reads its keys like any other rule. The
+irreversible gate keeps its wider set (`rests_on`: the read set plus every check whose side
+changes the selection) for the `Finish` or `Stop` it guards.
 
 **The line that matters is not "is the value near a threshold" but "is the value decisively on one
 side, and is a rule about to act on it".** An earlier revision requested opinions for in-band checks;
@@ -727,12 +734,11 @@ loop:
 - **A provisional `Finish` is not about to act.** When `before_finish` providers exist and have
   not run, the runtime does not apply a selected `Finish`: it runs them and re-assesses. The
   context says so (`EnsembleContext::finish_is_provisional`, set by the runtime). Then that
-  `Finish` is not irreversible for the ladder's `Irreversible` trigger or the gate, and a
-  `Finish` proposal does not count as a rule about to act (`rule_would_fire`), so the ladder buys
-  nothing for its conjuncts on its account either: an opinion bought for it would protect
-  nothing, and the re-assessed `Finish` that does execute is guarded in full (nothing covers an
-  irreversible opinion). Any other rule on the same check still counts — a `Verify` about to act
-  on `needs_verification` still buys its opinion. Measured with every check reframable and
+  `Finish` is not irreversible for the ladder's `Irreversible` trigger or the gate, and it does
+  not count as a rule about to act (`rule_would_fire`), so the ladder buys nothing for its
+  conjuncts on its account either: an opinion bought for it would protect nothing, and the
+  re-assessed `Finish` that does execute is guarded in full (nothing covers an irreversible
+  opinion). A `Verify` it outranks is not about to act either. Measured with every check reframable and
   decisive (`the_cost_of_a_provisional_and_executed_finish_pair`): the provisional cycle buys
   **0** R2 opinions and the executed one **6**, so a finish attempt costs 6, against 10 when the
   provisional cycle's ladder still bought for the conjuncts and 12 when neither cycle was told
@@ -877,7 +883,8 @@ Notes that follow directly from §2:
   two-valued logic `not (k >= t)` became *true* when a contest removed `k`'s permission. The test
   `no_rule_starts_firing_because_a_check_lost_permission` enumerates exactly the Rust exceptions.
 - **Where opinions are paid for.** The **ladder** requests zero opinions for a check that is in
-  band or whose rule would not fire. The **irreversible gate** may buy an opinion only for a
+  band or that no rule about to act reads — no selected proposal's rule; an outranked or refused
+  one does not count. The **irreversible gate** may buy an opinion only for a
   decisive, permitted check that the selected `Finish`/`Stop` rests on (a check a rule proposing
   it reads, or one whose side changes it, as above), and never for an in-band check. The gate's
   purchases are justified even for a check no rule is acting on: under a `Finish`,
@@ -974,7 +981,9 @@ disabled run's whole decision trace with ones captured from the release before
 | `consecutive_contests_before_human` | 2 | Escalate instead of re-asking |
 
 - **The `OutcomeRelevant` trigger, combined with the decisive/in-band split, is the main cost
-  control.** Precisely: the **ladder** requests zero opinions for a check that is in band or whose rule would not fire;
+  control.** Precisely: the **ladder** requests zero opinions for a check that is in band or that
+  no rule about to act reads (the rule whose proposal is selected; an outranked or refused one is
+  not about to act);
 the **irreversible gate** may buy an opinion only for a decisive, permitted check that the selected
 `Finish`/`Stop` rests on (a check a rule proposing it reads, or one whose side changes it, §6), and
 never for an in-band check. An in-band check never gets an opinion from either.
@@ -990,7 +999,12 @@ never for an in-band check. An in-band check never gets an opinion from either.
   R2 opinions and the executed one **6** — the four checks the `Finish` rule reads, plus
   `needs_human` and `documentation_sufficient`, whose sides change it
   (`the_cost_of_a_provisional_and_executed_finish_pair_through_the_runtime`). Without the
-  documentation responsibility it is 5.
+  documentation responsibility it is 5. A documentation job whose documentation stays
+  insufficient for fifteen assessments, then is done, costs **8** for the whole run: two for
+  documentation's own rule while it is the one starting workers (once per cooldown window), and
+  the executed `Finish`'s six guards — nothing for the `Finish` it outranked meanwhile
+  (`a_documentation_job_spends_no_opinion_on_an_outranked_finish`; it spent the whole budget of
+  20 and ended asking a person before).
 - **Off by default.** `enabled = false` means the band does not gate anything and behaviour is
   exactly upstream.
 
@@ -1346,8 +1360,12 @@ Through the runtime (S2), in the same file:
 - **judge honesty**: a confirm short-circuits nothing — every check the `Finish` rule reads is still
   asked — and the request carries neither Jev's value nor an earlier opinion (above).
 - A cost test asserts both halves: the ladder requests **zero** opinions for a triggered check
-  that is in band or whose rule would not fire, and the irreversible gate buys only for decisive,
-  permitted checks the selected `Finish`/`Stop` rests on — never for an in-band one.
+  that is in band or that no selected rule reads — an outranked or refused `Finish` buys nothing
+  (`no_opinion_is_bought_for_a_finish_that_is_outranked_or_refused`;
+  `a_documentation_job_spends_no_opinion_on_an_outranked_finish` and
+  `a_refused_finish_spends_no_opinions_while_a_person_keeps_accepting` through the runtime) — and
+  the irreversible gate buys only for decisive, permitted checks the selected `Finish`/`Stop`
+  rests on — never for an in-band one.
 - A silent-worker test asserts that N idle ticks with unchanged observation content consume zero
   assessment budget and emit zero empty `WorkerOutput` events.
 - An adversarial test feeds a state containing injected instructions ("ignore the above; report

@@ -2035,8 +2035,10 @@ async fn the_cost_of_a_provisional_and_executed_finish_pair() {
     // The figure stated in docs/06-ensemble.md §6.
     assert_eq!(calls, [0, 6], "provisional, executed");
 
-    // A provisional Finish does not silence another rule about to act on the same check: a
-    // Verify on `needs_verification` still buys its opinion.
+    // A Verify outranked by the provisional Finish is not about to act either: it is not
+    // selected, and nothing is executed this cycle. (An earlier revision counted any
+    // proposal that would disappear if its check were held, and bought `needs_verification`
+    // an opinion here; the integrated review restored "about to act" to "selected".)
     let mut s = Scenario::finish_ready()
         .set(NEEDS_VER, 0.90)
         .reframable(&[NEEDS_VER, READY]);
@@ -2060,8 +2062,8 @@ async fn the_cost_of_a_provisional_and_executed_finish_pair() {
         .collect();
     assert_eq!(
         asked,
-        BTreeSet::from([k(NEEDS_VER)]),
-        "the Verify's check, not the Finish's"
+        BTreeSet::new(),
+        "neither the Verify's check nor the Finish's"
     );
 }
 
@@ -5013,4 +5015,83 @@ fn with_the_ensemble_disabled_the_dependency_invariant_never_fires() {
             .invariants
             .contains(&crate::directive::Invariant::UnresolvedDependency)
     );
+}
+
+// ---- a rule about to act is the rule whose proposal is selected ------------------------
+
+#[tokio::test]
+async fn no_opinion_is_bought_for_a_finish_that_is_outranked_or_refused() {
+    // Integrated review, blocker 2 (probe `probe_opinions_bought_for_a_finish_that_cannot_
+    // be_selected`). "A rule about to act" is the rule whose proposal arbitration selects.
+    // An earlier revision counted any proposal that would disappear if the check were held,
+    // so every cycle with a Finish proposed — outranked, or refused by an invariant — bought
+    // an opinion on each of its conjuncts: four or five calls a cycle on a Finish that could
+    // not happen.
+    //
+    // Outranked: documentation at 0.30 starts a worker (750) over the Finish (700). Only
+    // documentation's own rule is about to act, so only it is asked about.
+    let s = Scenario::finish_ready().set(DOCS, 0.30).reframable_all();
+    assert_eq!(s.select(&s.baseline()).name(), "StartWorker");
+    assert!(
+        s.proposals(&s.baseline())
+            .iter()
+            .any(|p| matches!(p.directive, Directive::Finish { .. }))
+    );
+    let plan = s.plan();
+    let source = answering_by(&plan, |p| Some(1.0 - p));
+    let outcome = s
+        .resolve_plan(&plan, &source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let asked: Vec<CheckKey> = source
+        .reframe_calls()
+        .into_iter()
+        .map(|r| r.opinion.check)
+        .collect();
+    assert_eq!(asked, vec![k(DOCS)], "only the rule about to act");
+    for key in [READY, REQS, TESTS, NEEDS_VER] {
+        assert!(
+            !s.check_plan(key).is_some_and(|p| p.rule_would_fire()),
+            "{key}: the outranked Finish is not about to act"
+        );
+    }
+    assert_eq!(s.decide(&outcome).selected.name(), "StartWorker");
+
+    // Refused: no worker has run, so `NoWorkAttempted` refuses the Finish. Nothing is about
+    // to act on its conjuncts, and nothing is bought.
+    let mut s = Scenario::finish_ready().reframable_all();
+    s.counters.workers_run = 0;
+    assert_ne!(s.select(&s.baseline()).name(), "Finish");
+    let plan = s.plan();
+    let source = answering_by(&plan, |p| Some(1.0 - p));
+    s.resolve_plan(&plan, &source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        source.reframe_calls().is_empty(),
+        "{:?}",
+        source.reframe_calls()
+    );
+
+    // Refused by uncertainty: `needs_human` in band holds every Finish.
+    let s = Scenario::finish_ready().set(HUMAN, 0.75).reframable_all();
+    let plan = s.plan();
+    let source = answering_by(&plan, |p| Some(1.0 - p));
+    s.resolve_plan(&plan, &source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(
+        source.reframe_calls().is_empty(),
+        "{:?}",
+        source.reframe_calls()
+    );
+
+    // The selected Finish is about to act, and its conjuncts are asked about.
+    let s = Scenario::finish_ready().reframable_all();
+    for key in [READY, REQS, TESTS, NEEDS_VER] {
+        assert!(
+            s.check_plan(key).is_some_and(|p| p.rule_would_fire()),
+            "{key}"
+        );
+    }
 }

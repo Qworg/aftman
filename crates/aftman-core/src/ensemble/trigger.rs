@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
-use crate::assessment::{AnswerValue, CheckSuppression, Resolution, ResolvedCheck, Side};
+use crate::assessment::{AnswerValue, ResolvedCheck, Side};
 use crate::directive::{Directive, Proposal, Stakes};
 use crate::evidence::{EvidencePlan, RunWhen};
 use crate::ids::{AssessmentSeq, CheckKey, EvidenceId};
@@ -331,11 +331,22 @@ impl EnsemblePlan {
         }
         let mut triggered = Vec::new();
         if ctx.settings.enabled {
-            let (proposals, _) = evaluate(ctx, &baseline);
+            let (proposals, selected) = evaluate(ctx, &baseline);
+            // What is about to act: the rules whose proposal arbitration selects. Not a
+            // proposal that is outranked or refused, and not a provisional Finish, which
+            // the runtime re-assesses instead of executing.
+            let acting: BTreeSet<CheckKey> = proposals
+                .iter()
+                .filter(|p| p.directive == selected)
+                .filter(|p| {
+                    !(ctx.finish_is_provisional && matches!(p.directive, Directive::Finish { .. }))
+                })
+                .flat_map(|p| ctx.registry.reads(&p.rule))
+                .collect();
             let irreversible = irreversible_dependencies(ctx, &baseline);
             let high_stakes = high_stakes_dependencies(ctx, &baseline);
             let world = World {
-                proposals,
+                acting,
                 irreversible,
                 high_stakes,
             };
@@ -439,7 +450,8 @@ pub enum EnsembleError {
 
 /// What policy does with the baseline checks.
 struct World {
-    proposals: Vec<Proposal>,
+    /// The checks read by the rules whose proposal is selected: what is about to act.
+    acting: BTreeSet<CheckKey>,
     /// What the selected directive rests on, if it is irreversible.
     irreversible: BTreeSet<CheckKey>,
     /// What a pending high-stakes directive rests on (`high_stakes_dependencies`).
@@ -606,7 +618,6 @@ fn plan_check(
     // depends on the rule's comparator, which is exactly why both are evaluated.
     let (_, above_selected) = with_check(ctx, key, pinned(rc, Side::Above));
     let (_, below_selected) = with_check(ctx, key, pinned(rc, Side::Below));
-    let (held, _) = with_check(ctx, key, held(rc));
 
     if above_selected.name() != below_selected.name() {
         triggers.insert(EnsembleTrigger::OutcomeRelevant);
@@ -619,18 +630,12 @@ fn plan_check(
         triggers.insert(EnsembleTrigger::HighStakes);
     }
 
-    // A provisional Finish is not about to act: what follows it is the `before_finish`
-    // providers and a re-assessment, whose executed Finish is guarded in full. So it does
-    // not count here, and its conjuncts buy nothing in the ladder on its account. Any other
-    // rule on the same check — a Verify about to act, say — still counts.
-    let rule_would_fire = rc.permitted
-        && world
-            .proposals
-            .iter()
-            .filter(|p| {
-                !(ctx.finish_is_provisional && matches!(p.directive, Directive::Finish { .. }))
-            })
-            .any(|p| !held.contains(p));
+    // "A rule about to act" is a rule whose proposal arbitration selects, and this check is
+    // one it reads (`docs/06-ensemble.md` §3). A proposal that is outranked, or refused by
+    // an invariant, is not about to act, and an opinion bought for it protects nothing; nor
+    // is a provisional Finish, whose re-assessed, executed Finish is guarded in full. The
+    // irreversible gate keeps its wider set (`rests_on`) for the Finish or Stop it guards.
+    let rule_would_fire = rc.permitted && world.acting.contains(key);
 
     if rc.decisive && world.irreversible.contains(key) {
         triggers.insert(EnsembleTrigger::Irreversible);
@@ -724,17 +729,6 @@ fn with_check(
 /// the way that side does. Private, and only ever passed to `evaluate`.
 fn pinned(rc: &ResolvedCheck, side: Side) -> ResolvedCheck {
     rc.pinned(side)
-}
-
-/// A counterfactual: the check as it would be if an opinion contested it.
-fn held(rc: &ResolvedCheck) -> ResolvedCheck {
-    rc.clone().suppress(
-        CheckSuppression::Contested,
-        Resolution::UnresolvedInBand {
-            ask: String::new(),
-            rungs: Vec::new(),
-        },
-    )
 }
 
 /// The evidence a check selects: its own list, or the defaults.

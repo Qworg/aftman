@@ -38,12 +38,38 @@ pub async fn run_provider(
     forwarded_env: &[(String, String)],
     now: OffsetDateTime,
 ) -> EvidenceOutcome {
+    run_provider_until(
+        provider,
+        repo,
+        temp_dir,
+        forwarded_env,
+        now,
+        std::future::pending(),
+    )
+    .await
+}
+
+/// [`run_provider`], ended early when `cancel` completes.
+///
+/// Cancellation goes through the same path as the provider's own timeout: the whole process
+/// group is killed and reaped, and the outcome is recorded with `exit_code: None` and a
+/// `launch_error` saying why. **Never cancel a provider by dropping this future**: tokio's
+/// `kill_on_drop` reaches only the direct child, so a test runner's own children would
+/// outlive it.
+pub async fn run_provider_until(
+    provider: &CommandProvider,
+    repo: &Path,
+    temp_dir: &Path,
+    forwarded_env: &[(String, String)],
+    now: OffsetDateTime,
+    cancel: impl Future<Output = ()>,
+) -> EvidenceOutcome {
     let cwd = match provider.cwd {
         ProviderCwd::Repo => repo.to_path_buf(),
         ProviderCwd::Temp => temp_dir.to_path_buf(),
     };
     let started = tokio::time::Instant::now();
-    let outcome = run(provider, &cwd, forwarded_env).await;
+    let outcome = run(provider, &cwd, forwarded_env, cancel).await;
     let duration = started.elapsed();
 
     match outcome {
@@ -79,6 +105,7 @@ async fn run(
     provider: &CommandProvider,
     cwd: &Path,
     forwarded_env: &[(String, String)],
+    cancel: impl Future<Output = ()>,
 ) -> Result<(Option<i32>, String, bool), String> {
     let (program, args) = provider
         .argv
@@ -116,7 +143,21 @@ async fn run(
         (out, err, status)
     };
 
-    match tokio::time::timeout(provider.timeout(), collect).await {
+    // The collection future borrows the child; it is dropped at the end of this block, so
+    // a timeout or a cancel can then kill and reap the group.
+    let ended = {
+        tokio::select! {
+            collected = collect => Ended::Collected(collected),
+            () = tokio::time::sleep(provider.timeout()) => Ended::TimedOut,
+            () = cancel => Ended::Cancelled,
+        }
+    };
+    let collected = match ended {
+        Ended::Collected(collected) => Ok(collected),
+        Ended::TimedOut => Err(format!("timed out after {:?}", provider.timeout())),
+        Ended::Cancelled => Err("cancelled: the run was cancelled while it ran".to_owned()),
+    };
+    match collected {
         Ok((Ok(stdout), Ok(stderr), Ok(status))) => {
             let truncated = stdout.1 || stderr.1;
             let mut output = stdout.0;
@@ -131,8 +172,8 @@ async fn run(
         }
         Ok((Err(error), _, _)) | Ok((_, Err(error), _)) => Err(format!("reading output: {error}")),
         Ok((_, _, Err(error))) => Err(format!("waiting for the command: {error}")),
-        Err(_elapsed) => {
-            // Interrupt, then kill the group.
+        Err(why) => {
+            // Kill the whole group, so the command's own children go too, then reap.
             if let Some(pid) = child.id() {
                 let pid = pid as i32;
                 let _ = nix::sys::signal::kill(
@@ -141,9 +182,16 @@ async fn run(
                 );
             }
             let _ = child.wait().await;
-            Err(format!("timed out after {:?}", provider.timeout()))
+            Err(why)
         }
     }
+}
+
+/// How a provider's run ended.
+enum Ended<T> {
+    Collected(T),
+    TimedOut,
+    Cancelled,
 }
 
 /// Read a pipe, keeping at most `budget` bytes and reporting whether more arrived.
@@ -309,6 +357,65 @@ mod tests {
         assert!(outcome.truncated, "a clip must be reported, not silent");
         // The command still exited normally: the pipe kept being drained.
         assert_eq!(outcome.exit_code, Some(0));
+        Ok(())
+    }
+
+    /// Whether a process whose command line is exactly `sleep <arg>` is alive, by pid.
+    fn sleeping(arg: &str) -> Vec<String> {
+        std::process::Command::new("ps")
+            .args(["-eo", "pid=,args="])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .filter_map(|line| {
+                        let mut it = line.split_whitespace();
+                        let pid = it.next()?;
+                        (it.next() == Some("sleep")
+                            && it.next() == Some(arg)
+                            && it.next().is_none())
+                        .then(|| pid.to_owned())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_cancel_kills_the_whole_process_group_and_records_no_exit_code() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        // A background grandchild that would outlive a kill of `sh` alone.
+        let configured = provider(&["sh", "-c", "sleep 31.4159 & sleep 30; echo done"]);
+        let started = tokio::time::Instant::now();
+        let outcome = super::run_provider_until(
+            &configured,
+            dir.path(),
+            dir.path(),
+            &[],
+            now(),
+            tokio::time::sleep(Duration::from_millis(300)),
+        )
+        .await;
+        assert_eq!(outcome.exit_code, None);
+        assert!(
+            outcome
+                .launch_error
+                .as_deref()
+                .is_some_and(|e| e.contains("cancelled")),
+            "{:?}",
+            outcome.launch_error
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // The group is gone, grandchild included. Checked by pid, never by exe path.
+        let mut left = sleeping("31.4159");
+        for _ in 0..50 {
+            if left.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            left = sleeping("31.4159");
+        }
+        assert!(left.is_empty(), "orphaned: {left:?}");
         Ok(())
     }
 

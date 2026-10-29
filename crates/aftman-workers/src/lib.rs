@@ -27,7 +27,7 @@ pub mod simulated;
 pub mod subprocess;
 
 pub use backends::{BackendOptions, PermissionMode, SpecError, SteerProtocol};
-pub use evidence::run_provider;
+pub use evidence::{run_provider, run_provider_until};
 pub use output::{StreamDecoder, decode_all};
 pub use simulated::SimulatedWorker;
 pub use subprocess::{CommandSpec, SubprocessWorker};

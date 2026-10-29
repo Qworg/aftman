@@ -36,7 +36,7 @@ use super::trigger::{CheckPlan, EnsemblePlan, EnsembleTrigger};
 pub const OPINION_EXCERPT_CAP_BYTES: usize = 2048;
 /// Cap on the identifying strings an opinion carries (`source`, `model`, hashes).
 pub const OPINION_LABEL_CAP_BYTES: usize = 256;
-/// Cap on a refresh's error text.
+/// Cap on a refresh's error text, and on an escalation's question.
 pub const REFRESH_ERROR_CAP_BYTES: usize = 2048;
 
 /// Identifies one opinion: the cycle, the check, and the rung.
@@ -547,6 +547,7 @@ async fn refresh(
                 providers: plan.refresh_providers.clone(),
             })
             .await?,
+        plan.refresh_providers.len(),
     );
     let old_p = plan.baseline.jev_p;
     // A measurement needs both halves: a command that actually ran (it exited, so it
@@ -648,12 +649,18 @@ fn ask_for(plan: &CheckPlan, repeated: Option<(Repeated, u32)>) -> String {
         )),
         None => {}
     }
-    ask
+    cap_bytes(&ask, REFRESH_ERROR_CAP_BYTES)
 }
 
 /// Drop values that are not probabilities, and cap free text, so that what is recorded
 /// is exactly what a replay will read back.
-fn normalize_refresh(mut outcome: RefreshOutcome) -> RefreshOutcome {
+///
+/// At most one run per requested provider is kept, and each provider name is capped.
+fn normalize_refresh(mut outcome: RefreshOutcome, requested: usize) -> RefreshOutcome {
+    outcome.runs.truncate(requested);
+    for run in &mut outcome.runs {
+        run.provider = EvidenceId::new(cap_bytes(run.provider.as_str(), OPINION_LABEL_CAP_BYTES));
+    }
     outcome.new_p = outcome.new_p.filter(|p| is_probability(*p));
     outcome.error = outcome
         .error

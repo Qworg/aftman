@@ -1259,6 +1259,52 @@ async fn a_refresh_value_that_is_not_a_probability_does_not_permit() {
     }
 }
 
+#[tokio::test]
+async fn refresh_records_are_bounded() {
+    // Review finding 9: everything that reaches an event is capped.
+    let s = Scenario::finish_ready()
+        .set(READY, 0.79)
+        .selecting(READY, &["audit"]);
+    let runs: Vec<ProviderRun> = (0..100)
+        .map(|_| ProviderRun {
+            provider: EvidenceId::new("p".repeat(10_000)),
+            exit_code: Some(0),
+        })
+        .collect();
+    let source = RecordedOpinionSource::new().with_refresh(
+        CYCLE,
+        READY,
+        RefreshOutcome {
+            runs,
+            new_p: Some(0.96),
+            error: Some("e".repeat(100_000)),
+        },
+    );
+    let outcome = s
+        .plan()
+        .resolve(&source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let refresh = record(&outcome, READY).and_then(|r| r.refresh.clone());
+    let refresh = refresh.as_ref();
+    assert_eq!(
+        refresh.map(|r| r.outcome.runs.len()),
+        Some(1),
+        "one run per provider"
+    );
+    assert!(refresh.is_some_and(|r| {
+        r.outcome
+            .runs
+            .iter()
+            .all(|run| run.provider.as_str().len() <= 256)
+    }));
+    assert!(refresh.is_some_and(|r| r.outcome.error.as_ref().is_some_and(|e| e.len() <= 2048)));
+    match &outcome.checks[&k(READY)].resolution {
+        Resolution::EvidenceRefreshed { provider, .. } => assert!(provider.as_str().len() <= 256),
+        other => panic!("{other:?}"),
+    }
+}
+
 // ---- bounds ----------------------------------------------------------------
 
 #[tokio::test]
@@ -2065,32 +2111,29 @@ async fn run_case(c: &Case) {
         CounterState::BudgetSpent => counters.opinions_used = 20,
     }
     counters.checks.insert(key.clone(), check);
-    let plan = EnsemblePlan {
-        cycle: CYCLE,
-        settings: EnsembleSettings {
+    let plan = EnsemblePlan::scripted(
+        CYCLE,
+        EnsembleSettings {
             enabled: true,
             rungs: c.rungs.clone(),
             ..EnsembleSettings::default()
         },
         counters,
-        baseline: BTreeMap::from([(key.clone(), baseline.clone())]),
-        triggered: vec![CheckPlan {
-            check: key.clone(),
-            baseline: baseline.clone(),
-            triggers: c.triggers.clone(),
-            rule_would_fire: c.rule_would_fire && baseline.permitted,
-            refresh_providers: if c.providers {
+        vec![CheckPlan::scripted(
+            key.clone(),
+            c.p,
+            T,
+            M,
+            c.triggers.clone(),
+            c.rule_would_fire,
+            if c.providers {
                 vec![EvidenceId::new("tests")]
             } else {
                 Vec::new()
             },
-            reframe_available: c.reframe_available,
-            decisive_directives: DecisiveDirectives {
-                if_above: "Finish".into(),
-                if_below: "StartWorker".into(),
-            },
-        }],
-    };
+            c.reframe_available,
+        )],
+    );
     let new_p = match c.refresh {
         RefreshAnswer::Decisive => Some(0.05),
         RefreshAnswer::InBand => Some(0.70),

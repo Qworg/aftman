@@ -328,7 +328,9 @@ pub enum   EnsembleTrigger { NearThreshold, LowConfidence, ClaimOnlyEvidence, Ou
     HighStakes, Irreversible, RepeatContest }
 pub struct EnsembleContext<'a> { settings, cycle, policy: &PolicyInput, propose: &dyn Fn(&PolicyInput) -> Vec<Proposal>,
     definitions: &[Check], evidence: &EvidencePlan, answers, counters, reframe_available }
-pub struct EnsemblePlan { cycle, settings, counters, baseline, triggered: Vec<CheckPlan> }
+pub struct EnsemblePlan { /* private; accessors cycle(), settings(), counters(), baseline(),
+    triggered() -> &[CheckPlan] */ }       // only build() makes one, so a caller cannot hand the
+                                          // resolver a baseline from_measurement did not produce
 impl EnsemblePlan {
     pub fn build(ctx: &EnsembleContext) -> Self;                          // pure: triggers
     pub async fn resolve(&self, source: &dyn OpinionSource)

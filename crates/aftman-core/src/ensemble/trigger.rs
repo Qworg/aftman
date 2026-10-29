@@ -115,29 +115,99 @@ pub struct EnsembleContext<'a> {
 
 /// What the resolver needs to know about one triggered check. Plain data: building it
 /// is the only part of the ensemble that reads policy.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Its fields are private to the ensemble: a plan is only ever built by
+/// [`EnsemblePlan::build`], so a caller cannot hand the resolver a baseline that
+/// `ResolvedCheck::from_measurement` did not produce.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct CheckPlan {
-    pub check: CheckKey,
+    pub(super) check: CheckKey,
     /// Jev's own value, resolved with no opinion involved.
-    pub baseline: ResolvedCheck,
+    pub(super) baseline: ResolvedCheck,
     /// Never empty for a planned check.
-    pub triggers: BTreeSet<EnsembleTrigger>,
+    pub(super) triggers: BTreeSet<EnsembleTrigger>,
     /// A proposal made this cycle would disappear if this check were not permitted.
     ///
     /// This is "a rule is about to act on it": the only case in which an opinion,
     /// which can do nothing but remove permission, could change what is proposed.
     /// Always false for a value that is already held.
-    pub rule_would_fire: bool,
+    pub(super) rule_would_fire: bool,
     /// Command providers an evidence refresh would run for this check, in configuration
     /// order: those its selection names whose `run_when` is `on_demand` or
     /// `before_finish`.
-    pub refresh_providers: Vec<EvidenceId>,
+    pub(super) refresh_providers: Vec<EvidenceId>,
     /// Whether R2 can be asked for this check.
-    pub reframe_available: bool,
-    pub decisive_directives: DecisiveDirectives,
+    pub(super) reframe_available: bool,
+    pub(super) decisive_directives: DecisiveDirectives,
 }
 
 impl CheckPlan {
+    #[must_use]
+    pub fn check(&self) -> &CheckKey {
+        &self.check
+    }
+
+    /// Jev's own value, resolved with no opinion involved.
+    #[must_use]
+    pub fn baseline(&self) -> &ResolvedCheck {
+        &self.baseline
+    }
+
+    #[must_use]
+    pub fn triggers(&self) -> &BTreeSet<EnsembleTrigger> {
+        &self.triggers
+    }
+
+    /// Whether a proposal made this cycle would disappear if this check were held.
+    #[must_use]
+    pub fn rule_would_fire(&self) -> bool {
+        self.rule_would_fire
+    }
+
+    #[must_use]
+    pub fn refresh_providers(&self) -> &[EvidenceId] {
+        &self.refresh_providers
+    }
+
+    #[must_use]
+    pub fn reframe_available(&self) -> bool {
+        self.reframe_available
+    }
+
+    #[must_use]
+    pub fn decisive_directives(&self) -> &DecisiveDirectives {
+        &self.decisive_directives
+    }
+
+    /// A plan for one check, for the ensemble's own tests. The baseline is still derived
+    /// by `ResolvedCheck::from_measurement`, never supplied.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn scripted(
+        check: CheckKey,
+        p: f32,
+        threshold: f32,
+        margin: f32,
+        triggers: BTreeSet<EnsembleTrigger>,
+        rule_would_fire: bool,
+        refresh_providers: Vec<EvidenceId>,
+        reframe_available: bool,
+    ) -> Self {
+        let baseline =
+            ResolvedCheck::from_measurement(check.clone(), Some(p), Some(threshold), margin, true);
+        Self {
+            rule_would_fire: rule_would_fire && baseline.permitted,
+            check,
+            baseline,
+            triggers,
+            refresh_providers,
+            reframe_available,
+            decisive_directives: DecisiveDirectives {
+                if_above: "Finish".into(),
+                if_below: "StartWorker".into(),
+            },
+        }
+    }
+
     /// Whether a trigger is present.
     #[must_use]
     pub fn has(&self, trigger: EnsembleTrigger) -> bool {
@@ -153,20 +223,70 @@ impl CheckPlan {
     }
 }
 
-/// The ensemble's work for one cycle, decided before any I/O.
+/// The ensemble's work for one cycle, decided before any I/O. Built only by
+/// [`EnsemblePlan::build`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct EnsemblePlan {
-    pub cycle: AssessmentSeq,
-    pub settings: EnsembleSettings,
+    pub(super) cycle: AssessmentSeq,
+    pub(super) settings: EnsembleSettings,
     /// The counters as they stood before this cycle.
-    pub counters: EnsembleCounters,
+    pub(super) counters: EnsembleCounters,
     /// Every check's baseline resolution, as handed in.
-    pub baseline: BTreeMap<CheckKey, ResolvedCheck>,
+    pub(super) baseline: BTreeMap<CheckKey, ResolvedCheck>,
     /// Checks with at least one trigger, in key order.
-    pub triggered: Vec<CheckPlan>,
+    pub(super) triggered: Vec<CheckPlan>,
 }
 
 impl EnsemblePlan {
+    #[must_use]
+    pub fn cycle(&self) -> AssessmentSeq {
+        self.cycle
+    }
+
+    #[must_use]
+    pub fn settings(&self) -> &EnsembleSettings {
+        &self.settings
+    }
+
+    /// The counters as they stood before this cycle.
+    #[must_use]
+    pub fn counters(&self) -> &EnsembleCounters {
+        &self.counters
+    }
+
+    /// Every check's baseline resolution, as handed in.
+    #[must_use]
+    pub fn baseline(&self) -> &BTreeMap<CheckKey, ResolvedCheck> {
+        &self.baseline
+    }
+
+    /// Checks with at least one trigger, in key order. Emit `ENSEMBLE_TRIGGERED` for each
+    /// with [`CheckPlan::triggered_payload`].
+    #[must_use]
+    pub fn triggered(&self) -> &[CheckPlan] {
+        &self.triggered
+    }
+
+    /// A plan from scripted check plans, for the ensemble's own tests.
+    #[cfg(test)]
+    pub(super) fn scripted(
+        cycle: AssessmentSeq,
+        settings: EnsembleSettings,
+        counters: EnsembleCounters,
+        triggered: Vec<CheckPlan>,
+    ) -> Self {
+        Self {
+            cycle,
+            settings,
+            counters,
+            baseline: triggered
+                .iter()
+                .map(|plan| (plan.check.clone(), plan.baseline.clone()))
+                .collect(),
+            triggered,
+        }
+    }
+
     /// Compute the triggers for every check. Pure.
     ///
     /// With the ensemble disabled, nothing is triggered and the baseline stands.

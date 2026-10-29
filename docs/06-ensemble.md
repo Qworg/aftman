@@ -557,6 +557,12 @@ this section held it unconditionally. Without this rule an abstention on a `Veri
 let the next cycle's `Finish`, resting on the same check, through with no opinion at all — an
 opinion-driven `Finish` that no single-cycle test can see.
 
+A plan's fields are private to the ensemble and a plan is only built by `EnsemblePlan::build`, so no
+caller can hand the resolver a baseline with `permitted = true` that `from_measurement` did not
+produce. Every string that reaches an event is capped: opinion excerpts and errors at 2 KiB, labels
+and provider names at 256 bytes, refresh errors and escalation questions at 2 KiB, and a refresh
+keeps at most one run per requested provider.
+
 Every bound that stops the ladder — the refresh cap, the opinion budget, a cooldown — is recorded
 on the check's result (`EnsembleLimit`) and in `EnsembleResolved`, so a held check always says why.
 After every check is resolved, each thresholded check's two repeat counters are updated, and they

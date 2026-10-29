@@ -1605,6 +1605,42 @@ async fn a_refresh_whose_command_never_ran_does_not_permit() {
 }
 
 #[tokio::test]
+async fn a_run_of_a_provider_that_was_not_requested_does_not_count() {
+    // Round-2 probe P4b: `lint` exited, but the refresh asked for `audit`.
+    let s = Scenario::finish_ready()
+        .set(READY, 0.79)
+        .selecting(READY, &["audit"]);
+    let source = RecordedOpinionSource::new().with_refresh(
+        CYCLE,
+        READY,
+        RefreshOutcome {
+            runs: vec![ProviderRun {
+                provider: EvidenceId::new("lint"),
+                exit_code: Some(0),
+            }],
+            new_p: Some(0.95),
+            error: None,
+        },
+    );
+    let outcome = resolved(&s, &source).await;
+    let rc = &outcome.checks[&k(READY)];
+    assert!(!rc.permitted);
+    assert!(!matches!(
+        rc.resolution,
+        Resolution::EvidenceRefreshed { .. }
+    ));
+    let refresh = record(&outcome, READY).and_then(|r| r.refresh.clone());
+    assert_eq!(
+        refresh.as_ref().and_then(|r| r.rejected),
+        Some(super::RefreshRejection::NoProviderRan)
+    );
+    assert!(
+        refresh.is_some_and(|r| r.outcome.runs.is_empty()),
+        "the unrequested run is dropped from the record"
+    );
+}
+
+#[tokio::test]
 async fn a_refresh_value_that_is_not_a_probability_does_not_permit() {
     for new_p in [1.5_f32, -0.2, f32::NAN, f32::INFINITY] {
         let s = Scenario::finish_ready()
@@ -1637,12 +1673,18 @@ async fn refresh_records_are_bounded() {
     let s = Scenario::finish_ready()
         .set(READY, 0.79)
         .selecting(READY, &["audit"]);
-    let runs: Vec<ProviderRun> = (0..100)
+    // A hundred runs of the requested provider, and one of a provider with a huge name
+    // that was not requested.
+    let mut runs: Vec<ProviderRun> = (0..100)
         .map(|_| ProviderRun {
-            provider: EvidenceId::new("p".repeat(10_000)),
+            provider: EvidenceId::new("audit"),
             exit_code: Some(0),
         })
         .collect();
+    runs.push(ProviderRun {
+        provider: EvidenceId::new("p".repeat(10_000)),
+        exit_code: Some(0),
+    });
     let source = RecordedOpinionSource::new().with_refresh(
         CYCLE,
         READY,

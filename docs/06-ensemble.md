@@ -182,7 +182,8 @@ Outcome: `EvidenceRefreshed { old_p, new_p, provider, exit_code }` (plus `supers
 several providers run, `provider` and `exit_code` are the first that **exited**; the check's entry
 in `EnsembleResolved` records every attempt.
 
-A refresh is a measurement only if **at least one provider actually ran** (it has an exit code) **and**
+A refresh is a measurement only if **at least one requested provider actually ran** (it has an exit
+code; a run of a provider the request did not name is dropped from the record) **and**
 the fresh answer is a finite probability in `0..=1`. A model answer with no command behind it is
 not fresh evidence, however confident, and no provider is ever invented to stand in for one.
 Anything else is a rejected attempt, recorded as `rejected: no_provider_ran` or

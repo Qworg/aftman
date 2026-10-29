@@ -76,7 +76,8 @@ pub struct ProviderRun {
 /// None` when no provider exited — re-asking the model about evidence that was never
 /// produced is not a refresh. The resolver enforces this anyway: a refresh counts as a
 /// measurement only if at least one run has an exit code **and** `new_p` is a finite
-/// probability in `0..=1`. Anything else is recorded as a rejected attempt, still counts
+/// probability in `0..=1`. Only runs of providers the request named count; any other run
+/// is dropped. Anything else is recorded as a rejected attempt, still counts
 /// against the cap, and leaves the check held.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RefreshOutcome {
@@ -551,7 +552,7 @@ async fn refresh(
                 providers: plan.refresh_providers.clone(),
             })
             .await?,
-        plan.refresh_providers.len(),
+        &plan.refresh_providers,
     );
     let old_p = plan.baseline.jev_p;
     // A measurement needs both halves: a command that actually ran (it exited, so it
@@ -659,9 +660,18 @@ fn ask_for(plan: &CheckPlan, repeated: Option<(Repeated, u32)>) -> String {
 /// Drop values that are not probabilities, and cap free text, so that what is recorded
 /// is exactly what a replay will read back.
 ///
-/// At most one run per requested provider is kept, and each provider name is capped.
-fn normalize_refresh(mut outcome: RefreshOutcome, requested: usize) -> RefreshOutcome {
-    outcome.runs.truncate(requested);
+/// Only runs of providers that were requested are kept, at most one per provider: a run
+/// of a provider nobody asked for is not evidence about this check, and must not be what
+/// makes a refresh count as a measurement. Provider names are capped as well.
+fn normalize_refresh(mut outcome: RefreshOutcome, requested: &[EvidenceId]) -> RefreshOutcome {
+    let mut seen: Vec<EvidenceId> = Vec::new();
+    outcome.runs.retain(|run| {
+        let wanted = requested.contains(&run.provider) && !seen.contains(&run.provider);
+        if wanted {
+            seen.push(run.provider.clone());
+        }
+        wanted
+    });
     for run in &mut outcome.runs {
         run.provider = EvidenceId::new(cap_bytes(run.provider.as_str(), OPINION_LABEL_CAP_BYTES));
     }

@@ -248,7 +248,9 @@ impl EnsembleCounters {
     /// applied by the resolver on later cycles, and nothing here can permit a check.
     ///
     /// - `Accept` and `Guidance`: the check is held as `HumanDecided` whenever it is not
-    ///   decisively measured, for the rest of the run, and is not escalated again.
+    ///   decisively measured, for the rest of the run, and is not escalated again for
+    ///   that. A decisive value is untouched: a spent opinion budget or repeated contests
+    ///   on it still escalate.
     /// - `Recheck` and `ClaimComplete`: the next resolved cycle runs R0 for the check,
     ///   within the refresh cap, and forgets any earlier acceptance. `ClaimComplete` is
     ///   recorded exactly like `Recheck`: it buys a measurement, never a conjunct.
@@ -317,8 +319,9 @@ pub struct CheckCounters {
     /// escalation does not feed it either.
     pub consecutive_contests: u32,
     /// A person accepted this check's uncertainty. While its measurement is not decisive
-    /// it is held as `HumanDecided` and never escalated again; it is never made
-    /// permitted. Absent from older snapshots, which decode as no answer.
+    /// it is held as `HumanDecided` and not escalated again; it is never made permitted.
+    /// It does nothing for a decisive value. Absent from older snapshots, which decode as
+    /// no answer.
     #[serde(default)]
     pub human: Option<HumanAcceptance>,
     /// A person answered `Recheck` or `ClaimComplete`: the next resolved cycle runs R0

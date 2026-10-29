@@ -4661,43 +4661,46 @@ async fn an_accepted_check_is_held_as_human_decided_and_never_escalated_again() 
 }
 
 #[tokio::test]
-async fn an_accepted_budget_hold_is_not_escalated_again() {
-    use crate::assessment::HumanDecision;
+async fn an_earlier_accept_does_not_quiet_a_decisive_value_held_by_a_spent_budget() {
+    // Review probe SB3. Every check decisive, the job done, the opinion budget spent, and a
+    // person accepted every check earlier (when it was in band). An acceptance is about an
+    // uncertainty: it must not swallow the budget escalation for a decisive value, which
+    // left policy starting workers up to the limit.
+    let mut counters = EnsembleCounters {
+        opinions_used: 20,
+        ..EnsembleCounters::default()
+    };
+    let keys: Vec<CheckKey> = Scenario::finish_ready().values.keys().cloned().collect();
+    counters.record_human_decision(&keys, &crate::assessment::HumanDecision::Accept);
     let mut s = Scenario::finish_ready().reframable_all();
-    s.ensemble.opinions_used = s.settings.max_opinions_per_run;
+    s.ensemble = counters;
     let plan = s.plan();
-    let first = s
+    let outcome = s
         .resolve_plan(&plan, &answering_by(&plan, |p| Some(1.0 - p)))
         .await
         .unwrap_or_else(|e| panic!("{e}"));
-    let held: Vec<CheckKey> = first
-        .records
-        .iter()
-        .filter(|r| {
-            r.limits
-                .iter()
-                .any(|l| matches!(l, EnsembleLimit::OpinionBudget { .. }))
-        })
-        .map(|r| r.check.clone())
-        .collect();
-    assert!(!held.is_empty());
-    s.ensemble = first.counters.clone();
-    s.ensemble
-        .record_human_decision(&held, &HumanDecision::Accept);
-    s.cycle = AssessmentSeq(CYCLE.get() + 1);
-    let plan = s.plan();
-    let next = s
-        .resolve_plan(&plan, &answering_by(&plan, |p| Some(1.0 - p)))
+    assert_eq!(outcome.escalations().count(), 1);
+    assert!(
+        !outcome
+            .checks
+            .values()
+            .any(|c| matches!(c.resolution, Resolution::HumanDecided { .. })),
+        "no decisive value is recorded as a person's decision"
+    );
+    let decision = s.decide(&outcome);
+    assert!(outcome.is_escalation(&decision.selected), "{decision:?}");
+
+    // The decisive repeat-contest path ignores it too.
+    let s = Scenario::finish_ready()
+        .set(TESTS, 0.92)
+        .reframable(&[TESTS])
+        .contested_for(TESTS, 2)
+        .answered(&[TESTS], &crate::assessment::HumanDecision::Accept);
+    let outcome = s
+        .run_plan(&RecordedOpinionSource::new())
         .await
         .unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(next.escalations().count(), 0);
-    assert_ne!(s.decide(&next).selected.name(), "Finish");
-    for key in &held {
-        assert!(matches!(
-            next.checks[key].resolution,
-            Resolution::HumanDecided { .. }
-        ));
-    }
+    assert_eq!(outcome.escalations().count(), 1);
 }
 
 #[tokio::test]

@@ -391,32 +391,19 @@ impl EnsemblePlan {
         if !self.settings.has(Rung::Human) {
             return;
         }
-        let budget_held = |r: &CheckRecord| {
-            !r.resolved.permitted
-                && r.escalation.is_none()
-                && r.limits
-                    .iter()
-                    .any(|l| matches!(l, EnsembleLimit::OpinionBudget { .. }))
-        };
-        // A check a person has already accepted stays held, recorded as their decision,
-        // and is not put to them again.
-        for record in records.iter_mut() {
-            if budget_held(record)
-                && let Some(acceptance) = self.counters.check(&record.check).human
-            {
-                record.resolved = record.resolved.clone().suppress(
-                    CheckSuppression::Unresolved,
-                    Resolution::HumanDecided {
-                        decision: acceptance.decision(),
-                    },
-                );
-                checks.insert(record.check.clone(), record.resolved.clone());
-            }
-        }
+        // A budget hold is on a decisive value, which an earlier `Accept` does not touch:
+        // a person accepted an *uncertainty*, not the loss of the check that should have
+        // guarded this value (§4 R3).
         let held: Vec<usize> = records
             .iter()
             .enumerate()
-            .filter(|(_, r)| budget_held(r) && self.counters.check(&r.check).human.is_none())
+            .filter(|(_, r)| {
+                !r.resolved.permitted
+                    && r.escalation.is_none()
+                    && r.limits
+                        .iter()
+                        .any(|l| matches!(l, EnsembleLimit::OpinionBudget { .. }))
+            })
             .map(|(index, _)| index)
             .collect();
         let Some(first) = held.first().copied() else {
@@ -580,18 +567,9 @@ async fn resolve_check(
     }
 
     // A value that keeps being contested is a question for a person, not another opinion.
-    // One a person has already accepted stays held, and is not asked about again.
+    // The value is decisive, so an earlier `Accept` (about an in-band one) does not apply.
     if plan.has(EnsembleTrigger::RepeatContest) && settings.has(Rung::Human) {
-        if let Some(acceptance) = accepted {
-            record.resolved = rc.suppress(
-                CheckSuppression::Unresolved,
-                Resolution::HumanDecided {
-                    decision: acceptance.decision(),
-                },
-            );
-        } else {
-            escalate(plan, settings, counters, &mut record);
-        }
+        escalate(plan, settings, counters, &mut record);
         return Ok(record);
     }
 

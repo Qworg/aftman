@@ -356,7 +356,7 @@ records it, the resolver applies it):
 
 | Answer | What the next cycles do |
 | --- | --- |
-| `Accept` | For the rest of the run, whenever the check's measurement is not decisive it is held as `HumanDecided { Accept }` and **not escalated again**: no repeat of the question every cycle. Acceptance never permits it — it was held, it stays held, it can fire no rule — and an R0 refresh may still run within the cap. A later *decisive* measurement is Jev's own and is treated like any other (acceptance changes nothing about it in either direction). |
+| `Accept` | For the rest of the run, whenever the check's measurement is not decisive it is held as `HumanDecided { Accept }` and **not escalated again**: no repeat of the question every cycle. Acceptance never permits it — it was held, it stays held, it can fire no rule — and an R0 refresh may still run within the cap. A later *decisive* measurement is Jev's own and is treated like any other: acceptance changes nothing about it in either direction, so a spent opinion budget or repeated contests on a decisive value still escalate, whatever was accepted earlier. |
 | `Guidance` | `Accept`, and the text is delivered to the worker as a human steer (or recorded as `guidance_not_delivered` when no worker is running). The check records `HumanDecided { Guidance }`; the text itself is not repeated in every `ENSEMBLE_RESOLVED` — `ESCALATION_ANSWERED` has it once. |
 | `Recheck` | The next resolved cycle runs R0 for the check (the `HumanRecheck` trigger), in either band, **within the refresh cap**: a spent cap records `limit: refresh_cap` and refreshes nothing. Forgets an earlier acceptance. The blanket M3 re-run of providers is not done: the refresh is the check's own. The `before_finish` gate is re-armed. |
 | `ClaimComplete` | Exactly `Recheck`. It buys a measurement and **satisfies no conjunct**: a refresh that lands in the band again leaves the check held, and the run does not finish. Only a decisive fresh value can. |
@@ -537,7 +537,7 @@ evidence — can raise it, because only R0 produces a new *measurement*.
 | `Confirm` (R1/R2) | No effect. `permitted` is unchanged. |
 | `Contest` (R1/R2) | `permitted = false`, suppressing every rule that reads the check — `Finish`, `Stop`, `Verify`, `Steer`, `StartWorker`, and `<` rules alike. |
 | `UnresolvedInBand` | `permitted = false`. Contributes to escalation. |
-| `HumanDecided { Accept }` / `{ Guidance }` | `permitted = false` while the value is not decisive; not escalated again. |
+| `HumanDecided { Accept }` / `{ Guidance }` | `permitted = false` while the value is not decisive; not escalated again for that. Never applied to a decisive value. |
 | `HumanDecided { Stop }` | `Stop`. |
 | `HumanDecided { ClaimComplete }` | Runs R0. Cannot itself satisfy a `Finish` conjunct. |
 

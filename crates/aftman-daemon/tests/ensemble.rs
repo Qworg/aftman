@@ -1035,6 +1035,259 @@ async fn one_cycles_escalations_coalesce_into_one_escalate() -> TestResult {
     Ok(())
 }
 
+// ---- cancellation safety ------------------------------------------------------------
+
+/// The pids of live processes whose command line is exactly `sleep <arg>`. Matched by pid
+/// and command line, never by exe path (`AGENTS.md`).
+fn sleepers(arg: &str) -> Vec<String> {
+    std::process::Command::new("ps")
+        .args(["-eo", "pid=,args="])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .filter_map(|line| {
+                    let mut it = line.split_whitespace();
+                    let pid = it.next()?;
+                    (it.next() == Some("sleep") && it.next() == Some(arg) && it.next().is_none())
+                        .then(|| pid.to_owned())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Wait briefly for `sleep <arg>` processes to be gone; returns what is left (and kills it,
+/// so a failing test leaves nothing behind).
+async fn orphans(arg: &str) -> Vec<String> {
+    let mut left = sleepers(arg);
+    for _ in 0..100 {
+        if left.is_empty() {
+            return left;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        left = sleepers(arg);
+    }
+    for pid in &left {
+        let _ = std::process::Command::new("kill").arg(pid).status();
+    }
+    left
+}
+
+fn timed_provider(
+    script: &str,
+    timeout_seconds: u64,
+) -> Result<EvidencePlan, Box<dyn std::error::Error>> {
+    Ok(EvidencePlan::from_toml(
+        &format!(
+            r#"
+[[evidence.commands]]
+id = "tests"
+argv = ["sh", "-c", "{script}"]
+run_when = "on_demand"
+timeout_seconds = {timeout_seconds}
+success_exit_codes = [0]
+"#
+        ),
+        "test",
+    )?)
+}
+
+fn passing_model() -> StateModel {
+    StateModel::new(|text| {
+        if text.contains("PROVIDER-PASS") {
+            0.95
+        } else if claim_only(text) {
+            0.71
+        } else {
+            0.10
+        }
+    })
+}
+
+#[tokio::test]
+async fn a_provider_slower_than_the_opinion_timeout_is_still_measured() -> TestResult {
+    // Review probe PD1, first half. `opinion_timeout_seconds` bounds the model re-ask, not
+    // the provider: a provider inside its own timeout is waited for and measured.
+    let fx = Fixture::new(
+        definitions()?,
+        timed_provider("sleep 2; echo PROVIDER-PASS; exit 0", 30)?,
+    )?;
+    let rt = fx.runtime(
+        config(|_| {}),
+        settings(|s| s.opinion_timeout_seconds = 1),
+        Arc::new(passing_model()),
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let outcome = fx.run(rt).await?;
+    assert_eq!(outcome.status, FactoryStatus::Finished);
+    let refreshes = fx.refreshes(TESTS);
+    let (_, entry) = refreshes.first().ok_or("no refresh")?;
+    let refresh = entry.refresh.as_ref().ok_or("no refresh record")?;
+    assert_eq!(refresh.rejected, None, "{refresh:?}");
+    assert_eq!(refresh.outcome.runs.len(), 1);
+    assert_eq!(refresh.outcome.runs[0].exit_code, Some(0));
+    assert!(matches!(
+        entry.resolution,
+        Resolution::EvidenceRefreshed { .. }
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_provider_past_its_own_timeout_is_killed_with_its_group_and_recorded() -> TestResult {
+    // Review probe PD1, second half. Past its own `timeout_seconds` the provider is killed
+    // through its process-group path — the backgrounded grandchild too — and the run is
+    // recorded as launched, with no exit code. Before the fix an outer deadline dropped the
+    // future: `kill_on_drop` reached only `sh`, and the record said nothing had run.
+    let fx = Fixture::new(
+        definitions()?,
+        timed_provider("sleep 31.27 & sleep 30; echo PROVIDER-PASS; exit 0", 1)?,
+    )?;
+    let rt = fx.runtime(
+        config(|c| c.max_workers = 2),
+        settings(|s| s.max_evidence_refreshes_per_check = 1),
+        Arc::new(passing_model()),
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let outcome = fx.run(rt).await?;
+    let left = orphans("31.27").await;
+    assert!(left.is_empty(), "orphaned provider processes: {left:?}");
+    assert_ne!(outcome.status, FactoryStatus::Finished);
+    let refreshes = fx.refreshes(TESTS);
+    let (_, entry) = refreshes.first().ok_or("no refresh")?;
+    let refresh = entry.refresh.as_ref().ok_or("no refresh record")?;
+    assert_eq!(
+        refresh.outcome.runs.len(),
+        1,
+        "the launched provider is recorded"
+    );
+    assert_eq!(refresh.outcome.runs[0].exit_code, None);
+    assert_eq!(
+        refresh.rejected,
+        Some(aftman_core::ensemble::RefreshRejection::NoProviderRan)
+    );
+    let collected = fx.of_kind(EventKind::EvidenceCollected);
+    assert_eq!(collected.len(), 1);
+    assert!(
+        collected[0].payload["launch_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("timed out")),
+        "{}",
+        collected[0].payload
+    );
+    Ok(())
+}
+
+/// A store whose append returns two seconds after an `EVIDENCE_COLLECTED` is durably
+/// written: a slow disk, at the worst moment for a deadline.
+struct SlowAppend {
+    inner: Arc<dyn RunStore>,
+}
+
+#[async_trait]
+impl RunStore for SlowAppend {
+    async fn create(
+        &self,
+        header: &aftman_core::run::RunHeader,
+    ) -> Result<(), aftman_store::StoreError> {
+        self.inner.create(header).await
+    }
+    async fn append(&self, event: &EventEnvelope) -> Result<(), aftman_store::StoreError> {
+        self.inner.append(event).await?;
+        if event.kind == EventKind::EvidenceCollected {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        Ok(())
+    }
+    async fn snapshot(
+        &self,
+        state: &aftman_core::run::RunState,
+    ) -> Result<(), aftman_store::StoreError> {
+        self.inner.snapshot(state).await
+    }
+    async fn load(
+        &self,
+        id: aftman_core::ids::RunId,
+    ) -> Result<aftman_core::run::RunState, aftman_store::StoreError> {
+        self.inner.load(id).await
+    }
+    async fn events(
+        &self,
+        id: aftman_core::ids::RunId,
+        from: aftman_core::ids::EventSeq,
+    ) -> Result<Vec<EventEnvelope>, aftman_store::StoreError> {
+        self.inner.events(id, from).await
+    }
+    async fn list(
+        &self,
+        filter: &aftman_core::run::RunFilter,
+    ) -> Result<Vec<aftman_core::run::RunSummary>, aftman_store::StoreError> {
+        self.inner.list(filter).await
+    }
+    async fn read_log(
+        &self,
+        id: aftman_core::ids::RunId,
+    ) -> Result<aftman_store::EventLogRead, aftman_store::StoreError> {
+        self.inner.read_log(id).await
+    }
+    async fn delete(&self, id: aftman_core::ids::RunId) -> Result<(), aftman_store::StoreError> {
+        self.inner.delete(id).await
+    }
+    async fn ids(&self) -> Result<Vec<aftman_core::ids::RunId>, aftman_store::StoreError> {
+        self.inner.ids().await
+    }
+    async fn claim(
+        &self,
+        id: aftman_core::ids::RunId,
+    ) -> Result<Option<aftman_store::RunClaim>, aftman_store::StoreError> {
+        self.inner.claim(id).await
+    }
+    async fn claim_new(
+        &self,
+        id: aftman_core::ids::RunId,
+    ) -> Result<Option<aftman_store::RunClaim>, aftman_store::StoreError> {
+        self.inner.claim_new(id).await
+    }
+}
+
+#[tokio::test]
+async fn a_slow_append_during_a_refresh_is_never_cut_off() -> TestResult {
+    // Review probe PD5. With the whole refresh under `opinion_timeout_seconds`, the deadline
+    // dropped the future inside `emit`: the event was in the store, `last_seq` had not
+    // advanced, the hub never saw it, and the next append failed ("seq 36 does not follow
+    // the log's last seq 36"). Now nothing that writes is ever dropped.
+    let mut fx = Fixture::new(
+        definitions()?,
+        provider("on_demand", "echo PROVIDER-PASS; exit 0")?,
+    )?;
+    fx.store = Arc::new(SlowAppend {
+        inner: Arc::clone(&fx.store),
+    });
+    let rt = fx.runtime(
+        config(|c| c.max_workers = 2),
+        settings(|s| s.opinion_timeout_seconds = 1),
+        Arc::new(passing_model()),
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let outcome = fx.run(rt).await?;
+    assert_eq!(outcome.status, FactoryStatus::Finished);
+    let log = fx.store.read_log(outcome.run_id).await?;
+    let stored: Vec<(u64, EventKind)> = log.events.iter().map(|e| (e.seq.get(), e.kind)).collect();
+    let hub: Vec<(u64, EventKind)> = fx.events().iter().map(|e| (e.seq.get(), e.kind)).collect();
+    assert_eq!(stored, hub, "the store and the hub agree, event for event");
+    for (index, (seq, _)) in stored.iter().enumerate() {
+        assert_eq!(*seq, index as u64 + 1, "seq is contiguous");
+    }
+    assert!(
+        stored
+            .iter()
+            .any(|(_, kind)| *kind == EventKind::EvidenceCollected),
+        "the refresh ran"
+    );
+    Ok(())
+}
+
 // ---- the human answer ---------------------------------------------------------------
 
 /// `tests_sufficient` held in band with nothing to refresh it, under a control channel.

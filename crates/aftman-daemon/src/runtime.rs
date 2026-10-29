@@ -2556,8 +2556,9 @@ const REFRAME_UNAVAILABLE: &str =
 /// produced, and asks the model that check's question again under
 /// [`Purpose::Refresh`]. The call is billed like any other (the provider writes its usage
 /// line) and counts against `max_assessments` and the request budget. A failed or refused
-/// call, a spent budget, and the `opinion_timeout_seconds` deadline are outcomes with no
-/// value, never errors.
+/// call, a spent budget, and the `opinion_timeout_seconds` deadline — which bounds the model
+/// call alone; each provider is bounded by its own timeout — are outcomes with no value,
+/// never errors.
 ///
 /// It emits from inside the resolution, so it holds the run state behind a lock: one call
 /// at a time, each event appended to the store before it reaches the hub, in `seq` order
@@ -2675,18 +2676,53 @@ impl CycleSource<'_> {
 
         scratch.ls.assessments += 1;
         scratch.state.counters.assessments = scratch.ls.assessments;
-        match self
-            .rt
-            .deps
-            .model
-            .ask(
-                &aftman_core::model::AskContext::for_run(Purpose::Refresh, run_id, request.cycle),
-                &state_json,
-                &questions,
-                &self.rt.deps.jev_budget,
-            )
-            .await
-        {
+        // `opinion_timeout_seconds` bounds the model call, and only the model call. The
+        // call runs as its own task, so a deadline abandons the *wait*, never a future
+        // that writes: the call finishes on its own and the provider client records its
+        // usage line when it does. Every event below is emitted after the wait is over.
+        let model = Arc::clone(&self.rt.deps.model);
+        let context =
+            aftman_core::model::AskContext::for_run(Purpose::Refresh, run_id, request.cycle);
+        let budget = self.rt.deps.jev_budget;
+        let call =
+            tokio::spawn(
+                async move { model.ask(&context, &state_json, &questions, &budget).await },
+            );
+        let answered = match tokio::time::timeout(self.timeout, call).await {
+            Ok(Ok(answered)) => answered,
+            Ok(Err(joined)) => {
+                return Ok(no_value(
+                    runs,
+                    format!("the refresh call ended without an answer: {joined}"),
+                ));
+            }
+            Err(_) => {
+                self.rt
+                    .emit(
+                        scratch.state,
+                        EventKind::ModelError,
+                        json!({
+                            "code": "opinion_timeout",
+                            "message": format!(
+                                "the refresh call did not answer within {}s; it was abandoned",
+                                self.timeout.as_secs()
+                            ),
+                            "retryable": true,
+                            "purpose": "refresh",
+                            "check": request.check.to_string(),
+                        }),
+                    )
+                    .await?;
+                return Ok(no_value(
+                    runs,
+                    format!(
+                        "the refresh call did not answer within {}s",
+                        self.timeout.as_secs()
+                    ),
+                ));
+            }
+        };
+        match answered {
             Ok(answers) => {
                 let new_p = answers
                     .answers
@@ -2728,12 +2764,16 @@ impl OpinionSource for CycleSource<'_> {
                 error: Some("the run is ending".into()),
             });
         }
+        // Cancellation safety: this future is awaited to completion, never dropped part way
+        // (no timeout or select around it). It appends events and runs providers, and a
+        // dropped `emit` can leave an event in the store that never reaches the hub with
+        // `last_seq` not advanced, and a dropped provider orphans its process group. The
+        // bounds are inside: each provider's own timeout (a group kill), and
+        // `opinion_timeout_seconds` around the model call alone (`docs/02-lld.md` §11).
         let mut runs = Vec::new();
-        let result =
-            tokio::time::timeout(self.timeout, self.refresh(scratch, request, &mut runs)).await;
-        Ok(match result {
-            Ok(Ok(outcome)) => outcome,
-            Ok(Err(error)) => {
+        Ok(match self.refresh(scratch, request, &mut runs).await {
+            Ok(outcome) => outcome,
+            Err(error) => {
                 scratch.fatal = Some(error);
                 RefreshOutcome {
                     runs,
@@ -2741,14 +2781,6 @@ impl OpinionSource for CycleSource<'_> {
                     error: Some("the run is ending".into()),
                 }
             }
-            Err(_) => RefreshOutcome {
-                runs,
-                new_p: None,
-                error: Some(format!(
-                    "the refresh did not finish within {}s",
-                    self.timeout.as_secs()
-                )),
-            },
         })
     }
 

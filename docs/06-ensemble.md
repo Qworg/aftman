@@ -206,10 +206,12 @@ a `RefreshRequest` so:
 1. **Budget first.** With `max_assessments` spent nothing runs: the outcome has no runs and no value
    (`rejected: no_provider_ran`), because evidence nobody may be asked about is not worth a command.
 2. **Exactly the requested providers**, in order, through the one path every command provider takes
-   (`run_one_provider`: the environment built by `worker_environment()`, the provider's own timeout
-   and output cap, and one `EVIDENCE_COLLECTED` each). Each is reported with its real exit code, or
-   `None` if it could not be launched or was killed. Its output replaces the provider's previous
-   result in the run's evidence, so the cycles that follow see it too.
+   (`run_one_provider`: the environment built by `worker_environment()`, the output cap, and one
+   `EVIDENCE_COLLECTED` each). **Each provider is bounded by its own `timeout_seconds` only**, and
+   is never cut off by anything else: past it, the provider's whole process group is killed and
+   reaped, and the run is recorded with `exit_code: None`. Each is reported with its real exit
+   code, or `None` if it could not be launched or was killed. Its output replaces the provider's
+   previous result in the run's evidence, so the cycles that follow see it too.
 3. If none exited, no model call: no value.
 4. **The observation is rebuilt** exactly as a cycle builds it, with the fresh evidence, and the
    model is asked that one check's question again over `state_for(selection)`, where `selection`
@@ -222,12 +224,19 @@ a `RefreshRequest` so:
    (no value, `rejected: no_measurement`), recorded as `MODEL_ERROR` / `RATE_LIMITED` /
    `BUDGET_EXCEEDED` with `purpose: "refresh"` and the check; it does not count toward the cycle's
    consecutive-failure invariants, which are about the cycle's own call.
-6. The whole call is bounded by `opinion_timeout_seconds`; a refresh that outlives it answers with
-   whatever had run and no value.
+6. **`opinion_timeout_seconds` bounds the model call alone.** The call runs as its own task; past
+   the deadline the runtime stops waiting (a `MODEL_ERROR` with `code: "opinion_timeout"` and no
+   value), and the abandoned call finishes on its own, so the provider client still records its
+   usage line. A provider slower than `opinion_timeout_seconds` but inside its own timeout is
+   waited for and measured.
 
 The source writes events from inside the resolution. It holds the run state behind one lock for the
 duration and appends through the runtime's own `emit`, so every event is appended to the store
-before it reaches the hub, in `seq` order ([02-lld.md §11](02-lld.md)). A store failure ends the
+before it reaches the hub, in `seq` order ([02-lld.md §11](02-lld.md)). That holds only because
+**no future that appends an event or runs a provider is ever dropped part way**: there is no
+deadline or `select` around a refresh. A dropped `emit` can leave an event in the store that never
+reaches the hub, with `last_seq` not advanced, so the next append fails; a dropped provider
+orphans its process group (`kill_on_drop` reaches only the direct child). A store failure ends the
 run, as anywhere else: the source answers with no value, and the runtime returns the error once the
 resolution is done. The source never returns `Err`: that is reserved for a replay that has no
 recording.
@@ -862,7 +871,7 @@ disabled run's whole decision trace with one captured from the release before
 | --- | --- | --- |
 | `max_opinions_per_run` | 20 | A run needing more opinions has a broken check, not a hard question. Counts opinion calls only; refreshes are not opinions. A decisive check a rule is about to act on, with the budget spent, is held rather than acted on unchecked, and — with the `human` rung — the cycle raises one escalation saying so (§6) |
 | `max_evidence_refreshes_per_check` | 3 | Same reason. Every attempt counts, including one whose command could not run |
-| `opinion_timeout_seconds` | 120 | An opinion must not outlive the worker it is judging. The runtime applies the same bound to one evidence refresh (its commands and its model call together) |
+| `opinion_timeout_seconds` | 120 | An opinion must not outlive the worker it is judging. For an evidence refresh it bounds the model re-ask only; each command is bounded by its own `timeout_seconds` (§4 R0) |
 | `per_check_cooldown_cycles` | 10 | One opinion per check per ten cycles, for non-irreversible triggers. Within the window an opinion the last one covers (a confirm, on the same side) is skipped, and one it does not cover holds the check. Never applies to an `Irreversible` trigger, whose opinion is always bought fresh, budget permitting (§6) |
 | `consecutive_contests_before_human` | 2 | Escalate instead of re-asking |
 

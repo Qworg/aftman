@@ -1027,7 +1027,18 @@ events** — the runtime, the daemon's failure marking, restart recovery, and th
 a run's events are emitted in `seq` order with none skipped. The ensemble's evidence refresh
 (doc 06 §4 R0) writes from inside a resolution; it holds the run state behind one lock for the
 whole resolution and appends through the runtime's own `emit`, so it is the same writer, one
-event at a time, and a store failure there ends the run as it would anywhere else. A subscriber
+event at a time, and a store failure there ends the run as it would anywhere else.
+
+**Cancellation safety.** The append-then-emit pair is only as safe as the future that runs it:
+**never drop a future that contains an `emit`, or one that runs a command provider.** A dropped
+`emit` can leave an event durably appended with `last_seq` not advanced: the hub never sees it, and
+the next append fails because its `seq` no longer follows the log. A dropped provider orphans its
+process group, because `kill_on_drop` reaches only the direct child. So nothing of that kind sits
+under a `tokio::time::timeout` or a `select!` branch that can lose: a provider is bounded by its own
+timeout and stopped early only through `run_provider_until`'s cancellation, which takes the same
+process-group kill path; a deadline that must apply to a model call wraps a spawned task, so it
+abandons the wait and never the call; and every event about either is emitted after it has
+returned. A subscriber
 is registered for live
 delivery before its backlog is read, so anything it does not find in the log arrives live, and the
 overlap is dropped by `seq`. A writer that emitted before appending, or appended an event it never

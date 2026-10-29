@@ -278,6 +278,26 @@ impl ResponsibilityDefinition {
             ));
         }
 
+        // A check a built-in rule compares against a threshold must have one, or it is
+        // never banded: the ensemble would never hold or trigger it while the rule still
+        // acted on it.
+        if let Some((_, reads)) = crate::responsibility::builtin::THRESHOLD_READS
+            .iter()
+            .find(|(builtin, _)| *builtin == id)
+        {
+            for check_id in *reads {
+                if let Some(check) = self.checks.get(*check_id)
+                    && check.min_threshold.is_none()
+                {
+                    return Err(invalid(format!(
+                        "check `{check_id}` must declare `min_threshold`: a built-in rule \
+                         compares it against a threshold, and without one it has no \
+                         uncertainty band"
+                    )));
+                }
+            }
+        }
+
         for (check_id, check) in &self.checks {
             if check_id.trim().is_empty() {
                 return Err(invalid("a check id is empty".to_owned()));
@@ -954,6 +974,43 @@ mod tests {
         assert!(
             error.to_string().contains("routing_instructions"),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn an_overlay_cannot_drop_a_threshold_a_builtin_rule_reads() {
+        // Review probe 8: without `min_threshold`, `ready_to_finish` is never banded or
+        // triggered, while the built-in Finish rule still compares it against a number.
+        let error = parse(
+            "core.completion",
+            "enabled = true\nalways = true\ntitle = \"Completion\"\n\
+             [checks.implementation_complete]\ninstructions = \"?\"\nmin_threshold = 0.75\n\
+             [checks.requirements_satisfied]\ninstructions = \"?\"\nmin_threshold = 0.75\n\
+             [checks.ready_to_finish]\ninstructions = \"?\"\n",
+        )
+        .expect_err("must refuse");
+        let message = error.to_string();
+        assert!(message.contains("ready_to_finish"), "{message}");
+        assert!(message.contains("min_threshold"), "{message}");
+        // A check read by another built-in counts too: `tests_sufficient` is a Finish conjunct.
+        let error = parse(
+            "core.verification",
+            "enabled = true\nalways = true\ntitle = \"Verification\"\n\
+             [checks.tests_sufficient]\ninstructions = \"?\"\n\
+             [checks.needs_verification]\ninstructions = \"?\"\nmin_threshold = 0.65\n",
+        )
+        .expect_err("must refuse");
+        assert!(error.to_string().contains("tests_sufficient"), "{error}");
+        // A check no built-in reads may still omit it.
+        assert!(
+            parse(
+                "core.worker-health",
+                "enabled = true\nalways = true\ntitle = \"Health\"\n\
+                 [checks.meaningful_progress]\ninstructions = \"?\"\n\
+                 [checks.worker_stuck]\ninstructions = \"?\"\nmin_threshold = 0.8\n\
+                 [checks.work_off_track]\ninstructions = \"?\"\nmin_threshold = 0.8\n",
+            )
+            .is_ok()
         );
     }
 

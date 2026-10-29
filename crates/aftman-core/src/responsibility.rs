@@ -311,6 +311,29 @@ pub mod builtin {
     pub const HUMAN_ESCALATION_CHECKS: &[&str] = &["needs_human"];
     pub const REPOSITORY_INSTRUCTIONS_CHECKS: &[&str] = &["agents_md_drift"];
 
+    /// For each built-in id, the checks it declares that a built-in rule — its own or
+    /// another's — compares against a threshold.
+    ///
+    /// Such a check must declare `min_threshold`. Without one it has no band, so the
+    /// ensemble never holds or triggers it, while the rule still compares it against a
+    /// number. `core.completion`'s `Finish` rule reads `core.verification`'s
+    /// `tests_sufficient` and `needs_verification`; `core.verification`'s rule reads
+    /// `core.completion`'s `implementation_complete`.
+    pub const THRESHOLD_READS: &[(&str, &[&str])] = &[
+        (
+            COMPLETION,
+            &[
+                "implementation_complete",
+                "requirements_satisfied",
+                "ready_to_finish",
+            ],
+        ),
+        (VERIFICATION, &["tests_sufficient", "needs_verification"]),
+        (WORKER_HEALTH, &["worker_stuck", "work_off_track"]),
+        (HUMAN_ESCALATION, &["needs_human"]),
+        (REPOSITORY_INSTRUCTIONS, &["agents_md_drift"]),
+    ];
+
     /// Build the code-logic responsibility for one id, if there is one.
     ///
     /// `None` means the id is not a built-in, so the caller should fall back to the

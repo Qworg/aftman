@@ -153,10 +153,12 @@ side, and is a rule about to act on it".** An earlier revision requested opinion
 since an in-band check is never permitted, `Confirm` and `Contest` had identical effects there, so
 those calls could not change any outcome. They have been removed from the in-band path.
 
-The ensemble is never triggered by a check with no threshold. Such a check has no band and no
-side, and the definitions refuse a rule that reads one (every key a `when` reads must declare a
-`min_threshold`, [05-responsibilities.md](05-responsibilities.md)), so it is also never the check a
-rule references.
+The ensemble is never triggered by a check with no threshold and no referencing rule. In fact a check
+with no threshold is never triggered at all, because no rule can reference one: a declarative
+`when` may only read a key that declares `min_threshold`, and a built-in definition may not drop
+`min_threshold` from a check that a built-in rule compares (`builtin::THRESHOLD_READS`; both are
+refused at load, [05-responsibilities.md §2.1](05-responsibilities.md)). Such a check has no band
+and no side, so there is nothing to be uncertain about.
 
 ## 4. The opinion ladder
 

@@ -239,8 +239,12 @@ every present check is permitted and evaluation is unchanged; the one difference
 
 Validation rules (all fatal at load, never at assessment time):
 
-- `min_threshold` ∈ [0,1]; a check without one may be referenced by an explicit `[[rules]]` but
-  cannot participate in a declarative failure rule;
+- `min_threshold` ∈ [0,1]. A check without one cannot be read by a `[[rules]]` condition (every key
+  a `when` reads must declare one), and a built-in definition may not drop it from a check that a
+  built-in rule compares against a threshold — `implementation_complete`,
+  `requirements_satisfied`, `ready_to_finish`, `tests_sufficient`, `needs_verification`,
+  `worker_stuck`, `work_off_track`, `needs_human`, `agents_md_drift`. Without it the check would
+  have no uncertainty band while the rule still acted on it;
 - `always = false` requires non-empty `routing_instructions`;
 - `evidence` entries must be unique, non-empty, and must name a known provider;
 - a `choice` check requires at least one criterion; a `score` check requires at least one level;

@@ -1538,13 +1538,32 @@ impl FactoryRuntime {
         // directive: the only thing a person can cause directly is a stop. Nothing
         // below can produce `Finish`; `ClaimComplete` only buys a re-measurement, and
         // the next cycle's policy decision stands on the evidence.
+        //
+        // An ensemble escalation names its checks, and the answer is remembered against
+        // each in the ensemble's counters: `Accept`/`Guidance` hold the check as decided
+        // rather than asking again, and `Recheck`/`ClaimComplete` make the next cycle run
+        // R0 for it, within the refresh cap. Core applies both; this only records them.
+        let ensemble_checks = state.escalations[index].ensemble_checks.clone();
+        if !ensemble_checks.is_empty() {
+            state
+                .ensemble
+                .record_human_decision(&ensemble_checks, &decision);
+        }
         match decision {
             HumanDecision::Stop => {
                 self.cancel_run(state, ls, "stopped by operator").await?;
             }
             HumanDecision::Accept => self.resume(state, job, ls, false).await?,
             HumanDecision::Recheck | HumanDecision::ClaimComplete => {
-                self.resume(state, job, ls, true).await?;
+                if ensemble_checks.is_empty() {
+                    self.resume(state, job, ls, true).await?;
+                } else {
+                    // The refresh is the ladder's (R0, per check, capped), not the blanket
+                    // re-run of every provider. The `before_finish` gate is re-armed all the
+                    // same: a `Finish` after a person's claim runs those providers again.
+                    self.resume(state, job, ls, false).await?;
+                    ls.before_finish_ran = false;
+                }
             }
             HumanDecision::Guidance { text } => {
                 if self.deliver_human_steer(state, ls, &text).await?.is_none() {

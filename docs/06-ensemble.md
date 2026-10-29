@@ -344,11 +344,28 @@ to "run R0 and re-assess", because otherwise a human becomes a path around §2.2
 resolves the apparent conflict with [07-surfaces.md §10](07-surfaces.md): the surfaces cannot
 enable `Finish`, and neither can the operator's own words — only the resulting evidence can.
 
-If a human channel is connected, `Stop` and `Guidance` act immediately. If escalation is answered
-`Accept`, the run resumes and **asks again from scratch** in M3: the next cycle is a full assessment
-with no memory that a human accepted the uncertainty, so the same question can be raised again. M5
-makes the accepted check stay in-band for the rest of the run (so it still cannot fire a rule) and
-records the answer as `Resolution::HumanDecided`.
+If a human channel is connected, `Stop` and `Guidance` act immediately. For any escalation that is
+not the ensemble's (a model that is unavailable, a spent assessment budget, `needs_human`), an
+answer works as in M3: `Accept` resumes and the next cycle is a full assessment with no memory of
+the answer, and `Recheck`/`ClaimComplete` re-run the `worker_completed` and `on_demand` providers
+before it.
+
+**An ensemble escalation (M5)** names its checks (`Escalation::ensemble_checks`), and the answer is
+remembered against each in the run's `EnsembleCounters` (`record_human_decision`; the runtime only
+records it, the resolver applies it):
+
+| Answer | What the next cycles do |
+| --- | --- |
+| `Accept` | For the rest of the run, whenever the check's measurement is not decisive it is held as `HumanDecided { Accept }` and **not escalated again**: no repeat of the question every cycle. Acceptance never permits it — it was held, it stays held, it can fire no rule — and an R0 refresh may still run within the cap. A later *decisive* measurement is Jev's own and is treated like any other (acceptance changes nothing about it in either direction). |
+| `Guidance` | `Accept`, and the text is delivered to the worker as a human steer (or recorded as `guidance_not_delivered` when no worker is running). The check records `HumanDecided { Guidance }`; the text itself is not repeated in every `ENSEMBLE_RESOLVED` — `ESCALATION_ANSWERED` has it once. |
+| `Recheck` | The next resolved cycle runs R0 for the check (the `HumanRecheck` trigger), in either band, **within the refresh cap**: a spent cap records `limit: refresh_cap` and refreshes nothing. Forgets an earlier acceptance. The blanket M3 re-run of providers is not done: the refresh is the check's own. The `before_finish` gate is re-armed. |
+| `ClaimComplete` | Exactly `Recheck`. It buys a measurement and **satisfies no conjunct**: a refresh that lands in the band again leaves the check held, and the run does not finish. Only a decisive fresh value can. |
+| `Stop` | Ends the run as `Cancelled` (below). |
+
+Why acceptance holds only while the value is not decisive: "I accept this uncertainty" is about
+*this* uncertainty. Holding the check for the rest of the run even after Jev measured it decisively
+would make a single `Accept` on a `Finish` conjunct a permanent veto on finishing — a reading of the
+answer the person did not give. It can never be less safe than not having escalated at all.
 
 If no human channel is connected (`--no-daemon`, or every control handle dropped), the M3 run
 **ends** with the question recorded: `NeedsHuman` ends the run and the status is reported as

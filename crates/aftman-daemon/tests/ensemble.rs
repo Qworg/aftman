@@ -2,24 +2,26 @@
 //!
 //! Offline: a simulated or scripted worker, a model that answers from the state it was
 //! shown, and command providers made of `sh -c` one-liners. Every run is bounded by a
-//! timeout, so nothing outlives its test.
+//! timeout, and every run driven with a control channel is aborted if the test fails
+//! before it ends (`RunGuard`), so nothing outlives its test.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use serde_json::Value;
+use tokio::task::JoinHandle;
 
-use aftman_core::assessment::{AnswerValue, Resolution};
+use aftman_core::assessment::{AnswerValue, HumanDecision, Resolution};
 use aftman_core::clock::SystemClock;
 use aftman_core::definitions::{DefinitionSet, ResponsibilityDefinition};
 use aftman_core::ensemble::{EnsembleResolvedPayload, EnsembleSettings, EnsembleTrigger};
 use aftman_core::error::ModelError;
 use aftman_core::event::{EventEnvelope, EventKind};
 use aftman_core::evidence::EvidencePlan;
-use aftman_core::ids::{CheckKey, ResponsibilityId};
+use aftman_core::ids::{CheckKey, EscalationId, ResponsibilityId};
 use aftman_core::job::{FactoryStatus, Job, JobSource, RunConfig, WorkerKind};
 use aftman_core::model::{
     AskContext, Budget, DecisionModel, ModelAnswers, Purpose, Question, Usage,
@@ -27,7 +29,9 @@ use aftman_core::model::{
 use aftman_core::responsibility::ResponsibilityRegistry;
 use aftman_core::testing::{RecordedOpinionSource, ScriptedModel, SimulatedModel};
 use aftman_core::worker::Worker;
-use aftman_daemon::{EnsembleCycle, FactoryRuntime, RunOutcome, RuntimeDeps, VecSink};
+use aftman_daemon::{
+    EnsembleCycle, FactoryRuntime, RunControl, RunOutcome, RuntimeDeps, RuntimeError, VecSink,
+};
 use aftman_store::{FileRunStore, RunStore};
 use aftman_workers::SimulatedWorker;
 
@@ -335,8 +339,87 @@ impl Fixture {
     }
 }
 
+/// A run driven with a control channel. Aborted on drop, so a failing assertion never
+/// leaves it running.
+struct RunGuard {
+    control: RunControl,
+    task: Option<JoinHandle<Result<RunOutcome, RuntimeError>>>,
+}
+
+impl Drop for RunGuard {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
+impl RunGuard {
+    async fn launch(fx: &Fixture, rt: FactoryRuntime) -> Result<Self, Box<dyn std::error::Error>> {
+        let rt = Arc::new(rt);
+        let started = rt.start(fx.job()).await?;
+        let (control, receiver) = RunControl::channel();
+        let task = tokio::spawn(async move { rt.drive(started, Some(receiver)).await });
+        Ok(Self {
+            control,
+            task: Some(task),
+        })
+    }
+
+    async fn answer(&self, id: EscalationId, decision: HumanDecision) -> TestResult {
+        self.control.answer(id, decision, "", "test").await?;
+        Ok(())
+    }
+
+    async fn join(&mut self) -> Result<RunOutcome, Box<dyn std::error::Error>> {
+        let task = self.task.take().ok_or("already joined")?;
+        Ok(tokio::time::timeout(PATIENCE, task)
+            .await
+            .map_err(|_| "the run did not end")???)
+    }
+
+    async fn cancel(&mut self) -> Result<RunOutcome, Box<dyn std::error::Error>> {
+        // A run that already ended answers `RunEnded`; either way it is joined.
+        let _ = self.control.cancel("test done").await;
+        self.join().await
+    }
+}
+
+/// Wait until `condition` holds over the run's events.
+async fn until(fx: &Fixture, what: &str, condition: impl Fn(&[EventEnvelope]) -> bool) {
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    loop {
+        if condition(&fx.events()) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "gave up waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
 fn count(events: &[EventEnvelope], kind: EventKind) -> usize {
     events.iter().filter(|event| event.kind == kind).count()
+}
+
+/// The id of the `nth` (1-based) escalation, once the run is parked on it.
+async fn escalation(fx: &Fixture, nth: usize) -> Result<EscalationId, Box<dyn std::error::Error>> {
+    until(fx, "an escalation", |events| {
+        count(events, EventKind::EscalationRaised) >= nth
+            && events
+                .iter()
+                .rev()
+                .find(|e| e.kind == EventKind::StateChanged)
+                .is_some_and(|e| e.payload["to"] == "needs_human")
+    })
+    .await;
+    let raised = fx.of_kind(EventKind::EscalationRaised);
+    Ok(raised[nth - 1].payload["escalation_id"]
+        .as_str()
+        .ok_or("no escalation id")?
+        .parse()?)
 }
 
 // ---- disabled: unchanged ------------------------------------------------------
@@ -900,6 +983,267 @@ async fn one_cycles_escalations_coalesce_into_one_escalate() -> TestResult {
         .filter(|e| e.payload["rule"] == "core.ensemble:escalate")
         .count();
     assert_eq!(proposed, 1);
+    Ok(())
+}
+
+// ---- the human answer ---------------------------------------------------------------
+
+/// `tests_sufficient` held in band with nothing to refresh it, under a control channel.
+async fn held_in_band(
+    fx: &Fixture,
+    model: StateModel,
+) -> Result<(RunGuard, EscalationId), Box<dyn std::error::Error>> {
+    let rt = fx.runtime(
+        config(|c| c.skip_unchanged_assessments = false),
+        settings(|s| s.max_evidence_refreshes_per_check = 10),
+        Arc::new(model),
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let guard = RunGuard::launch(fx, rt).await?;
+    let id = escalation(fx, 1).await?;
+    Ok((guard, id))
+}
+
+fn in_band_model() -> StateModel {
+    StateModel::new(|text| {
+        if text.contains("3 passed") {
+            0.71
+        } else {
+            0.10
+        }
+    })
+}
+
+/// The `tests_sufficient` entries of `ENSEMBLE_RESOLVED` events after `seq`.
+fn entries_after(fx: &Fixture, seq: u64) -> Vec<aftman_core::ensemble::CheckResolvedPayload> {
+    fx.resolutions()
+        .into_iter()
+        .filter(|(at, _)| *at > seq)
+        .flat_map(|(_, p)| p.checks)
+        .filter(|c| c.check == CheckKey::from(TESTS))
+        .collect()
+}
+
+#[tokio::test]
+async fn accept_holds_the_check_and_does_not_ask_again() -> TestResult {
+    let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+    let (mut run, id) = held_in_band(&fx, in_band_model()).await?;
+    run.answer(id, HumanDecision::Accept).await?;
+    let answered = fx
+        .of_kind(EventKind::EscalationAnswered)
+        .last()
+        .map(|e| e.seq.get())
+        .ok_or("no answer")?;
+    // Several more held cycles.
+    until(&fx, "five more cycles", |events| {
+        events
+            .iter()
+            .filter(|e| e.kind == EventKind::EnsembleResolved && e.seq.get() > answered)
+            .count()
+            >= 5
+    })
+    .await;
+    assert_eq!(
+        fx.of_kind(EventKind::EscalationRaised).len(),
+        1,
+        "asked once"
+    );
+    let after = entries_after(&fx, answered);
+    assert!(!after.is_empty());
+    for entry in &after {
+        assert!(!entry.permitted, "acceptance never permits");
+    }
+    assert!(after.iter().any(|entry| entry.resolution
+        == Resolution::HumanDecided {
+            decision: HumanDecision::Accept
+        }));
+    assert!(
+        !fx.of_kind(EventKind::DirectiveSelected)
+            .iter()
+            .any(|e| e.payload["directive"] == "Finish")
+    );
+    let outcome = run.cancel().await?;
+    assert_eq!(outcome.status, FactoryStatus::Cancelled);
+    Ok(())
+}
+
+#[tokio::test]
+async fn guidance_is_accept_plus_a_steer() -> TestResult {
+    let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+    let (mut run, id) = held_in_band(&fx, in_band_model()).await?;
+    run.answer(
+        id,
+        HumanDecision::Guidance {
+            text: "the suite is known to be thin; carry on".into(),
+        },
+    )
+    .await?;
+    let answered = fx
+        .of_kind(EventKind::EscalationAnswered)
+        .last()
+        .map(|e| e.seq.get())
+        .ok_or("no answer")?;
+    until(&fx, "three more cycles", |events| {
+        events
+            .iter()
+            .filter(|e| e.kind == EventKind::EnsembleResolved && e.seq.get() > answered)
+            .count()
+            >= 3
+    })
+    .await;
+    assert_eq!(
+        fx.of_kind(EventKind::EscalationRaised).len(),
+        1,
+        "asked once"
+    );
+    // Delivered to the worker if one was running; recorded as undeliverable otherwise.
+    let steered = fx
+        .of_kind(EventKind::WorkerSteered)
+        .iter()
+        .any(|e| e.seq.get() > answered);
+    let noted = fx
+        .of_kind(EventKind::Notification)
+        .iter()
+        .any(|e| e.payload["code"] == "guidance_not_delivered");
+    assert!(steered || noted);
+    assert!(entries_after(&fx, answered).iter().any(|entry| matches!(
+        entry.resolution,
+        Resolution::HumanDecided {
+            decision: HumanDecision::Guidance { .. }
+        }
+    )));
+    run.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stop_ends_the_run_as_cancelled() -> TestResult {
+    let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+    let (mut run, id) = held_in_band(&fx, in_band_model()).await?;
+    run.answer(id, HumanDecision::Stop).await?;
+    let outcome = run.join().await?;
+    assert_eq!(outcome.status, FactoryStatus::Cancelled);
+    assert_eq!(outcome.reason.as_deref(), Some("stopped by operator"));
+    Ok(())
+}
+
+/// A provider whose command does not exist until the test writes it: until then every
+/// refresh is rejected (nothing ran), so the check is escalated with refreshes left.
+fn late_provider(dir: &Path) -> Result<(EvidencePlan, PathBuf), Box<dyn std::error::Error>> {
+    let script = dir.join("late-tests.sh");
+    let plan = EvidencePlan::from_toml(
+        &format!(
+            r#"
+[[evidence.commands]]
+id = "tests"
+argv = ["{}"]
+run_when = "on_demand"
+"#,
+            script.display()
+        ),
+        "test",
+    )?;
+    Ok((plan, script))
+}
+
+fn write_script(path: &Path, body: &str) -> TestResult {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::write(path, format!("#!/bin/sh\n{body}\n"))?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))?;
+    Ok(())
+}
+
+async fn recheck_with(
+    decision: HumanDecision,
+    fresh: f32,
+) -> Result<(Fixture, RunGuard, u64), Box<dyn std::error::Error>> {
+    let mut fx = Fixture::new(definitions()?, EvidencePlan::default())?;
+    let (plan, script) = late_provider(fx.dir.path())?;
+    fx.evidence = plan;
+    let model = StateModel::new(move |text| {
+        if text.contains("PROVIDER-RAN") {
+            fresh
+        } else if text.contains("3 passed") {
+            0.71
+        } else {
+            0.10
+        }
+    });
+    let (run, id) = held_in_band(&fx, model).await?;
+    let before = fx.of_kind(EventKind::EvidenceCollected).len();
+    assert!(before > 0, "refreshes were attempted, and nothing ran");
+    write_script(&script, "echo 'PROVIDER-RAN 17 passed'")?;
+    run.answer(id, decision).await?;
+    let answered = fx
+        .of_kind(EventKind::EscalationAnswered)
+        .last()
+        .map(|e| e.seq.get())
+        .ok_or("no answer")?;
+    until(&fx, "a refresh after the answer", |_| {
+        !fx.refreshes(TESTS)
+            .iter()
+            .filter(|(seq, entry)| {
+                *seq > answered && entry.refresh.as_ref().is_some_and(|r| r.rejected.is_none())
+            })
+            .collect::<Vec<_>>()
+            .is_empty()
+    })
+    .await;
+    Ok((fx, run, answered))
+}
+
+#[tokio::test]
+async fn recheck_runs_r0_on_the_next_cycle_and_evidence_may_finish() -> TestResult {
+    let (fx, mut run, answered) = recheck_with(HumanDecision::Recheck, 0.95).await?;
+    let outcome = run.join().await?;
+    assert_eq!(outcome.status, FactoryStatus::Finished);
+    let (seq, entry) = fx
+        .refreshes(TESTS)
+        .into_iter()
+        .find(|(seq, _)| *seq > answered)
+        .ok_or("no refresh after the answer")?;
+    assert!(entry.triggers.contains(&EnsembleTrigger::HumanRecheck));
+    assert!(matches!(
+        entry.resolution,
+        Resolution::EvidenceRefreshed { .. }
+    ));
+    assert!(entry.permitted);
+    // The fresh, decisive measurement is what finishes the run: not the person.
+    assert_eq!(fx.selected_after(seq).as_deref(), Some("Finish"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn claim_complete_followed_by_an_in_band_refresh_does_not_finish() -> TestResult {
+    let (fx, mut run, answered) = recheck_with(HumanDecision::ClaimComplete, 0.72).await?;
+    let (seq, entry) = fx
+        .refreshes(TESTS)
+        .into_iter()
+        .find(|(seq, _)| *seq > answered)
+        .ok_or("no refresh after the answer")?;
+    assert!(entry.triggers.contains(&EnsembleTrigger::HumanRecheck));
+    let Resolution::EvidenceRefreshed { new_p, .. } = entry.resolution else {
+        panic!("expected a refresh");
+    };
+    assert!((new_p - 0.72).abs() < f32::EPSILON);
+    assert!(!entry.permitted, "in band, so still held");
+    assert_ne!(fx.selected_after(seq).as_deref(), Some("Finish"));
+    // A few more cycles: it never finishes on the person's word.
+    until(&fx, "more cycles", |events| {
+        events
+            .iter()
+            .filter(|e| e.kind == EventKind::EnsembleResolved && e.seq.get() > seq)
+            .count()
+            >= 3
+    })
+    .await;
+    assert!(
+        !fx.of_kind(EventKind::DirectiveSelected)
+            .iter()
+            .any(|e| e.payload["directive"] == "Finish")
+    );
+    let outcome = run.cancel().await?;
+    assert_ne!(outcome.status, FactoryStatus::Finished);
     Ok(())
 }
 

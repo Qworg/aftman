@@ -488,6 +488,79 @@ fn a_decisive_value_a_finish_rests_on_is_irreversible() {
 }
 
 #[test]
+fn triggers_agree_with_a_brute_force_oracle() {
+    // Review finding 6: the decision table takes triggers as input, so trigger computation
+    // needs its own oracle. Here every decisive value on each side is tried for real
+    // (through `from_measurement`, not the planner's pinned ends), and the selected
+    // directive kinds compared.
+    for worker in [false, true] {
+        for key in [READY, TESTS, NEEDS_VER, DOCS, STUCK, HUMAN, DRIFT] {
+            for step in 0..=20 {
+                let p = step as f32 / 20.0;
+                let mut s = Scenario::finish_ready();
+                if worker {
+                    s = s.with_worker();
+                }
+                let s = s.set(key, p);
+                let t = s.thresholds()[&k(key)].unwrap_or(0.75);
+                let baseline = s.baseline();
+                let rc = &baseline[&k(key)];
+                let kinds = |above: bool| -> BTreeSet<&'static str> {
+                    (0..=100)
+                        .map(|v| v as f32 / 100.0)
+                        .filter(|v| (*v >= t) == above)
+                        .filter_map(|v| {
+                            let probe = ResolvedCheck::from_measurement(
+                                k(key),
+                                Some(v),
+                                Some(t),
+                                0.15,
+                                true,
+                            );
+                            probe.decisive.then(|| {
+                                let mut checks = baseline.clone();
+                                checks.insert(k(key), probe);
+                                s.select(&checks).name()
+                            })
+                        })
+                        .collect()
+                };
+                let (above, below) = (kinds(true), kinds(false));
+                let triggers = s.triggers(key);
+                let label = format!("{key}={p} worker={worker} above={above:?} below={below:?}");
+
+                assert_eq!(
+                    triggers.contains(&EnsembleTrigger::NearThreshold),
+                    !rc.decisive,
+                    "near threshold: {label}"
+                );
+                if !above.is_empty() && !below.is_empty() {
+                    assert_eq!(
+                        triggers.contains(&EnsembleTrigger::OutcomeRelevant),
+                        above != below,
+                        "outcome relevant: {label}"
+                    );
+                }
+                let selected = s.select(&baseline);
+                let opposite = if rc.jev_p.is_some_and(|v| v >= t) {
+                    &below
+                } else {
+                    &above
+                };
+                let irreversible = rc.decisive
+                    && selected.is_irreversible()
+                    && opposite.iter().any(|kind| *kind != selected.name());
+                assert_eq!(
+                    triggers.contains(&EnsembleTrigger::Irreversible),
+                    irreversible,
+                    "irreversible: {label}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn the_counterfactual_does_not_count_the_uncertainty_invariant_as_relevance() {
     // A held check blocks `Finish` through `UnresolvedUncertainty`, whatever it measures.
     // If "forced not to fire" meant "not permitted", every check would look relevant to
@@ -1240,30 +1313,247 @@ async fn a_triggered_check_in_band_or_inert_requests_zero_opinions() {
         }
     }
 
-    // Decisive, triggered, but no rule acts on it: still nothing bought.
-    let s = Scenario::finish_ready().reframable_all();
-    let plan = s.plan();
-    let source = answering_all(&plan, Some(0.5));
-    let outcome = plan
+    // Decisive, triggered, but no rule acts on it: still nothing bought. "Inert" is
+    // established here from the proposals alone — holding the check removes no proposal —
+    // not read back from the plan under test. (Not from the selected directive: holding
+    // *any* check blocks a Finish through `UnresolvedUncertainty`, which is exactly the
+    // confusion the counterfactual construction avoids.)
+    for worker in [false, true] {
+        for &(key, p) in &[
+            (STUCK, 0.05_f32),
+            (DRIFT, 0.05),
+            (HUMAN, 0.05),
+            (DOCS, 0.95),
+            (READY, 0.30),
+            (TESTS, 0.05),
+            (NEEDS_VER, 0.90),
+        ] {
+            let mut s = Scenario::finish_ready().set(key, p).reframable_all();
+            if worker {
+                s = s.with_worker();
+            }
+            let baseline = s.baseline();
+            let plan = s.plan();
+            let source = answering_all(&plan, Some(0.5));
+            let outcome = plan
+                .resolve(&source)
+                .await
+                .unwrap_or_else(|e| panic!("{e}"));
+            let before = s.proposals(&baseline);
+            for (check, rc) in &baseline {
+                if !rc.decisive {
+                    continue;
+                }
+                let mut held = baseline.clone();
+                held.insert(
+                    check.clone(),
+                    apply_opinions(
+                        rc.clone(),
+                        &[opinion(Verdict::Contest { side: Side::Below })],
+                    ),
+                );
+                let after = s.proposals(&held);
+                let inert = before.iter().all(|proposal| after.contains(proposal));
+                if inert {
+                    assert!(
+                        !source
+                            .reframe_calls()
+                            .iter()
+                            .any(|r| r.opinion.check == *check),
+                        "{check} is inert ({key}={p}, worker={worker}) but was asked about"
+                    );
+                    assert!(
+                        outcome.checks[check].permitted,
+                        "{check} is inert and decisive: it stands"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn the_last_opinion_in_the_budget_is_still_bought() {
+    // Pins the budget comparison: with one opinion left, it is bought.
+    let mut s = Scenario::finish_ready()
+        .set(TESTS, 0.92)
+        .reframable(&[TESTS]);
+    s.ensemble.opinions_used = s.settings.max_opinions_per_run - 1;
+    let source =
+        RecordedOpinionSource::new().with_reframe(reframe_key(CYCLE, TESTS), answer(Some(0.08)));
+    let outcome = s
+        .plan()
         .resolve(&source)
         .await
         .unwrap_or_else(|e| panic!("{e}"));
-    for record in &outcome.records {
-        let would_fire = plan
-            .triggered
-            .iter()
-            .find(|p| p.check == record.check)
-            .is_some_and(|p| p.rule_would_fire);
-        if !would_fire {
-            assert!(record.opinions.is_empty(), "{} is inert", record.check);
-        }
+    assert_eq!(source.reframe_calls().len(), 1);
+    assert_eq!(
+        outcome.counters.opinions_used,
+        s.settings.max_opinions_per_run
+    );
+    assert!(outcome.checks[&k(TESTS)].permitted);
+}
+
+#[tokio::test]
+async fn repeat_contest_rows_from_the_contract() {
+    // Written from docs/06-ensemble.md §3 and §6 and the review's decisions, not from the
+    // resolver. Columns: value, in-band count, contest count, human rung, R2 available,
+    // expected escalation, expected permitted, expected R2 calls.
+    struct Row {
+        key: &'static str,
+        p: f32,
+        in_band: u32,
+        contests: u32,
+        human: bool,
+        reframe: bool,
+        escalate: bool,
+        permitted: bool,
+        calls: usize,
     }
-    let asked: BTreeSet<CheckKey> = source
-        .reframe_calls()
-        .into_iter()
-        .map(|r| r.opinion.check)
-        .collect();
-    assert!(!asked.contains(&k(STUCK)) && !asked.contains(&k(DRIFT)));
+    let rows = [
+        // In band, high stakes, held for two cycles: escalate (with a person to ask).
+        Row {
+            key: TESTS,
+            p: 0.71,
+            in_band: 2,
+            contests: 0,
+            human: true,
+            reframe: true,
+            escalate: true,
+            permitted: false,
+            calls: 0,
+        },
+        Row {
+            key: TESTS,
+            p: 0.71,
+            in_band: 2,
+            contests: 0,
+            human: false,
+            reframe: true,
+            escalate: false,
+            permitted: false,
+            calls: 0,
+        },
+        Row {
+            key: TESTS,
+            p: 0.71,
+            in_band: 1,
+            contests: 0,
+            human: true,
+            reframe: true,
+            escalate: false,
+            permitted: false,
+            calls: 0,
+        },
+        // In band, but no high-stakes rule depends on it (no worker): hold, do not escalate.
+        Row {
+            key: DRIFT,
+            p: 0.79,
+            in_band: 5,
+            contests: 0,
+            human: true,
+            reframe: true,
+            escalate: false,
+            permitted: false,
+            calls: 0,
+        },
+        // Decisive after in-band history: the history does not count.
+        Row {
+            key: TESTS,
+            p: 0.92,
+            in_band: 5,
+            contests: 0,
+            human: true,
+            reframe: true,
+            escalate: false,
+            permitted: true,
+            calls: 1,
+        },
+        // Decisive, contested twice: escalate instead of asking a third time.
+        Row {
+            key: TESTS,
+            p: 0.92,
+            in_band: 0,
+            contests: 2,
+            human: true,
+            reframe: true,
+            escalate: true,
+            permitted: false,
+            calls: 0,
+        },
+        // ... unless there is no opinion to buy: it stands, whatever its history.
+        Row {
+            key: TESTS,
+            p: 0.92,
+            in_band: 0,
+            contests: 2,
+            human: true,
+            reframe: false,
+            escalate: false,
+            permitted: true,
+            calls: 0,
+        },
+        // ... or nobody to escalate to: ask again.
+        Row {
+            key: TESTS,
+            p: 0.92,
+            in_band: 0,
+            contests: 2,
+            human: false,
+            reframe: true,
+            escalate: false,
+            permitted: true,
+            calls: 1,
+        },
+        // Decisive and inert: nothing acts on it, nothing to escalate.
+        Row {
+            key: DRIFT,
+            p: 0.05,
+            in_band: 0,
+            contests: 7,
+            human: true,
+            reframe: true,
+            escalate: false,
+            permitted: true,
+            calls: 0,
+        },
+    ];
+    for row in rows {
+        let mut s = Scenario::finish_ready().set(row.key, row.p);
+        if row.reframe {
+            s = s.reframable(&[row.key]);
+        }
+        if !row.human {
+            s = s.without_rung(Rung::Human);
+        }
+        let s = s
+            .held_for(row.key, row.in_band)
+            .contested_for(row.key, row.contests);
+        // Confirms if asked.
+        let p_negated = 1.0 - row.p;
+        let source = RecordedOpinionSource::new()
+            .with_reframe(reframe_key(CYCLE, row.key), answer(Some(p_negated)));
+        let outcome = s
+            .plan()
+            .resolve(&source)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let label = format!(
+            "{} p={} in_band={} contests={} human={} reframe={}",
+            row.key, row.p, row.in_band, row.contests, row.human, row.reframe
+        );
+        assert_eq!(
+            outcome.escalations().any(|(check, _)| *check == k(row.key)),
+            row.escalate,
+            "escalation: {label}"
+        );
+        assert_eq!(
+            outcome.checks[&k(row.key)].permitted,
+            row.permitted,
+            "permitted: {label}"
+        );
+        assert_eq!(source.reframe_calls().len(), row.calls, "calls: {label}");
+    }
 }
 
 #[tokio::test]
@@ -1960,7 +2250,12 @@ enum RefreshAnswer {
 
 #[derive(Debug, Clone, Copy)]
 enum ReframeKind {
+    /// `1 - p(not X)` equals `p`.
     Consistent,
+    /// `1 - p(not X)` is `0.14` from `p`: inside the 0.15 tolerance.
+    NearlyInconsistent,
+    /// `1 - p(not X)` is `0.16` from `p`: just outside it.
+    JustInconsistent,
     Inconsistent,
     Unusable,
 }
@@ -1982,6 +2277,8 @@ struct Expected {
     permitted: bool,
     refreshed: bool,
     reframed: bool,
+    /// The verdict the new opinion mark records, when an opinion was bought.
+    mark: Option<MarkVerdict>,
 }
 
 const T: f32 = 0.75;
@@ -2006,6 +2303,7 @@ fn oracle(c: &Case) -> Expected {
                 permitted: (p - T).abs() >= M,
                 refreshed: true,
                 reframed: false,
+                mark: None,
             },
             None => Expected {
                 refreshed: true,
@@ -2018,6 +2316,7 @@ fn oracle(c: &Case) -> Expected {
         permitted,
         refreshed: false,
         reframed: false,
+        mark: None,
     };
     let decisive = (c.p - T).abs() >= M;
 
@@ -2066,10 +2365,11 @@ fn oracle(c: &Case) -> Expected {
         CounterState::BudgetSpent => return with(done(Kind::Unresolved, false)),
         CounterState::Fresh | CounterState::RefreshCapped => {}
     }
-    let contest = match c.reframe {
-        ReframeKind::Consistent => false,
-        ReframeKind::Inconsistent => true,
-        ReframeKind::Unusable => has(EnsembleTrigger::Irreversible),
+    let (contest, mark) = match c.reframe {
+        ReframeKind::Consistent | ReframeKind::NearlyInconsistent => (false, MarkVerdict::Confirm),
+        ReframeKind::Inconsistent | ReframeKind::JustInconsistent => (true, MarkVerdict::Contest),
+        ReframeKind::Unusable if has(EnsembleTrigger::Irreversible) => (true, MarkVerdict::Contest),
+        ReframeKind::Unusable => (false, MarkVerdict::Abstain),
     };
     Expected {
         kind: if contest {
@@ -2080,6 +2380,7 @@ fn oracle(c: &Case) -> Expected {
         permitted: !contest,
         refreshed,
         reframed: true,
+        mark: Some(mark),
     }
 }
 
@@ -2142,6 +2443,8 @@ async fn resolve_matches_the_decision_table_exhaustively() {
                                 ] {
                                     for reframe in [
                                         ReframeKind::Consistent,
+                                        ReframeKind::NearlyInconsistent,
+                                        ReframeKind::JustInconsistent,
                                         ReframeKind::Inconsistent,
                                         ReframeKind::Unusable,
                                     ] {
@@ -2224,6 +2527,8 @@ async fn run_case(c: &Case) {
     let p_negated = match c.reframe {
         // 1 - p(not X) equals p exactly: consistent.
         ReframeKind::Consistent => Some(1.0 - c.p),
+        ReframeKind::NearlyInconsistent => Some(1.0 - c.p + 0.14),
+        ReframeKind::JustInconsistent => Some(1.0 - c.p + 0.16),
         ReframeKind::Inconsistent => Some(c.p),
         ReframeKind::Unusable => None,
     };
@@ -2259,6 +2564,55 @@ async fn run_case(c: &Case) {
         source.reframe_calls().len(),
         usize::from(expected.reframed),
         "{label}"
+    );
+
+    // The counters, row by row.
+    let base_opinions = if matches!(c.counters, CounterState::BudgetSpent) {
+        20
+    } else {
+        0
+    };
+    let base_refreshes = if matches!(c.counters, CounterState::RefreshCapped) {
+        3
+    } else {
+        0
+    };
+    let after = outcome.counters.check(&key);
+    assert_eq!(
+        outcome.counters.opinions_used,
+        base_opinions + u32::from(expected.reframed),
+        "opinions_used: {label}"
+    );
+    assert_eq!(
+        after.refreshes,
+        base_refreshes + u32::from(expected.refreshed),
+        "refreshes: {label}"
+    );
+    match expected.mark {
+        Some(verdict) => assert_eq!(
+            after.last_opinion,
+            Some(OpinionMark {
+                cycle: CYCLE,
+                verdict,
+                side: baseline.side,
+                irreversible: c.triggers.contains(&EnsembleTrigger::Irreversible),
+            }),
+            "mark: {label}"
+        ),
+        None => assert_eq!(
+            after.last_opinion, check.last_opinion,
+            "mark unchanged: {label}"
+        ),
+    }
+    assert_eq!(
+        after.consecutive_in_band,
+        u32::from(!rc.decisive),
+        "in band: {label}"
+    );
+    assert_eq!(
+        after.consecutive_contests,
+        u32::from(expected.mark == Some(MarkVerdict::Contest)),
+        "contests: {label}"
     );
 
     // Invariants that hold in every row.

@@ -26,7 +26,8 @@ pub use resolve::{
     RefreshRequest, apply_opinions, reframe_verdict,
 };
 pub use settings::{
-    CheckCounters, EnsembleCounters, EnsembleSettings, EnsembleSettingsError, OpinionMark,
+    CheckCounters, EnsembleCounters, EnsembleSettings, EnsembleSettingsError, MarkVerdict,
+    OpinionMark,
 };
 pub use trigger::{
     CheckPlan, DecisiveDirectives, EnsembleContext, EnsemblePlan, EnsembleTrigger,

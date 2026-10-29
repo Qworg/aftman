@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::assessment::{DEFAULT_UNCERTAINTY_MARGIN, Rung};
+use crate::assessment::{DEFAULT_UNCERTAINTY_MARGIN, Rung, Side};
 use crate::ids::{AssessmentSeq, CheckKey};
 
 /// Default for [`EnsembleSettings::confidence_floor`].
@@ -211,11 +211,48 @@ pub struct CheckCounters {
     pub consecutive_held: u32,
 }
 
-/// When an opinion was last bought for a check, and whether it contested.
+/// When an opinion was last bought for a check, and what it established.
+///
+/// The cooldown uses this to decide whether the earlier opinion **covers** one it would
+/// otherwise buy: only a confirm does, only about the side Jev is on now, and only one
+/// obtained under an `Irreversible` trigger covers an `Irreversible` cycle. An abstention
+/// covers nothing. A mark from a snapshot written before these fields existed decodes as
+/// an abstention, which covers nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpinionMark {
     pub cycle: AssessmentSeq,
-    pub contested: bool,
+    /// The cycle's combined verdict: `Contest` if any opinion contested, else `Abstain`
+    /// if any abstained, else `Confirm`.
+    #[serde(default)]
+    pub verdict: MarkVerdict,
+    /// Jev's side when the opinion was asked.
+    #[serde(default)]
+    pub side: Option<Side>,
+    /// Whether it was asked under an `Irreversible` trigger.
+    #[serde(default)]
+    pub irreversible: bool,
+}
+
+impl OpinionMark {
+    /// Whether this earlier opinion stands in for one about a value on `side`, asked
+    /// under an `Irreversible` trigger when `irreversible` is set.
+    #[must_use]
+    pub fn covers(&self, side: Option<Side>, irreversible: bool) -> bool {
+        self.verdict == MarkVerdict::Confirm
+            && self.side.is_some()
+            && self.side == side
+            && (self.irreversible || !irreversible)
+    }
+}
+
+/// The verdict kind a mark remembers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkVerdict {
+    Confirm,
+    Contest,
+    #[default]
+    Abstain,
 }
 
 #[cfg(test)]

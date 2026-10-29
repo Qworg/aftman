@@ -29,7 +29,7 @@ use crate::assessment::{
 use crate::ids::{AssessmentSeq, CheckKey, EvidenceId};
 use crate::model::Usage;
 
-use super::settings::{EnsembleCounters, EnsembleSettings, OpinionMark};
+use super::settings::{EnsembleCounters, EnsembleSettings, MarkVerdict, OpinionMark};
 use super::trigger::{CheckPlan, EnsemblePlan, EnsembleTrigger};
 
 /// Cap on an opinion's stored excerpt, and on its error text.
@@ -361,19 +361,22 @@ async fn resolve_check(
         return record;
     }
 
+    let irreversible = plan.has(EnsembleTrigger::Irreversible);
     let state = counters.check(&plan.check);
     if let Some(last) = state.last_opinion
         && cycle.get().saturating_sub(last.cycle.get()) < settings.per_check_cooldown_cycles
     {
-        // One opinion per check per cooldown window. After a contest the check stays
-        // held for the window; after a confirm or an abstention nothing is re-asked and
-        // the decisive value stands, exactly as it would with no opinion rung at all.
+        // One opinion per check per cooldown window. The earlier opinion may stand in for
+        // this one only if it covers it: a confirm, about the side Jev is on now, obtained
+        // under an `Irreversible` trigger if this cycle's is one. Otherwise the opinion
+        // that would be bought cannot be, and the check is held for the window.
+        let covered = last.covers(rc.side, irreversible);
         record.limits.push(EnsembleLimit::Cooldown {
             last_opinion: last.cycle,
             cooldown_cycles: settings.per_check_cooldown_cycles,
-            held: last.contested,
+            held: !covered,
         });
-        if last.contested {
+        if !covered {
             record.resolved = rc.suppress(
                 CheckSuppression::Unresolved,
                 Resolution::UnresolvedInBand {
@@ -404,7 +407,6 @@ async fn resolve_check(
 
     // R1 and R2 both run when both are enabled; neither short-circuits the other (§4).
     // Only R2 exists before S3.
-    let irreversible = plan.has(EnsembleTrigger::Irreversible);
     let (Some(p), Some(threshold)) = (rc.jev_p, rc.threshold) else {
         return record;
     };
@@ -440,6 +442,17 @@ async fn resolve_check(
         .iter()
         .map(|keyed| keyed.opinion.clone())
         .collect();
+    let verdict = if opinions
+        .iter()
+        .any(|o| matches!(o.verdict, Verdict::Contest { .. }))
+    {
+        MarkVerdict::Contest
+    } else if opinions.iter().any(|o| o.verdict == Verdict::Abstain) {
+        MarkVerdict::Abstain
+    } else {
+        MarkVerdict::Confirm
+    };
+    let side = rc.side;
     let resolved = apply_opinions(rc, &opinions);
     counters
         .checks
@@ -447,7 +460,9 @@ async fn resolve_check(
         .or_default()
         .last_opinion = Some(OpinionMark {
         cycle,
-        contested: resolved.contested,
+        verdict,
+        side,
+        irreversible,
     });
     record.resolved = resolved;
     record

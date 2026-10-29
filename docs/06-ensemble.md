@@ -522,9 +522,10 @@ async fn resolve_check(plan: &CheckPlan, sources: &dyn OpinionSource) -> Resolve
         return rc;
     }
     if let Some(last) = cooldown_active(&plan.check) {
-        // One opinion per check per window. After a contest the check stays held;
-        // after a confirm or abstain nothing is re-asked and the value stands.
-        return if last.contested { rc.suppress(Unresolved, ..) } else { rc };
+        // One opinion per check per window. The earlier opinion stands in for this
+        // one only if it COVERS it; otherwise the opinion cannot be bought, so hold.
+        return if last.covers(rc.side, plan.has(Irreversible)) { rc }
+               else { rc.suppress(Unresolved, ..) };
     }
     if opinions_used + opinion_rungs.len() > max_opinions_per_run {
         return rc.suppress(Unresolved, ..);                   // cannot check it: hold it
@@ -538,6 +539,22 @@ async fn resolve_check(plan: &CheckPlan, sources: &dyn OpinionSource) -> Resolve
     apply_opinions(rc, &verdicts)    // any Contest ⇒ SuppressedByContest; else rc unchanged
 }
 ```
+
+**What a cooldown may skip.** Within `per_check_cooldown_cycles` of the last opinion bought for a
+check, no new one is bought. The earlier opinion stands in for the skipped one only if it *covers*
+it (`OpinionMark::covers`):
+
+- it was a **Confirm** — every opinion that cycle confirmed. An Abstain covers nothing: on an
+  `Irreversible` trigger an unobtainable opinion is a contest (§4), and a remembered abstention
+  must not quietly become a pass;
+- it was about the **same side** of `t` that Jev's value is on now;
+- if this cycle's trigger is `Irreversible`, it was obtained under an `Irreversible` trigger too. A
+  confirm bought to guard a `Verify` does not guard a `Finish`.
+
+Otherwise the check is **held** (`Unresolved`) for the rest of the window, as an earlier draft of
+this section held it unconditionally. Without this rule an abstention on a `Verify` in one cycle
+let the next cycle's `Finish`, resting on the same check, through with no opinion at all — an
+opinion-driven `Finish` that no single-cycle test can see.
 
 Every bound that stops the ladder — the refresh cap, the opinion budget, a cooldown — is recorded
 on the check's result (`EnsembleLimit`) and in `EnsembleResolved`, so a held check always says why.
@@ -553,10 +570,10 @@ also ran the claim-only refresh before asking whether a rule would fire. Both we
   through `UnresolvedUncertainty`. A spent opinion budget would then have blocked `Finish` forever
   on account of a check nothing was asking about. The budget and cooldown are bounds on
   *opinions*, so they apply only where an opinion would be bought.
-- The cooldown held the check whatever the last opinion said. After a **confirm**, that held a
-  decisive `Finish` conjunct for the whole window and, through `RepeatContest`, escalated a check
-  that had just been agreed with. Holding is right after a contest; after a confirm or abstain the
-  value stands exactly as it would with no opinion rung configured.
+- The cooldown held the check whatever the last opinion said, so a check that had just been
+  **confirmed** was held for the whole window. It now holds unless the earlier opinion *covers* the
+  one it would otherwise buy (below). It must not go further than that: letting any non-contest
+  stand would let an opinion obtained in one cycle carry an irreversible action in a later one.
 - Refreshing a decisive check that no rule acts on spends a command and a model call, capped per
   run, on something that cannot change the outcome.
 
@@ -586,7 +603,7 @@ Notes that follow directly from §2:
 | `max_opinions_per_run` | 20 | A run needing more opinions has a broken check, not a hard question. Counts opinion calls only; refreshes are not opinions. A decisive check a rule is about to act on, with the budget spent, is held rather than acted on unchecked |
 | `max_evidence_refreshes_per_check` | 3 | Same reason. Every attempt counts, including one whose command could not run |
 | `opinion_timeout_seconds` | 120 | An opinion must not outlive the worker it is judging |
-| `per_check_cooldown_cycles` | 10 | One opinion per check per ten cycles. Within the window the check is held if the last opinion contested, and otherwise stands on Jev's decisive value (§6) |
+| `per_check_cooldown_cycles` | 10 | One opinion per check per ten cycles. Within the window the check is held unless the last opinion covers the one that would be bought: a confirm, on the same side, and under an `Irreversible` trigger if this one is (§6) |
 | `consecutive_contests_before_human` | 2 | Escalate instead of re-asking |
 
 - **The `OutcomeRelevant` trigger, combined with the decisive/in-band split, is the main cost

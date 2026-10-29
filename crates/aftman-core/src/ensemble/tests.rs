@@ -9,8 +9,8 @@ use time::macros::datetime;
 
 use super::{
     CheckCounters, CheckPlan, DecisiveDirectives, EnsembleContext, EnsembleCounters, EnsembleLimit,
-    EnsembleOutcome, EnsemblePlan, EnsembleSettings, EnsembleTrigger, OpinionKey, OpinionMark,
-    ProviderRun, ReframeAnswer, RefreshOutcome, apply_opinions, reframe_verdict,
+    EnsembleOutcome, EnsemblePlan, EnsembleSettings, EnsembleTrigger, MarkVerdict, OpinionKey,
+    OpinionMark, ProviderRun, ReframeAnswer, RefreshOutcome, apply_opinions, reframe_verdict,
 };
 use crate::assessment::{
     AnswerValue, CheckSuppression, Opinion, Resolution, ResolvedCheck, Rung, Side, Verdict,
@@ -348,6 +348,22 @@ fn answering_all(plan: &EnsemblePlan, p_negated: Option<f32>) -> RecordedOpinion
                     rung: Rung::ReframeSameModel,
                 },
                 answer(p_negated),
+            )
+        })
+}
+
+/// A source that answers every opinion the plan could ask with `p(not X) = answer(p(X))`.
+fn answering_by(plan: &EnsemblePlan, by: impl Fn(f32) -> Option<f32>) -> RecordedOpinionSource {
+    plan.triggered
+        .iter()
+        .fold(RecordedOpinionSource::new(), |source, check| {
+            source.with_reframe(
+                OpinionKey {
+                    cycle: plan.cycle,
+                    check: check.check.clone(),
+                    rung: Rung::ReframeSameModel,
+                },
+                answer(check.baseline.jev_p.and_then(&by)),
             )
         })
 }
@@ -1045,6 +1061,126 @@ async fn repeated_refresh_is_capped_and_visible() {
     assert_eq!(s.ensemble.check(&k(TESTS)).refreshes, 3);
 }
 
+/// Cycle A of review probe 3: `needs_verification` decisively high selects `Verify`; the
+/// opinion bought on it fails, so it abstains.
+fn verify_cycle() -> Scenario {
+    let mut a = Scenario::finish_ready()
+        .set(NEEDS_VER, 0.90)
+        .reframable(&[NEEDS_VER]);
+    a.cycle = AssessmentSeq(20);
+    a
+}
+
+/// Cycle B of probe 3: the verifier ran without completing, and `needs_verification` is
+/// now decisively low, which satisfies the `Finish` disjunct. `Finish` rests on it.
+fn finish_after_verify_cycle() -> Scenario {
+    let mut b = Scenario::finish_ready()
+        .set(NEEDS_VER, 0.05)
+        .reframable(&[NEEDS_VER]);
+    b.counters.verifiers_run = 1;
+    b.cycle = AssessmentSeq(21);
+    b
+}
+
+#[tokio::test]
+async fn a_cooldown_after_an_abstain_does_not_skip_the_irreversible_guard() {
+    // Review probe 3.
+    let a = verify_cycle();
+    assert_eq!(a.select(&a.baseline()).name(), "Verify");
+    let failing =
+        RecordedOpinionSource::new().with_reframe(reframe_key(a.cycle, NEEDS_VER), answer(None));
+    let out_a = a.plan().resolve(&failing).await;
+    assert_eq!(failing.reframe_calls().len(), 1);
+    assert!(
+        record(&out_a, NEEDS_VER)
+            .is_some_and(|r| r.opinions[0].opinion.verdict == Verdict::Abstain)
+    );
+
+    let mut b = finish_after_verify_cycle();
+    assert_eq!(b.select(&b.baseline()).name(), "Finish");
+    assert!(
+        b.triggers(NEEDS_VER)
+            .contains(&EnsembleTrigger::Irreversible)
+    );
+    b.ensemble = out_a.counters.clone();
+    let source = RecordedOpinionSource::new();
+    let out_b = b.plan().resolve(&source).await;
+    assert_ne!(
+        b.select(&out_b.checks).name(),
+        "Finish",
+        "an abstention is not a confirm, and cannot carry a Finish through the cooldown"
+    );
+    assert!(!out_b.checks[&k(NEEDS_VER)].permitted);
+    assert!(
+        source.reframe_calls().is_empty(),
+        "the cooldown still holds the call back"
+    );
+}
+
+#[tokio::test]
+async fn a_cooldown_skips_an_opinion_only_when_an_earlier_confirm_covers_it() {
+    // A confirm under a non-irreversible trigger does not cover an irreversible one.
+    let a = verify_cycle();
+    let confirming = RecordedOpinionSource::new()
+        .with_reframe(reframe_key(a.cycle, NEEDS_VER), answer(Some(0.10)));
+    let out_a = a.plan().resolve(&confirming).await;
+    assert!(
+        record(&out_a, NEEDS_VER).is_some_and(
+            |r| r.opinions[0].opinion.verdict == Verdict::Confirm { side: Side::Above }
+        )
+    );
+    let mut b = finish_after_verify_cycle();
+    b.ensemble = out_a.counters.clone();
+    let out_b = b.plan().resolve(&RecordedOpinionSource::new()).await;
+    assert_ne!(
+        b.select(&out_b.checks).name(),
+        "Finish",
+        "not covered: held"
+    );
+    assert!(record(&out_b, NEEDS_VER).is_some_and(|r| {
+        r.limits
+            .iter()
+            .any(|l| matches!(l, EnsembleLimit::Cooldown { held: true, .. }))
+    }));
+
+    // A confirm under an irreversible trigger, on the same side, covers the next cycle.
+    let mut b1 = finish_after_verify_cycle();
+    b1.cycle = AssessmentSeq(20);
+    let confirming = RecordedOpinionSource::new()
+        .with_reframe(reframe_key(b1.cycle, NEEDS_VER), answer(Some(0.95)));
+    let out_b1 = b1.plan().resolve(&confirming).await;
+    assert_eq!(b1.select(&out_b1.checks).name(), "Finish");
+    let mut b2 = finish_after_verify_cycle();
+    b2.ensemble = out_b1.counters.clone();
+    let source = RecordedOpinionSource::new();
+    let out_b2 = b2.plan().resolve(&source).await;
+    assert!(source.reframe_calls().is_empty());
+    assert_eq!(
+        b2.select(&out_b2.checks).name(),
+        "Finish",
+        "covered: the confirm stands"
+    );
+    assert!(record(&out_b2, NEEDS_VER).is_some_and(|r| {
+        r.limits
+            .iter()
+            .any(|l| matches!(l, EnsembleLimit::Cooldown { held: false, .. }))
+    }));
+
+    // The same confirm does not cover a value that has moved to the other side.
+    let mut b3 = finish_after_verify_cycle().set(NEEDS_VER, 0.90);
+    b3.counters.verifiers_run = 0;
+    b3.ensemble = out_b1.counters.clone();
+    let out_b3 = b3.plan().resolve(&RecordedOpinionSource::new()).await;
+    assert!(
+        b3.check_plan(NEEDS_VER)
+            .is_some_and(|p| p.wants_opinion() && p.rule_would_fire)
+    );
+    assert!(
+        !out_b3.checks[&k(NEEDS_VER)].permitted,
+        "a confirm about the other side covers nothing"
+    );
+}
+
 #[tokio::test]
 async fn the_opinion_budget_holds_rather_than_acting_unchecked() {
     let mut s = Scenario::finish_ready()
@@ -1065,32 +1201,57 @@ async fn the_opinion_budget_holds_rather_than_acting_unchecked() {
 }
 
 #[tokio::test]
-async fn the_cooldown_holds_after_a_contest_and_does_not_re_ask_after_a_confirm() {
-    for contested in [true, false] {
+async fn the_cooldown_holds_unless_an_earlier_confirm_covers_the_opinion() {
+    // Rows written from the contract (review finding 1), not from the resolver: inside
+    // the window an opinion is skipped only when the earlier one was a confirm, about the
+    // same side, obtained under an irreversible trigger if this one is irreversible.
+    // `tests_sufficient = 0.92` with a Finish pending: decisive, above, irreversible.
+    let rows = [
+        (MarkVerdict::Contest, Some(Side::Above), true, false),
+        (MarkVerdict::Abstain, Some(Side::Above), true, false),
+        (MarkVerdict::Confirm, Some(Side::Above), true, true),
+        (MarkVerdict::Confirm, Some(Side::Above), false, false),
+        (MarkVerdict::Confirm, Some(Side::Below), true, false),
+        (MarkVerdict::Confirm, None, true, false),
+    ];
+    for (verdict, side, irreversible, stands) in rows {
         let mut s = Scenario::finish_ready()
             .set(TESTS, 0.92)
             .reframable(&[TESTS]);
+        assert!(s.triggers(TESTS).contains(&EnsembleTrigger::Irreversible));
         s.ensemble.checks.insert(
             k(TESTS),
             CheckCounters {
                 last_opinion: Some(OpinionMark {
                     cycle: AssessmentSeq(CYCLE.get() - 3),
-                    contested,
+                    verdict,
+                    side,
+                    irreversible,
                 }),
                 ..CheckCounters::default()
             },
         );
         let source = RecordedOpinionSource::new();
         let outcome = s.plan().resolve(&source).await;
-        assert!(source.reframe_calls().is_empty(), "one opinion per window");
-        assert!(record(&outcome, TESTS).is_some_and(|r| r.limits.contains(
-            &EnsembleLimit::Cooldown {
+        let row = format!("{verdict:?} {side:?} irreversible={irreversible}");
+        assert!(
+            source.reframe_calls().is_empty(),
+            "one opinion per window: {row}"
+        );
+        assert!(
+            record(&outcome, TESTS).is_some_and(|r| r.limits.contains(&EnsembleLimit::Cooldown {
                 last_opinion: AssessmentSeq(CYCLE.get() - 3),
                 cooldown_cycles: 10,
-                held: contested,
-            }
-        )));
-        assert_eq!(outcome.checks[&k(TESTS)].permitted, !contested);
+                held: !stands,
+            })),
+            "{row}"
+        );
+        assert_eq!(outcome.checks[&k(TESTS)].permitted, stands, "{row}");
+        assert_eq!(
+            s.select(&outcome.checks).name() == "Finish",
+            stands,
+            "{row}"
+        );
     }
     // Once the window has passed, it is asked again.
     let mut s = Scenario::finish_ready()
@@ -1101,7 +1262,9 @@ async fn the_cooldown_holds_after_a_contest_and_does_not_re_ask_after_a_confirm(
         CheckCounters {
             last_opinion: Some(OpinionMark {
                 cycle: AssessmentSeq(CYCLE.get() - 10),
-                contested: true,
+                verdict: MarkVerdict::Contest,
+                side: Some(Side::Above),
+                irreversible: true,
             }),
             ..CheckCounters::default()
         },
@@ -1111,6 +1274,16 @@ async fn the_cooldown_holds_after_a_contest_and_does_not_re_ask_after_a_confirm(
     let outcome = s.plan().resolve(&source).await;
     assert_eq!(source.reframe_calls().len(), 1);
     assert!(outcome.checks[&k(TESTS)].permitted, "consistent: confirmed");
+    assert_eq!(
+        outcome.counters.check(&k(TESTS)).last_opinion,
+        Some(OpinionMark {
+            cycle: CYCLE,
+            verdict: MarkVerdict::Confirm,
+            side: Some(Side::Above),
+            irreversible: true,
+        }),
+        "the new mark records what the confirm established"
+    );
 }
 
 #[tokio::test]
@@ -1431,7 +1604,13 @@ async fn run_case(c: &Case) {
         CounterState::CooldownAfterContest | CounterState::CooldownAfterConfirm => {
             check.last_opinion = Some(OpinionMark {
                 cycle: AssessmentSeq(CYCLE.get() - 1),
-                contested: matches!(c.counters, CounterState::CooldownAfterContest),
+                verdict: if matches!(c.counters, CounterState::CooldownAfterContest) {
+                    MarkVerdict::Contest
+                } else {
+                    MarkVerdict::Confirm
+                },
+                side: baseline.side,
+                irreversible: true,
             });
         }
         CounterState::BudgetSpent => counters.opinions_used = 20,
@@ -1573,6 +1752,147 @@ async fn monotonic_conservatism_removing_r2_never_shrinks_the_permitted_set() {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CycleState {
+    Verify,
+    FinishAfterVerify,
+    ReadyInBand,
+    FinishReady,
+    TestsLow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Answers {
+    Fail,
+    Consistent,
+    Inconsistent,
+}
+
+fn cycle_scenario(state: CycleState, cycle: u64, counters: &EnsembleCounters) -> Scenario {
+    let mut s = Scenario::finish_ready().reframable_all();
+    match state {
+        CycleState::Verify => s = s.set(NEEDS_VER, 0.90),
+        CycleState::FinishAfterVerify => {
+            s = s.set(NEEDS_VER, 0.05);
+            s.counters.verifiers_run = 1;
+        }
+        CycleState::ReadyInBand => s = s.set(READY, 0.79),
+        CycleState::FinishReady => {}
+        CycleState::TestsLow => s = s.set(TESTS, 0.30),
+    }
+    s.cycle = AssessmentSeq(cycle);
+    s.ensemble = counters.clone();
+    s
+}
+
+#[tokio::test]
+async fn no_opinion_driven_finish_across_cycles() {
+    // Review finding 1: the single-cycle property cannot see a cooldown carrying an
+    // opinion from one cycle into a Finish in the next. Every sequence of three cycles
+    // over these states, with every combination of answer kinds, counters carried.
+    use CycleState as C;
+    let states = [
+        C::Verify,
+        C::FinishAfterVerify,
+        C::ReadyInBand,
+        C::FinishReady,
+        C::TestsLow,
+    ];
+    let modes = [Answers::Fail, Answers::Consistent, Answers::Inconsistent];
+    let mut finishes = 0;
+    for &s0 in &states {
+        for &s1 in &states {
+            for &s2 in &states {
+                let sequence = [s0, s1, s2];
+                // The same sequence with no opinion rung at all.
+                let mut without = Vec::new();
+                let mut counters = EnsembleCounters::default();
+                for (i, state) in sequence.iter().enumerate() {
+                    let s = cycle_scenario(*state, 20 + i as u64, &counters)
+                        .without_rung(Rung::ReframeSameModel);
+                    let outcome = s.plan().resolve(&RecordedOpinionSource::new()).await;
+                    without.push(s.select(&outcome.checks).name());
+                    counters = outcome.counters;
+                }
+                for &m0 in &modes {
+                    for &m1 in &modes {
+                        for &m2 in &modes {
+                            let answers = [m0, m1, m2];
+                            let mut counters = EnsembleCounters::default();
+                            // Per check: (cycle, all confirmed, irreversible, side) of the
+                            // most recent opinion, reconstructed from the records alone.
+                            let mut last: BTreeMap<CheckKey, (u64, bool, bool, Option<Side>)> =
+                                BTreeMap::new();
+                            for (i, state) in sequence.iter().enumerate() {
+                                let cycle = 20 + i as u64;
+                                let s = cycle_scenario(*state, cycle, &counters);
+                                let plan = s.plan();
+                                let source = match answers[i] {
+                                    Answers::Fail => answering_by(&plan, |_| None),
+                                    Answers::Consistent => answering_by(&plan, |p| Some(1.0 - p)),
+                                    Answers::Inconsistent => answering_by(&plan, Some),
+                                };
+                                let outcome = plan.resolve(&source).await;
+                                for record in &outcome.records {
+                                    if !record.opinions.is_empty() {
+                                        let confirmed = record.opinions.iter().all(|o| {
+                                            matches!(o.opinion.verdict, Verdict::Confirm { .. })
+                                        });
+                                        last.insert(
+                                            record.check.clone(),
+                                            (
+                                                cycle,
+                                                confirmed,
+                                                record
+                                                    .triggers
+                                                    .contains(&EnsembleTrigger::Irreversible),
+                                                record.baseline.side,
+                                            ),
+                                        );
+                                    }
+                                }
+                                let selected = s.select(&outcome.checks).name();
+                                let label = format!("{sequence:?} {answers:?} cycle {i}");
+                                if selected == "Finish" {
+                                    finishes += 1;
+                                    assert_eq!(without[i], "Finish", "{label}");
+                                    assert!(
+                                        !answers[..=i].iter().all(|a| *a == Answers::Fail),
+                                        "a source that never answered let a Finish through: {label}"
+                                    );
+                                    // Every check the Finish rests on was confirmed, under an
+                                    // irreversible trigger, on its present side, recently.
+                                    for check in &plan.triggered {
+                                        if check.has(EnsembleTrigger::Irreversible)
+                                            && check.rule_would_fire
+                                        {
+                                            let covered = last.get(&check.check).is_some_and(
+                                                |(at, confirmed, irreversible, side)| {
+                                                    *confirmed
+                                                        && *irreversible
+                                                        && *side == check.baseline.side
+                                                        && cycle - at < 10
+                                                },
+                                            );
+                                            assert!(
+                                                covered,
+                                                "{} not covered: {label}",
+                                                check.check
+                                            );
+                                        }
+                                    }
+                                }
+                                counters = outcome.counters;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(finishes > 0, "the property was exercised");
 }
 
 #[tokio::test]

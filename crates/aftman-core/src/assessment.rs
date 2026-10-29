@@ -104,6 +104,10 @@ pub struct Opinion {
     /// Digest of the state the opinion was shown, so it can be proven that it saw
     /// what the model saw.
     pub state_digest: String,
+    /// What the call cost, when the provider reported it. Absent from records written
+    /// before it was carried, which decode as unknown.
+    #[serde(default)]
+    pub usage: Usage,
     pub latency: Duration,
     pub error: Option<String>,
 }
@@ -154,10 +158,18 @@ pub enum Resolution {
     /// `|p - t| >= margin`. Policy may evaluate the comparator.
     Decisive,
     /// Deterministic evidence produced a fresh value from a real measurement.
+    ///
+    /// `old_p` and `exit_code` are provenance for the log: what the value was before the
+    /// refresh, and how the provider's command exited. Neither is read by policy. Both
+    /// decode as `None` from a record written before they were carried.
     EvidenceRefreshed {
         new_p: f32,
         provider: EvidenceId,
         supersedes: AssessmentSeq,
+        #[serde(default)]
+        old_p: Option<f32>,
+        #[serde(default)]
+        exit_code: Option<i32>,
     },
     /// An opinion contested the value.
     SuppressedByContest { jev_p: f32, dissent: Vec<Opinion> },
@@ -178,6 +190,21 @@ pub const DEFAULT_UNCERTAINTY_MARGIN: f32 = 0.15;
 
 fn default_margin_value() -> f32 {
     DEFAULT_UNCERTAINTY_MARGIN
+}
+
+/// A fresh measurement produced by an evidence refresh (R0), with its provenance.
+///
+/// The input to [`ResolvedCheck::from_refresh`]. `new_p` is a new answer from the model
+/// about new evidence; `old_p` is carried only so the log can show what it replaced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefreshMeasurement {
+    pub new_p: f32,
+    pub old_p: Option<f32>,
+    /// The provider reported as having produced the evidence.
+    pub provider: EvidenceId,
+    pub exit_code: Option<i32>,
+    /// The assessment whose value this one replaces, for this check only.
+    pub supersedes: AssessmentSeq,
 }
 
 /// What policy actually reads for one check.
@@ -286,20 +313,24 @@ impl ResolvedCheck {
 
     /// Build from a deterministic evidence refresh: a **new measurement**, which is
     /// the only thing that can legitimately move `permitted` upward.
+    ///
+    /// The fresh value is judged against the same threshold and margin as the one it
+    /// supersedes, so a refresh that lands in the band again is still held.
     #[must_use]
     pub fn from_refresh(
         check: CheckKey,
-        new_p: f32,
         threshold: Option<f32>,
         margin: f32,
-        provider: EvidenceId,
-        supersedes: AssessmentSeq,
+        refresh: RefreshMeasurement,
     ) -> Self {
-        let mut refreshed = Self::from_measurement(check, Some(new_p), threshold, margin, true);
+        let mut refreshed =
+            Self::from_measurement(check, Some(refresh.new_p), threshold, margin, true);
         refreshed.resolution = Resolution::EvidenceRefreshed {
-            new_p,
-            provider,
-            supersedes,
+            new_p: refresh.new_p,
+            provider: refresh.provider,
+            supersedes: refresh.supersedes,
+            old_p: refresh.old_p,
+            exit_code: refresh.exit_code,
         };
         refreshed
     }
@@ -431,8 +462,8 @@ impl Assessment {
 #[cfg(test)]
 mod tests {
     use super::{
-        AnswerValue, Band, CheckSuppression, HumanDecision, Resolution, ResolvedCheck, Side,
-        Verdict, side_of,
+        AnswerValue, Band, CheckSuppression, HumanDecision, RefreshMeasurement, Resolution,
+        ResolvedCheck, Side, Verdict, side_of,
     };
     use crate::ids::{AssessmentSeq, CheckKey, EvidenceId};
 
@@ -530,11 +561,15 @@ mod tests {
 
         let refreshed = ResolvedCheck::from_refresh(
             key(),
-            0.08,
             Some(T),
             M,
-            EvidenceId::new("command:tests"),
-            AssessmentSeq::FIRST,
+            RefreshMeasurement {
+                new_p: 0.08,
+                old_p: Some(0.71),
+                provider: EvidenceId::new("tests"),
+                exit_code: Some(1),
+                supersedes: AssessmentSeq::FIRST,
+            },
         );
         assert!(
             refreshed.permitted,
@@ -544,8 +579,55 @@ mod tests {
         assert!(refreshed.less_than(T));
         assert!(matches!(
             refreshed.resolution,
-            Resolution::EvidenceRefreshed { .. }
+            Resolution::EvidenceRefreshed {
+                old_p: Some(_),
+                exit_code: Some(1),
+                ..
+            }
         ));
+        assert_eq!(
+            refreshed.jev_p,
+            Some(0.08),
+            "the fresh value is the new measurement"
+        );
+    }
+
+    #[test]
+    fn a_refresh_record_without_provenance_still_decodes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        // Written before `old_p` and `exit_code` were carried.
+        let json =
+            r#"{"resolution":"evidence_refreshed","new_p":0.08,"provider":"tests","supersedes":3}"#;
+        let resolution: Resolution = serde_json::from_str(json)?;
+        assert_eq!(
+            resolution,
+            Resolution::EvidenceRefreshed {
+                new_p: 0.08,
+                provider: EvidenceId::new("tests"),
+                supersedes: AssessmentSeq(3),
+                old_p: None,
+                exit_code: None,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_refresh_that_lands_in_band_is_still_held() {
+        let refreshed = ResolvedCheck::from_refresh(
+            key(),
+            Some(T),
+            M,
+            RefreshMeasurement {
+                new_p: 0.80,
+                old_p: Some(0.71),
+                provider: EvidenceId::new("tests"),
+                exit_code: Some(0),
+                supersedes: AssessmentSeq::FIRST,
+            },
+        );
+        assert!(!refreshed.permitted);
+        assert_eq!(refreshed.band, Band::InBand);
     }
 
     #[test]

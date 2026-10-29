@@ -45,8 +45,8 @@ pub mod worker;
 pub use activity::{StreamActivity, StreamUsage, ToolCall};
 pub use ansi::strip_control;
 pub use assessment::{
-    AnswerValue, Assessment, Band, CheckSuppression, Opinion, Resolution, ResolvedCheck, Rung,
-    Side, Verdict,
+    AnswerValue, Assessment, Band, CheckSuppression, Opinion, RefreshMeasurement, Resolution,
+    ResolvedCheck, Rung, Side, Verdict,
 };
 pub use clock::{Clock, FixedClock, SystemClock};
 pub use condition::{Comparator, Condition, ConditionError};

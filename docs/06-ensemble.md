@@ -290,7 +290,7 @@ pub struct Opinion {
     pub excerpt: String,         // ≤ 2 KiB
     pub prompt_hash: String,
     pub state_digest: String,
-    pub usage: Usage,
+    pub usage: Usage,            // #[serde(default)]: older records decode as unknown
     pub latency: Duration,
     pub error: Option<String>,
 }
@@ -303,8 +303,11 @@ pub enum CheckSuppression { InBand, Contested, Unresolved, NoThreshold }
 pub enum Resolution {
     /// `|p − t| >= margin`. Policy may evaluate the comparator.
     Decisive,
-    /// R0 produced fresh evidence and a fresh Jev value.
-    EvidenceRefreshed { new_p: f32, provider: EvidenceId, supersedes: AssessmentSeq },
+    /// R0 produced fresh evidence and a fresh Jev value. `old_p` and `exit_code` are
+    /// provenance for the log (§4 R0) and are read by nothing; both decode as `None`
+    /// from a record written before they were carried.
+    EvidenceRefreshed { new_p: f32, provider: EvidenceId, supersedes: AssessmentSeq,
+                        old_p: Option<f32>, exit_code: Option<i32> },
     /// An opinion contested the value.
     SuppressedByContest { jev_p: f32, dissent: Vec<Opinion> },
     /// In-band and not resolvable by evidence.

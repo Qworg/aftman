@@ -281,12 +281,9 @@ impl ResponsibilityDefinition {
         // A check a built-in rule compares against a threshold must have one, or it is
         // never banded: the ensemble would never hold or trigger it while the rule still
         // acted on it.
-        if let Some((_, reads)) = crate::responsibility::builtin::THRESHOLD_READS
-            .iter()
-            .find(|(builtin, _)| *builtin == id)
         {
-            for check_id in *reads {
-                if let Some(check) = self.checks.get(*check_id)
+            for check_id in crate::responsibility::builtin::threshold_reads(id) {
+                if let Some(check) = self.checks.get(check_id)
                     && check.min_threshold.is_none()
                 {
                     return Err(invalid(format!(
@@ -684,6 +681,13 @@ impl DeclarativeResponsibility {
 }
 
 impl Responsibility for DeclarativeResponsibility {
+    fn reads(&self, rule: &RuleId) -> Option<Vec<CheckKey>> {
+        self.rules
+            .iter()
+            .find(|(id, ..)| id == rule)
+            .map(|(_, condition, ..)| condition.keys())
+    }
+
     fn id(&self) -> &ResponsibilityId {
         &self.id
     }

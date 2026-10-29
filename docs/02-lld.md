@@ -326,7 +326,7 @@ pub struct EnsembleCounters { pub opinions_used: u32,
     pub checks: BTreeMap<CheckKey, CheckCounters> }              // in RunState.ensemble
 pub enum   EnsembleTrigger { NearThreshold, LowConfidence, ClaimOnlyEvidence, OutcomeRelevant,
     HighStakes, Irreversible, RepeatContest }
-pub struct EnsembleContext<'a> { settings, cycle, policy: &PolicyInput, propose: &(dyn Fn(&PolicyInput) -> Vec<Proposal> + Sync),
+pub struct EnsembleContext<'a> { settings, cycle, policy: &PolicyInput, registry: &ResponsibilityRegistry,
     definitions: &[Check], evidence: &EvidencePlan, answers, counters, reframe_available }
 pub struct EnsemblePlan { /* private; accessors cycle(), settings(), counters(), baseline(),
     triggered() -> &[CheckPlan] */ }       // only build() makes one, so a caller cannot hand the
@@ -351,6 +351,12 @@ pub enum EnsembleError { BaselineMismatch { check }, ContextMismatch(String), So
 pub fn reframe_verdict(p, p_negated, threshold, framing_tolerance, irreversible) -> Verdict;
 pub fn apply_opinions(rc: ResolvedCheck, opinions: &[Opinion]) -> ResolvedCheck; // suppress-only
 ```
+
+`Responsibility` gains `fn reads(&self, rule: &RuleId) -> Option<Vec<CheckKey>>` (default `None`): the
+checks a rule compares against a threshold, which the irreversible gate guards. Declarative rules
+answer with their condition's keys; built-ins with `builtin::RULE_READS`, a per-rule table pinned
+against the code by a test, from which the definitions' "a built-in reads this, so it needs a
+`min_threshold`" rule is also derived. `ResponsibilityRegistry::reads(rule)` looks it up.
 
 `aftman_core::testing::RecordedOpinionSource` implements `OpinionSource` from recorded outcomes
 only: `from_events` refuses an incomplete log, an unrecorded call is a `SourceError`, and

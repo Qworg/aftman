@@ -6,9 +6,9 @@
 //! after the ladder, on the **resolved** checks:
 //!
 //! 1. Arbitrate. If the selected directive is not `Finish` or `Stop`, stop.
-//! 2. Find the checks that selection depends on — with the same counterfactual as
-//!    `OutcomeRelevant`: pinned decisively above and below, the selected directive differs
-//!    — among those that are decisive and permitted.
+//! 2. Find the checks that selection rests on (`irreversible_dependencies`: every check
+//!    a rule proposing it reads, plus every check whose side changes it) among those that
+//!    are decisive and permitted.
 //! 3. Each must carry an R2 verdict obtained this cycle under `Irreversible` semantics
 //!    (an unusable answer contests). A verdict the ladder obtained under another trigger
 //!    is re-read under those semantics; a missing one is bought. With the budget spent
@@ -22,7 +22,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::assessment::{CheckSuppression, Resolution, ResolvedCheck, Rung, Side, Verdict};
+use crate::assessment::{CheckSuppression, Resolution, ResolvedCheck, Rung, Verdict};
 use crate::ids::CheckKey;
 
 use super::resolve::{
@@ -81,8 +81,13 @@ pub(super) async fn run(
         if !selected.is_irreversible() {
             break;
         }
-        let pending: Vec<CheckKey> = dependencies(ctx, checks)
+        let pending: Vec<CheckKey> = super::trigger::irreversible_dependencies(ctx, checks)
             .into_iter()
+            .filter(|key| {
+                checks
+                    .get(key)
+                    .is_some_and(|rc| rc.threshold.is_some() && rc.decisive && rc.permitted)
+            })
             .filter(|key| !guarded.contains(key))
             .collect();
         if pending.is_empty() {
@@ -104,29 +109,6 @@ pub(super) async fn run(
         }
     }
     Ok(rounds)
-}
-
-/// The decisive, permitted checks whose side the current selection depends on.
-///
-/// The `OutcomeRelevant` counterfactual — the check pinned decisively above and below —
-/// compared on the whole selected directive, not only its kind. `core.worker-health`
-/// proposes the more probable of two findings, so a `Stop` may rest on either: pinning
-/// `worker_stuck` below leaves a `Stop`, but one for `work_off_track`. Comparing kinds
-/// alone would find neither check a dependency, and that `Stop` would go unguarded.
-fn dependencies(
-    ctx: &EnsembleContext<'_>,
-    checks: &BTreeMap<CheckKey, ResolvedCheck>,
-) -> Vec<CheckKey> {
-    checks
-        .iter()
-        .filter(|(_, rc)| rc.threshold.is_some() && rc.decisive && rc.permitted)
-        .filter(|(key, rc)| {
-            let above = super::trigger::select_with(ctx, checks, key, Side::Above, rc);
-            let below = super::trigger::select_with(ctx, checks, key, Side::Below, rc);
-            above != below
-        })
-        .map(|(key, _)| key.clone())
-        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]

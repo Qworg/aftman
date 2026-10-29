@@ -138,7 +138,7 @@ Precisely, for a check `k` with threshold `t` (`aftman_core::ensemble::EnsembleP
 | `ClaimOnlyEvidence` | `k`'s evidence selection reached **no command evidence this cycle**: it names no `command:<id>` (or `command_evidence`) whose output is in the observation. A provider `k` names that has not run yet (an `on_demand` one) does not count — what `k` scored was the worker's claim. This is the case in §9.1 |
 | `OutcomeRelevant` | the selected directive's kind differs between `k` pinned above and `k` pinned below |
 | `HighStakes` | some `stakes = "high"` proposal depends on `k`: for a decisive `k`, one proposed now that would not be proposed were `k` held; for a held `k`, one that either pinned side proposes and the held state does not |
-| `Irreversible` | `k` is decisive, the selected directive is `Finish` or `Stop`, and pinning `k` to the *other* side changes it. Every check is load-bearing for `Finish` through `UnresolvedUncertainty`; this asks whether the irreversible directive rests on `k`'s *side* |
+| `Irreversible` | `k` is decisive, the selected directive is `Finish` or `Stop`, and that directive rests on `k`: a rule proposing it reads `k`, or `k`'s side changes it (`irreversible_dependencies`, §6; the gate uses the same set). Every check is load-bearing for `Finish` through `UnresolvedUncertainty`; this asks whether the directive rests on `k` itself |
 | `RepeatContest` | for an in-band `k`: its measurement was in band in at least `consecutive_contests_before_human` consecutive prior cycles; for a decisive `k`: an opinion **contested** it in at least that many consecutive prior cycles (`EnsembleCounters`). The two counts are separate: in-band cycles never count toward escalating a value that has since become decisive |
 
 Alongside the triggers the plan records whether **a rule would fire** on `k`: some proposal made this
@@ -156,7 +156,7 @@ those calls could not change any outcome. They have been removed from the in-ban
 The ensemble is never triggered by a check with no threshold and no referencing rule. In fact a check
 with no threshold is never triggered at all, because no rule can reference one: a declarative
 `when` may only read a key that declares `min_threshold`, and a built-in definition may not drop
-`min_threshold` from a check that a built-in rule compares (`builtin::THRESHOLD_READS`; both are
+`min_threshold` from a check that a built-in rule compares (`builtin::RULE_READS`; both are
 refused at load, [05-responsibilities.md §2.1](05-responsibilities.md)). Such a check has no band
 and no side, so there is nothing to be uncertain about.
 
@@ -566,9 +566,10 @@ over the resolved set (`ensemble/gate.rs`):
 loop:
     selected = arbitrate(propose(resolved))
     if selected is not Finish or Stop: done
-    deps = checks k, decisive and permitted, such that the selected directive differs between
-           k pinned decisively above and k pinned decisively below (the OutcomeRelevant
-           counterfactual, compared on the whole directive, not only its kind)
+    deps = (every check READ by the rule of every proposal whose directive is the selected one)
+         ∪ (every check whose side changes the selected directive: the OutcomeRelevant
+            counterfactual, k pinned decisively above vs below, compared on the whole directive)
+           — keeping those that are decisive and permitted
     pending = deps not yet guarded this cycle
     if pending is empty: done
     for k in pending:
@@ -596,9 +597,20 @@ loop:
   (`already_guarded`, `reinterpreted`, `bought`, `unavailable`, `budget_spent`) in its
   `CheckRecord` and in its `EnsembleResolved` entry. A check the gate guarded that the ladder never
   looked at gets a record with no triggers.
-- **Whole directive, not kind.** `core.worker-health` proposes the more probable of two findings,
-  so a `Stop` may rest on either; with kinds alone neither would be a dependency and the `Stop`
-  would go unguarded.
+- **What a directive rests on** (`irreversible_dependencies`, shared by the gate and the ladder's
+  `Irreversible` trigger so the two agree) is the union of two sets, because each misses cases the
+  other catches:
+  - **the read set** — every check read by the rule of every proposal whose directive is the
+    selected one: a declarative rule's condition keys, a built-in rule's entry in
+    `builtin::RULE_READS` (pinned against the code by a test). A `Stop` on
+    `a >= 0.75 or b >= 0.75` with both true survives flipping either check alone, so the
+    counterfactual finds nothing; it rests on both. The same holds for two rules proposing an
+    identical directive;
+  - **the counterfactual set** — every check whose side changes the selected directive, compared
+    on the whole directive, not only its kind. It catches checks no proposing rule reads, such as
+    `needs_human` under a `Finish` (decisively high, it would let a higher-priority `Escalate`
+    win), and `core.worker-health`'s runner-up (a `Stop` on one of two findings is not the same
+    directive as a `Stop` on the other).
 
 **What a cooldown may skip.** The cooldown applies only to opinions a *non-irreversible* trigger
 (`OutcomeRelevant`, `HighStakes`) would buy. **An opinion an `Irreversible` trigger needs is never
@@ -688,8 +700,10 @@ Notes that follow directly from §2:
   the ladder never planned for. The per-check ladder, which plans from the selection before it
   runs, cannot see these. **The irreversible gate is what makes them safe for `Finish` and
   `Stop`**: whatever the cycle finally selects, an irreversible directive goes ahead only if
-  every check it rests on carries an R2 verdict obtained this cycle under `Irreversible`
-  semantics, so an unmasked `Stop` or `Finish` is guarded exactly as one selected from the start.
+  every decisive, permitted check it rests on — every check a rule proposing it reads, and every
+  check whose side changes it — carries an R2 verdict obtained this cycle under `Irreversible`
+  semantics, **or has no R2 available, in which case it stands, exactly as it would in the
+  ladder.** An unmasked `Stop` or `Finish` is guarded exactly as one selected from the start.
 
   The declarative half holds because conditions are **three-valued** (Kleene,
   [05-responsibilities.md §2.1](05-responsibilities.md)): a comparison on a check that is missing or

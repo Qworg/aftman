@@ -262,12 +262,11 @@ impl Scenario {
     ) -> Result<EnsemblePlan, super::EnsembleError> {
         let input = self.input(checks);
         let answers = self.answer_map();
-        let propose = |input: &PolicyInput<'_>| self.registry.propose(input);
         EnsemblePlan::build(&EnsembleContext {
             settings: &self.settings,
             cycle: self.cycle,
             policy: &input,
-            propose: &propose,
+            registry: &self.registry,
             definitions: &self.definitions,
             evidence: &self.evidence,
             answers: &answers,
@@ -285,12 +284,11 @@ impl Scenario {
         let baseline = self.baseline();
         let input = self.input(&baseline);
         let answers = self.answer_map();
-        let propose = |input: &PolicyInput<'_>| self.registry.propose(input);
         let ctx = EnsembleContext {
             settings: &self.settings,
             cycle: self.cycle,
             policy: &input,
-            propose: &propose,
+            registry: &self.registry,
             definitions: &self.definitions,
             evidence: &self.evidence,
             answers: &answers,
@@ -1407,6 +1405,150 @@ fn no_rule_starts_firing_because_a_check_lost_permission() {
         }
     }
     assert!(exercised > 0);
+}
+
+/// Round-3 probe G1: a declarative Stop on `a >= 0.75 or b >= 0.75`.
+fn either_stop() -> Scenario {
+    let mut s = Scenario::finish_ready().with_worker();
+    let mut definitions = DefinitionSet::bundled().unwrap_or_default();
+    let source = r#"enabled = true
+always = true
+title = "either"
+[checks.a]
+instructions = "?"
+min_threshold = 0.75
+[checks.b]
+instructions = "?"
+min_threshold = 0.75
+[[rules]]
+id = "my.either:halt"
+when = "my.either__a >= 0.75 or my.either__b >= 0.75"
+propose = "stop"
+reason = "either signal says stop"
+"#;
+    if let Ok(definition) =
+        crate::definitions::ResponsibilityDefinition::parse("my.either", source, "test")
+    {
+        definitions
+            .definitions
+            .insert("my.either".into(), definition);
+    }
+    let ids: Vec<ResponsibilityId> = definitions
+        .definitions
+        .keys()
+        .map(ResponsibilityId::new)
+        .collect();
+    if let Ok(registry) = ResponsibilityRegistry::from_definitions(&definitions, &ids, 30, 1) {
+        s.registry = registry;
+    }
+    s.definitions = s.registry.checks();
+    s.values.insert(k("my.either__a"), Some(0.95));
+    s.values.insert(k("my.either__b"), Some(0.95));
+    s.reframable(&["my.either__a", "my.either__b"])
+}
+
+#[tokio::test]
+async fn a_stop_resting_on_a_disjunction_is_guarded_on_every_disjunct() {
+    // Flipping either check alone leaves the Stop in place, so the single-check
+    // counterfactual finds no dependency. The rule reads both, so both are guarded.
+    let s = either_stop();
+    assert_eq!(s.select(&s.baseline()).name(), "Stop");
+    let plan = s.plan();
+    // Every R2 answer contests.
+    let source = answering_by(&plan, Some);
+    let outcome = s
+        .resolve_plan(&plan, &source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let asked: BTreeSet<CheckKey> = source
+        .reframe_calls()
+        .into_iter()
+        .map(|r| r.opinion.check)
+        .collect();
+    assert!(asked.contains(&k("my.either__a")) && asked.contains(&k("my.either__b")));
+    assert_ne!(s.select(&outcome.checks).name(), "Stop");
+    // Both confirm: the Stop goes ahead, guarded on both.
+    let source = answering_by(&plan, |p| Some(1.0 - p));
+    let outcome = s
+        .resolve_plan(&plan, &source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(s.select(&outcome.checks).name(), "Stop");
+    assert_irreversible_guarded(&s, &outcome, "either, confirmed");
+    for key in ["my.either__a", "my.either__b"] {
+        assert!(
+            record(&outcome, key).is_some_and(|r| r.irreversible_guard.is_some()),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn builtin_read_lists_match_the_rules() {
+    // `RULE_READS` against the code: in every scenario where a built-in rule fires, the
+    // checks whose loss of permission removes it are exactly within its read list, and over
+    // the scenarios every listed check is seen to matter.
+    use crate::responsibility::builtin::{RULE_READS, rule_reads};
+    let mut drift = Scenario::finish_ready().with_worker().set(DRIFT, 0.97);
+    drift.observation.instructions = Some(crate::observation::RepoInstructions {
+        file: "AGENTS.md".into(),
+        excerpt: "x".into(),
+        truncated: false,
+    });
+    let scenarios = vec![
+        Scenario::finish_ready(),
+        Scenario::finish_ready().set(READY, 0.30),
+        Scenario::finish_ready().set(NEEDS_VER, 0.90),
+        Scenario::finish_ready().set(HUMAN, 0.97),
+        Scenario::finish_ready().with_worker().set(STUCK, 0.97),
+        Scenario::finish_ready().with_worker().set(OFF_TRACK, 0.97),
+        drift,
+    ];
+    let mut seen: BTreeMap<String, BTreeSet<CheckKey>> = BTreeMap::new();
+    let mut fired: BTreeSet<String> = BTreeSet::new();
+    for s in &scenarios {
+        let baseline = s.baseline();
+        let before = s.proposals(&baseline);
+        for proposal in &before {
+            let rule = proposal.rule.to_string();
+            let Some(reads) = rule_reads(&rule) else {
+                continue;
+            };
+            fired.insert(rule.clone());
+            for (key, rc) in &baseline {
+                if !rc.permitted {
+                    continue;
+                }
+                let mut held = baseline.clone();
+                held.insert(
+                    key.clone(),
+                    apply_opinions(
+                        rc.clone(),
+                        &[opinion(Verdict::Contest { side: Side::Below })],
+                    ),
+                );
+                if !s.proposals(&held).iter().any(|p| p.rule == proposal.rule) {
+                    assert!(
+                        reads.contains(key),
+                        "{rule} depends on {key}, not in its read list"
+                    );
+                    seen.entry(rule.clone()).or_default().insert(key.clone());
+                }
+            }
+        }
+    }
+    for (rule, reads) in RULE_READS {
+        if reads.is_empty() {
+            continue;
+        }
+        assert!(fired.contains(*rule), "{rule} never fired in the scenarios");
+        let listed: BTreeSet<CheckKey> = rule_reads(rule).unwrap_or_default().into_iter().collect();
+        assert_eq!(
+            seen.get(*rule),
+            Some(&listed),
+            "{rule}: listed reads not all seen to matter"
+        );
+    }
 }
 
 #[tokio::test]
@@ -3182,10 +3324,22 @@ fn irreversible_dependencies(
     if !selected.is_irreversible() {
         return Vec::new();
     }
+    // What the rules proposing the selected directive read (the read lists are pinned
+    // against the rules' code by `builtin_read_lists_match_the_rules`).
+    let read: BTreeSet<CheckKey> = s
+        .proposals(checks)
+        .iter()
+        .filter(|p| p.directive == selected)
+        .flat_map(|p| s.registry.reads(&p.rule))
+        .collect();
     let mut deps = Vec::new();
     for (key, rc) in checks {
         let Some(t) = rc.threshold else { continue };
         if !(rc.decisive && rc.permitted) {
+            continue;
+        }
+        if read.contains(key) {
+            deps.push(key.clone());
             continue;
         }
         // Compared on the whole directive: a Stop for one finding is not a Stop for another.

@@ -19,7 +19,7 @@ use crate::evidence::{EvidencePlan, RunWhen};
 use crate::ids::{AssessmentSeq, CheckKey, EvidenceId};
 use crate::observation::Observation;
 use crate::policy::{PolicyInput, arbitrate};
-use crate::responsibility::Check;
+use crate::responsibility::{Check, ResponsibilityRegistry};
 
 use super::settings::{EnsembleCounters, EnsembleSettings};
 
@@ -41,8 +41,9 @@ pub enum EnsembleTrigger {
     /// A rule that depends on this check is marked `stakes = "high"`. As
     /// `OutcomeRelevant`.
     HighStakes,
-    /// The selected directive is `Finish` or `Stop` and rests on this check's side.
-    /// Decisive values only; R2 (and R1).
+    /// The selected directive is `Finish` or `Stop` and rests on this check: a rule
+    /// proposing it reads the check, or the check's side changes it. Decisive values
+    /// only; R2 (and R1). The irreversible gate uses the same definition.
     Irreversible,
     /// The check was held or contested in at least `consecutive_contests_before_human`
     /// consecutive prior cycles. Escalates rather than asking again.
@@ -98,12 +99,11 @@ pub struct EnsembleContext<'a> {
     /// derives itself — `ResolvedCheck::from_measurement` over `answers` and `definitions`
     /// with the settings' margin and `enabled` — or `build` refuses.
     pub policy: &'a PolicyInput<'a>,
-    /// Proposal generation, for example `|input| registry.propose(input)`. Must be the
-    /// same pure function the runtime uses, or the counterfactuals answer a different
-    /// question from the one policy will be asked.
-    /// `Sync` so that a resolution, which holds the context across the source's awaits,
-    /// can run in a spawned task.
-    pub propose: &'a (dyn Fn(&PolicyInput<'_>) -> Vec<Proposal> + Sync),
+    /// The active responsibilities: what proposes, and which checks each rule reads. Must
+    /// be the registry the runtime arbitrates with, or the counterfactuals answer a
+    /// different question from the one policy will be asked. It cannot be compared, so
+    /// `resolve` trusts the caller to pass the same one to `build` and `resolve`.
+    pub registry: &'a ResponsibilityRegistry,
     /// The active check definitions, for their evidence selections.
     pub definitions: &'a [Check],
     /// The configured command providers.
@@ -312,10 +312,11 @@ impl EnsemblePlan {
         }
         let mut triggered = Vec::new();
         if ctx.settings.enabled {
-            let (proposals, selected) = evaluate(ctx, &baseline);
+            let (proposals, _) = evaluate(ctx, &baseline);
+            let irreversible = irreversible_dependencies(ctx, &baseline);
             let world = World {
                 proposals,
-                selected,
+                irreversible,
             };
             for (key, rc) in &baseline {
                 if let Some(plan) = plan_check(ctx, &world, key, rc)
@@ -389,7 +390,46 @@ pub enum EnsembleError {
 /// What policy does with the baseline checks.
 struct World {
     proposals: Vec<Proposal>,
-    selected: Directive,
+    /// What the selected directive rests on, if it is irreversible.
+    irreversible: BTreeSet<CheckKey>,
+}
+
+/// The checks an irreversible selection rests on: empty unless `Finish` or `Stop` is
+/// selected over `checks`. The union of
+///
+/// - every check **read** by the rule of every proposal whose directive is the selected
+///   one — so a directive resting on a disjunction (`a >= t or b >= t`), or proposed by
+///   two rules, rests on every check that could have produced it; and
+/// - every decisive, permitted check whose side changes the selected directive (the
+///   `OutcomeRelevant` counterfactual, compared on the whole directive) — so a check that
+///   matters because it would let a higher-priority rule win is included.
+///
+/// Used by both the ladder's `Irreversible` trigger and the gate, so the two agree.
+pub(super) fn irreversible_dependencies(
+    ctx: &EnsembleContext<'_>,
+    checks: &BTreeMap<CheckKey, ResolvedCheck>,
+) -> BTreeSet<CheckKey> {
+    let (proposals, selected) = evaluate(ctx, checks);
+    if !selected.is_irreversible() {
+        return BTreeSet::new();
+    }
+    let mut deps: BTreeSet<CheckKey> = proposals
+        .iter()
+        .filter(|proposal| proposal.directive == selected)
+        .flat_map(|proposal| ctx.registry.reads(&proposal.rule))
+        .filter(|key| checks.contains_key(key))
+        .collect();
+    for (key, rc) in checks {
+        if rc.threshold.is_some()
+            && rc.decisive
+            && rc.permitted
+            && select_with(ctx, checks, key, Side::Above, rc)
+                != select_with(ctx, checks, key, Side::Below, rc)
+        {
+            deps.insert(key.clone());
+        }
+    }
+    deps
 }
 
 fn plan_check(
@@ -452,15 +492,8 @@ fn plan_check(
 
     let rule_would_fire = rc.permitted && world.proposals.iter().any(|p| !held.contains(p));
 
-    if rc.decisive && world.selected.is_irreversible() {
-        let opposite = match rc.side {
-            Some(Side::Above) => Some(&below_selected),
-            Some(Side::Below) => Some(&above_selected),
-            None => None,
-        };
-        if opposite.is_some_and(|other| other.name() != world.selected.name()) {
-            triggers.insert(EnsembleTrigger::Irreversible);
-        }
+    if rc.decisive && world.irreversible.contains(key) {
+        triggers.insert(EnsembleTrigger::Irreversible);
     }
 
     // In band, the count is of consecutive in-band measurements; decisive, of consecutive
@@ -508,7 +541,7 @@ fn evaluate(
         ensemble_enabled: base.ensemble_enabled,
         steering_grace: base.steering_grace,
     };
-    let proposals = (ctx.propose)(&input);
+    let proposals = ctx.registry.propose(&input);
     let selected = arbitrate(&input, &proposals).selected;
     (proposals, selected)
 }

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::assessment::Band;
 use crate::definitions::{DeclarativeResponsibility, DefinitionSet};
 use crate::directive::Proposal;
-use crate::ids::{CheckId, CheckKey, EvidenceId, ResponsibilityId};
+use crate::ids::{CheckId, CheckKey, EvidenceId, ResponsibilityId, RuleId};
 use crate::model::Question;
 use crate::policy::PolicyInput;
 
@@ -102,6 +102,14 @@ pub trait Responsibility: Send + Sync {
     /// carries a materialised `now` and the active worker record, so nothing here needs
     /// a clock.
     fn propose(&self, input: &PolicyInput<'_>) -> Vec<Proposal>;
+
+    /// The checks `rule` compares against a threshold, if `rule` is one of this
+    /// responsibility's. The irreversible gate guards them when the rule's directive is
+    /// the one selected.
+    fn reads(&self, rule: &RuleId) -> Option<Vec<CheckKey>> {
+        let _ = rule;
+        None
+    }
 }
 
 /// The set of responsibilities active for a run.
@@ -256,6 +264,15 @@ impl ResponsibilityRegistry {
         groups
     }
 
+    /// The checks `rule` compares against a threshold. Empty for an unknown rule.
+    #[must_use]
+    pub fn reads(&self, rule: &RuleId) -> Vec<CheckKey> {
+        self.active
+            .iter()
+            .find_map(|r| r.reads(rule))
+            .unwrap_or_default()
+    }
+
     /// All proposals from all active responsibilities, in a deterministic order.
     #[must_use]
     pub fn propose(&self, input: &PolicyInput<'_>) -> Vec<Proposal> {
@@ -311,28 +328,77 @@ pub mod builtin {
     pub const HUMAN_ESCALATION_CHECKS: &[&str] = &["needs_human"];
     pub const REPOSITORY_INSTRUCTIONS_CHECKS: &[&str] = &["agents_md_drift"];
 
-    /// For each built-in id, the checks it declares that a built-in rule — its own or
-    /// another's — compares against a threshold.
+    /// For each built-in rule, the checks it compares against a threshold, as
+    /// `(responsibility id, check id)`.
     ///
-    /// Such a check must declare `min_threshold`. Without one it has no band, so the
-    /// ensemble never holds or triggers it, while the rule still compares it against a
-    /// number. `core.completion`'s `Finish` rule reads `core.verification`'s
-    /// `tests_sufficient` and `needs_verification`; `core.verification`'s rule reads
-    /// `core.completion`'s `implementation_complete`.
-    pub const THRESHOLD_READS: &[(&str, &[&str])] = &[
+    /// This is what the irreversible gate guards when a built-in rule's directive is the one
+    /// selected (`docs/06-ensemble.md` §6), and what the definitions require a threshold
+    /// for. `core.completion`'s `Finish` reads `core.verification`'s `tests_sufficient`
+    /// and `needs_verification`; `core.verification`'s rule reads `core.completion`'s
+    /// `implementation_complete`. A test asserts this table against the rules' code.
+    pub const RULE_READS: &[(&str, &[(&str, &str)])] = &[
         (
-            COMPLETION,
+            "core.completion:thresholds-satisfied",
             &[
-                "implementation_complete",
-                "requirements_satisfied",
-                "ready_to_finish",
+                (COMPLETION, "ready_to_finish"),
+                (COMPLETION, "requirements_satisfied"),
+                (VERIFICATION, "tests_sufficient"),
+                (VERIFICATION, "needs_verification"),
             ],
         ),
-        (VERIFICATION, &["tests_sufficient", "needs_verification"]),
-        (WORKER_HEALTH, &["worker_stuck", "work_off_track"]),
-        (HUMAN_ESCALATION, &["needs_human"]),
-        (REPOSITORY_INSTRUCTIONS, &["agents_md_drift"]),
+        ("core.completion:retry-stopped", &[]),
+        ("core.completion:work-remains", &[]),
+        (
+            "core.verification:warranted",
+            &[
+                (VERIFICATION, "needs_verification"),
+                (COMPLETION, "implementation_complete"),
+            ],
+        ),
+        (
+            "core.worker-health:stuck",
+            &[(WORKER_HEALTH, "worker_stuck")],
+        ),
+        (
+            "core.worker-health:off-track",
+            &[(WORKER_HEALTH, "work_off_track")],
+        ),
+        ("core.worker-health:grace", &[]),
+        (
+            "core.human-escalation:needs-human",
+            &[(HUMAN_ESCALATION, "needs_human")],
+        ),
+        (
+            "repository.instructions:drift",
+            &[(REPOSITORY_INSTRUCTIONS, "agents_md_drift")],
+        ),
     ];
+
+    /// The checks a built-in rule compares against a threshold, as wire keys. `None` for a
+    /// rule id that is not a built-in's.
+    #[must_use]
+    pub fn rule_reads(rule: &str) -> Option<Vec<CheckKey>> {
+        RULE_READS
+            .iter()
+            .find(|(id, _)| *id == rule)
+            .map(|(_, reads)| reads.iter().map(|(r, c)| key(r, c)).collect())
+    }
+
+    /// The checks of built-in `id` that any built-in rule compares against a threshold.
+    /// Such a check must declare `min_threshold`, or it would have no uncertainty band
+    /// while a rule still acted on it.
+    #[must_use]
+    pub fn threshold_reads(id: &str) -> Vec<&'static str> {
+        let mut checks: Vec<&'static str> = RULE_READS
+            .iter()
+            .flat_map(|(_, reads)| reads.iter())
+            .filter(|(responsibility, _)| *responsibility == id)
+            .map(|(_, check)| *check)
+            .collect();
+        checks.sort_unstable();
+        checks.dedup();
+        checks
+    }
 
     /// Build the code-logic responsibility for one id, if there is one.
     ///
@@ -515,6 +581,13 @@ pub mod builtin {
             &self.routing
         }
 
+        fn reads(&self, rule: &RuleId) -> Option<Vec<CheckKey>> {
+            rule.as_str()
+                .strip_prefix(self.id.as_str())
+                .filter(|rest| rest.starts_with(':'))
+                .and_then(|_| rule_reads(rule.as_str()))
+        }
+
         fn propose(&self, input: &PolicyInput<'_>) -> Vec<Proposal> {
             if input.active_worker.is_some() {
                 return Vec::new();
@@ -602,6 +675,13 @@ pub mod builtin {
             &self.routing
         }
 
+        fn reads(&self, rule: &RuleId) -> Option<Vec<CheckKey>> {
+            rule.as_str()
+                .strip_prefix(self.id.as_str())
+                .filter(|rest| rest.starts_with(':'))
+                .and_then(|_| rule_reads(rule.as_str()))
+        }
+
         fn propose(&self, input: &PolicyInput<'_>) -> Vec<Proposal> {
             // A verifier is only warranted once implementation looks complete, and never
             // twice.
@@ -659,6 +739,13 @@ pub mod builtin {
 
         fn routing(&self) -> &Routing {
             &self.routing
+        }
+
+        fn reads(&self, rule: &RuleId) -> Option<Vec<CheckKey>> {
+            rule.as_str()
+                .strip_prefix(self.id.as_str())
+                .filter(|rest| rest.starts_with(':'))
+                .and_then(|_| rule_reads(rule.as_str()))
         }
 
         fn propose(&self, input: &PolicyInput<'_>) -> Vec<Proposal> {
@@ -745,6 +832,13 @@ pub mod builtin {
             &self.routing
         }
 
+        fn reads(&self, rule: &RuleId) -> Option<Vec<CheckKey>> {
+            rule.as_str()
+                .strip_prefix(self.id.as_str())
+                .filter(|rest| rest.starts_with(':'))
+                .and_then(|_| rule_reads(rule.as_str()))
+        }
+
         fn propose(&self, input: &PolicyInput<'_>) -> Vec<Proposal> {
             if !input.check_ge(
                 &key(HUMAN_ESCALATION, "needs_human"),
@@ -783,6 +877,13 @@ pub mod builtin {
 
         fn routing(&self) -> &Routing {
             &self.routing
+        }
+
+        fn reads(&self, rule: &RuleId) -> Option<Vec<CheckKey>> {
+            rule.as_str()
+                .strip_prefix(self.id.as_str())
+                .filter(|rest| rest.starts_with(':'))
+                .and_then(|_| rule_reads(rule.as_str()))
         }
 
         fn propose(&self, input: &PolicyInput<'_>) -> Vec<Proposal> {

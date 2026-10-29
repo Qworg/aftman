@@ -3311,6 +3311,83 @@ async fn a_replay_refuses_a_log_missing_an_opinion_record() {
     ));
 }
 
+/// An `OPINION_REQUESTED` event for `key`, as the daemon's source would emit it.
+fn requested_event(seq: u64, key: OpinionKey) -> EventEnvelope {
+    let payload = super::OpinionRequestedPayload::new(
+        &super::ReframeRequest {
+            opinion: key,
+            timeout: Duration::from_secs(120),
+        },
+        "jev",
+        "model",
+        "prompt-hash",
+        "state-digest",
+    );
+    EventEnvelope::new(
+        EventSeq(seq),
+        RunId::new(),
+        datetime!(2026-01-01 00:00:00 UTC),
+        EventKind::OpinionRequested,
+        serde_json::to_value(payload).unwrap_or_default(),
+    )
+}
+
+#[tokio::test]
+async fn a_replay_tolerates_a_dangling_request_in_the_trailing_cycle() -> TestResult {
+    // Round-2 probe P6c: a complete cycle, then a run cancelled mid-opinion in the next.
+    let (_, mut events) = docs_cycle_events().await;
+    events.push(requested_event(100, reframe_key(AssessmentSeq(99), DOCS)));
+    let source = RecordedOpinionSource::from_events(&events)?;
+    assert_eq!(source.incomplete_cycle(), Some(AssessmentSeq(99)));
+    // The complete cycle still replays.
+    let replayed = resolved(
+        &Scenario::finish_ready().set(DOCS, 0.31).reframable_all(),
+        &source,
+    )
+    .await;
+    assert_eq!(source.divergences(&replayed), Vec::new());
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_replay_refuses_a_dangling_request_before_the_last_resolved_cycle() {
+    // The same dangling request, but a later cycle was resolved: a gap, not a crash.
+    let (_, events) = docs_cycle_events().await;
+    let mut log = vec![requested_event(0, reframe_key(AssessmentSeq(5), DOCS))];
+    log.extend(events);
+    assert!(matches!(
+        RecordedOpinionSource::from_events(&log),
+        Err(super::super::testing::ReplayError::MissingOpinion(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_requested_opinion_in_a_resolved_cycle_needs_its_record() {
+    // Pins the OPINION_REQUESTED requirement on its own: the resolved entry no longer
+    // names the rung, so only the request says an opinion was asked.
+    let (_, events) = docs_cycle_events().await;
+    let mut log: Vec<EventEnvelope> = vec![requested_event(0, reframe_key(CYCLE, DOCS))];
+    for mut event in events {
+        if event.kind == EventKind::OpinionRecorded {
+            continue;
+        }
+        if let Some(checks) = event
+            .payload
+            .get_mut("checks")
+            .and_then(|c| c.as_array_mut())
+        {
+            for check in checks {
+                check["rungs_used"] = serde_json::json!([]);
+            }
+        }
+        log.push(event);
+    }
+    assert!(matches!(
+        RecordedOpinionSource::from_events(&log),
+        Err(super::super::testing::ReplayError::MissingOpinion(_))
+    ));
+}
+
 #[tokio::test]
 async fn a_replay_refuses_a_log_missing_a_refresh_record() {
     let s = Scenario::finish_ready()

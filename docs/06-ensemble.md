@@ -714,7 +714,10 @@ Properties:
   what the live run used.
 - **A replay never invents an answer.** `RecordedOpinionSource::from_events` refuses an incomplete
   log: every opinion an `OpinionRequested` or an `EnsembleResolved` entry's `rungs_used` names
-  needs its `OpinionRecorded`, and every refresh an entry names needs its recorded outcome. A call
+  needs its `OpinionRecorded`, and every refresh an entry names needs its recorded outcome. The one
+  tolerated gap is a **trailing** cycle that never reached `EnsembleResolved` — a run cancelled or
+  crashed mid-opinion: the log replays up to its last complete cycle and `incomplete_cycle()` names
+  the trailing one. A gap in any earlier or resolved cycle is refused. A call
   the log does not record returns `SourceError::NotRecorded`, which aborts the resolution instead of
   being folded in as an abstention. After a replayed cycle, `divergences(&outcome)` compares each
   recomputed verdict with the recorded one and reports any mismatch. This is why `OpinionSource`

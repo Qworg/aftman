@@ -361,6 +361,8 @@ pub struct RecordedOpinionSource {
     refreshes: BTreeMap<(AssessmentSeq, CheckKey), RefreshOutcome>,
     reframes: BTreeMap<OpinionKey, ReframeAnswer>,
     verdicts: BTreeMap<OpinionKey, Verdict>,
+    /// A trailing cycle the log started but never resolved. See `from_events`.
+    incomplete_cycle: Option<AssessmentSeq>,
     refresh_calls: Mutex<Vec<RefreshRequest>>,
     reframe_calls: Mutex<Vec<ReframeRequest>>,
 }
@@ -445,6 +447,11 @@ impl RecordedOpinionSource {
     /// `OPINION_RECORDED`; every refresh an entry lists needs its recorded outcome. An
     /// `ENSEMBLE_RESOLVED` written before it carried check entries records nothing and is
     /// skipped.
+    ///
+    /// One gap is tolerated: requests in a **trailing** cycle that never reached
+    /// `ENSEMBLE_RESOLVED` — a run cancelled or crashed mid-opinion. The log replays up to
+    /// its last complete cycle, and [`RecordedOpinionSource::incomplete_cycle`] names the
+    /// trailing one. A gap in any earlier cycle, or in a resolved cycle, is still refused.
     pub fn from_events(events: &[EventEnvelope]) -> Result<Self, ReplayError> {
         let decode = |event: &EventEnvelope, error: serde_json::Error| ReplayError::Decode {
             seq: event.seq.get(),
@@ -453,12 +460,15 @@ impl RecordedOpinionSource {
         let mut source = Self::new();
         let mut required_opinions: Vec<OpinionKey> = Vec::new();
         let mut required_refreshes: Vec<(AssessmentSeq, CheckKey)> = Vec::new();
+        let mut resolved_cycles: Vec<AssessmentSeq> = Vec::new();
+        let mut last_seen: Option<AssessmentSeq> = None;
         for event in events {
             match event.kind {
                 EventKind::OpinionRequested => {
                     let payload: OpinionRequestedPayload =
                         serde_json::from_value(event.payload.clone())
                             .map_err(|e| decode(event, e))?;
+                    last_seen = last_seen.max(Some(payload.opinion_id.cycle));
                     required_opinions.push(payload.opinion_id);
                 }
                 EventKind::OpinionRecorded => {
@@ -479,6 +489,8 @@ impl RecordedOpinionSource {
                     let Some(cycle) = payload.cycle else {
                         continue;
                     };
+                    resolved_cycles.push(cycle);
+                    last_seen = last_seen.max(Some(cycle));
                     for check in payload.checks {
                         for rung in &check.rungs_used {
                             match rung {
@@ -505,8 +517,16 @@ impl RecordedOpinionSource {
                 _ => {}
             }
         }
+        // The only cycle allowed to be missing records: the last one in the log, and only
+        // if it was never resolved.
+        let last_complete = resolved_cycles.iter().max().copied();
+        let trailing = last_seen.filter(|cycle| Some(*cycle) > last_complete);
         for key in required_opinions {
             if !source.reframes.contains_key(&key) {
+                if Some(key.cycle) == trailing {
+                    source.incomplete_cycle = trailing;
+                    continue;
+                }
                 return Err(ReplayError::MissingOpinion(key));
             }
         }
@@ -516,6 +536,13 @@ impl RecordedOpinionSource {
             }
         }
         Ok(source)
+    }
+
+    /// A trailing cycle the log started but never resolved (a run cancelled or crashed
+    /// mid-opinion). A replay should stop before it.
+    #[must_use]
+    pub const fn incomplete_cycle(&self) -> Option<AssessmentSeq> {
+        self.incomplete_cycle
     }
 
     /// Compare a replayed resolution with the recorded verdicts. Empty means the replay

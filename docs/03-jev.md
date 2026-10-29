@@ -250,6 +250,14 @@ client needs no other change for it. `aftman usage` aggregates this file; the we
 same numbers. Usage records are written **before** the answer is validated, so a malformed
 response still shows up in the bill.
 
+A request dropped while it is in flight — the runtime aborts a model call its opinion timeout
+abandoned when the run ends ([06-ensemble.md §4](06-ensemble.md)) — never reaches those records,
+so the client keeps a guard on it from the moment it is sent until the send returns. Dropped in
+between, the guard writes one line with `error: "abandoned"`, the latency up to the drop, one
+attempt (the fewest it can have taken), and no token counts: they were in the response nobody
+read, and the provider may have billed them anyway. `aftman usage` counts it as a failed request.
+A request dropped before it was sent records nothing.
+
 ## 8. Rate limiting and cost safety
 
 - A per-run ceiling: `jev.max_assessments_per_run` (default 400). Exceeding it is a `Stop` with a

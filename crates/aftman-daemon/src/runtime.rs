@@ -279,6 +279,50 @@ struct Loop {
     /// at the top of the next iteration. A cancel among them means the cycle applies
     /// nothing: **a cancel always wins over what its cycle selected.**
     pending_control: Vec<ControlMessage>,
+    /// Model calls this run stopped waiting for, aborted when the run ends.
+    abandoned: AbandonedCalls,
+}
+
+/// Model calls a run stopped waiting for — past `opinion_timeout_seconds`, or when a cancel
+/// arrived — that may still be running (`docs/06-ensemble.md` §4 R0, item 6).
+///
+/// The deadline abandons the *wait*, never the call: a future dropped part way through an
+/// `emit` is never safe (`docs/02-lld.md` §11), so the call runs as its own task. Left to
+/// finish on its own, though, it outlives the run, spending tokens and writing its usage line
+/// after `RUN_FINISHED`. So the run keeps every one, and aborts those still running when it
+/// ends: before `RUN_FINISHED` on every exit the loop takes, and on drop if the run's own
+/// future is dropped first. A model call appends no event, so aborting one cannot tear the
+/// log; the provider client records a usage line for the request it never finished
+/// (`docs/03-jev.md` §7).
+#[derive(Default)]
+struct AbandonedCalls(Vec<tokio::task::JoinHandle<ModelCall>>);
+
+/// What a spawned model call returns.
+type ModelCall = Result<aftman_core::model::ModelAnswers, ModelError>;
+
+impl AbandonedCalls {
+    fn push(&mut self, call: tokio::task::JoinHandle<ModelCall>) {
+        self.0.retain(|call| !call.is_finished());
+        self.0.push(call);
+    }
+
+    /// Abort every call still running, and wait until each has stopped.
+    async fn abort_all(&mut self) {
+        for call in self.0.drain(..) {
+            call.abort();
+            // `Err(cancelled)` once the task is gone; a call that had already finished
+            // returns its answer, which nobody wants any more.
+            let _ = call.await;
+        }
+    }
+}
+
+impl Drop for AbandonedCalls {
+    fn drop(&mut self) {
+        for call in &self.0 {
+            call.abort();
+        }
+    }
 }
 
 impl Loop {
@@ -299,6 +343,7 @@ impl Loop {
             completed_while_waiting: false,
             finish_reason: None,
             pending_control: Vec::new(),
+            abandoned: AbandonedCalls::default(),
         }
     }
 
@@ -643,6 +688,9 @@ impl FactoryRuntime {
         } = started;
         let mut ls = Loop::new(self.instant(), &self.deps.config);
         let result = self.drive_inner(job, &mut state, &mut ls, control).await;
+        // Every exit of the loop has already done this before `RUN_FINISHED`; an error
+        // return has not.
+        ls.abandoned.abort_all().await;
         if result.is_err() {
             // An error return must not leave a worker running against the repository.
             if let Some(handle) = ls.worker.take() {
@@ -747,6 +795,9 @@ impl FactoryRuntime {
                 if let Some(reason) = &ls.finish_reason {
                     payload["reason"] = json!(reason);
                 }
+                // No model call of this run may outlive it: abandoned ones are stopped
+                // before the run is reported over.
+                ls.abandoned.abort_all().await;
                 self.emit_final(state, payload).await?;
                 return Ok(outcome);
             }
@@ -2807,9 +2858,11 @@ impl CycleSource<'_> {
     /// channel.
     ///
     /// The call runs as its own task, so the deadline or a cancel abandons the *wait* and
-    /// never a future that writes: the call finishes on its own and the provider client
-    /// records its usage line when it does. Nothing here emits; every event about the call
-    /// is the caller's, after this returns (`docs/02-lld.md` §11).
+    /// never a future that writes. An abandoned call is kept in `ls.abandoned`: it may
+    /// still answer (and the provider client records its usage line when it does), and
+    /// whatever is still running when the run ends is aborted then. Nothing here emits;
+    /// every event about the call is the caller's, after this returns (`docs/02-lld.md`
+    /// §11).
     async fn bounded_ask(
         &self,
         scratch: &mut Scratch<'_>,
@@ -2819,10 +2872,10 @@ impl CycleSource<'_> {
     ) -> Asked {
         let model = Arc::clone(&self.rt.deps.model);
         let budget = self.rt.deps.jev_budget;
-        let call =
+        let mut call =
             tokio::spawn(async move { model.ask(&context, &state, &questions, &budget).await });
         let deadline = tokio::time::sleep(self.timeout);
-        tokio::pin!(call, deadline);
+        tokio::pin!(deadline);
         let mut closed = scratch.control.is_none();
         let asked = loop {
             tokio::select! {
@@ -2845,6 +2898,10 @@ impl CycleSource<'_> {
         };
         if closed {
             *scratch.control = None;
+        }
+        if matches!(asked, Asked::TimedOut | Asked::Cancelled) {
+            // Still running: the run keeps it, and aborts it when it ends.
+            scratch.ls.abandoned.push(call);
         }
         asked
     }

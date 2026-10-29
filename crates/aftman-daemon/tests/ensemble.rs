@@ -3162,3 +3162,116 @@ async fn a_run_with_reframes_replays_from_its_own_log() -> TestResult {
     );
     replay(&fx, &outcome).await
 }
+
+// ---- abandoned model calls ------------------------------------------------------------
+
+/// One less in flight when dropped, however the call ends — and one more `late` if the run
+/// had already reported itself over by then.
+struct InFlight {
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    late: Arc<std::sync::atomic::AtomicUsize>,
+    sink: Arc<VecSink>,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        if !self.sink.of_kind(EventKind::RunFinished).is_empty() {
+            self.late.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// `R2Model`, except that the negation of `ready_to_finish` never comes back.
+struct HangingReframe {
+    inner: R2Model,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    late: Arc<std::sync::atomic::AtomicUsize>,
+    sink: Arc<VecSink>,
+    started: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl DecisionModel for HangingReframe {
+    async fn ask(
+        &self,
+        context: &AskContext,
+        state: &Value,
+        questions: &BTreeMap<CheckKey, Question>,
+        budget: &Budget,
+    ) -> Result<ModelAnswers, ModelError> {
+        if context.purpose == Purpose::Reframe && questions.contains_key(&CheckKey::from(READY)) {
+            self.in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.started
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _flight = InFlight {
+                in_flight: Arc::clone(&self.in_flight),
+                late: Arc::clone(&self.late),
+                sink: Arc::clone(&self.sink),
+            };
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+        self.inner.ask(context, state, questions, budget).await
+    }
+}
+
+#[tokio::test]
+async fn a_model_call_the_opinion_timeout_abandoned_does_not_outlive_its_run() -> TestResult {
+    // Stage B review RV1. `opinion_timeout_seconds` abandons the wait for a model call, not
+    // the call: it runs as its own task. Every one still running when the run ends is
+    // aborted then — before RUN_FINISHED — so none spends tokens or writes a usage line
+    // after the run is over.
+    let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let late = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let model = Arc::new(HangingReframe {
+        inner: R2Model::finish_ready(),
+        in_flight: Arc::clone(&in_flight),
+        late: Arc::clone(&late),
+        sink: Arc::clone(&fx.sink),
+        started: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let rt = fx.runtime(
+        config(|c| c.max_workers = 2),
+        settings(|s| s.opinion_timeout_seconds = 1),
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let outcome = fx.run(rt).await?;
+    assert_ne!(outcome.status, FactoryStatus::Finished);
+    let started = model.started.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(started >= 1, "a reframe was abandoned");
+    // The run is over, and so is every call it abandoned.
+    assert_eq!(
+        in_flight.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "{started} abandoned, none still running"
+    );
+    assert_eq!(
+        late.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "every one was stopped before RUN_FINISHED"
+    );
+    // Each was a timeout the log records, and an irreversible guard that could not be had
+    // contested rather than confirmed.
+    let timeouts = fx
+        .of_kind(EventKind::ModelError)
+        .iter()
+        .filter(|e| e.payload["code"] == "opinion_timeout" && e.payload["purpose"] == "reframe")
+        .count();
+    assert_eq!(timeouts, started);
+    let (_, payload) = first_guarded(&fx).ok_or("a guarded Finish")?;
+    let ready = entry(&payload, READY)?;
+    assert_eq!(verdicts(ready), vec!["contest"]);
+    assert!(
+        ready.opinions[0]
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("did not answer within 1s")),
+        "{:?}",
+        ready.opinions[0].error
+    );
+    Ok(())
+}

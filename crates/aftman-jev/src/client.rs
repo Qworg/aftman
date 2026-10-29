@@ -246,7 +246,20 @@ impl SystemOneClient {
             HttpRequest::post(settings.endpoint(), self.headers(0), body, settings.timeout);
 
         let started = Instant::now();
-        let (response, attempts) = match self.send_with_retries(&request, settings.retry).await {
+        // A request dropped while it is in flight never reaches the records below: the
+        // runtime aborts a call its opinion timeout abandoned when the run ends. The
+        // provider may still have billed it, so the guard records it as abandoned. Once the
+        // send has returned, nothing below awaits, so every other path records for itself.
+        let mut in_flight = InFlight {
+            client: self,
+            context,
+            fitted: &fitted,
+            started,
+            armed: true,
+        };
+        let sent = self.send_with_retries(&request, settings.retry).await;
+        in_flight.armed = false;
+        let (response, attempts) = match sent {
             Ok(ok) => ok,
             Err(error) => {
                 // A failed call still belongs in the log, with the time it consumed.
@@ -423,6 +436,42 @@ impl SystemOneClient {
             .collect())
     }
 }
+
+/// A request that has been sent and has not come back.
+///
+/// If it is dropped in that state — its future abandoned part way, as the runtime does when
+/// it aborts a call its opinion timeout gave up on — the provider may have billed it all
+/// the same, so a bill that left it out would lie. It records one usage line, `error:
+/// "abandoned"`, with the latency up to the drop and no token counts: those were in the
+/// response nobody read. One attempt is recorded, the fewest it can have taken. Disarmed as
+/// soon as the send returns, after which every path records for itself.
+struct InFlight<'a> {
+    client: &'a SystemOneClient,
+    context: &'a AskContext,
+    fitted: &'a crate::budget::BudgetFit,
+    started: Instant,
+    armed: bool,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if self.armed {
+            self.client.record(
+                self.context,
+                Usage::default(),
+                "unavailable",
+                1,
+                self.started.elapsed(),
+                None,
+                self.fitted,
+                Some(ABANDONED),
+            );
+        }
+    }
+}
+
+/// The usage line's `error` for a request dropped in flight.
+pub const ABANDONED: &str = "abandoned";
 
 /// How many attempts a failed call consumed, as far as we can tell.
 fn attempts_of(error: &ModelError, max_retries: u32) -> u32 {
@@ -836,6 +885,69 @@ mod tests {
             .expect_err("must refuse");
         assert!(matches!(error, ModelError::BudgetExceeded(_)), "{error:?}");
         assert_eq!(transport.call_count(), 0, "nothing was sent");
+        Ok(())
+    }
+
+    /// A transport whose request never comes back.
+    struct Hanging(Arc<tokio::sync::Notify>);
+
+    #[async_trait::async_trait]
+    impl Transport for Hanging {
+        async fn send(
+            &self,
+            _request: crate::transport::HttpRequest,
+        ) -> Result<HttpResponse, ModelError> {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_dropped_in_flight_is_still_billed_as_abandoned()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // The runtime aborts a model call its opinion timeout abandoned when the run ends
+        // (docs/06-ensemble.md §4 R0). The provider may have billed it; the log must say so.
+        let dir = tempfile::tempdir()?;
+        let recorder = Arc::new(UsageRecorder::in_state_dir(dir.path()));
+        let sent = Arc::new(tokio::sync::Notify::new());
+        let client = Arc::new(
+            SystemOneClient::new(
+                settings(),
+                Arc::new(Hanging(Arc::clone(&sent))),
+                Arc::new(FixedClock::epoch()),
+            )
+            .with_usage(Arc::clone(&recorder)),
+        );
+        let run = RunId::new();
+        let task = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .ask(
+                        &AskContext::for_run(Purpose::Reframe, run, AssessmentSeq(4)),
+                        &state(),
+                        &questions(),
+                        &Budget::default(),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(10), sent.notified()).await?;
+        assert!(
+            recorder.read()?.is_empty(),
+            "nothing recorded while in flight"
+        );
+        task.abort();
+        assert!(task.await.is_err_and(|e| e.is_cancelled()));
+
+        let entries = recorder.read()?;
+        assert_eq!(entries.len(), 1, "one line for the abandoned request");
+        assert_eq!(entries[0].error.as_deref(), Some(super::ABANDONED));
+        assert_eq!(entries[0].purpose, Purpose::Reframe);
+        assert_eq!(entries[0].run_id, Some(run));
+        assert_eq!(entries[0].assessment_seq, Some(AssessmentSeq(4)));
+        assert_eq!(entries[0].input_tokens, None, "the counts were never read");
+        assert_eq!(crate::usage::totals(&entries).failed_requests, 1);
         Ok(())
     }
 

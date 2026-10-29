@@ -226,9 +226,19 @@ a `RefreshRequest` so:
    consecutive-failure invariants, which are about the cycle's own call.
 6. **`opinion_timeout_seconds` bounds the model call alone.** The call runs as its own task; past
    the deadline the runtime stops waiting (a `MODEL_ERROR` with `code: "opinion_timeout"` and no
-   value), and the abandoned call finishes on its own, so the provider client still records its
-   usage line. A provider slower than `opinion_timeout_seconds` but inside its own timeout is
-   waited for and measured.
+   value). A provider slower than `opinion_timeout_seconds` but inside its own timeout is waited
+   for and measured. **An abandoned call does not outlive its run.** The run keeps every call it
+   stopped waiting for — past the deadline, or because a cancel arrived — whether a refresh's or a
+   reframe's (§4 R2). One that answers while the run goes on finishes as any call does, and the
+   provider client records its usage line. Every one still running when the run ends is aborted
+   then, and waited for, **before `RUN_FINISHED`** on every exit the loop takes (on an error
+   return, as the drive returns; if the run's own future is dropped, on drop). An aborted call
+   cannot tear the log — a model call appends no event — and is not lost from the bill: the
+   provider client records one usage line for the request it never finished, `error:
+   "abandoned"`, with the latency up to the abort and **no token counts**, because those were in a
+   response nobody read; the provider may have billed tokens that line cannot show
+   ([03-jev.md §7](03-jev.md)). A call aborted before its request was sent records nothing,
+   because nothing was sent.
 
 The source writes events from inside the resolution. It holds the run state behind one lock for the
 duration and appends through the runtime's own `emit`, so every event is appended to the store

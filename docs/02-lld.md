@@ -1056,8 +1056,9 @@ process group, because `kill_on_drop` reaches only the direct child. So nothing 
 under a `tokio::time::timeout` or a `select!` branch that can lose: a provider is bounded by its own
 timeout and stopped early only through `run_provider_until`'s cancellation, which takes the same
 process-group kill path; a deadline that must apply to a model call wraps a spawned task, so it
-abandons the wait and never the call; and every event about either is emitted after it has
-returned. A subscriber
+abandons the wait and never the call — the run keeps the abandoned task and aborts it when the
+run ends, before `RUN_FINISHED`, which is safe because a model call appends no event (doc 06 §4
+R0); and every event about either is emitted after it has returned. A subscriber
 is registered for live
 delivery before its backlog is read, so anything it does not find in the log arrives live, and the
 overlap is dropped by `seq`. A writer that emitted before appending, or appended an event it never

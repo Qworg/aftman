@@ -497,6 +497,39 @@ characters per reason or ask, 24 proposals / 24 suppressions / 16 invariants per
 
 Not built: the diff view (the event stream carries none in M3).
 
+### The ensemble on the surfaces (M5, stage S1)
+
+All three surfaces read the same record: each `ENSEMBLE_RESOLVED` entry
+([06-ensemble.md §8](06-ensemble.md)), rendered by one pure function in core
+(`CheckResolvedPayload::describe`) so the three cannot disagree, then sanitised or escaped by each
+surface like any other event text. Per triggered check it shows:
+
+- the **check**, Jev's first value, where the check stands (`permitted`, `held: in band`,
+  `held: unresolved`, `held: contested`, `held: a person decided (accept)`), and its **triggers**;
+- the **refresh**: `refreshed 0.71 -> 0.08 (tests exit 1); supersedes assessment 4`, or
+  `refresh rejected, no provider ran (tests did not run): <error>`;
+- every **limit** that stopped the ladder: `limit: refresh cap reached (3/3)`,
+  `limit: opinion budget spent (20/20)`, `limit: cooldown, …`;
+- the **escalation**: `escalated: <the question>`, and, from S2, the irreversible guard.
+
+Where it appears:
+
+- **`aftman decisions`** prints, under each `ensemble …` line, the headline of every triggered check
+  and its refresh / limit / escalation lines (each at most 300 characters).
+- **`aftman watch`** adds a timeline row for each check the ensemble *did* something about — a
+  refresh, a limit, an escalation, a person's decision (`Human` level for an escalation, `Warn` for
+  a limit or a hold). A check that was only triggered and held is not repeated every cycle; its
+  hold is visible in the assessment pane. `ENSEMBLE_TRIGGERED` is not shown on its own: the
+  resolution carries the same triggers.
+- **The web** run-detail timeline and `/runs/{id}/decisions` summarise `ENSEMBLE_TRIGGERED` (check,
+  triggers, the directive with the check decisively above and below) and `ENSEMBLE_RESOLVED` (the
+  lines above, per check). The assessment table's *why* column says when a value came from a
+  refresh (`refreshed by tests (exit 1): decisive`), was escalated, or is held by a person's
+  decision.
+
+An ensemble escalation is an ordinary escalation on every surface, answered the same way; its
+`ESCALATION_RAISED` also names the `checks` it is about.
+
 ## 5. Surface 2 — herdr
 
 herdr is a terminal workspace manager for coding agents. Aftman works at **three graduated levels

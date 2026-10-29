@@ -700,10 +700,39 @@ impl WatchState {
                 );
                 self.finished = Some(Finish { status, reason });
             }
-            // Kinds this view has no use for yet (the ensemble ones arrive with M5).
-            // They are counted above and otherwise ignored.
+            EventKind::EnsembleResolved => self.on_ensemble_resolved(event),
+            // `ENSEMBLE_TRIGGERED` is not shown on its own: the check's
+            // `ENSEMBLE_RESOLVED` entry carries the same triggers, with what came of them.
+            // Kinds this view has no use for yet are counted above and otherwise ignored.
             // (and any kind added later: see the module documentation).
             _ => {}
+        }
+    }
+
+    /// One timeline row per check the ensemble did something about this cycle: a refresh
+    /// (old → new value, provider and exit code, the assessment it supersedes), a limit
+    /// that stopped the ladder, an escalation, a person's decision. A check that was only
+    /// triggered and held is not repeated every cycle. Every field is cleaned on the way in.
+    fn on_ensemble_resolved(&mut self, event: &EventEnvelope) {
+        let Ok(payload) = serde_json::from_value::<aftman_core::ensemble::EnsembleResolvedPayload>(
+            event.payload.clone(),
+        ) else {
+            return;
+        };
+        for check in payload.checks.iter().filter(|check| check.is_notable()) {
+            let level = if check.escalation.is_some() {
+                Level::Human
+            } else if !check.limits.is_empty() || !check.permitted {
+                Level::Warn
+            } else {
+                Level::Info
+            };
+            let text = check.describe().join("; ");
+            self.note(
+                event,
+                level,
+                clean_field(&format!("ensemble {text}"), MAX_FIELD_CHARS),
+            );
         }
     }
 
@@ -1808,6 +1837,105 @@ mod tests {
             "an unknown kind shows nothing"
         );
         assert!(state.trouble.is_none());
+    }
+
+    /// An `ENSEMBLE_RESOLVED` payload with one refreshed, capped, escalated check, built
+    /// from the core types so its shape is the runtime's.
+    fn ensemble_resolved() -> Value {
+        use aftman_core::assessment::{Resolution, Rung};
+        use aftman_core::ensemble::{
+            CheckResolvedPayload, EnsembleLimit, EnsembleResolvedPayload, EnsembleTrigger,
+            ProviderRun, RefreshOutcome, RefreshRecord,
+        };
+        use aftman_core::ids::{AssessmentSeq, EvidenceId};
+        let entry = CheckResolvedPayload {
+            check: "core.verification__tests_sufficient".into(),
+            triggers: vec![
+                EnsembleTrigger::NearThreshold,
+                EnsembleTrigger::ClaimOnlyEvidence,
+            ],
+            jev_p: Some(0.71),
+            decisive: true,
+            contested: false,
+            permitted: true,
+            suppression: None,
+            resolution: Resolution::EvidenceRefreshed {
+                new_p: 0.95,
+                provider: EvidenceId::new("tests"),
+                supersedes: AssessmentSeq(3),
+                old_p: Some(0.71),
+                exit_code: Some(0),
+            },
+            rungs_used: vec![Rung::RefreshEvidence],
+            limits: vec![EnsembleLimit::RefreshCap { used: 2, cap: 2 }],
+            refresh: Some(RefreshRecord {
+                providers: vec![EvidenceId::new("tests")],
+                old_p: Some(0.71),
+                outcome: RefreshOutcome {
+                    runs: vec![ProviderRun {
+                        provider: EvidenceId::new("tests"),
+                        exit_code: Some(0),
+                    }],
+                    new_p: Some(0.95),
+                    error: None,
+                },
+                rejected: None,
+            }),
+            escalation: Some("is it done?\u{1b}[2J".into()),
+            irreversible_guard: None,
+        };
+        serde_json::to_value(EnsembleResolvedPayload {
+            enabled: true,
+            margin: 0.15,
+            unresolved: Vec::new(),
+            rungs: vec![Rung::RefreshEvidence],
+            cycle: Some(AssessmentSeq(3)),
+            checks: vec![entry],
+        })
+        .expect("serializes")
+    }
+
+    #[test]
+    fn an_ensemble_refresh_its_limits_and_its_escalation_are_on_the_timeline() {
+        let mut state = WatchState::new();
+        state.apply(&ev(1, EventKind::EnsembleResolved, ensemble_resolved()));
+        let notes: Vec<&Note> = state
+            .timeline
+            .iter()
+            .filter_map(|entry| match entry {
+                Entry::Note(note) => Some(note),
+                Entry::Decision(_) => None,
+            })
+            .collect();
+        assert_eq!(notes.len(), 1);
+        let text = &notes[0].text;
+        assert!(
+            text.contains("core.verification__tests_sufficient"),
+            "{text}"
+        );
+        assert!(
+            text.contains("near_threshold, claim_only_evidence"),
+            "{text}"
+        );
+        assert!(
+            text.contains("refreshed 0.71 -> 0.95 (tests exit 0); supersedes assessment 3"),
+            "{text}"
+        );
+        assert!(text.contains("limit: refresh cap reached (2/2)"), "{text}");
+        assert!(text.contains("escalated: is it done?"), "{text}");
+        assert!(!text.contains('\u{1b}'), "escapes are cleaned: {text:?}");
+        assert_eq!(notes[0].level, Level::Human);
+
+        // A check that was only triggered and held adds no row.
+        let mut quiet = ensemble_resolved();
+        let entry = &mut quiet["checks"][0];
+        entry["refresh"] = Value::Null;
+        entry["limits"] = json!([]);
+        entry["escalation"] = Value::Null;
+        entry["resolution"] = json!({"resolution": "decisive"});
+        let mut state = WatchState::new();
+        state.apply(&ev(1, EventKind::EnsembleResolved, quiet));
+        assert!(state.timeline.is_empty());
     }
 
     #[test]

@@ -1133,7 +1133,7 @@ in `Counters`, which is serialized into the model-facing observation.
 | Stage | Contains | Ships when |
 | --- | --- | --- |
 | **S0** | Types, events, `permitted` plumbing, no-op resolver | With M2. Disabled. No behavior change. |
-| **S1** | **R0 only** — evidence refresh | R0 is deterministic, fixes the most common failure (thin evidence), and needs no opinion infrastructure |
+| **S1** | **R0 only** — evidence refresh | R0 is deterministic, fixes the most common failure (thin evidence), and needs no opinion infrastructure. **Built in M5** (§4 R0 and §6.1): config, the runtime's source, events, persisted counters, escalation through policy, the human answer, and the surfaces |
 | **S2** | R0 + R2 (same-model reframing, confirm/contest) | Still one provider, still calibrated |
 | **S3** | R0 + R2 + R1 (cross-model judge, suppress-only) | Needs judge prompt fixtures, no-tools enforcement, same-family warning |
 | **S4** | R3 human channels | CLI prompt, web form, herdr pane; needs `NeedsHuman` observable and answerable |
@@ -1167,6 +1167,31 @@ only ever half-built, S1 is the half worth having.
 
 These live in `crates/aftman-core/src/ensemble/tests.rs`. The silent-worker test is the runtime's;
 the adversarial and judge-honesty tests need a judge and arrive with S3.
+
+Through the runtime (S1), in `crates/aftman-daemon/tests/ensemble.rs`, offline (a simulated
+worker, a model that answers from the state it is shown, `sh -c` providers):
+
+- **the exit criterion**: the worker claims "3 passed", `tests_sufficient = 0.71`; R0 runs the
+  `tests` provider, the model re-asked over the fresh observation says `0.95`, the resolution is
+  `EvidenceRefreshed`, and the run finishes on it; and §9.1, where the provider exits 1, the fresh
+  value is `0.08`, and the run does not finish;
+- **repeated refresh is capped and visible**: in events (`limit: refresh_cap`), in the count of
+  `EVIDENCE_COLLECTED` and refresh calls, and in `aftman decisions`
+  (`aftman-cli/tests/decisions.rs`);
+- **`finish_is_provisional`**, both halves: true exactly until the `before_finish` providers have
+  run (also when one cannot be launched, and its `Finish` is never applied), false throughout when
+  none is configured;
+- **escalation**: a held check pre-empts the `StartWorker` policy would otherwise select; two in one
+  cycle become one `Escalate` naming both; the G2 scenario (budget spent, job done, no worker
+  started, one escalation) through policy in core, since R2 is not wired before S2;
+- **the human answers**: `Accept` and `Guidance` hold without asking again, `Recheck` runs R0 next
+  cycle and a decisive fresh value may then finish, `ClaimComplete` followed by an in-band refresh
+  does not finish, `Stop` cancels;
+- **disabled is unchanged**: a disabled run's decision trace equals the one captured before S1;
+- **replay**: `RecordedOpinionSource::from_events` over a real run's log reproduces every cycle's
+  `ENSEMBLE_RESOLVED` with no divergence;
+- **the silent worker**, with the ensemble on: idle ticks cost no model call and emit no
+  `WorkerOutput` (and `offline_run.rs` holds the same test with it off).
 - A cost test asserts both halves: the ladder requests **zero** opinions for a triggered check
   that is in band or whose rule would not fire, and the irreversible gate buys only for decisive,
   permitted checks the selected `Finish`/`Stop` rests on — never for an in-band one.

@@ -2,6 +2,7 @@
 //! the daemon-backed and the embedded paths print the same thing, and the TUI can
 //! reuse the pieces it wants.
 
+use aftman_core::ensemble::EnsembleResolvedPayload;
 use aftman_core::event::{EventEnvelope, EventKind};
 use aftman_core::ids::RunId;
 use aftman_core::run::{RunState, RunSummary};
@@ -440,6 +441,10 @@ pub fn timeline_lines(events: &[EventEnvelope]) -> Vec<String> {
     out
 }
 
+/// The longest line `aftman decisions` prints for one part of a check's ensemble entry; an
+/// escalation's question can be 2 KiB.
+const ENSEMBLE_LINE_CHARS: usize = 300;
+
 /// `aftman decisions`: every selection, suppression, and ensemble resolution.
 #[must_use]
 pub fn decision_lines(events: &[EventEnvelope]) -> Vec<String> {
@@ -471,6 +476,23 @@ pub fn decision_lines(events: &[EventEnvelope]) -> Vec<String> {
                     event.payload["enabled"],
                     event.payload["margin"]
                 ));
+                // Per check: the triggers, the refresh, the limits that stopped the
+                // ladder, and the escalation (`docs/07-surfaces.md` §4). Text from the
+                // event reaches the terminal only through `outln!`, which sanitizes it.
+                let resolved: Option<EnsembleResolvedPayload> =
+                    serde_json::from_value(event.payload.clone()).ok();
+                for check in resolved.iter().flat_map(|payload| &payload.checks) {
+                    let mut lines = check.describe().into_iter();
+                    if let Some(headline) = lines.next() {
+                        out.push(format!("        {headline}"));
+                    }
+                    for line in lines {
+                        out.push(format!(
+                            "          {}",
+                            truncate(&line, ENSEMBLE_LINE_CHARS)
+                        ));
+                    }
+                }
             }
             EventKind::AssessmentSkippedUnchanged => {
                 out.push(format!(

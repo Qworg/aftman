@@ -453,6 +453,11 @@ docs/06-ensemble.md §6) — never for an in-band check; a fake passing test run
 converts a `0.71` into a decisive value; no input can produce an opinion-driven `Finish`; repeated
 refresh is capped and visible.
 
+*Status:* S1 is wired end to end — the `[ensemble]` table, the runtime's R0 source, the events and
+persisted counters, escalation through policy (`core.ensemble:escalate`, priority 850), the human
+answer per check, and the surfaces (docs/06-ensemble.md §4 R0, §4 R3, §6.1, §12). S2 (the negated
+question for R2) is next; until then no check is reframable.
+
 ## M6 — herdr
 
 *Deliverable:* `aftman run --worker herdr:pane --kind claude` runs a worker in a pane, steers it,

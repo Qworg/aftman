@@ -21,7 +21,10 @@ use axum::extract::{ConnectInfo, Form, Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 
-use aftman_core::assessment::{Band, HumanDecision, ResolvedCheck};
+use aftman_core::assessment::{
+    Band, CheckSuppression, HumanDecision, Resolution, ResolvedCheck, Rung,
+};
+use aftman_core::ensemble::{EnsembleResolvedPayload, EnsembleTriggeredPayload};
 use aftman_core::event::{EventEnvelope, EventKind};
 use aftman_core::ids::{EscalationId, RunId};
 use aftman_core::job::FactoryStatus;
@@ -884,8 +887,33 @@ fn check_row(check: &ResolvedCheck) -> String {
 
 /// The reason a check is or is not permitted, in one phrase.
 fn why(check: &ResolvedCheck) -> String {
+    if let Resolution::EvidenceRefreshed {
+        provider,
+        exit_code,
+        ..
+    } = &check.resolution
+    {
+        let exit = exit_code.map_or_else(|| "no exit code".to_owned(), |c| format!("exit {c}"));
+        let standing = if check.permitted {
+            "decisive"
+        } else {
+            "still in band"
+        };
+        return format!("refreshed by {provider} ({exit}): {standing}");
+    }
     if check.permitted {
         return "decisive".to_owned();
+    }
+    if let Resolution::HumanDecided { .. } = &check.resolution {
+        return "held: a person accepted the uncertainty".to_owned();
+    }
+    if let Resolution::UnresolvedInBand { rungs, .. } = &check.resolution
+        && rungs.contains(&Rung::Human)
+    {
+        return "held: escalated to a person".to_owned();
+    }
+    if check.suppression == Some(CheckSuppression::Unresolved) {
+        return "held: unresolved (see the decisions page)".to_owned();
     }
     if check.contested {
         return "contested: two opinions disagree".to_owned();
@@ -1092,13 +1120,38 @@ fn summarise(kind: EventKind, payload: &serde_json::Value) -> String {
         EventKind::RunFinished => strings("status").to_string(),
         EventKind::EvidenceCollected => strings("provider"),
         EventKind::JobRouted => "routing decided which responsibilities apply".to_owned(),
-        EventKind::EnsembleTriggered => strings("reason").to_string(),
-        EventKind::EnsembleResolved => strings("resolution").to_string(),
+        EventKind::EnsembleTriggered => {
+            serde_json::from_value::<EnsembleTriggeredPayload>(payload.clone())
+                .map_or_else(|_| strings("reason"), |p| p.describe())
+        }
+        EventKind::EnsembleResolved => ensemble_summary(payload),
         EventKind::OpinionRequested | EventKind::OpinionRecorded => strings("model"),
         EventKind::WorkerSteered => excerpt(&strings("message"), 120),
         EventKind::WorkerTerminated => strings("reason"),
         EventKind::RunCreated | EventKind::Notification | EventKind::Unknown => String::new(),
     }
+}
+
+/// An `ENSEMBLE_RESOLVED` in one line: per check, its triggers, the refresh (old and new
+/// value, provider and exit code, the assessment it supersedes), the limits that stopped
+/// the ladder, and the escalation (`docs/07-surfaces.md`). Escaped by the caller, like
+/// every other summary.
+fn ensemble_summary(payload: &serde_json::Value) -> String {
+    let Ok(resolved) = serde_json::from_value::<EnsembleResolvedPayload>(payload.clone()) else {
+        return String::new();
+    };
+    let mut parts = vec![format!(
+        "{} · margin {:.2}",
+        if resolved.enabled { "on" } else { "off" },
+        resolved.margin
+    )];
+    if !resolved.unresolved.is_empty() {
+        parts.push(format!("{} held", resolved.unresolved.len()));
+    }
+    for check in &resolved.checks {
+        parts.push(excerpt(&check.describe().join("; "), 600));
+    }
+    parts.join(" | ")
 }
 
 /// A small table of the payload's scalar fields, for a page that wants the raw detail.
@@ -1193,4 +1246,108 @@ fn not_found_error(state: &AppState, message: &str) -> Response {
 /// it from the daemon's current configuration, which may have changed since.
 fn check_margin(run: &RunState) -> Option<f32> {
     run.checks.values().next().map(|check| check.margin)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{event_row, why};
+    use aftman_core::assessment::{Resolution, ResolvedCheck, Rung};
+    use aftman_core::ensemble::{
+        CheckResolvedPayload, EnsembleLimit, EnsembleResolvedPayload, EnsembleTrigger, ProviderRun,
+        RefreshOutcome, RefreshRecord,
+    };
+    use aftman_core::event::{EventEnvelope, EventKind};
+    use aftman_core::ids::{AssessmentSeq, EventSeq, EvidenceId, RunId};
+
+    fn resolved() -> serde_json::Value {
+        let entry = CheckResolvedPayload {
+            check: "core.verification__tests_sufficient".into(),
+            triggers: vec![EnsembleTrigger::NearThreshold],
+            jev_p: Some(0.71),
+            decisive: true,
+            contested: false,
+            permitted: true,
+            suppression: None,
+            resolution: Resolution::EvidenceRefreshed {
+                new_p: 0.08,
+                provider: EvidenceId::new("tests"),
+                supersedes: AssessmentSeq(4),
+                old_p: Some(0.71),
+                exit_code: Some(1),
+            },
+            rungs_used: vec![Rung::RefreshEvidence],
+            limits: vec![EnsembleLimit::RefreshCap { used: 3, cap: 3 }],
+            refresh: Some(RefreshRecord {
+                providers: vec![EvidenceId::new("tests")],
+                old_p: Some(0.71),
+                outcome: RefreshOutcome {
+                    runs: vec![ProviderRun {
+                        provider: EvidenceId::new("tests"),
+                        exit_code: Some(1),
+                    }],
+                    new_p: Some(0.08),
+                    error: None,
+                },
+                rejected: None,
+            }),
+            escalation: Some("<script>alert(1)</script> is it done?".into()),
+            irreversible_guard: None,
+        };
+        serde_json::to_value(EnsembleResolvedPayload {
+            enabled: true,
+            margin: 0.15,
+            unresolved: Vec::new(),
+            rungs: vec![Rung::RefreshEvidence],
+            cycle: Some(AssessmentSeq(4)),
+            checks: vec![entry],
+        })
+        .expect("serializes")
+    }
+
+    #[test]
+    fn an_ensemble_resolution_shows_the_refresh_the_cap_and_the_escalation_escaped() {
+        let event = EventEnvelope::new(
+            EventSeq(9),
+            RunId::new(),
+            time::macros::datetime!(2026-01-01 00:00:00 UTC),
+            EventKind::EnsembleResolved,
+            resolved(),
+        );
+        let row = event_row(&event);
+        assert!(row.contains("core.verification__tests_sufficient"), "{row}");
+        assert!(row.contains("near_threshold"), "{row}");
+        assert!(
+            row.contains("refreshed 0.71 -&gt; 0.08 (tests exit 1); supersedes assessment 4"),
+            "{row}"
+        );
+        assert!(row.contains("limit: refresh cap reached (3/3)"), "{row}");
+        assert!(row.contains("escalated: &lt;script&gt;"), "{row}");
+        assert!(!row.contains("<script>"), "{row}");
+    }
+
+    #[test]
+    fn the_check_table_says_why_a_refreshed_or_decided_check_stands_as_it_does() {
+        let refreshed = ResolvedCheck::from_refresh(
+            "k__c".into(),
+            Some(0.75),
+            0.15,
+            aftman_core::assessment::RefreshMeasurement {
+                new_p: 0.08,
+                old_p: Some(0.71),
+                provider: EvidenceId::new("tests"),
+                exit_code: Some(1),
+                supersedes: AssessmentSeq(4),
+            },
+        );
+        assert_eq!(why(&refreshed), "refreshed by tests (exit 1): decisive");
+        let decided =
+            ResolvedCheck::from_measurement("k__c".into(), Some(0.71), Some(0.75), 0.15, true)
+                .suppress(
+                    aftman_core::assessment::CheckSuppression::InBand,
+                    Resolution::HumanDecided {
+                        decision: aftman_core::assessment::HumanDecision::Accept,
+                    },
+                );
+        assert_eq!(why(&decided), "held: a person accepted the uncertainty");
+    }
 }

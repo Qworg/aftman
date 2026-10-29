@@ -24,7 +24,7 @@ use crate::model::Usage;
 use super::gate::IrreversibleGuard;
 use super::resolve::{
     CheckRecord, EnsembleLimit, EnsembleOutcome, KeyedOpinion, OpinionKey, ReframeAnswer,
-    ReframeRequest, RefreshRecord,
+    ReframeRequest, RefreshRecord, RefreshRejection,
 };
 use super::trigger::{CheckPlan, DecisiveDirectives, EnsembleTrigger};
 
@@ -260,5 +260,149 @@ impl EnsembleOutcome {
                 .map(CheckResolvedPayload::from)
                 .collect(),
         }
+    }
+}
+
+/// Two decimals, or `none`.
+fn p2(p: Option<f32>) -> String {
+    p.map_or_else(|| "none".to_owned(), |p| format!("{p:.2}"))
+}
+
+impl EnsembleTriggeredPayload {
+    /// One line for a surface: the check, why it triggered, and what was at stake.
+    ///
+    /// Event text is untrusted: every surface sanitizes or escapes what this returns.
+    #[must_use]
+    pub fn describe(&self) -> String {
+        format!(
+            "{} p={} triggered: {} (decisively above: {}, below: {})",
+            self.check,
+            p2(self.jev_p),
+            self.reason,
+            self.decisive_directives.if_above,
+            self.decisive_directives.if_below
+        )
+    }
+}
+
+impl CheckResolvedPayload {
+    /// What happened to one check, for a surface (`docs/07-surfaces.md`): first a headline
+    /// (the check, Jev's value, where it stands, the triggers), then one line for each of
+    /// the refresh, the limits that stopped the ladder, the escalation, and the
+    /// irreversible guard, when present.
+    ///
+    /// Event text is untrusted — an error, a provider name, a question — and is included
+    /// verbatim: every surface sanitizes or escapes what this returns.
+    #[must_use]
+    pub fn describe(&self) -> Vec<String> {
+        let standing = match (&self.resolution, self.suppression) {
+            (Resolution::HumanDecided { decision }, _) => {
+                let name = serde_json::to_value(decision)
+                    .ok()
+                    .and_then(|v| v["decision"].as_str().map(ToOwned::to_owned))
+                    .unwrap_or_else(|| "?".to_owned());
+                format!("held: a person decided ({name})")
+            }
+            _ if self.permitted => "permitted".to_owned(),
+            (_, Some(CheckSuppression::Contested)) => "held: contested".to_owned(),
+            (_, Some(CheckSuppression::InBand)) => "held: in band".to_owned(),
+            (_, Some(CheckSuppression::Unresolved)) => "held: unresolved".to_owned(),
+            _ => "held".to_owned(),
+        };
+        let triggers = self
+            .triggers
+            .iter()
+            .map(|t| t.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut lines = vec![format!(
+            "{} p={} {standing} [{triggers}]",
+            self.check,
+            p2(self.jev_p)
+        )];
+        if let Some(refresh) = &self.refresh {
+            let runs = refresh
+                .outcome
+                .runs
+                .iter()
+                .map(|run| match run.exit_code {
+                    Some(code) => format!("{} exit {code}", run.provider),
+                    None => format!("{} did not run", run.provider),
+                })
+                .collect::<Vec<_>>();
+            let runs = if runs.is_empty() {
+                "nothing ran".to_owned()
+            } else {
+                runs.join(", ")
+            };
+            match (&self.resolution, refresh.rejected) {
+                (
+                    Resolution::EvidenceRefreshed {
+                        new_p,
+                        old_p,
+                        supersedes,
+                        ..
+                    },
+                    None,
+                ) => lines.push(format!(
+                    "refreshed {} -> {new_p:.2} ({runs}); supersedes assessment {supersedes}",
+                    p2(*old_p)
+                )),
+                (_, rejected) => {
+                    let why = match rejected {
+                        Some(RefreshRejection::NoProviderRan) => "no provider ran",
+                        Some(RefreshRejection::NoMeasurement) => "no fresh value",
+                        None => "superseded",
+                    };
+                    let mut line = format!("refresh rejected, {why} ({runs})");
+                    if let Some(error) = &refresh.outcome.error {
+                        line.push_str(&format!(": {error}"));
+                    }
+                    lines.push(line);
+                }
+            }
+        }
+        for limit in &self.limits {
+            lines.push(match limit {
+                EnsembleLimit::RefreshCap { used, cap } => {
+                    format!("limit: refresh cap reached ({used}/{cap})")
+                }
+                EnsembleLimit::OpinionBudget { used, cap } => {
+                    format!("limit: opinion budget spent ({used}/{cap})")
+                }
+                EnsembleLimit::Cooldown {
+                    last_opinion,
+                    cooldown_cycles,
+                    held,
+                } => format!(
+                    "limit: cooldown, last opinion at assessment {last_opinion} \
+                     ({cooldown_cycles} cycles){}",
+                    if *held { ", held" } else { "" }
+                ),
+            });
+        }
+        if let Some(ask) = &self.escalation {
+            lines.push(format!("escalated: {ask}"));
+        }
+        if let Some(guard) = &self.irreversible_guard {
+            let outcome = serde_json::to_value(guard.outcome)
+                .ok()
+                .and_then(|v| v.as_str().map(ToOwned::to_owned))
+                .unwrap_or_default();
+            lines.push(format!("guarded for {}: {outcome}", guard.directive));
+        }
+        lines
+    }
+
+    /// Whether this entry has more to say than its headline: a refresh, a limit, an
+    /// escalation, a guard, or a person's decision. Surfaces that cannot show every
+    /// triggered check every cycle show these.
+    #[must_use]
+    pub fn is_notable(&self) -> bool {
+        self.refresh.is_some()
+            || !self.limits.is_empty()
+            || self.escalation.is_some()
+            || self.irreversible_guard.is_some()
+            || matches!(self.resolution, Resolution::HumanDecided { .. })
     }
 }

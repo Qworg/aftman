@@ -239,7 +239,9 @@ a `RefreshRequest` so:
    reframe's (§4 R2). One that answers while the run goes on finishes as any call does, and the
    provider client records its usage line. Every one still running when the run ends is aborted
    then, and waited for, **before `RUN_FINISHED`** on every exit the loop takes (on an error
-   return, as the drive returns; if the run's own future is dropped, on drop). An aborted call
+   return, as the drive returns; if the run's own future is dropped, on drop). A call is owned
+   by an abort-on-drop guard from the moment it is spawned, so one the run is still waiting for
+   when its future is dropped is aborted with it too, rather than left running detached. An aborted call
    cannot tear the log — a model call appends no event — and is not lost from the bill: the
    provider client records one usage line for the request it never finished, `error:
    "abandoned"`, with the latency up to the abort and **no token counts**, because those were in a

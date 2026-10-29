@@ -317,6 +317,20 @@ impl AbandonedCalls {
     }
 }
 
+/// A model call being waited for, aborted if dropped while still held: the future waiting
+/// for it was dropped (`docs/06-ensemble.md` §4 R0, item 6). Taken out of the guard when
+/// the wait gives up on it, to be kept in [`AbandonedCalls`]; a call that already returned
+/// is unaffected by the abort.
+struct InFlightCall(Option<tokio::task::JoinHandle<ModelCall>>);
+
+impl Drop for InFlightCall {
+    fn drop(&mut self) {
+        if let Some(call) = &self.0 {
+            call.abort();
+        }
+    }
+}
+
 impl Drop for AbandonedCalls {
     fn drop(&mut self) {
         for call in &self.0 {
@@ -2912,14 +2926,21 @@ impl CycleSource<'_> {
     ) -> Asked {
         let model = Arc::clone(&self.rt.deps.model);
         let budget = self.rt.deps.jev_budget;
-        let mut call =
-            tokio::spawn(async move { model.ask(&context, &state, &questions, &budget).await });
+        // Owned by a guard from the moment it is spawned: if this future is dropped while
+        // it waits — the run's own future dropped — the call is aborted with it rather than
+        // left running, detached, with nothing to stop it.
+        let mut call = InFlightCall(Some(tokio::spawn(async move {
+            model.ask(&context, &state, &questions, &budget).await
+        })));
         let deadline = tokio::time::sleep(self.timeout);
         tokio::pin!(deadline);
         let mut closed = scratch.control.is_none();
         let asked = loop {
+            let Some(handle) = call.0.as_mut() else {
+                break Asked::Lost("the model call was already given up".to_owned());
+            };
             tokio::select! {
-                joined = &mut call => break match joined {
+                joined = handle => break match joined {
                     Ok(returned) => Asked::Returned(returned),
                     Err(joined) => Asked::Lost(joined.to_string()),
                 },
@@ -2939,9 +2960,11 @@ impl CycleSource<'_> {
         if closed {
             *scratch.control = None;
         }
-        if matches!(asked, Asked::TimedOut | Asked::Cancelled) {
+        if matches!(asked, Asked::TimedOut | Asked::Cancelled)
+            && let Some(handle) = call.0.take()
+        {
             // Still running: the run keeps it, and aborts it when it ends.
-            scratch.ls.abandoned.push(call);
+            scratch.ls.abandoned.push(handle);
         }
         asked
     }

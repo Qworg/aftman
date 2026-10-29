@@ -3455,3 +3455,43 @@ async fn command_output_a_check_selects_reaches_jev_before_a_finish_resting_on_i
     ));
     Ok(())
 }
+
+#[tokio::test]
+async fn dropping_the_run_mid_reframe_stops_the_call_it_was_waiting_for() -> TestResult {
+    // Integrated review, finding 4 (probe `probe_dropping_the_run_mid_reframe_leaves_the_
+    // call_running`). The run's own future is dropped while it waits for a reframe's model
+    // call — before any timeout or cancel has made it an abandoned call. The call is a task
+    // of its own, and used to be left running, detached, with nothing to stop it.
+    let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+    let in_flight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let model = Arc::new(HangingReframe {
+        inner: R2Model::finish_ready(),
+        in_flight: Arc::clone(&in_flight),
+        late: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        sink: Arc::clone(&fx.sink),
+        started: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let rt = fx.runtime(
+        config(|_| {}),
+        settings(|s| s.opinion_timeout_seconds = 600),
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let run = RunGuard::launch(&fx, rt).await?;
+    let deadline = tokio::time::Instant::now() + PATIENCE;
+    while in_flight.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        assert!(tokio::time::Instant::now() < deadline, "no reframe started");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Drop the run mid-wait: its future goes, and so must the call it was awaiting.
+    drop(run);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while in_flight.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the reframe call outlived the run that was waiting for it"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    Ok(())
+}

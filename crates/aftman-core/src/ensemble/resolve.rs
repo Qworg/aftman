@@ -307,6 +307,11 @@ impl EnsemblePlan {
                 "the policy input differs from the one the plan was built over".to_owned(),
             ));
         }
+        if *ctx.reframe_available != self.reframe_available {
+            return Err(EnsembleError::ContextMismatch(
+                "the set of checks R2 can be asked about differs from the plan's".to_owned(),
+            ));
+        }
         if *ctx.settings != self.settings || derive_baseline(ctx) != self.baseline {
             return Err(EnsembleError::ContextMismatch(
                 "the context derives a different baseline or carries different settings".to_owned(),

@@ -248,6 +248,9 @@ pub struct EnsemblePlan {
     /// A digest of the policy input the plan was built over (`context_fingerprint`), so
     /// `resolve` can refuse a different one.
     pub(super) context: String,
+    /// The checks R2 could be asked about, as the plan was built. The gate reads this copy,
+    /// and `resolve` refuses a context whose set differs.
+    pub(super) reframe_available: BTreeSet<CheckKey>,
 }
 
 impl EnsemblePlan {
@@ -289,6 +292,7 @@ impl EnsemblePlan {
         mut baseline: BTreeMap<CheckKey, ResolvedCheck>,
         triggered: Vec<CheckPlan>,
         context: String,
+        reframe_available: BTreeSet<CheckKey>,
     ) -> Self {
         for plan in &triggered {
             baseline.insert(plan.check.clone(), plan.baseline.clone());
@@ -300,6 +304,7 @@ impl EnsemblePlan {
             baseline,
             triggered,
             context,
+            reframe_available,
         }
     }
 
@@ -345,6 +350,7 @@ impl EnsemblePlan {
             baseline,
             triggered,
             context: context_fingerprint(ctx),
+            reframe_available: ctx.reframe_available.clone(),
         })
     }
 }

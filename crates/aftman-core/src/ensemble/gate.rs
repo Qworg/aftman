@@ -97,7 +97,6 @@ pub(super) async fn run(
             guarded.insert(key.clone());
             guard(
                 plan,
-                ctx,
                 source,
                 &key,
                 selected.name(),
@@ -114,7 +113,6 @@ pub(super) async fn run(
 #[allow(clippy::too_many_arguments)]
 async fn guard(
     plan: &EnsemblePlan,
-    ctx: &EnsembleContext<'_>,
     source: &dyn OpinionSource,
     key: &CheckKey,
     directive: &str,
@@ -173,7 +171,7 @@ async fn guard(
             );
             GuardOutcome::Reinterpreted
         }
-    } else if !(settings.has(Rung::ReframeSameModel) && ctx.reframe_available.contains(key)) {
+    } else if !(settings.has(Rung::ReframeSameModel) && plan.reframe_available.contains(key)) {
         GuardOutcome::Unavailable
     } else if counters.opinions_used.saturating_add(1) > settings.max_opinions_per_run {
         GuardOutcome::BudgetSpent

@@ -655,11 +655,16 @@ A plan's fields are private to the ensemble and a plan is only built by `Ensembl
 settings' `enabled` and `uncertainty_margin` — and refuses (`EnsembleError::BaselineMismatch`) a
 policy input whose checks differ from it. So no caller can hand the resolver a baseline with
 `permitted = true` that `from_measurement`, under these settings, did not produce. `resolve`, which
-re-arbitrates for the irreversible gate, refuses (`ContextMismatch`) a context that is not the one
-the plan was built over: a different cycle, settings or derived baseline, or a different policy
-input — the plan stores a digest of the status, counters, configuration, observation, clock, active
-worker, last directive, steering grace and `finish_is_provisional`. The registry is a set of trait
-objects and cannot be digested, so the caller must pass the same one to `build` and `resolve`. Every string that reaches an event is capped: opinion excerpts and errors at 2 KiB, labels
+re-arbitrates for the irreversible gate, refuses (`ContextMismatch`) a context that differs from the
+one the plan was built over in any of exactly these: the cycle; the settings; the baseline derived
+from the answers and definitions; the set of checks R2 can be asked about (`reframe_available`,
+which the gate reads; the plan keeps its own copy); and a digest of the policy input — status,
+counters, configuration, observation, clock, active worker, last directive, steering grace,
+`ensemble_enabled` and `finish_is_provisional`. Evidence selections are read only by `build` and
+kept in the plan. The registry is a set of trait objects and is not compared: passing the same
+registry to `build` and `resolve` is the caller's responsibility.
+
+Every string that reaches an event is capped: opinion excerpts and errors at 2 KiB, labels
 and provider names at 256 bytes, refresh errors and escalation questions at 2 KiB, and a refresh
 keeps at most one run per requested provider.
 

@@ -574,6 +574,27 @@ async fn resolve_refuses_different_answers_or_settings_under_the_same_policy_inp
 }
 
 #[tokio::test]
+async fn resolve_refuses_a_different_set_of_reframable_checks() {
+    // Round-4 item 1. The gate reads which checks R2 can be asked about. Clearing that set
+    // between `build` and `resolve` let a refresh-unmasked Finish through with no R2 call.
+    let mut s = Scenario::finish_ready()
+        .set(READY, 0.79)
+        .selecting(READY, &["audit"])
+        .set(TESTS, 0.92)
+        .reframable(&[TESTS]);
+    let plan = s.plan();
+    s.reframe.clear();
+    let source =
+        RecordedOpinionSource::new().with_refresh(CYCLE, READY, refreshed(Some(0.95), "audit", 0));
+    let result = s.resolve_plan(&plan, &source).await;
+    assert!(
+        matches!(result, Err(super::EnsembleError::ContextMismatch(_))),
+        "{result:?}"
+    );
+    assert!(source.refresh_calls().is_empty() && source.reframe_calls().is_empty());
+}
+
+#[tokio::test]
 async fn resolve_refuses_a_different_policy_input() {
     // Round-3 probe N2b: a plan built with no worker, resolved with one. The baseline is
     // identical, so only the fingerprint can tell.
@@ -3344,6 +3365,7 @@ async fn run_case(c: &Case, s: &mut Scenario) {
             c.reframe_available,
         )],
         s.fingerprint(),
+        s.reframe.clone(),
     );
     let new_p = match c.refresh {
         RefreshAnswer::Decisive => Some(0.05),

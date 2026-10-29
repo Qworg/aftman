@@ -270,7 +270,8 @@ pub struct RunArgs {
     #[arg(long, value_parser = ["never", "when-asked", "always"], default_value = "when-asked")]
     pub verify: String,
 
-    /// Enable the uncertainty band and the second-opinion path.
+    /// Enable the uncertainty band and the second-opinion path for this run. Turns on the
+    /// `[ensemble]` table of config.toml (its other keys still apply); never turns it off.
     #[arg(long)]
     pub ensemble: bool,
 

@@ -43,6 +43,7 @@ use time::format_description::well_known::Rfc3339;
 
 use aftman_core::clock::SystemClock;
 use aftman_core::definitions::DefinitionSet;
+use aftman_core::ensemble::EnsembleSettings;
 use aftman_core::evidence::EvidencePlan;
 use aftman_core::ids::RunId;
 use aftman_core::job::{Job, JobSource, RunConfig, VerifyPolicy, WorkerKind};
@@ -89,6 +90,8 @@ pub enum FactoryError {
     },
     #[error("loading command evidence providers: {0}")]
     Evidence(String),
+    #[error("{}: [ensemble]: {message}", path.display())]
+    Ensemble { path: PathBuf, message: String },
 }
 
 /// Everything the factory reads from outside the program, gathered once in `main`
@@ -104,6 +107,8 @@ pub struct FactoryInputs {
     pub responsibilities_dir: Option<PathBuf>,
     /// The command-evidence configuration file.
     pub evidence_config: Option<PathBuf>,
+    /// `config.toml`, for its `[ensemble]` table (`docs/06-ensemble.md` §12).
+    pub config_file: Option<PathBuf>,
 }
 
 impl FactoryInputs {
@@ -135,7 +140,10 @@ impl FactoryInputs {
             responsibilities_dir: env(RESPONSIBILITIES_DIR_ENV)
                 .map(PathBuf::from)
                 .map(absolute),
-            evidence_config: config_home.map(|dir| dir.join("aftman/evidence.toml")),
+            evidence_config: config_home
+                .as_ref()
+                .map(|dir| dir.join("aftman/evidence.toml")),
+            config_file: config_home.map(|dir| dir.join("aftman/config.toml")),
         }
     }
 
@@ -318,6 +326,8 @@ impl CliFactory {
             .map_err(|e| config_error(e.to_string()))?;
         let evidence = load_evidence_from(self.inputs.evidence_config.as_deref())
             .map_err(|e| config_error(e.to_string()))?;
+        let ensemble = ensemble_settings(self.inputs.config_file.as_deref(), params.ensemble)
+            .map_err(|e| config_error(e.to_string()))?;
         let evidence_temp_dir = self.data_dir.join(crate::statedir::EVIDENCE_DIR);
 
         let runtime = FactoryRuntime::new(RuntimeDeps {
@@ -333,10 +343,7 @@ impl CliFactory {
             evidence_temp_dir,
             clock: context.clock,
             sink: context.sink,
-            ensemble: aftman_core::ensemble::EnsembleSettings {
-                enabled: params.ensemble,
-                ..Default::default()
-            },
+            ensemble,
             steering_grace: std::time::Duration::from_secs(30),
             launch,
             // The client's allowlisted environment, already validated for supervisor
@@ -623,6 +630,51 @@ pub fn load_evidence_from(path: Option<&Path>) -> Result<EvidencePlan, FactoryEr
         .map_err(|e| FactoryError::Evidence(e.to_string()))
 }
 
+/// Load the `[ensemble]` table from `config.toml`, if the file exists, validated.
+///
+/// # Errors
+/// A file that cannot be read, is not valid TOML, names a table or key this release does
+/// not read, or holds a value `EnsembleSettings::validate` refuses. The message names the
+/// file and the key.
+pub fn load_ensemble_from(path: Option<&Path>) -> Result<EnsembleSettings, FactoryError> {
+    let Some(path) = path else {
+        return Ok(EnsembleSettings::default());
+    };
+    if !path.is_file() {
+        return Ok(EnsembleSettings::default());
+    }
+    let source = std::fs::read_to_string(path).map_err(|source| FactoryError::Read {
+        path: path.to_owned(),
+        source,
+    })?;
+    EnsembleSettings::from_config_toml(&source).map_err(|e| FactoryError::Ensemble {
+        path: path.to_owned(),
+        message: e.to_string(),
+    })
+}
+
+/// The ensemble settings for one run: the `[ensemble]` table, with `--ensemble` (the
+/// protocol's `ensemble: true`) turning it on.
+///
+/// The flag can only set `enabled`; it never turns off an ensemble the table enabled, and
+/// every other key comes from the table. The combination is validated again, so
+/// `--ensemble` over a table with `rungs = []` is refused rather than run with nothing.
+///
+/// # Errors
+/// As [`load_ensemble_from`], and a combination `validate` refuses.
+pub fn ensemble_settings(
+    path: Option<&Path>,
+    flag: bool,
+) -> Result<EnsembleSettings, FactoryError> {
+    let mut settings = load_ensemble_from(path)?;
+    settings.enabled |= flag;
+    settings.validate().map_err(|e| FactoryError::Ensemble {
+        path: path.map_or_else(|| PathBuf::from("--ensemble"), Path::to_path_buf),
+        message: e.to_string(),
+    })?;
+    Ok(settings)
+}
+
 /// Construct the configured coding-agent backend.
 ///
 /// A backend whose posture it cannot express fails here, at startup, rather than
@@ -903,6 +955,58 @@ mod tests {
         );
         let (work, clean) = factory();
         assert!(clean.prepare(&params(work.path()), context()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn the_ensemble_table_is_read_and_the_flag_only_turns_it_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config.toml");
+
+        // No file: the defaults; the flag turns the ensemble on.
+        assert!(!ensemble_settings(Some(&config), false).unwrap().enabled);
+        assert!(ensemble_settings(Some(&config), true).unwrap().enabled);
+
+        std::fs::write(
+            &config,
+            "[ensemble]\nenabled = true\nmax_evidence_refreshes_per_check = 5\n",
+        )
+        .unwrap();
+        let settings = ensemble_settings(Some(&config), false).unwrap();
+        assert!(settings.enabled, "the flag never turns it off");
+        assert_eq!(settings.max_evidence_refreshes_per_check, 5);
+        assert_eq!(settings.max_opinions_per_run, 20);
+
+        // `--ensemble` over a table with no rungs is refused, naming the key.
+        std::fs::write(&config, "[ensemble]\nrungs = []\n").unwrap();
+        assert!(!ensemble_settings(Some(&config), false).unwrap().enabled);
+        let error = ensemble_settings(Some(&config), true)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("rungs"), "{error}");
+
+        // A typo or a refused value is a configuration error at run start.
+        std::fs::write(&config, "[ensemble]\nuncertainty_margin = 2.0\n").unwrap();
+        let (work, broken) = factory_with(
+            FactoryInputs {
+                config_file: Some(config.clone()),
+                ..FactoryInputs::empty()
+            },
+            Mode::Embedded,
+        );
+        let error = broken
+            .prepare(&params(work.path()), context())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::InvalidConfig);
+        assert!(
+            error.message.contains("ensemble.uncertainty_margin"),
+            "{}",
+            error.message
+        );
+        std::fs::write(&config, "[ensemble]\nmarign = 0.1\n").unwrap();
+        let error = load_ensemble_from(Some(&config)).unwrap_err().to_string();
+        assert!(error.contains("marign"), "{error}");
     }
 
     #[tokio::test]

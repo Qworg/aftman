@@ -275,6 +275,7 @@ pub async fn doctor(
             }
         }
     }
+    ensemble_section(ctx, &mut problems)?;
     outln!()?;
     outln!(
         "git         {} (not needed by aftman; repositories are read in-process)",
@@ -298,6 +299,50 @@ pub async fn doctor(
     }
     outln!("ready for a live run")?;
     Ok(exit::FINISHED)
+}
+
+/// The `[ensemble]` table as a run would load it (`docs/06-ensemble.md` §12).
+fn ensemble_section(ctx: &Ctx, problems: &mut bool) -> Result<(), CliError> {
+    outln!()?;
+    outln!("ensemble")?;
+    if let Some(path) = &ctx.inputs.config_file {
+        outln!(
+            "  config file {} ({})",
+            path.display(),
+            if path.is_file() { "present" } else { "absent" }
+        )?;
+    }
+    match crate::factory::load_ensemble_from(ctx.inputs.config_file.as_deref()) {
+        Ok(s) => {
+            outln!(
+                "  enabled     {} (--ensemble turns it on for one run)",
+                s.enabled
+            )?;
+            outln!("  margin      {}", s.uncertainty_margin)?;
+            outln!(
+                "  rungs       {}",
+                s.rungs
+                    .iter()
+                    .map(|rung| aftman_core::ensemble::settings::rung_name(*rung))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?;
+            outln!(
+                "  limits      {} refreshes per check, {} opinions per run, {}s per opinion, \
+                 cooldown {} cycles, a person after {} cycles",
+                s.max_evidence_refreshes_per_check,
+                s.max_opinions_per_run,
+                s.opinion_timeout_seconds,
+                s.per_check_cooldown_cycles,
+                s.consecutive_contests_before_human
+            )?;
+        }
+        Err(error) => {
+            outln!("  INVALID     {error}")?;
+            *problems = true;
+        }
+    }
+    Ok(())
 }
 
 /// What a one-turn probe concluded.

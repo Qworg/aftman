@@ -165,6 +165,52 @@ impl EnsembleSettings {
     }
 }
 
+/// The shape of `config.toml` as the ensemble reads it.
+///
+/// `deny_unknown_fields`, so a misspelt table is an error rather than a silently ignored
+/// line. `[web]` belongs to the web surface (`aftman_web::config`), which reads and
+/// validates it; it is accepted here unread, as `[ensemble]` is accepted unread there.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFile {
+    #[serde(default)]
+    ensemble: Option<EnsembleSettings>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    web: Option<toml::Value>,
+}
+
+/// Why the `[ensemble]` table could not be used.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub enum EnsembleConfigError {
+    /// Not TOML, an unknown table or key, or a value of the wrong type. The message names
+    /// the key.
+    #[error("{0}")]
+    Parse(String),
+    /// Parsed, but refused by [`EnsembleSettings::validate`].
+    #[error(transparent)]
+    Invalid(#[from] EnsembleSettingsError),
+}
+
+impl EnsembleSettings {
+    /// The `[ensemble]` table of a `config.toml`, validated. A file without the table
+    /// yields the defaults (the ensemble off).
+    ///
+    /// # Errors
+    ///
+    /// [`EnsembleConfigError::Parse`] for a file that is not valid TOML, a table or key
+    /// this release does not know (`[ensemble.judge]` included, until S3), or a value of
+    /// the wrong type; [`EnsembleConfigError::Invalid`] for one [`EnsembleSettings::validate`]
+    /// refuses.
+    pub fn from_config_toml(source: &str) -> Result<Self, EnsembleConfigError> {
+        let file: ConfigFile = toml::from_str(source)
+            .map_err(|e| EnsembleConfigError::Parse(e.message().to_owned()))?;
+        let settings = file.ensemble.unwrap_or_default();
+        settings.validate()?;
+        Ok(settings)
+    }
+}
+
 /// The configuration spelling of a rung.
 #[must_use]
 pub const fn rung_name(rung: Rung) -> &'static str {
@@ -445,6 +491,40 @@ rungs = ["refresh_evidence", "human"]
         assert_eq!(s.max_opinions_per_run, 20, "unset keys keep their default");
         assert_eq!(s.rungs, vec![Rung::RefreshEvidence, Rung::Human]);
         assert!(toml::from_str::<EnsembleSettings>("allow_finish_from_opinion = true").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn the_config_file_table_is_read_validated_and_named_in_errors() -> TestResult {
+        use super::EnsembleConfigError;
+        // No table: the defaults, off.
+        assert_eq!(
+            EnsembleSettings::from_config_toml("")?,
+            EnsembleSettings::default()
+        );
+        // The web surface's table is someone else's, and is left alone.
+        let s = EnsembleSettings::from_config_toml(
+            "[web]\nbind = \"127.0.0.1:1\"\n\n[ensemble]\nenabled = true\nmax_evidence_refreshes_per_check = 5\n",
+        )?;
+        assert!(s.enabled);
+        assert_eq!(s.max_evidence_refreshes_per_check, 5);
+        assert_eq!(s.max_opinions_per_run, 20);
+        // A typo names the key; a refused value names the key.
+        let typo = EnsembleSettings::from_config_toml("[ensemble]\nuncertainty_marign = 0.1\n");
+        assert!(
+            matches!(&typo, Err(EnsembleConfigError::Parse(m)) if m.contains("uncertainty_marign")),
+            "{typo:?}"
+        );
+        let bad = EnsembleSettings::from_config_toml("[ensemble]\nuncertainty_margin = 1.5\n");
+        assert!(
+            matches!(&bad, Err(e) if e.to_string().contains("ensemble.uncertainty_margin")),
+            "{bad:?}"
+        );
+        // A table nobody reads is refused, not ignored; so is the judge, until S3.
+        assert!(EnsembleSettings::from_config_toml("[ensembel]\nenabled = true\n").is_err());
+        assert!(
+            EnsembleSettings::from_config_toml("[ensemble.judge]\nbackend = \"agy\"\n").is_err()
+        );
         Ok(())
     }
 

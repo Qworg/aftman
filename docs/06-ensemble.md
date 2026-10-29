@@ -1093,6 +1093,20 @@ max_output_bytes = 2048
 
 `enabled = true` with an empty `rungs` list is a config error, not a no-op.
 
+**Where it is read (M5).** The table lives in `config.toml` (`$XDG_CONFIG_HOME/aftman/config.toml`,
+else `~/.config/aftman/config.toml`) and is read **at every run start** by the run factory
+(`EnsembleSettings::from_config_toml`), so editing it needs no daemon restart. The file is shared
+with the web surface's `[web]`, which each loader accepts unread; any other table is refused rather
+than ignored, and so is `[ensemble.judge]` until S3. Every error is fatal to the run start
+(`invalid_config`) and names the file and the key: an unknown key by its spelling, a refused value
+as `ensemble.<key> = <value> is outside <range>`.
+
+**The flag.** `aftman run --ensemble` (the protocol's `run.start` `ensemble: true`) sets
+`enabled = true` for that run and nothing else; without it, the table decides. The flag cannot turn
+off an ensemble the table enabled. The combination is validated again, so `--ensemble` over a table
+with `rungs = []` is refused. `uncertainty_margin` always comes from the settings: there is no other
+source of the margin in the runtime. `aftman doctor` prints the table as a run would load it.
+
 The type is `aftman_core::ensemble::EnsembleSettings` (`deny_unknown_fields`, every key defaulted),
 and `EnsembleSettings::validate()` is the single place these rules live, so every loader refuses the
 same things:

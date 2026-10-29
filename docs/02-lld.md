@@ -331,6 +331,8 @@ pub struct EnsembleCounters { pub opinions_used: u32,
     pub checks: BTreeMap<CheckKey, CheckCounters> }              // in RunState.ensemble
     // CheckCounters also remembers a person's answer: `human` (Accept/Guidance) and
     // `recheck` (Recheck/ClaimComplete), set by record_human_decision (doc 06 §4 R3)
+impl EnsembleSettings { pub fn from_config_toml(source: &str)    // the [ensemble] table of
+    -> Result<Self, EnsembleConfigError>; }                     // config.toml, validated
 pub enum   EnsembleTrigger { NearThreshold, LowConfidence, ClaimOnlyEvidence, OutcomeRelevant,
     HighStakes, Irreversible, RepeatContest, HumanRecheck }
 pub struct EnsembleContext<'a> { settings, cycle, policy: &PolicyInput, registry: &ResponsibilityRegistry,
@@ -1256,14 +1258,21 @@ upstream names for compatibility: `TYPESAFE_API_KEY`, `TYPESAFE_BASE_URL`.
 
 Config is parsed with `deny_unknown_fields` so a typo is an error, not a silent default.
 
-**Status (M3): the file above is the design; no `config.toml` is read yet.** What exists today:
-CLI flags and their environment variables (`AFTMAN_DATA_DIR`, `AFTMAN_SOCKET`, the Jev
-credentials `TYPESAFE_*`), the bundled responsibility definitions and evidence plan (TOML,
-parsed with `deny_unknown_fields`), and compiled defaults for the sections above: `[obs]` is
-`ObsCaps::default()`, `[runtime]` is `RunConfig::default()`, `[jev.budget]` is the budget
-module's constants. Every key in the block is **designed but not yet read**, including
-`[workers]`, `[ensemble]`, `[herdr]` and `[web]` (the web surface is M4). Do not rely on a key
-here having an effect until the milestone that builds it lands.
+**Status (M5): two tables of the file above are read; the rest is design.** `config.toml`
+(`$XDG_CONFIG_HOME/aftman/config.toml`, else `~/.config/aftman/config.toml`) is read by two
+loaders, each with `deny_unknown_fields`, each accepting the other's table unread and refusing any
+other: the web surface reads `[web]` at `aftman serve`; the run factory reads `[ensemble]` at every
+run start (`EnsembleSettings::from_config_toml`, validated by `EnsembleSettings::validate()`; a
+typo, an out-of-range value, or `[ensemble.judge]` before S3 is a fatal `invalid_config` that names
+the key). `aftman run --ensemble` (the protocol's `ensemble: true`) can only set
+`ensemble.enabled = true`; every other key comes from the table, and the combination is validated
+again (doc 06 §12). `aftman doctor` prints the table as a run would load it. Everything else is as
+before: CLI flags and their environment variables (`AFTMAN_DATA_DIR`, `AFTMAN_SOCKET`, the Jev
+credentials `TYPESAFE_*`), the bundled responsibility definitions and evidence plan (TOML, parsed
+with `deny_unknown_fields`), and compiled defaults for the remaining sections: `[obs]` is
+`ObsCaps::default()`, `[runtime]` is `RunConfig::default()`, `[jev.budget]` is the budget module's
+constants. `[jev]`, `[jev.budget]`, `[obs]`, `[runtime]`, `[workers]` and `[herdr]` are **designed
+but not yet read**, and are refused if present rather than silently ignored.
 
 ## 13. Logging and observability
 

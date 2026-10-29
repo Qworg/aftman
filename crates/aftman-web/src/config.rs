@@ -507,6 +507,12 @@ fn parse_bool(name: &str, value: &str) -> Result<bool, WebConfigError> {
 struct RawFile {
     #[serde(default)]
     web: RawWeb,
+    /// The `[ensemble]` table belongs to the run factory, which reads and validates it
+    /// (`aftman_core::ensemble::EnsembleSettings::from_config_toml`). Accepted here unread,
+    /// so that configuring the ensemble does not stop the web surface from starting.
+    #[serde(default)]
+    #[allow(dead_code)]
+    ensemble: Option<toml::Value>,
 }
 
 impl RawFile {
@@ -775,6 +781,22 @@ mod tests {
         assert!(!config.enabled(), "the web surface is opt-in");
         assert_eq!(config.bind(), DEFAULT_BIND.parse().expect("parses"));
         assert_eq!(config.auth(), AuthMode::Loopback);
+    }
+
+    #[test]
+    fn an_ensemble_table_does_not_stop_the_web_surface() {
+        // `[ensemble]` shares `config.toml` and is the run factory's to validate.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = WebConfig::default_path(Some(dir.path())).expect("path");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        std::fs::write(
+            &path,
+            "[web]\nenabled = true\n\n[ensemble]\nenabled = true\nuncertainty_margin = 0.1\n",
+        )
+        .expect("write");
+        let config =
+            WebConfig::load(Some(dir.path()), &env(&[("HOME", "/home/me")])).expect("resolves");
+        assert!(config.enabled());
     }
 
     #[test]

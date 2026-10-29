@@ -262,6 +262,8 @@ pub struct RunStartParams {
     pub model: Option<String>,
     #[serde(default)]
     pub verify: Option<String>,
+    /// `--ensemble`: sets `ensemble.enabled = true` for this run over the daemon's
+    /// `[ensemble]` table, whose other keys still apply. `false` leaves the table to decide.
     #[serde(default)]
     pub ensemble: bool,
     #[serde(default)]

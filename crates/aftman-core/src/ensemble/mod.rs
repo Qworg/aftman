@@ -33,8 +33,8 @@ pub use resolve::{
     RefreshRequest, SourceError, apply_opinions, reframe_verdict,
 };
 pub use settings::{
-    CheckCounters, EnsembleCounters, EnsembleSettings, EnsembleSettingsError, HumanAcceptance,
-    MarkVerdict, OpinionMark,
+    CheckCounters, EnsembleConfigError, EnsembleCounters, EnsembleSettings, EnsembleSettingsError,
+    HumanAcceptance, MarkVerdict, OpinionMark,
 };
 pub use trigger::{
     CheckPlan, DecisiveDirectives, EnsembleContext, EnsembleError, EnsemblePlan, EnsembleTrigger,

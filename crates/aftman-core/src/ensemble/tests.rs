@@ -1,4 +1,5 @@
-//! The ensemble's tests (`docs/06-ensemble.md` §14).
+//! The ensemble's tests (`docs/06-ensemble.md` §14). Offline: every answer comes from a
+//! [`RecordedOpinionSource`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
@@ -7,19 +8,24 @@ use std::time::Duration;
 use time::macros::datetime;
 
 use super::{
-    CheckPlan, DecisiveDirectives, EnsembleContext, EnsembleCounters, EnsemblePlan,
-    EnsembleSettings, EnsembleTrigger,
+    CheckCounters, CheckPlan, DecisiveDirectives, EnsembleContext, EnsembleCounters, EnsembleLimit,
+    EnsembleOutcome, EnsemblePlan, EnsembleSettings, EnsembleTrigger, OpinionKey, OpinionMark,
+    ProviderRun, ReframeAnswer, RefreshOutcome, apply_opinions, reframe_verdict,
 };
-use crate::assessment::{AnswerValue, ResolvedCheck, Rung};
+use crate::assessment::{
+    AnswerValue, CheckSuppression, Opinion, Resolution, ResolvedCheck, Rung, Side, Verdict,
+};
 use crate::definitions::DefinitionSet;
 use crate::directive::{Directive, Proposal};
 use crate::evidence::{CommandProvider, EvidencePlan, ProviderCwd, RunWhen};
 use crate::ids::{AssessmentSeq, CheckKey, EvidenceId, ResponsibilityId, RunId, WorkerId};
 use crate::job::{FactoryStatus, JobSummary, RunConfig, TaskKind, WorkerKind};
 use crate::log::BoundedLog;
+use crate::model::Usage;
 use crate::observation::{Counters, GitEvidence, Observation};
 use crate::policy::{PolicyInput, arbitrate};
 use crate::responsibility::{Check, ResponsibilityRegistry};
+use crate::testing::RecordedOpinionSource;
 use crate::worker::WorkerRecord;
 
 const IMPL: &str = "core.completion__implementation_complete";
@@ -289,7 +295,84 @@ fn observation() -> Observation {
     }
 }
 
+fn refreshed(new_p: Option<f32>, provider: &str, exit_code: i32) -> RefreshOutcome {
+    RefreshOutcome {
+        runs: vec![ProviderRun {
+            provider: EvidenceId::new(provider),
+            exit_code: Some(exit_code),
+        }],
+        new_p,
+        error: None,
+    }
+}
+
+fn answer(p_negated: Option<f32>) -> ReframeAnswer {
+    ReframeAnswer {
+        p_negated,
+        source: "jev".into(),
+        model: "recorded-model".into(),
+        excerpt: "{\"p\": ...}".into(),
+        prompt_hash: "prompt-hash".into(),
+        state_digest: "state-digest".into(),
+        latency: Duration::from_millis(250),
+        usage: Usage {
+            input_tokens: Some(100),
+            output_tokens: Some(5),
+        },
+        error: None,
+    }
+}
+
+fn reframe_key(cycle: AssessmentSeq, key: &str) -> OpinionKey {
+    OpinionKey {
+        cycle,
+        check: k(key),
+        rung: Rung::ReframeSameModel,
+    }
+}
+
+/// A source that answers every opinion the plan could ask with the same `p(not X)`.
+fn answering_all(plan: &EnsemblePlan, p_negated: Option<f32>) -> RecordedOpinionSource {
+    plan.triggered
+        .iter()
+        .fold(RecordedOpinionSource::new(), |source, check| {
+            source.with_reframe(
+                OpinionKey {
+                    cycle: plan.cycle,
+                    check: check.check.clone(),
+                    rung: Rung::ReframeSameModel,
+                },
+                answer(p_negated),
+            )
+        })
+}
+
+fn permitted_set(checks: &BTreeMap<CheckKey, ResolvedCheck>) -> BTreeSet<CheckKey> {
+    checks
+        .iter()
+        .filter(|(_, rc)| rc.permitted)
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+fn record<'a>(outcome: &'a EnsembleOutcome, key: &str) -> Option<&'a super::CheckRecord> {
+    outcome.records.iter().find(|r| r.check == k(key))
+}
+
 // ---- triggers --------------------------------------------------------------
+
+#[tokio::test]
+async fn with_the_ensemble_disabled_nothing_triggers_and_nothing_is_asked() {
+    let mut s = Scenario::finish_ready().set(READY, 0.79).reframable_all();
+    s.settings.enabled = false;
+    let plan = s.plan();
+    assert!(plan.triggered.is_empty());
+    let source = RecordedOpinionSource::new();
+    let outcome = plan.resolve(&source).await;
+    assert_eq!(outcome.checks, s.baseline());
+    assert_eq!(outcome.counters, EnsembleCounters::default());
+    assert!(source.refresh_calls().is_empty() && source.reframe_calls().is_empty());
+}
 
 #[test]
 fn a_check_with_no_threshold_never_triggers() {
@@ -509,4 +592,1124 @@ fn the_plan_records_what_the_ladder_could_use() {
     let s = s.reframable_all().without_rung(Rung::ReframeSameModel);
     assert_eq!(s.check_plan(READY).map(|p| p.reframe_available), Some(true));
     assert!(!s.settings.has(Rung::ReframeSameModel));
+}
+
+// ---- the R2 consistency rule ----------------------------------------------
+
+#[test]
+fn reframe_verdict_is_the_documented_consistency_rule() {
+    // p = 0.92, p(not X) = 0.10: 1 - 0.10 = 0.90, within 0.15.
+    assert_eq!(
+        reframe_verdict(0.92, Some(0.10), 0.75, 0.15, false),
+        Verdict::Confirm { side: Side::Above }
+    );
+    // p = 0.92, p(not X) = 0.75: 1 - 0.75 = 0.25, far outside.
+    assert_eq!(
+        reframe_verdict(0.92, Some(0.75), 0.75, 0.15, false),
+        Verdict::Contest { side: Side::Below }
+    );
+    // Inconsistent but on the same side still contests.
+    assert_eq!(
+        reframe_verdict(0.99, Some(0.20), 0.75, 0.15, false),
+        Verdict::Contest { side: Side::Above }
+    );
+    // Exactly at the tolerance is consistent (exactly representable values).
+    assert_eq!(
+        reframe_verdict(0.75, Some(0.5), 0.5, 0.25, false),
+        Verdict::Confirm { side: Side::Above }
+    );
+    // A below-threshold value confirmed stays below.
+    assert_eq!(
+        reframe_verdict(0.30, Some(0.70), 0.75, 0.15, false),
+        Verdict::Confirm { side: Side::Below }
+    );
+}
+
+#[test]
+fn an_unusable_reframe_abstains_except_on_an_irreversible_trigger() {
+    for unusable in [
+        None,
+        Some(f32::NAN),
+        Some(-0.1),
+        Some(1.5),
+        Some(f32::INFINITY),
+    ] {
+        assert_eq!(
+            reframe_verdict(0.92, unusable, 0.75, 0.15, false),
+            Verdict::Abstain,
+            "{unusable:?}"
+        );
+        assert_eq!(
+            reframe_verdict(0.92, unusable, 0.75, 0.15, true),
+            Verdict::Contest { side: Side::Above },
+            "{unusable:?}"
+        );
+    }
+}
+
+// ---- worked examples (§9) --------------------------------------------------
+
+#[tokio::test]
+async fn worked_example_9_1_thin_evidence_is_measured_not_judged() {
+    let s = Scenario::finish_ready()
+        .set(TESTS, 0.71)
+        .selecting(TESTS, &["tests"])
+        .reframable_all();
+    let plan = s.plan();
+    let triggers = s.triggers(TESTS);
+    assert!(triggers.contains(&EnsembleTrigger::OutcomeRelevant));
+    assert!(triggers.contains(&EnsembleTrigger::HighStakes));
+    assert!(triggers.contains(&EnsembleTrigger::ClaimOnlyEvidence));
+
+    // The command exits 1; the fresh answer is 0.08.
+    let source =
+        RecordedOpinionSource::new().with_refresh(CYCLE, TESTS, refreshed(Some(0.08), "tests", 1));
+    let outcome = plan.resolve(&source).await;
+    let rc = &outcome.checks[&k(TESTS)];
+    assert_eq!(
+        rc.resolution,
+        Resolution::EvidenceRefreshed {
+            new_p: 0.08,
+            provider: EvidenceId::new("tests"),
+            supersedes: CYCLE,
+            old_p: Some(0.71),
+            exit_code: Some(1),
+        }
+    );
+    assert!(rc.permitted, "decisively below: usable");
+    assert!(!rc.at_least(0.75), "but the `>=` conjunct is false");
+    assert_eq!(s.select(&outcome.checks).name(), "StartWorker");
+    assert!(
+        source.reframe_calls().is_empty(),
+        "no second model was involved"
+    );
+    assert_eq!(source.refresh_calls().len(), 1);
+    assert_eq!(
+        source.refresh_calls()[0].providers,
+        vec![EvidenceId::new("tests")]
+    );
+}
+
+#[tokio::test]
+async fn a_fake_passing_test_run_converts_a_0_71_into_a_decisive_value() {
+    // The M5 exit criterion: the same check, and this time the command passes.
+    let s = Scenario::finish_ready()
+        .set(TESTS, 0.71)
+        .selecting(TESTS, &["tests"]);
+    assert_ne!(s.select(&s.baseline()).name(), "Finish");
+    let source =
+        RecordedOpinionSource::new().with_refresh(CYCLE, TESTS, refreshed(Some(0.93), "tests", 0));
+    let outcome = s.plan().resolve(&source).await;
+    let rc = &outcome.checks[&k(TESTS)];
+    assert!(rc.decisive && rc.permitted);
+    assert_eq!(rc.jev_p, Some(0.93));
+    assert_eq!(s.select(&outcome.checks).name(), "Finish");
+}
+
+#[tokio::test]
+async fn worked_example_9_2_in_band_without_evidence_escalates_and_asks_no_model() {
+    // No command evidence configured for the check, and R2 available: still not asked.
+    let s = Scenario::finish_ready().set(TESTS, 0.71).reframable_all();
+    let source = RecordedOpinionSource::new();
+    let outcome = s.plan().resolve(&source).await;
+    let rc = &outcome.checks[&k(TESTS)];
+    assert!(!rc.permitted);
+    assert_eq!(rc.suppression, Some(CheckSuppression::InBand));
+    assert!(matches!(
+        &rc.resolution,
+        Resolution::UnresolvedInBand { rungs, .. } if rungs.is_empty()
+    ));
+    assert!(source.reframe_calls().is_empty() && source.refresh_calls().is_empty());
+    assert_ne!(s.select(&outcome.checks).name(), "Finish");
+    assert_eq!(
+        outcome.counters.check(&k(TESTS)).consecutive_held,
+        1,
+        "held cycles are counted"
+    );
+
+    // After `consecutive_contests_before_human` held cycles: escalate, still no model.
+    let s = s.held_for(TESTS, 2);
+    let source = RecordedOpinionSource::new();
+    let outcome = s.plan().resolve(&source).await;
+    let rc = &outcome.checks[&k(TESTS)];
+    assert!(!rc.permitted);
+    assert_eq!(rc.suppression, Some(CheckSuppression::Unresolved));
+    assert!(matches!(
+        &rc.resolution,
+        Resolution::UnresolvedInBand { rungs, .. } if rungs == &[Rung::Human]
+    ));
+    assert_eq!(outcome.escalations().count(), 1);
+    assert!(source.reframe_calls().is_empty() && source.refresh_calls().is_empty());
+}
+
+#[tokio::test]
+async fn worked_example_9_2_a_decisive_finish_is_contested() {
+    // The doc's example uses the independent judge; until S3 the same suppression comes
+    // from R2, which is what this asserts.
+    let s = Scenario::finish_ready()
+        .set(TESTS, 0.92)
+        .reframable(&[TESTS]);
+    assert_eq!(s.select(&s.baseline()).name(), "Finish");
+    let source =
+        RecordedOpinionSource::new().with_reframe(reframe_key(CYCLE, TESTS), answer(Some(0.75)));
+    let outcome = s.plan().resolve(&source).await;
+    let rc = &outcome.checks[&k(TESTS)];
+    assert!(!rc.permitted && rc.contested);
+    assert_eq!(rc.jev_p, Some(0.92), "Jev's value is untouched");
+    match &rc.resolution {
+        Resolution::SuppressedByContest { jev_p, dissent } => {
+            assert!((jev_p - 0.92).abs() < f32::EPSILON);
+            assert_eq!(dissent.len(), 1);
+            assert_eq!(dissent[0].p_reported, Some(0.75), "stored for audit");
+        }
+        other => panic!("expected a contest, got {other:?}"),
+    }
+    assert_ne!(s.select(&outcome.checks).name(), "Finish");
+    assert_eq!(source.reframe_calls().len(), 1);
+    assert_eq!(outcome.counters.opinions_used, 1);
+}
+
+#[tokio::test]
+async fn worked_example_9_3_agreement_below_cannot_stop_a_worker() {
+    let s = Scenario::finish_ready()
+        .with_worker()
+        .set(STUCK, 0.78)
+        .reframable_all();
+    let source = answering_all(&s.plan(), Some(0.75));
+    let outcome = s.plan().resolve(&source).await;
+    let rc = &outcome.checks[&k(STUCK)];
+    assert!(!rc.permitted, "in band: held");
+    assert!(
+        source.reframe_calls().is_empty(),
+        "in-band checks never reach an opinion"
+    );
+    // Even if one had, a confirm on the same side changes nothing.
+    let confirmed = apply_opinions(
+        rc.clone(),
+        &[opinion(Verdict::Confirm { side: Side::Below })],
+    );
+    assert_eq!(&confirmed, rc);
+    let proposals = s.proposals(&outcome.checks);
+    assert!(
+        !proposals
+            .iter()
+            .any(|p| p.rule.as_str() == "core.worker-health:stuck"),
+        "the worker continues"
+    );
+}
+
+#[tokio::test]
+async fn worked_example_9_4_only_evidence_may_finish() {
+    let s = Scenario::finish_ready()
+        .set(READY, 0.79)
+        .selecting(READY, &["tests", "audit"])
+        .reframable_all();
+    // Without a refresh: Finish is impossible, and no judge is asked.
+    let no_refresh = s.plan().resolve(&RecordedOpinionSource::new()).await;
+    assert_ne!(s.select(&no_refresh.checks).name(), "Finish");
+
+    let s = s.without_rung(Rung::RefreshEvidence);
+    let source = answering_all(&s.plan(), Some(0.02));
+    let outcome = s.plan().resolve(&source).await;
+    assert!(source.reframe_calls().is_empty());
+    assert!(!outcome.checks[&k(READY)].permitted);
+    assert_ne!(s.select(&outcome.checks).name(), "Finish");
+
+    // With R0: tests and audit pass, and the fresh answer is decisive.
+    let s = Scenario::finish_ready()
+        .set(READY, 0.79)
+        .selecting(READY, &["tests", "audit"]);
+    let source = RecordedOpinionSource::new().with_refresh(
+        CYCLE,
+        READY,
+        RefreshOutcome {
+            runs: vec![
+                ProviderRun {
+                    provider: EvidenceId::new("tests"),
+                    exit_code: Some(0),
+                },
+                ProviderRun {
+                    provider: EvidenceId::new("audit"),
+                    exit_code: Some(0),
+                },
+            ],
+            new_p: Some(0.96),
+            error: None,
+        },
+    );
+    let outcome = s.plan().resolve(&source).await;
+    let rc = &outcome.checks[&k(READY)];
+    assert!(rc.permitted && rc.decisive);
+    assert_eq!(s.select(&outcome.checks).name(), "Finish");
+    assert_eq!(
+        record(&outcome, READY)
+            .and_then(|r| r.refresh.as_ref())
+            .map(|r| r.outcome.runs.len()),
+        Some(2),
+        "every provider that ran is recorded"
+    );
+}
+
+#[tokio::test]
+async fn worked_example_9_5_a_less_than_rule_is_not_collateral_damage() {
+    let s = Scenario::finish_ready().set(DOCS, 0.31).reframable_all();
+    let plan = s.check_plan(DOCS);
+    assert_eq!(plan.as_ref().map(|p| p.rule_would_fire), Some(true));
+    // R2 agrees it is below.
+    let source = answering_all(&s.plan(), Some(0.70));
+    let outcome = s.plan().resolve(&source).await;
+    let rc = &outcome.checks[&k(DOCS)];
+    assert!(
+        rc.permitted,
+        "the direction is none of `permitted`'s business"
+    );
+    assert!(rc.less_than(0.75));
+    let proposals = s.proposals(&outcome.checks);
+    assert!(
+        proposals
+            .iter()
+            .any(|p| p.rule.as_str() == "quality.documentation:insufficient"),
+        "the `<` rule fires"
+    );
+    assert_eq!(s.select(&outcome.checks).name(), "StartWorker");
+}
+
+// ---- cost ------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_triggered_check_in_band_or_inert_requests_zero_opinions() {
+    // In band, for every check and every value in the band, with every rung on and R2
+    // available everywhere.
+    for key in [
+        IMPL, REQS, READY, TESTS, NEEDS_VER, STUCK, OFF_TRACK, HUMAN, DRIFT, DOCS,
+    ] {
+        for worker in [false, true] {
+            for offset in [-0.14_f32, -0.05, 0.0, 0.05, 0.14] {
+                let mut s = Scenario::finish_ready().reframable_all();
+                if worker {
+                    s = s.with_worker();
+                }
+                let t = s.thresholds()[&k(key)].unwrap_or(0.75);
+                let s = s.set(key, (t + offset).clamp(0.0, 1.0));
+                let plan = s.plan();
+                let source = answering_all(&plan, Some(0.5));
+                let outcome = plan.resolve(&source).await;
+                let asked: Vec<CheckKey> = source
+                    .reframe_calls()
+                    .into_iter()
+                    .map(|r| r.opinion.check)
+                    .collect();
+                assert!(
+                    !asked.contains(&k(key)),
+                    "{key} in band at {offset} was asked about"
+                );
+                for record in &outcome.records {
+                    if !record.baseline.decisive {
+                        assert!(record.opinions.is_empty(), "{}", record.check);
+                    }
+                }
+            }
+        }
+    }
+
+    // Decisive, triggered, but no rule acts on it: still nothing bought.
+    let s = Scenario::finish_ready().reframable_all();
+    let plan = s.plan();
+    let source = answering_all(&plan, Some(0.5));
+    let outcome = plan.resolve(&source).await;
+    for record in &outcome.records {
+        let would_fire = plan
+            .triggered
+            .iter()
+            .find(|p| p.check == record.check)
+            .is_some_and(|p| p.rule_would_fire);
+        if !would_fire {
+            assert!(record.opinions.is_empty(), "{} is inert", record.check);
+        }
+    }
+    let asked: BTreeSet<CheckKey> = source
+        .reframe_calls()
+        .into_iter()
+        .map(|r| r.opinion.check)
+        .collect();
+    assert!(!asked.contains(&k(STUCK)) && !asked.contains(&k(DRIFT)));
+}
+
+// ---- bounds ----------------------------------------------------------------
+
+#[tokio::test]
+async fn repeated_refresh_is_capped_and_visible() {
+    let mut s = Scenario::finish_ready()
+        .set(TESTS, 0.71)
+        .selecting(TESTS, &["tests"]);
+    let mut source = RecordedOpinionSource::new();
+    for cycle in 20..30 {
+        source = source.with_refresh(
+            AssessmentSeq(cycle),
+            TESTS,
+            refreshed(Some(0.70), "tests", 0),
+        );
+    }
+    let mut refreshes = 0;
+    for cycle in 20..26 {
+        s.cycle = AssessmentSeq(cycle);
+        let outcome = s.plan().resolve(&source).await;
+        s.ensemble = outcome.counters.clone();
+        let record = record(&outcome, TESTS);
+        let refreshed_now = record.is_some_and(|r| r.refresh.is_some());
+        if refreshed_now {
+            refreshes += 1;
+        }
+        let capped = record.is_some_and(|r| {
+            r.limits
+                .contains(&EnsembleLimit::RefreshCap { used: 3, cap: 3 })
+        });
+        assert_eq!(refreshed_now, cycle < 23, "cycle {cycle}");
+        assert_eq!(capped, cycle >= 23, "cycle {cycle}: the cap is visible");
+        assert!(!outcome.checks[&k(TESTS)].permitted);
+    }
+    assert_eq!(refreshes, 3);
+    assert_eq!(source.refresh_calls().len(), 3);
+    assert_eq!(s.ensemble.check(&k(TESTS)).refreshes, 3);
+}
+
+#[tokio::test]
+async fn the_opinion_budget_holds_rather_than_acting_unchecked() {
+    let mut s = Scenario::finish_ready()
+        .set(TESTS, 0.92)
+        .reframable(&[TESTS]);
+    s.ensemble.opinions_used = s.settings.max_opinions_per_run;
+    let source = RecordedOpinionSource::new();
+    let outcome = s.plan().resolve(&source).await;
+    let rc = &outcome.checks[&k(TESTS)];
+    assert!(!rc.permitted);
+    assert_eq!(rc.suppression, Some(CheckSuppression::Unresolved));
+    assert!(record(&outcome, TESTS).is_some_and(|r| {
+        r.limits
+            .contains(&EnsembleLimit::OpinionBudget { used: 20, cap: 20 })
+    }));
+    assert!(source.reframe_calls().is_empty());
+    assert_ne!(s.select(&outcome.checks).name(), "Finish");
+}
+
+#[tokio::test]
+async fn the_cooldown_holds_after_a_contest_and_does_not_re_ask_after_a_confirm() {
+    for contested in [true, false] {
+        let mut s = Scenario::finish_ready()
+            .set(TESTS, 0.92)
+            .reframable(&[TESTS]);
+        s.ensemble.checks.insert(
+            k(TESTS),
+            CheckCounters {
+                last_opinion: Some(OpinionMark {
+                    cycle: AssessmentSeq(CYCLE.get() - 3),
+                    contested,
+                }),
+                ..CheckCounters::default()
+            },
+        );
+        let source = RecordedOpinionSource::new();
+        let outcome = s.plan().resolve(&source).await;
+        assert!(source.reframe_calls().is_empty(), "one opinion per window");
+        assert!(record(&outcome, TESTS).is_some_and(|r| r.limits.contains(
+            &EnsembleLimit::Cooldown {
+                last_opinion: AssessmentSeq(CYCLE.get() - 3),
+                cooldown_cycles: 10,
+                held: contested,
+            }
+        )));
+        assert_eq!(outcome.checks[&k(TESTS)].permitted, !contested);
+    }
+    // Once the window has passed, it is asked again.
+    let mut s = Scenario::finish_ready()
+        .set(TESTS, 0.92)
+        .reframable(&[TESTS]);
+    s.ensemble.checks.insert(
+        k(TESTS),
+        CheckCounters {
+            last_opinion: Some(OpinionMark {
+                cycle: AssessmentSeq(CYCLE.get() - 10),
+                contested: true,
+            }),
+            ..CheckCounters::default()
+        },
+    );
+    let source =
+        RecordedOpinionSource::new().with_reframe(reframe_key(CYCLE, TESTS), answer(Some(0.08)));
+    let outcome = s.plan().resolve(&source).await;
+    assert_eq!(source.reframe_calls().len(), 1);
+    assert!(outcome.checks[&k(TESTS)].permitted, "consistent: confirmed");
+}
+
+#[tokio::test]
+async fn a_repeated_contest_escalates_instead_of_asking_again() {
+    let s = Scenario::finish_ready()
+        .set(TESTS, 0.92)
+        .reframable(&[TESTS])
+        .held_for(TESTS, 2);
+    let source = RecordedOpinionSource::new();
+    let outcome = s.plan().resolve(&source).await;
+    assert!(source.reframe_calls().is_empty());
+    let rc = &outcome.checks[&k(TESTS)];
+    assert!(!rc.permitted);
+    assert_eq!(outcome.escalations().count(), 1);
+    assert_ne!(s.select(&outcome.checks).name(), "Finish");
+
+    // Without a human rung there is nobody to escalate to: the opinion is asked.
+    let s = s.without_rung(Rung::Human);
+    let source =
+        RecordedOpinionSource::new().with_reframe(reframe_key(CYCLE, TESTS), answer(Some(0.08)));
+    let outcome = s.plan().resolve(&source).await;
+    assert_eq!(source.reframe_calls().len(), 1);
+    assert_eq!(outcome.escalations().count(), 0);
+}
+
+#[tokio::test]
+async fn an_unusable_opinion_on_an_irreversible_action_holds_it() {
+    let s = Scenario::finish_ready()
+        .set(TESTS, 0.92)
+        .reframable(&[TESTS]);
+    let outcome = s.plan().resolve(&RecordedOpinionSource::new()).await;
+    let rc = &outcome.checks[&k(TESTS)];
+    assert!(rc.contested && !rc.permitted);
+    assert_ne!(s.select(&outcome.checks).name(), "Finish");
+}
+
+#[tokio::test]
+async fn opinion_text_is_bounded() {
+    let s = Scenario::finish_ready()
+        .set(TESTS, 0.92)
+        .reframable(&[TESTS]);
+    let mut long = answer(Some(0.08));
+    long.excerpt = "é".repeat(5000);
+    long.model = "m".repeat(5000);
+    long.error = Some("x".repeat(9000));
+    let source = RecordedOpinionSource::new().with_reframe(reframe_key(CYCLE, TESTS), long);
+    let outcome = s.plan().resolve(&source).await;
+    let opinion = &record(&outcome, TESTS).map(|r| r.opinions[0].opinion.clone());
+    let opinion = opinion.as_ref();
+    assert!(opinion.is_some_and(|o| o.excerpt.len() <= 2048 && o.excerpt.len() > 2000));
+    assert!(opinion.is_some_and(|o| o.model.len() <= 256));
+    assert!(opinion.is_some_and(|o| o.error.as_ref().is_some_and(|e| e.len() <= 2048)));
+}
+
+// ---- the exhaustive table --------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Kind {
+    Decisive,
+    Refreshed,
+    InBand,
+    Unresolved,
+    Escalated,
+    Contested,
+}
+
+fn kind_of(rc: &ResolvedCheck) -> Kind {
+    match (&rc.resolution, rc.suppression) {
+        (Resolution::EvidenceRefreshed { .. }, _) => Kind::Refreshed,
+        (Resolution::SuppressedByContest { .. }, _) => Kind::Contested,
+        (Resolution::UnresolvedInBand { rungs, .. }, _) if rungs.contains(&Rung::Human) => {
+            Kind::Escalated
+        }
+        (Resolution::UnresolvedInBand { .. }, Some(CheckSuppression::Unresolved)) => {
+            Kind::Unresolved
+        }
+        (Resolution::UnresolvedInBand { .. }, _) => Kind::InBand,
+        (Resolution::Decisive, _) => Kind::Decisive,
+        (Resolution::HumanDecided { .. }, _) => Kind::Unresolved,
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum CounterState {
+    Fresh,
+    RefreshCapped,
+    CooldownAfterContest,
+    CooldownAfterConfirm,
+    BudgetSpent,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RefreshAnswer {
+    Decisive,
+    InBand,
+    Failed,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReframeKind {
+    Consistent,
+    Inconsistent,
+    Unusable,
+}
+
+struct Case {
+    p: f32,
+    triggers: BTreeSet<EnsembleTrigger>,
+    rule_would_fire: bool,
+    providers: bool,
+    rungs: Vec<Rung>,
+    reframe_available: bool,
+    counters: CounterState,
+    refresh: RefreshAnswer,
+    reframe: ReframeKind,
+}
+
+struct Expected {
+    kind: Kind,
+    permitted: bool,
+    refreshed: bool,
+    reframed: bool,
+}
+
+const T: f32 = 0.75;
+const M: f32 = 0.15;
+
+/// The ladder of §6, written out as a decision table, independently of the resolver.
+fn oracle(c: &Case) -> Expected {
+    let has = |t: EnsembleTrigger| c.triggers.contains(&t);
+    let rung = |r: Rung| c.rungs.contains(&r);
+    let refresh_possible = rung(Rung::RefreshEvidence)
+        && c.providers
+        && !matches!(c.counters, CounterState::RefreshCapped);
+    let refreshed_value = match c.refresh {
+        RefreshAnswer::Decisive => Some(0.05_f32),
+        RefreshAnswer::InBand => Some(0.70),
+        RefreshAnswer::Failed => None,
+    };
+    let after_refresh = |e: Expected| -> Expected {
+        match refreshed_value {
+            Some(p) => Expected {
+                kind: Kind::Refreshed,
+                permitted: (p - T).abs() >= M,
+                refreshed: true,
+                reframed: false,
+            },
+            None => Expected {
+                refreshed: true,
+                ..e
+            },
+        }
+    };
+    let done = |kind, permitted| Expected {
+        kind,
+        permitted,
+        refreshed: false,
+        reframed: false,
+    };
+    let decisive = (c.p - T).abs() >= M;
+
+    if !decisive {
+        let fallback = if has(EnsembleTrigger::RepeatContest)
+            && has(EnsembleTrigger::HighStakes)
+            && rung(Rung::Human)
+        {
+            done(Kind::Escalated, false)
+        } else {
+            done(Kind::InBand, false)
+        };
+        return if refresh_possible {
+            after_refresh(fallback)
+        } else {
+            fallback
+        };
+    }
+    if !c.rule_would_fire {
+        return done(Kind::Decisive, true);
+    }
+    let mut refreshed = false;
+    if has(EnsembleTrigger::ClaimOnlyEvidence) && refresh_possible {
+        if refreshed_value.is_some() {
+            return after_refresh(done(Kind::Decisive, true));
+        }
+        refreshed = true;
+    }
+    let with = |e: Expected| Expected { refreshed, ..e };
+    let wants = has(EnsembleTrigger::OutcomeRelevant)
+        || has(EnsembleTrigger::HighStakes)
+        || has(EnsembleTrigger::Irreversible);
+    if !wants {
+        return with(done(Kind::Decisive, true));
+    }
+    if has(EnsembleTrigger::RepeatContest) && rung(Rung::Human) {
+        return with(done(Kind::Escalated, false));
+    }
+    if !(rung(Rung::ReframeSameModel) && c.reframe_available) {
+        return with(done(Kind::Decisive, true));
+    }
+    match c.counters {
+        CounterState::CooldownAfterContest => return with(done(Kind::Unresolved, false)),
+        CounterState::CooldownAfterConfirm => return with(done(Kind::Decisive, true)),
+        CounterState::BudgetSpent => return with(done(Kind::Unresolved, false)),
+        CounterState::Fresh | CounterState::RefreshCapped => {}
+    }
+    let contest = match c.reframe {
+        ReframeKind::Consistent => false,
+        ReframeKind::Inconsistent => true,
+        ReframeKind::Unusable => has(EnsembleTrigger::Irreversible),
+    };
+    Expected {
+        kind: if contest {
+            Kind::Contested
+        } else {
+            Kind::Decisive
+        },
+        permitted: !contest,
+        refreshed,
+        reframed: true,
+    }
+}
+
+fn trigger_sets() -> Vec<BTreeSet<EnsembleTrigger>> {
+    use EnsembleTrigger as E;
+    let all = [
+        E::NearThreshold,
+        E::LowConfidence,
+        E::ClaimOnlyEvidence,
+        E::OutcomeRelevant,
+        E::HighStakes,
+        E::Irreversible,
+        E::RepeatContest,
+    ];
+    let mut sets: Vec<BTreeSet<E>> = all.iter().map(|t| BTreeSet::from([*t])).collect();
+    sets.extend([
+        BTreeSet::from([E::RepeatContest, E::HighStakes]),
+        BTreeSet::from([E::ClaimOnlyEvidence, E::Irreversible]),
+        BTreeSet::from([E::ClaimOnlyEvidence, E::OutcomeRelevant, E::RepeatContest]),
+        BTreeSet::from([E::NearThreshold, E::OutcomeRelevant, E::HighStakes]),
+        BTreeSet::from(all),
+    ]);
+    sets
+}
+
+fn rung_sets() -> Vec<Vec<Rung>> {
+    let rungs = EnsembleSettings::available_rungs();
+    (0..(1_u32 << rungs.len()))
+        .map(|mask| {
+            rungs
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, r)| *r)
+                .collect()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn resolve_matches_the_decision_table_exhaustively() {
+    let mut cases = 0_u32;
+    for p in [0.71_f32, 0.92, 0.30] {
+        for triggers in trigger_sets() {
+            for rule_would_fire in [false, true] {
+                for providers in [false, true] {
+                    for rungs in rung_sets() {
+                        for reframe_available in [false, true] {
+                            for counters in [
+                                CounterState::Fresh,
+                                CounterState::RefreshCapped,
+                                CounterState::CooldownAfterContest,
+                                CounterState::CooldownAfterConfirm,
+                                CounterState::BudgetSpent,
+                            ] {
+                                for refresh in [
+                                    RefreshAnswer::Decisive,
+                                    RefreshAnswer::InBand,
+                                    RefreshAnswer::Failed,
+                                ] {
+                                    for reframe in [
+                                        ReframeKind::Consistent,
+                                        ReframeKind::Inconsistent,
+                                        ReframeKind::Unusable,
+                                    ] {
+                                        let case = Case {
+                                            p,
+                                            triggers: triggers.clone(),
+                                            rule_would_fire,
+                                            providers,
+                                            rungs: rungs.clone(),
+                                            reframe_available,
+                                            counters,
+                                            refresh,
+                                            reframe,
+                                        };
+                                        run_case(&case).await;
+                                        cases += 1;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(cases > 100_000, "{cases} cases");
+}
+
+async fn run_case(c: &Case) {
+    let key = k(TESTS);
+    let baseline = ResolvedCheck::from_measurement(key.clone(), Some(c.p), Some(T), M, true);
+    let mut check = CheckCounters::default();
+    let mut counters = EnsembleCounters::default();
+    match c.counters {
+        CounterState::Fresh => {}
+        CounterState::RefreshCapped => check.refreshes = 3,
+        CounterState::CooldownAfterContest | CounterState::CooldownAfterConfirm => {
+            check.last_opinion = Some(OpinionMark {
+                cycle: AssessmentSeq(CYCLE.get() - 1),
+                contested: matches!(c.counters, CounterState::CooldownAfterContest),
+            });
+        }
+        CounterState::BudgetSpent => counters.opinions_used = 20,
+    }
+    counters.checks.insert(key.clone(), check);
+    let plan = EnsemblePlan {
+        cycle: CYCLE,
+        settings: EnsembleSettings {
+            enabled: true,
+            rungs: c.rungs.clone(),
+            ..EnsembleSettings::default()
+        },
+        counters,
+        baseline: BTreeMap::from([(key.clone(), baseline.clone())]),
+        triggered: vec![CheckPlan {
+            check: key.clone(),
+            baseline: baseline.clone(),
+            triggers: c.triggers.clone(),
+            rule_would_fire: c.rule_would_fire && baseline.permitted,
+            refresh_providers: if c.providers {
+                vec![EvidenceId::new("tests")]
+            } else {
+                Vec::new()
+            },
+            reframe_available: c.reframe_available,
+            decisive_directives: DecisiveDirectives {
+                if_above: "Finish".into(),
+                if_below: "StartWorker".into(),
+            },
+        }],
+    };
+    let new_p = match c.refresh {
+        RefreshAnswer::Decisive => Some(0.05),
+        RefreshAnswer::InBand => Some(0.70),
+        RefreshAnswer::Failed => None,
+    };
+    let p_negated = match c.reframe {
+        // 1 - p(not X) equals p exactly: consistent.
+        ReframeKind::Consistent => Some(1.0 - c.p),
+        ReframeKind::Inconsistent => Some(c.p),
+        ReframeKind::Unusable => None,
+    };
+    let source = RecordedOpinionSource::new()
+        .with_refresh(CYCLE, TESTS, refreshed(new_p, "tests", 0))
+        .with_reframe(reframe_key(CYCLE, TESTS), answer(p_negated));
+    let outcome = plan.resolve(&source).await;
+    let rc = &outcome.checks[&key];
+    let expected = oracle(c);
+    let label = format!(
+        "p={} triggers={:?} fire={} providers={} rungs={:?} reframe={} counters={:?} refresh={:?} reframe={:?}",
+        c.p,
+        c.triggers,
+        c.rule_would_fire,
+        c.providers,
+        c.rungs,
+        c.reframe_available,
+        c.counters,
+        c.refresh,
+        c.reframe
+    );
+    assert_eq!(kind_of(rc), expected.kind, "{label}");
+    assert_eq!(rc.permitted, expected.permitted, "{label}");
+    assert_eq!(
+        source.refresh_calls().len(),
+        usize::from(expected.refreshed),
+        "{label}"
+    );
+    assert_eq!(
+        source.reframe_calls().len(),
+        usize::from(expected.reframed),
+        "{label}"
+    );
+
+    // Invariants that hold in every row.
+    if !matches!(rc.resolution, Resolution::EvidenceRefreshed { .. }) {
+        assert_eq!(rc.jev_p, Some(c.p), "no fabrication: {label}");
+        assert!(
+            !rc.permitted || baseline.permitted,
+            "only a refresh may raise permission: {label}"
+        );
+    }
+    if !baseline.decisive || !c.rule_would_fire {
+        assert!(source.reframe_calls().is_empty(), "cost: {label}");
+    }
+}
+
+// ---- properties ------------------------------------------------------------
+
+const GRID: [f32; 11] = [
+    0.05, 0.30, 0.55, 0.62, 0.70, 0.74, 0.75, 0.80, 0.88, 0.92, 0.99,
+];
+const NEGATED: [Option<f32>; 8] = [
+    None,
+    Some(0.0),
+    Some(0.08),
+    Some(0.25),
+    Some(0.5),
+    Some(0.75),
+    Some(0.92),
+    Some(1.0),
+];
+
+#[tokio::test]
+async fn monotonic_conservatism_removing_r2_never_shrinks_the_permitted_set() {
+    for worker in [false, true] {
+        for &ready in &GRID {
+            for &tests in &GRID {
+                for &q in &NEGATED {
+                    let mut s = Scenario::finish_ready()
+                        .set(READY, ready)
+                        .set(TESTS, tests)
+                        .set(STUCK, tests)
+                        .reframable_all();
+                    if worker {
+                        s = s.with_worker();
+                    }
+                    let plan = s.plan();
+                    let with = plan.resolve(&answering_all(&plan, q)).await;
+                    let s = s.without_rung(Rung::ReframeSameModel);
+                    let without = s.plan().resolve(&RecordedOpinionSource::new()).await;
+                    assert!(
+                        permitted_set(&with.checks).is_subset(&permitted_set(&without.checks)),
+                        "ready={ready} tests={tests} q={q:?} worker={worker}"
+                    );
+                    // And at the verdict level: every verdict replaced by Abstain.
+                    for record in &with.records {
+                        let abstained: Vec<Opinion> = record
+                            .opinions
+                            .iter()
+                            .map(|keyed| Opinion {
+                                verdict: Verdict::Abstain,
+                                ..keyed.opinion.clone()
+                            })
+                            .collect();
+                        let relaxed = apply_opinions(record.baseline.clone(), &abstained);
+                        assert!(relaxed.permitted || !record.resolved.permitted);
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn no_fabrication_jev_p_is_unchanged_unless_refreshed() {
+    for &tests in &GRID {
+        for &q in &NEGATED {
+            for refresh in [None, Some(0.05_f32), Some(0.8)] {
+                let s = Scenario::finish_ready()
+                    .set(TESTS, tests)
+                    .set(READY, tests)
+                    .selecting(TESTS, &["tests"])
+                    .reframable_all();
+                let plan = s.plan();
+                let mut source = answering_all(&plan, q);
+                if let Some(p) = refresh {
+                    source = source.with_refresh(CYCLE, TESTS, refreshed(Some(p), "tests", 0));
+                }
+                let outcome = plan.resolve(&source).await;
+                let baseline = s.baseline();
+                for (key, rc) in &outcome.checks {
+                    match &rc.resolution {
+                        Resolution::EvidenceRefreshed { new_p, old_p, .. } => {
+                            assert_eq!(rc.jev_p, Some(*new_p));
+                            assert_eq!(*old_p, baseline[key].jev_p);
+                        }
+                        _ => {
+                            assert_eq!(rc.jev_p, baseline[key].jev_p, "{key} tests={tests} q={q:?}")
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn no_input_produces_an_opinion_driven_finish() {
+    let grid = [0.30_f32, 0.62, 0.70, 0.80, 0.95];
+    for &ready in &grid {
+        for &reqs in &grid {
+            for &tests in &grid {
+                for &needs in &[0.10_f32, 0.55, 0.62, 0.80] {
+                    for &docs in &[0.30_f32, 0.95] {
+                        for &q in &[None, Some(0.05_f32), Some(0.5), Some(0.95)] {
+                            for verifier_completed in [false, true] {
+                                let mut s = Scenario::finish_ready()
+                                    .set(READY, ready)
+                                    .set(REQS, reqs)
+                                    .set(TESTS, tests)
+                                    .set(NEEDS_VER, needs)
+                                    .set(DOCS, docs)
+                                    // No evidence refresh: an opinion-only resolution.
+                                    .without_rung(Rung::RefreshEvidence)
+                                    .reframable_all();
+                                s.counters.verifier_completed = verifier_completed;
+                                let plan = s.plan();
+                                let outcome = plan.resolve(&answering_all(&plan, q)).await;
+                                let baseline_finishes = s.select(&s.baseline()).name() == "Finish";
+                                // Whatever verdict any opinion could return, folded into
+                                // every check at once, cannot construct a Finish either.
+                                for verdict in [
+                                    Verdict::Confirm { side: Side::Above },
+                                    Verdict::Confirm { side: Side::Below },
+                                    Verdict::Abstain,
+                                    Verdict::Contest { side: Side::Above },
+                                ] {
+                                    let folded: BTreeMap<CheckKey, ResolvedCheck> = outcome
+                                        .checks
+                                        .iter()
+                                        .map(|(key, rc)| {
+                                            (
+                                                key.clone(),
+                                                apply_opinions(rc.clone(), &[opinion(verdict)]),
+                                            )
+                                        })
+                                        .collect();
+                                    assert!(
+                                        s.select(&folded).name() != "Finish" || baseline_finishes,
+                                        "{verdict:?} produced a Finish"
+                                    );
+                                }
+                                if s.select(&outcome.checks).name() == "Finish" {
+                                    assert_eq!(
+                                        s.select(&s.baseline()).name(),
+                                        "Finish",
+                                        "an opinion produced a Finish: ready={ready} \
+                                         reqs={reqs} tests={tests} needs={needs} docs={docs} \
+                                         q={q:?}"
+                                    );
+                                    for key in [READY, REQS, TESTS] {
+                                        assert_eq!(
+                                            outcome.checks[&k(key)].resolution,
+                                            Resolution::Decisive
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn side_guard_a_confirm_below_never_permits_the_rule() {
+    // §9.3 as a property: a below-threshold worker_stuck, whatever the opinions say.
+    for &p in &[0.0_f32, 0.30, 0.64, 0.66, 0.70, 0.78, 0.79] {
+        for &q in &NEGATED {
+            let s = Scenario::finish_ready()
+                .with_worker()
+                .set(STUCK, p)
+                .reframable_all();
+            let plan = s.plan();
+            let outcome = plan.resolve(&answering_all(&plan, q)).await;
+            let rc = &outcome.checks[&k(STUCK)];
+            for verdict in [
+                Verdict::Confirm { side: Side::Below },
+                Verdict::Confirm { side: Side::Above },
+                Verdict::Abstain,
+                Verdict::Contest { side: Side::Below },
+            ] {
+                let after = apply_opinions(rc.clone(), &[opinion(verdict)]);
+                assert!(!after.at_least(0.80), "p={p} {verdict:?}");
+                assert!(
+                    !after.permitted || rc.permitted,
+                    "p={p} {verdict:?} raised permission"
+                );
+            }
+            assert!(
+                !s.proposals(&outcome.checks)
+                    .iter()
+                    .any(|p| p.rule.as_str() == "core.worker-health:stuck"),
+                "p={p} q={q:?}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn direction_guard_less_than_rules_fire_and_every_finish_comparison_is_gated() {
+    // A `<` rule fires on a decisively-below value.
+    for &docs in &[0.0_f32, 0.30, 0.59] {
+        let s = Scenario::finish_ready().set(DOCS, docs);
+        let outcome = s.plan().resolve(&RecordedOpinionSource::new()).await;
+        assert!(outcome.checks[&k(DOCS)].permitted, "docs={docs}");
+        assert!(
+            s.proposals(&outcome.checks)
+                .iter()
+                .any(|p| p.rule.as_str() == "quality.documentation:insufficient"),
+            "docs={docs}"
+        );
+    }
+
+    // Every comparison in the Finish precondition — the three `>=` conjuncts and the
+    // `needs_verification < 0.65` disjunct — is false for an in-band or contested check.
+    let finish_rule = "core.completion:thresholds-satisfied";
+    let in_band = [
+        (READY, 0.79_f32),
+        (REQS, 0.71),
+        (TESTS, 0.80),
+        (NEEDS_VER, 0.55),
+    ];
+    for (key, value) in in_band {
+        let s = Scenario::finish_ready().set(key, value);
+        let outcome = s.plan().resolve(&RecordedOpinionSource::new()).await;
+        assert!(!outcome.checks[&k(key)].permitted, "{key} in band");
+        assert!(
+            !s.proposals(&outcome.checks)
+                .iter()
+                .any(|p| p.rule.as_str() == finish_rule),
+            "{key} in band still proposed Finish"
+        );
+    }
+    for key in [READY, REQS, TESTS, NEEDS_VER] {
+        let s = Scenario::finish_ready().reframable(&[key]);
+        let mut checks = s.baseline();
+        assert!(
+            s.proposals(&checks)
+                .iter()
+                .any(|p| p.rule.as_str() == finish_rule)
+        );
+        let contested = apply_opinions(
+            checks[&k(key)].clone(),
+            &[opinion(Verdict::Contest { side: Side::Below })],
+        );
+        checks.insert(k(key), contested);
+        assert!(
+            !s.proposals(&checks)
+                .iter()
+                .any(|p| p.rule.as_str() == finish_rule),
+            "{key} contested still proposed Finish"
+        );
+    }
+}
+
+fn opinion(verdict: Verdict) -> Opinion {
+    Opinion {
+        rung: Rung::ReframeSameModel,
+        source: "test".into(),
+        model: "test".into(),
+        verdict,
+        p_reported: Some(0.5),
+        excerpt: String::new(),
+        prompt_hash: String::new(),
+        state_digest: String::new(),
+        usage: Usage::default(),
+        latency: Duration::ZERO,
+        error: None,
+    }
 }

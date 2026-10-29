@@ -175,7 +175,11 @@ Not an opinion. This is the rung that actually resolves things, and the only one
 5. The refreshed value is `Decisive` for band purposes if it is outside the margin; thresholds are
    then evaluated normally.
 
-Outcome: `EvidenceRefreshed { old_p, new_p, provider, exit_code }`.
+Outcome: `EvidenceRefreshed { old_p, new_p, provider, exit_code }` (plus `supersedes`). When
+several providers run, `provider` and `exit_code` are the first that ran; the check's entry in
+`EnsembleResolved` records every run. A refresh whose command could not run, or whose fresh answer
+is missing or not a probability, produces no measurement: it still counts against the cap, and the
+ladder continues as if it had not been available.
 
 Cost: one command execution plus one Jev call. Bounded to
 `max_evidence_refreshes_per_check` (default 3) per run — a check that keeps needing a refresh is
@@ -236,6 +240,13 @@ consistent  ⇔  |p(X) − (1 − p(¬X))| ≤ framing_tolerance      (default 0
 Note what this is not: it is not an average. `(p(X) + (1 − p(¬X))) / 2` is never computed. Two
 calibrated numbers agreeing is evidence about *reliability*; combining them would need a joint
 error model that aftman does not have.
+
+For R2 the stored `p_reported` is `p(¬X)`. It enters this one comparison, which yields a verdict, and
+nothing else: `1 − p(¬X)` is never stored, never shown to policy, and never used as a probability.
+
+An R2 answer that is missing, not a number, or outside `0..=1` is unusable: **ABSTAIN**, or
+**CONTEST** for an `Irreversible` trigger, exactly as for R1. An inconsistent answer contests with
+the side `1 − p(¬X)` points to; a consistent one confirms Jev's side.
 
 Cost: one additional Jev call, same provider, same budget.
 
@@ -452,94 +463,113 @@ they are evaluated with `permitted(check) && comparator(...)`, never against a f
 
 ## 6. The algorithm
 
-Pure and deterministic. `opinions` is injected, so replay reproduces the resolution exactly.
+Pure and deterministic. The I/O — running a command and re-asking Jev for R0, asking the negated
+question for R2 — is behind an injected `OpinionSource`, so replay reproduces the resolution exactly
+(§8). It runs in two steps:
+
+1. **Plan** (`EnsemblePlan::build`, pure, no I/O): compute every check's triggers (§3), whether a
+   rule would fire on it, which providers a refresh would run, and whether R2 can be asked.
+2. **Resolve** (`EnsemblePlan::resolve(&dyn OpinionSource)`): walk the ladder for each triggered
+   check, in key order, threading the per-run counters.
 
 ```rust
-fn resolve(input: &ResolveInput, sources: &OpinionSources) -> ResolvedCheck {
-    let t = input.threshold;
-    let p = input.jev_p;
+// For one triggered check. `rc` is the baseline: `ResolvedCheck::from_measurement`,
+// `permitted = decisive`, computed from the measurement alone (§5.2).
+async fn resolve_check(plan: &CheckPlan, sources: &dyn OpinionSource) -> ResolvedCheck {
+    let rc = plan.baseline.clone();
 
-    // Baseline: Jev's own value. `permitted = decisive`, computed from the
-    // measurement alone -- never from the comparison direction (§5.2).
-    let mut rc = ResolvedCheck::from_jev(p, t, input.margin, input.ensemble_enabled);
-
-    if !input.triggered(&rc) {
-        return rc;                                   // nothing to do
-    }
-    if input.budget_exhausted() || input.cooldown_active(&rc.check) {
-        return rc.suppress(CheckSuppression::Unresolved, Resolution::UnresolvedInBand { .. });
-    }
-
-    // In-band: an opinion provably cannot change `permitted` (§5.2), so none is
+    // In band: an opinion provably cannot change `permitted` (§5.2), so none is
     // requested here. Evidence or escalation are the only options. (§3)
     if !rc.decisive {
-        if input.refreshes_left(&rc.check) > 0 && sources.can_refresh(&rc.check) {
-            if let Some(fresh) = sources.refresh_evidence(&rc.check) {
-                let new_p = reassess_with(fresh);     // a real Jev call
-                return ResolvedCheck::from_refresh(new_p, t, input.margin, fresh.provider);
-            }
+        if let Some(fresh) = refresh(plan, sources).await {   // R0, if enabled, capped
+            return fresh;                                     // ResolvedCheck::from_refresh
         }
-        if input.stakes(&rc) == Stakes::High
-            && input.elapsed_in_band(&rc.check) >= input.cfg.consecutive_contests_before_human
-            && input.rungs.contains(Rung::Human)
-        {
-            return sources.escalate(&rc);             // R3
+        if plan.has(RepeatContest) && plan.has(HighStakes) && rungs.contains(Rung::Human) {
+            return rc.suppress(Unresolved, UnresolvedInBand { ask, rungs: vec![Rung::Human] });
         }
-        return rc.suppress(
-            CheckSuppression::InBand,
-            Resolution::UnresolvedInBand { ask: input.default_ask(&rc.check), rungs: vec![] },
-        );
+        return rc.suppress(InBand, UnresolvedInBand { ask, rungs: vec![] });
     }
 
-    // Decisive, and a rule may act on it: guard against a confidently wrong
-    // model. Measuring beats second-guessing, so R0 goes first when the
-    // evidence is a bare worker claim.
-    if input.claim_only_evidence(&rc)
-        && input.refreshes_left(&rc.check) > 0
-        && sources.can_refresh(&rc.check)
-    {
-        if let Some(fresh) = sources.refresh_evidence(&rc.check) {
-            let new_p = reassess_with(fresh);
-            return ResolvedCheck::from_refresh(new_p, t, input.margin, fresh.provider);
+    // Decisive. Nothing to guard unless a rule is acting on it: every later step
+    // costs a command or a model call, and none can change an inert check's effect.
+    if !plan.rule_would_fire {
+        return rc;                                            // permitted, but inert
+    }
+
+    // Measuring beats second-guessing: a decisive value about to act on a bare
+    // worker claim is re-measured first.
+    if plan.has(ClaimOnlyEvidence) {
+        if let Some(fresh) = refresh(plan, sources).await {
+            return fresh;
         }
     }
 
-    if !input.rule_would_fire(&rc) {
-        return rc;                                    // permitted, but inert
+    if !plan.wants_opinion() {                                // OutcomeRelevant | HighStakes | Irreversible
+        return rc;
+    }
+    if plan.has(RepeatContest) && rungs.contains(Rung::Human) {
+        return rc.suppress(Unresolved, UnresolvedInBand { ask, rungs: vec![Rung::Human] });
+    }
+    let opinion_rungs = [ReframeSameModel /*, IndependentJudge from S3 */]
+        .filter(enabled && available for this check);
+    if opinion_rungs.is_empty() {
+        return rc;
+    }
+    if let Some(last) = cooldown_active(&plan.check) {
+        // One opinion per check per window. After a contest the check stays held;
+        // after a confirm or abstain nothing is re-asked and the value stands.
+        return if last.contested { rc.suppress(Unresolved, ..) } else { rc };
+    }
+    if opinions_used + opinion_rungs.len() > max_opinions_per_run {
+        return rc.suppress(Unresolved, ..);                   // cannot check it: hold it
     }
 
     // R1 and R2 both run when both are enabled. NEITHER short-circuits the
     // other: they fail in different ways, and either may contest. (§4)
-    let mut verdicts = Vec::new();
-    if input.rungs.contains(Rung::ReframeSameModel) {
-        verdicts.push((Rung::ReframeSameModel, sources.reframe_same_model(&rc)?));
-    }
-    if input.rungs.contains(Rung::IndependentJudge) {
-        verdicts.push((Rung::IndependentJudge, sources.independent_judge(&rc)?));
-    }
+    let verdicts = opinion_rungs.map(|rung| verdict(sources.ask(rung).await));
 
     // A Contest may only ever remove permission. `suppress` has no counterpart.
-    if verdicts.any_contest() {
-        return rc.suppress(
-            CheckSuppression::Contested,
-            Resolution::SuppressedByContest { jev_p: p, dissent: verdicts.opinions() },
-        );
-    }
-
-    rc   // both confirm (or abstain): permission unchanged, Jev's value stands
+    apply_opinions(rc, &verdicts)    // any Contest ⇒ SuppressedByContest; else rc unchanged
 }
 ```
+
+Every bound that stops the ladder — the refresh cap, the opinion budget, a cooldown — is recorded
+on the check's result (`EnsembleLimit`) and in `EnsembleResolved`, so a held check always says why.
+After every check is resolved, each thresholded check's `consecutive_held` counter is incremented if
+it ended not permitted and reset otherwise; that counter is what `RepeatContest` reads next cycle.
+
+**Ordering, and why it differs from an earlier draft.** An earlier draft of this section checked the
+opinion budget and the cooldown *first*, for every triggered check, and suppressed on either; it
+also ran the claim-only refresh before asking whether a rule would fire. Both were wrong:
+
+- Suppressing a triggered check that no rule acts on — a decisively-low `worker_stuck` triggered
+  only by `ClaimOnlyEvidence`, say — makes it unresolved, and an unresolved check blocks `Finish`
+  through `UnresolvedUncertainty`. A spent opinion budget would then have blocked `Finish` forever
+  on account of a check nothing was asking about. The budget and cooldown are bounds on
+  *opinions*, so they apply only where an opinion would be bought.
+- The cooldown held the check whatever the last opinion said. After a **confirm**, that held a
+  decisive `Finish` conjunct for the whole window and, through `RepeatContest`, escalated a check
+  that had just been agreed with. Holding is right after a contest; after a confirm or abstain the
+  value stands exactly as it would with no opinion rung configured.
+- Refreshing a decisive check that no rule acts on spends a command and a model call, capped per
+  run, on something that cannot change the outcome.
 
 Notes that follow directly from §2:
 
 - **`Confirm` has no branch that grants anything.** It is an observation, not a license.
 - **There is no `promote`.** No `ε`. No arithmetic on `p` anywhere in this module.
-- `ResolvedCheck::from_jev` is the only place `permitted` can become `true` without new evidence,
+- `ResolvedCheck::from_measurement` is the only place `permitted` can become `true` without new evidence,
   and it is a pure function of `p`, `t`, and `margin` — not of which side of `t` the value is on.
 - **The opinion rungs are monotonically conservative.** Deleting every R1/R2 call can only
-  *increase* the set of rules that fire; no opinion can make a rule fire that would not otherwise
-  have. R0 is deliberately excluded from that claim: it is not an opinion, it is a measurement, and
-  it may legitimately move a rule either way.
+  *increase* the set of permitted checks, and so the set of comparisons that hold; no opinion can
+  make a comparison true that would not otherwise have been. R0 is deliberately excluded from that
+  claim: it is not an opinion, it is a measurement, and it may legitimately move a rule either way.
+
+  The claim is about comparisons, not about every rule. A rule that fires *because* a comparison is
+  false — `core.completion:work-remains`, the `else` of the `Finish` precondition, or a declarative
+  `not (...)` — can start firing when a contest removes permission. That is the intended
+  conservative fallback (`StartWorker` instead of `Finish`), not an opinion enabling an action, and
+  `Finish`, `Stop` and every other comparison-driven rule can only lose their trigger.
 - The in-band branch returns before any R1/R2 call, so **the cost of an opinion is only ever paid
   on a check that is about to act.**
 
@@ -547,10 +577,10 @@ Notes that follow directly from §2:
 
 | Bound | Default | Why |
 | --- | --- | --- |
-| `max_opinions_per_run` | 20 | A run needing more opinions has a broken check, not a hard question |
-| `max_evidence_refreshes_per_check` | 3 | Same reason |
+| `max_opinions_per_run` | 20 | A run needing more opinions has a broken check, not a hard question. Counts opinion calls only; refreshes are not opinions. A decisive check a rule is about to act on, with the budget spent, is held rather than acted on unchecked |
+| `max_evidence_refreshes_per_check` | 3 | Same reason. Every attempt counts, including one whose command could not run |
 | `opinion_timeout_seconds` | 120 | An opinion must not outlive the worker it is judging |
-| `per_check_cooldown_cycles` | 10 | One opinion per check per ten cycles |
+| `per_check_cooldown_cycles` | 10 | One opinion per check per ten cycles. Within the window the check is held if the last opinion contested, and otherwise stands on Jev's decisive value (§6) |
 | `consecutive_contests_before_human` | 2 | Escalate instead of re-asking |
 
 - **The `OutcomeRelevant` trigger, combined with the decisive/in-band split, is the main cost
@@ -633,7 +663,9 @@ outcome    UnresolvedInBand; after consecutive_contests_before_human cycles → 
   guaranteed no-op at the price of a model request, so it is no longer made.
 - The check is held, `Finish` is impossible this cycle, and repeated holding escalates to a human.
 
-Now the same check, decisive, and decisively **contested** — this is where opinions are spent:
+Now the same check, decisive, and decisively **contested** — this is where opinions are spent (until
+S3 ships R1, the same suppression comes from R2 when `p(¬X)` is inconsistent with `p(X)`; the test
+for this example uses R2):
 
 ```text
 tests_sufficient = 0.92   (|0.92 − 0.75| = 0.17 >= 0.15 → Decisive, permitted = true)
@@ -805,6 +837,11 @@ only ever half-built, S1 is the half worth having.
     contested check makes the comparison false. This test exists because the previous definition
     hardcoded `>=` and both of these were broken.
 - A replay test asserts bit-identical resolutions from `RecordedOpinionSource`.
+- The monotonic-conservatism property is asserted over permitted checks (and so over every
+  comparison), not over every rule, for the reason given in §6.
+
+These live in `crates/aftman-core/src/ensemble/tests.rs`. The silent-worker test is the runtime's;
+the adversarial and judge-honesty tests need a judge and arrive with S3.
 - A cost test asserts that a triggered check which is in-band, or whose rule would not fire,
   requests **zero** opinions.
 - A silent-worker test asserts that N idle ticks with unchanged observation content consume zero

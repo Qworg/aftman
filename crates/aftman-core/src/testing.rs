@@ -11,8 +11,12 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::assessment::AnswerValue;
+use crate::ensemble::{
+    EnsembleOutcome, OpinionKey, OpinionSource, ReframeAnswer, ReframeRequest, RefreshOutcome,
+    RefreshRequest,
+};
 use crate::error::ModelError;
-use crate::ids::CheckKey;
+use crate::ids::{AssessmentSeq, CheckKey};
 use crate::model::{AskContext, Budget, DecisionModel, ModelAnswers, ModelInfo, Question, Usage};
 
 /// A model that returns answers from a fixed table.
@@ -334,6 +338,121 @@ impl DecisionModel for SimulatedModel {
             description: "offline simulated decision model".into(),
             release_date: "2026-01-01".into(),
         }])
+    }
+}
+
+/// An [`OpinionSource`] that answers from recorded outcomes.
+///
+/// Built from a resolution ([`RecordedOpinionSource::record`]), it gives back exactly what was
+/// recorded, so that replaying a run's [`crate::ensemble::EnsemblePlan`]s against it
+/// produces identical resolutions (`docs/06-ensemble.md` §8). Tests also build it by
+/// hand, as a scripted source.
+///
+/// A request with no recording gets an outcome that says so (no value, and an error),
+/// which the resolver treats as it would a failed call. Every request is counted, so a
+/// test can assert that nothing was asked.
+#[derive(Debug, Default)]
+pub struct RecordedOpinionSource {
+    refreshes: BTreeMap<(AssessmentSeq, CheckKey), RefreshOutcome>,
+    reframes: BTreeMap<OpinionKey, ReframeAnswer>,
+    refresh_calls: Mutex<Vec<RefreshRequest>>,
+    reframe_calls: Mutex<Vec<ReframeRequest>>,
+}
+
+impl RecordedOpinionSource {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Answer a refresh of `check` in `cycle` with `outcome`.
+    #[must_use]
+    pub fn with_refresh(
+        mut self,
+        cycle: AssessmentSeq,
+        check: impl Into<CheckKey>,
+        outcome: RefreshOutcome,
+    ) -> Self {
+        self.refreshes.insert((cycle, check.into()), outcome);
+        self
+    }
+
+    /// Answer the opinion `key` with `answer`.
+    #[must_use]
+    pub fn with_reframe(mut self, key: OpinionKey, answer: ReframeAnswer) -> Self {
+        self.reframes.insert(key, answer);
+        self
+    }
+
+    /// Record everything a resolution asked for and got.
+    pub fn record(&mut self, outcome: &EnsembleOutcome) {
+        for record in &outcome.records {
+            if let Some(refresh) = &record.refresh {
+                self.refreshes.insert(
+                    (outcome.cycle, record.check.clone()),
+                    refresh.outcome.clone(),
+                );
+            }
+            for keyed in &record.opinions {
+                self.reframes
+                    .insert(keyed.key.clone(), ReframeAnswer::from(&keyed.opinion));
+            }
+        }
+    }
+
+    /// Every refresh requested, in order.
+    pub fn refresh_calls(&self) -> Vec<RefreshRequest> {
+        self.refresh_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Every opinion requested, in order.
+    pub fn reframe_calls(&self) -> Vec<ReframeRequest> {
+        self.reframe_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait]
+impl OpinionSource for RecordedOpinionSource {
+    async fn refresh_evidence(&self, request: &RefreshRequest) -> RefreshOutcome {
+        self.refresh_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request.clone());
+        self.refreshes
+            .get(&(request.cycle, request.check.clone()))
+            .cloned()
+            .unwrap_or_else(|| RefreshOutcome {
+                runs: Vec::new(),
+                new_p: None,
+                error: Some("no recorded refresh".to_owned()),
+            })
+    }
+
+    async fn reframe_same_model(&self, request: &ReframeRequest) -> ReframeAnswer {
+        self.reframe_calls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(request.clone());
+        self.reframes
+            .get(&request.opinion)
+            .cloned()
+            .unwrap_or_else(|| ReframeAnswer {
+                p_negated: None,
+                source: "recorded".to_owned(),
+                model: String::new(),
+                excerpt: String::new(),
+                prompt_hash: String::new(),
+                state_digest: String::new(),
+                latency: std::time::Duration::ZERO,
+                usage: Usage::default(),
+                error: Some("no recorded opinion".to_owned()),
+            })
     }
 }
 

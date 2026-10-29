@@ -8,12 +8,18 @@
 //! ([`crate::assessment::ResolvedCheck::from_refresh`]). Opinions can only take
 //! permission away.
 
+pub mod resolve;
 pub mod settings;
 pub mod trigger;
 
 #[cfg(test)]
 mod tests;
 
+pub use resolve::{
+    CheckRecord, EnsembleLimit, EnsembleOutcome, KeyedOpinion, OpinionKey, OpinionSource,
+    ProviderRun, ReframeAnswer, ReframeRequest, RefreshOutcome, RefreshRecord, RefreshRequest,
+    apply_opinions, reframe_verdict,
+};
 pub use settings::{
     CheckCounters, EnsembleCounters, EnsembleSettings, EnsembleSettingsError, OpinionMark,
 };

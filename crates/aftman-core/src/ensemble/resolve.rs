@@ -1,0 +1,653 @@
+//! The ladder: R0 (evidence refresh), R2 (same-model reframe), and escalation.
+//! See `docs/06-ensemble.md` §4 and §6.
+//!
+//! The only I/O is behind [`OpinionSource`]. Everything else here is a deterministic
+//! function of the [`EnsemblePlan`] and what the source answered, which is what lets a
+//! recorded source replay a run exactly.
+//!
+//! Three properties are structural rather than checked:
+//!
+//! - `permitted = true` is only ever produced by `ResolvedCheck::from_measurement` (the
+//!   baseline, built before this module runs) or `ResolvedCheck::from_refresh` (R0).
+//!   Every other step here goes through `ResolvedCheck::suppress`, which has no inverse.
+//! - No request carries Jev's value. A source cannot show the model its own earlier
+//!   answer, because it is never given it.
+//! - No arithmetic is done on a probability. The one subtraction in the module is the
+//!   R2 consistency rule, which compares two answers and produces a verdict; its result
+//!   is never stored or used as a probability.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
+use crate::assessment::{
+    CheckSuppression, Opinion, RefreshMeasurement, Resolution, ResolvedCheck, Rung, Verdict,
+    side_of,
+};
+use crate::ids::{AssessmentSeq, CheckKey, EvidenceId};
+use crate::model::Usage;
+
+use super::settings::{EnsembleCounters, EnsembleSettings, OpinionMark};
+use super::trigger::{CheckPlan, EnsemblePlan, EnsembleTrigger};
+
+/// Cap on an opinion's stored excerpt, and on its error text.
+pub const OPINION_EXCERPT_CAP_BYTES: usize = 2048;
+/// Cap on the identifying strings an opinion carries (`source`, `model`, hashes).
+pub const OPINION_LABEL_CAP_BYTES: usize = 256;
+/// Cap on a refresh's error text.
+pub const REFRESH_ERROR_CAP_BYTES: usize = 2048;
+
+/// Identifies one opinion: the cycle, the check, and the rung.
+///
+/// Deterministic on purpose, so a replay asks for the same key the live run recorded.
+/// At most one opinion per rung per check per cycle is ever requested.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct OpinionKey {
+    pub cycle: AssessmentSeq,
+    pub check: CheckKey,
+    pub rung: Rung,
+}
+
+/// R0: run these providers, rebuild the observation, and ask Jev the same question.
+///
+/// Carries no probability: the refreshed answer must come from the fresh evidence alone.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefreshRequest {
+    pub cycle: AssessmentSeq,
+    pub check: CheckKey,
+    /// In configuration order. Never empty.
+    pub providers: Vec<EvidenceId>,
+}
+
+/// One provider run during a refresh.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderRun {
+    pub provider: EvidenceId,
+    /// `None` if the command was killed by a signal or could not be launched.
+    pub exit_code: Option<i32>,
+}
+
+/// What a refresh produced.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RefreshOutcome {
+    /// The providers that ran, in the order they ran.
+    pub runs: Vec<ProviderRun>,
+    /// Jev's answer for this check on the fresh evidence. `None` if the call failed or
+    /// the answer was not a probability; a non-finite or out-of-range value is treated
+    /// the same way.
+    pub new_p: Option<f32>,
+    pub error: Option<String>,
+}
+
+/// R2: ask the same model the negated question about the same state.
+///
+/// Carries no probability, so the model cannot be shown its own first answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReframeRequest {
+    pub opinion: OpinionKey,
+    /// `opinion_timeout_seconds`. The source enforces it.
+    pub timeout: Duration,
+}
+
+/// What an R2 call returned, before any verdict is computed.
+///
+/// This is also the recorded shape a replay answers from.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReframeAnswer {
+    /// `p(not X)`. `None` if the call failed or did not produce a probability.
+    pub p_negated: Option<f32>,
+    pub source: String,
+    pub model: String,
+    pub excerpt: String,
+    pub prompt_hash: String,
+    pub state_digest: String,
+    pub latency: Duration,
+    #[serde(default)]
+    pub usage: Usage,
+    pub error: Option<String>,
+}
+
+impl From<&Opinion> for ReframeAnswer {
+    /// The answer a recorded opinion was built from, for a replay to give back.
+    ///
+    /// Exact, because the opinion stores the answer's fields already capped and with any
+    /// non-finite value dropped, and building an opinion from this answer does nothing
+    /// further to them.
+    fn from(opinion: &Opinion) -> Self {
+        Self {
+            p_negated: opinion.p_reported,
+            source: opinion.source.clone(),
+            model: opinion.model.clone(),
+            excerpt: opinion.excerpt.clone(),
+            prompt_hash: opinion.prompt_hash.clone(),
+            state_digest: opinion.state_digest.clone(),
+            latency: opinion.latency,
+            usage: opinion.usage,
+            error: opinion.error.clone(),
+        }
+    }
+}
+
+/// Where the ladder's I/O goes. The runtime implements it against the evidence
+/// providers and the decision model; [`crate::testing::RecordedOpinionSource`]
+/// implements it from a recording.
+///
+/// Neither method can fail: a failure is an outcome (`new_p: None`, `p_negated: None`)
+/// and the resolver decides what it means, so that a replay of a failure resolves the
+/// same way the failure did.
+///
+/// R1 (`independent_judge`) has no method until ensemble stage S3.
+#[async_trait]
+pub trait OpinionSource: Send + Sync {
+    /// R0. Run the providers, rebuild the observation, re-ask Jev.
+    async fn refresh_evidence(&self, request: &RefreshRequest) -> RefreshOutcome;
+
+    /// R2. Ask Jev the check's negated question about the same state.
+    async fn reframe_same_model(&self, request: &ReframeRequest) -> ReframeAnswer;
+}
+
+/// A bound that stopped the ladder, recorded so that it is visible in the log.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "limit")]
+pub enum EnsembleLimit {
+    /// `max_evidence_refreshes_per_check` is spent for this check.
+    RefreshCap { used: u32, cap: u32 },
+    /// `max_opinions_per_run` would be exceeded. The check is held.
+    OpinionBudget { used: u32, cap: u32 },
+    /// An opinion was bought for this check within `per_check_cooldown_cycles`.
+    /// `held` says whether the check was held for it (the last opinion contested).
+    Cooldown {
+        last_opinion: AssessmentSeq,
+        cooldown_cycles: u64,
+        held: bool,
+    },
+}
+
+/// One R0 attempt, as recorded.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RefreshRecord {
+    pub providers: Vec<EvidenceId>,
+    /// The value it set out to replace. For the log only.
+    pub old_p: Option<f32>,
+    pub outcome: RefreshOutcome,
+}
+
+/// One opinion, with its key.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyedOpinion {
+    pub key: OpinionKey,
+    pub opinion: Opinion,
+}
+
+/// What the ladder did for one triggered check.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CheckRecord {
+    pub check: CheckKey,
+    pub triggers: BTreeSet<EnsembleTrigger>,
+    /// Jev's own value, before the ladder.
+    pub baseline: ResolvedCheck,
+    /// What policy will read.
+    pub resolved: ResolvedCheck,
+    /// In the order they were used.
+    pub rungs_used: Vec<Rung>,
+    pub refresh: Option<RefreshRecord>,
+    pub opinions: Vec<KeyedOpinion>,
+    pub limits: Vec<EnsembleLimit>,
+    /// Set when the check was escalated to a person: the question to ask.
+    pub escalation: Option<String>,
+}
+
+/// The ensemble's result for one cycle.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EnsembleOutcome {
+    pub cycle: AssessmentSeq,
+    /// Every check, as policy should read it: the baseline, with each triggered check
+    /// replaced by its resolution.
+    pub checks: BTreeMap<CheckKey, ResolvedCheck>,
+    /// One per triggered check, in key order.
+    pub records: Vec<CheckRecord>,
+    /// The counters to store for the next cycle.
+    pub counters: EnsembleCounters,
+}
+
+impl EnsembleOutcome {
+    /// The checks the ladder escalated, with the question for each.
+    pub fn escalations(&self) -> impl Iterator<Item = (&CheckKey, &str)> {
+        self.records
+            .iter()
+            .filter_map(|record| record.escalation.as_deref().map(|ask| (&record.check, ask)))
+    }
+}
+
+impl EnsemblePlan {
+    /// Walk the ladder for every triggered check (`docs/06-ensemble.md` §6).
+    ///
+    /// Deterministic given the plan and the source's answers: checks are resolved in key
+    /// order, and every decision is a function of the plan, the counters, and what the
+    /// source returned.
+    pub async fn resolve(&self, source: &dyn OpinionSource) -> EnsembleOutcome {
+        let mut counters = self.counters.clone();
+        let mut checks = self.baseline.clone();
+        let mut records = Vec::with_capacity(self.triggered.len());
+        for plan in &self.triggered {
+            let record =
+                resolve_check(plan, self.cycle, &self.settings, &mut counters, source).await;
+            checks.insert(plan.check.clone(), record.resolved.clone());
+            records.push(record);
+        }
+        if self.settings.enabled {
+            for (key, rc) in &checks {
+                if rc.threshold.is_none() {
+                    continue;
+                }
+                let entry = counters.checks.entry(key.clone()).or_default();
+                entry.consecutive_held = if rc.permitted {
+                    0
+                } else {
+                    entry.consecutive_held.saturating_add(1)
+                };
+            }
+        }
+        EnsembleOutcome {
+            cycle: self.cycle,
+            checks,
+            records,
+            counters,
+        }
+    }
+}
+
+async fn resolve_check(
+    plan: &CheckPlan,
+    cycle: AssessmentSeq,
+    settings: &EnsembleSettings,
+    counters: &mut EnsembleCounters,
+    source: &dyn OpinionSource,
+) -> CheckRecord {
+    let mut record = CheckRecord {
+        check: plan.check.clone(),
+        triggers: plan.triggers.clone(),
+        baseline: plan.baseline.clone(),
+        resolved: plan.baseline.clone(),
+        rungs_used: Vec::new(),
+        refresh: None,
+        opinions: Vec::new(),
+        limits: Vec::new(),
+        escalation: None,
+    };
+    let rc = plan.baseline.clone();
+
+    // ---- In band: no opinion can change `permitted` here (§5.2), so none is asked.
+    // Evidence, then escalation, are the only options.
+    if !rc.decisive {
+        if let Some(refreshed) = refresh(plan, cycle, settings, counters, source, &mut record).await
+        {
+            record.resolved = refreshed;
+            return record;
+        }
+        if plan.has(EnsembleTrigger::RepeatContest)
+            && plan.has(EnsembleTrigger::HighStakes)
+            && settings.has(Rung::Human)
+        {
+            escalate(plan, settings, counters, &mut record);
+            return record;
+        }
+        record.resolved = rc.suppress(
+            CheckSuppression::InBand,
+            Resolution::UnresolvedInBand {
+                ask: ask_for(plan, None),
+                rungs: Vec::new(),
+            },
+        );
+        return record;
+    }
+
+    // ---- Decisive. Nothing to guard unless a rule is acting on it.
+    if !plan.rule_would_fire {
+        return record;
+    }
+
+    // Measuring beats second-guessing: a decisive value about to act on a bare claim is
+    // re-measured first.
+    if plan.has(EnsembleTrigger::ClaimOnlyEvidence)
+        && let Some(refreshed) = refresh(plan, cycle, settings, counters, source, &mut record).await
+    {
+        record.resolved = refreshed;
+        return record;
+    }
+
+    if !plan.wants_opinion() {
+        return record;
+    }
+
+    // A check that keeps being held is a question for a person, not another opinion.
+    if plan.has(EnsembleTrigger::RepeatContest) && settings.has(Rung::Human) {
+        escalate(plan, settings, counters, &mut record);
+        return record;
+    }
+
+    let rungs: Vec<Rung> = [Rung::ReframeSameModel]
+        .into_iter()
+        .filter(|rung| settings.has(*rung))
+        .filter(|rung| *rung != Rung::ReframeSameModel || plan.reframe_available)
+        .collect();
+    if rungs.is_empty() {
+        return record;
+    }
+
+    let state = counters.check(&plan.check);
+    if let Some(last) = state.last_opinion
+        && cycle.get().saturating_sub(last.cycle.get()) < settings.per_check_cooldown_cycles
+    {
+        // One opinion per check per cooldown window. After a contest the check stays
+        // held for the window; after a confirm or an abstention nothing is re-asked and
+        // the decisive value stands, exactly as it would with no opinion rung at all.
+        record.limits.push(EnsembleLimit::Cooldown {
+            last_opinion: last.cycle,
+            cooldown_cycles: settings.per_check_cooldown_cycles,
+            held: last.contested,
+        });
+        if last.contested {
+            record.resolved = rc.suppress(
+                CheckSuppression::Unresolved,
+                Resolution::UnresolvedInBand {
+                    ask: ask_for(plan, None),
+                    rungs: Vec::new(),
+                },
+            );
+        }
+        return record;
+    }
+
+    let needed = u32::try_from(rungs.len()).unwrap_or(u32::MAX);
+    if counters.opinions_used.saturating_add(needed) > settings.max_opinions_per_run {
+        // Unable to check a decisive value a rule is about to act on: hold it.
+        record.limits.push(EnsembleLimit::OpinionBudget {
+            used: counters.opinions_used,
+            cap: settings.max_opinions_per_run,
+        });
+        record.resolved = rc.suppress(
+            CheckSuppression::Unresolved,
+            Resolution::UnresolvedInBand {
+                ask: ask_for(plan, None),
+                rungs: Vec::new(),
+            },
+        );
+        return record;
+    }
+
+    // R1 and R2 both run when both are enabled; neither short-circuits the other (§4).
+    // Only R2 exists before S3.
+    let irreversible = plan.has(EnsembleTrigger::Irreversible);
+    let (Some(p), Some(threshold)) = (rc.jev_p, rc.threshold) else {
+        return record;
+    };
+    for rung in rungs {
+        let key = OpinionKey {
+            cycle,
+            check: plan.check.clone(),
+            rung,
+        };
+        counters.opinions_used = counters.opinions_used.saturating_add(1);
+        record.rungs_used.push(rung);
+        let answer = source
+            .reframe_same_model(&ReframeRequest {
+                opinion: key.clone(),
+                timeout: Duration::from_secs(settings.opinion_timeout_seconds),
+            })
+            .await;
+        let verdict = reframe_verdict(
+            p,
+            answer.p_negated,
+            threshold,
+            settings.framing_tolerance,
+            irreversible,
+        );
+        record.opinions.push(KeyedOpinion {
+            key,
+            opinion: opinion_from(rung, verdict, answer),
+        });
+    }
+
+    let opinions: Vec<Opinion> = record
+        .opinions
+        .iter()
+        .map(|keyed| keyed.opinion.clone())
+        .collect();
+    let resolved = apply_opinions(rc, &opinions);
+    counters
+        .checks
+        .entry(plan.check.clone())
+        .or_default()
+        .last_opinion = Some(OpinionMark {
+        cycle,
+        contested: resolved.contested,
+    });
+    record.resolved = resolved;
+    record
+}
+
+/// R0, if it applies and its cap allows. `Some` only for a fresh, usable measurement.
+async fn refresh(
+    plan: &CheckPlan,
+    cycle: AssessmentSeq,
+    settings: &EnsembleSettings,
+    counters: &mut EnsembleCounters,
+    source: &dyn OpinionSource,
+    record: &mut CheckRecord,
+) -> Option<ResolvedCheck> {
+    if !settings.has(Rung::RefreshEvidence) || plan.refresh_providers.is_empty() {
+        return None;
+    }
+    let used = counters.check(&plan.check).refreshes;
+    if used >= settings.max_evidence_refreshes_per_check {
+        record.limits.push(EnsembleLimit::RefreshCap {
+            used,
+            cap: settings.max_evidence_refreshes_per_check,
+        });
+        return None;
+    }
+    counters
+        .checks
+        .entry(plan.check.clone())
+        .or_default()
+        .refreshes = used.saturating_add(1);
+    record.rungs_used.push(Rung::RefreshEvidence);
+
+    let outcome = normalize_refresh(
+        source
+            .refresh_evidence(&RefreshRequest {
+                cycle,
+                check: plan.check.clone(),
+                providers: plan.refresh_providers.clone(),
+            })
+            .await,
+    );
+    let old_p = plan.baseline.jev_p;
+    record.refresh = Some(RefreshRecord {
+        providers: plan.refresh_providers.clone(),
+        old_p,
+        outcome: outcome.clone(),
+    });
+    let new_p = outcome.new_p?;
+    // The provider reported on the resolution is the first that ran; the record keeps
+    // them all.
+    let (provider, exit_code) = match outcome.runs.first() {
+        Some(run) => (run.provider.clone(), run.exit_code),
+        None => (plan.refresh_providers.first()?.clone(), None),
+    };
+    Some(ResolvedCheck::from_refresh(
+        plan.check.clone(),
+        plan.baseline.threshold,
+        plan.baseline.margin,
+        RefreshMeasurement {
+            new_p,
+            old_p,
+            provider,
+            exit_code,
+            supersedes: cycle,
+        },
+    ))
+}
+
+/// Hold the check and ask a person. The hold is what blocks `Finish`; the question is
+/// for the runtime to raise.
+fn escalate(
+    plan: &CheckPlan,
+    settings: &EnsembleSettings,
+    counters: &EnsembleCounters,
+    record: &mut CheckRecord,
+) {
+    let held_for = counters.check(&plan.check).consecutive_held;
+    let ask = ask_for(
+        plan,
+        Some((held_for, settings.consecutive_contests_before_human)),
+    );
+    record.rungs_used.push(Rung::Human);
+    record.escalation = Some(ask.clone());
+    record.resolved = plan.baseline.clone().suppress(
+        CheckSuppression::Unresolved,
+        Resolution::UnresolvedInBand {
+            ask,
+            rungs: vec![Rung::Human],
+        },
+    );
+}
+
+/// The question a held check puts to a person. Built only from the check key and
+/// numbers, never from model or repository text.
+fn ask_for(plan: &CheckPlan, repeated: Option<(u32, u32)>) -> String {
+    let rc = &plan.baseline;
+    let value = rc
+        .jev_p
+        .map_or_else(|| "no value".to_owned(), |p| format!("{p:.2}"));
+    let threshold = rc
+        .threshold
+        .map_or_else(|| "no threshold".to_owned(), |t| format!("{t:.2}"));
+    let mut ask = format!(
+        "`{}` is {value} against a threshold of {threshold} (margin {:.2}), and aftman will \
+         not act on it.",
+        plan.check, rc.margin
+    );
+    if let Some((held, limit)) = repeated {
+        ask.push_str(&format!(
+            " It has been held or contested for {held} consecutive cycles (limit {limit}). Is \
+             the work it describes actually done?"
+        ));
+    }
+    ask
+}
+
+/// Drop values that are not probabilities, and cap free text, so that what is recorded
+/// is exactly what a replay will read back.
+fn normalize_refresh(mut outcome: RefreshOutcome) -> RefreshOutcome {
+    outcome.new_p = outcome.new_p.filter(|p| is_probability(*p));
+    outcome.error = outcome
+        .error
+        .map(|error| cap_bytes(&error, REFRESH_ERROR_CAP_BYTES));
+    outcome
+}
+
+fn is_probability(p: f32) -> bool {
+    p.is_finite() && (0.0..=1.0).contains(&p)
+}
+
+/// The R2 verdict. Pure.
+///
+/// ```text
+/// consistent  ⇔  |p(X) − (1 − p(¬X))| ≤ framing_tolerance
+/// ```
+///
+/// Consistent confirms Jev's side; inconsistent contests, carrying the side the reframed
+/// answer points to. Nothing is averaged and no value is produced: `1 − p(¬X)` exists
+/// only inside this comparison.
+///
+/// An unusable answer — missing, non-finite, or outside `0..=1` — abstains, except when
+/// the trigger is `Irreversible`, where it contests on Jev's side (§4: an opinion that
+/// cannot be had on an irreversible action is not a reason to take it).
+#[must_use]
+pub fn reframe_verdict(
+    p: f32,
+    p_negated: Option<f32>,
+    threshold: f32,
+    framing_tolerance: f32,
+    irreversible: bool,
+) -> Verdict {
+    let Some(q) = p_negated.filter(|q| is_probability(*q)) else {
+        return if irreversible {
+            Verdict::Contest {
+                side: side_of(p, threshold),
+            }
+        } else {
+            Verdict::Abstain
+        };
+    };
+    let reframed = 1.0 - q;
+    if (p - reframed).abs() <= framing_tolerance {
+        Verdict::Confirm {
+            side: side_of(p, threshold),
+        }
+    } else {
+        Verdict::Contest {
+            side: side_of(reframed, threshold),
+        }
+    }
+}
+
+/// Fold opinions into a check. **Suppress-only.**
+///
+/// A `Contest` from any opinion removes permission. `Confirm` and `Abstain` change
+/// nothing — whatever their `side`. There is no branch here that can set `permitted`.
+#[must_use]
+pub fn apply_opinions(rc: ResolvedCheck, opinions: &[Opinion]) -> ResolvedCheck {
+    let dissent: Vec<Opinion> = opinions
+        .iter()
+        .filter(|opinion| matches!(opinion.verdict, Verdict::Contest { .. }))
+        .cloned()
+        .collect();
+    if dissent.is_empty() {
+        return rc;
+    }
+    let resolution = match rc.jev_p {
+        Some(jev_p) => Resolution::SuppressedByContest { jev_p, dissent },
+        None => Resolution::UnresolvedInBand {
+            ask: String::new(),
+            rungs: Vec::new(),
+        },
+    };
+    rc.suppress(CheckSuppression::Contested, resolution)
+}
+
+/// Build the stored opinion from an answer: bounded, and with no non-finite number, so
+/// that what is recorded is exactly what a replay reads back.
+fn opinion_from(rung: Rung, verdict: Verdict, answer: ReframeAnswer) -> Opinion {
+    Opinion {
+        rung,
+        source: cap_bytes(&answer.source, OPINION_LABEL_CAP_BYTES),
+        model: cap_bytes(&answer.model, OPINION_LABEL_CAP_BYTES),
+        verdict,
+        p_reported: answer.p_negated.filter(|p| p.is_finite()),
+        excerpt: cap_bytes(&answer.excerpt, OPINION_EXCERPT_CAP_BYTES),
+        prompt_hash: cap_bytes(&answer.prompt_hash, OPINION_LABEL_CAP_BYTES),
+        state_digest: cap_bytes(&answer.state_digest, OPINION_LABEL_CAP_BYTES),
+        usage: answer.usage,
+        latency: answer.latency,
+        error: answer
+            .error
+            .map(|error| cap_bytes(&error, OPINION_EXCERPT_CAP_BYTES)),
+    }
+}
+
+/// At most `cap` bytes, cut on a character boundary. Idempotent.
+pub(crate) fn cap_bytes(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_owned();
+    }
+    let mut end = cap;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_owned()
+}

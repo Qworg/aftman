@@ -317,6 +317,34 @@ than redefined, because a duplicate definition of the same name in two documents
 `SuppressionReason` collision nearly happened: `Rung`, `Opinion`, `CheckSuppression`,
 `ResolvedCheck`, and `HumanDecision`.
 
+The ensemble's own API lives in `aftman_core::ensemble` and is specified in
+[06-ensemble.md](06-ensemble.md) §3, §6, §8 and §12 rather than repeated here. In outline:
+
+```rust
+pub struct EnsembleSettings { /* the [ensemble] table */ }      // validate() -> Result<(), EnsembleSettingsError>
+pub struct EnsembleCounters { pub opinions_used: u32,
+    pub checks: BTreeMap<CheckKey, CheckCounters> }              // in RunState.ensemble
+pub enum   EnsembleTrigger { NearThreshold, LowConfidence, ClaimOnlyEvidence, OutcomeRelevant,
+    HighStakes, Irreversible, RepeatContest }
+pub struct EnsembleContext<'a> { settings, cycle, policy: &PolicyInput, propose: &dyn Fn(&PolicyInput) -> Vec<Proposal>,
+    definitions: &[Check], evidence: &EvidencePlan, answers, counters, reframe_available }
+pub struct EnsemblePlan { cycle, settings, counters, baseline, triggered: Vec<CheckPlan> }
+impl EnsemblePlan {
+    pub fn build(ctx: &EnsembleContext) -> Self;                          // pure: triggers
+    pub async fn resolve(&self, source: &dyn OpinionSource) -> EnsembleOutcome; // the ladder
+}
+#[async_trait] pub trait OpinionSource: Send + Sync {
+    async fn refresh_evidence(&self, r: &RefreshRequest) -> RefreshOutcome;     // R0
+    async fn reframe_same_model(&self, r: &ReframeRequest) -> ReframeAnswer;    // R2
+}
+pub struct EnsembleOutcome { cycle, checks: BTreeMap<CheckKey, ResolvedCheck>,
+    records: Vec<CheckRecord>, counters: EnsembleCounters }
+pub fn reframe_verdict(p, p_negated, threshold, framing_tolerance, irreversible) -> Verdict;
+pub fn apply_opinions(rc: ResolvedCheck, opinions: &[Opinion]) -> ResolvedCheck; // suppress-only
+```
+
+`aftman_core::testing::RecordedOpinionSource` implements `OpinionSource` from recorded outcomes.
+
 ## 4. Responsibilities
 
 ```rust
@@ -1220,7 +1248,7 @@ here having an effect until the milestone that builds it lands.
 | Jev client | `wiremock` HTTP fixture: happy path, 429 with `retry-after-ms`, 500, timeout, missing answer, extra unknown answer type, malformed float |
 | Workers | Fake executables (shell scripts) that emit known stdout/stderr and exit codes; assert argv, env scrubbing, streaming, graceful termination |
 | Runtime | `tokio::time::pause` + `SimulatedWorker` + `ScriptedDecisionModel`; assert event sequence and directives |
-| Ensemble | Scripted opinions → deterministic resolutions, including the "disagreement escalates" cases |
+| Ensemble | `RecordedOpinionSource` (scripted, or recorded from a resolution) → deterministic resolutions: an exhaustive decision table over triggers × rungs × verdicts, the §14 invariant properties over value grids, and the §9 worked examples (doc 06 §14) |
 | Store | Crash-consistency: truncate `events.jsonl` mid-line and assert recovery behaviour |
 | Protocol | In-process client against a real socket; HTTP mirror against the same handler |
 | End-to-end | One offline scenario per surface: CLI run, daemon run with two clients, web SSE reconnect |
@@ -1261,7 +1289,7 @@ network access**.
 | --- | --- |
 | `Worker` | Add a coding agent backend |
 | `DecisionModel` | Swap or wrap the supervisory model |
-| `SecondOpinion` | Add an ensemble opinion source (doc 06) |
+| `OpinionSource` | Answer the ensemble's I/O: evidence refresh (R0) and reframe (R2); the judge (R1) from S3 (doc 06 §6) |
 | `EvidenceProvider` | Add a command-based evidence collector (doc 05) |
 | `RunStore` | Change persistence |
 

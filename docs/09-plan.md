@@ -14,7 +14,7 @@ agent appear. Every milestone ends with the full offline suite green.
 | M1 — real Jev | **complete** | `b826530` |
 | M2 — responsibilities, policy, a real worker | **complete** | `d3730f5`, `6d4b2a9`, `450b1a6` |
 | M3 — daemon, protocol, CLI, TUI | **complete** | `cdb5b0c`, `eab59ac`, `d673a67`, `76810fe`, `160ebdc`, `d74327f`, `1169b5c` |
-| M4 — web UI | not started | — |
+| M4 — web UI | **complete** | `826e737`, `55233b3`, `36c8742`, `fc38d02`, `8ff5ede`, `425e4a8`, `82e9c50` |
 | M5 — ensemble S1 and S2 | not started | — |
 | M6 — herdr | not started | — |
 | M7 — ensemble S3 and S4 | not started | — |

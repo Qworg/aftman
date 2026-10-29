@@ -337,7 +337,10 @@ impl EnsemblePlan {
                                      // baseline, refuses a caller's checks that differ; triggers
     pub async fn resolve(&self, ctx: &EnsembleContext, source: &dyn OpinionSource)
         -> Result<EnsembleOutcome, EnsembleError>;   // the ladder, then the irreversible gate
-                                                     // (ctx must be the one build() was given)
+                                                     // (ctx must be the one build() was given:
+                                                     // cycle, settings, baseline and a digest of
+                                                     // the policy input are checked; the registry
+                                                     // cannot be, so pass the same one)
 }
 #[async_trait] pub trait OpinionSource: Send + Sync {
     // A failed call is an Ok outcome with no value; Err only when there is no answer at

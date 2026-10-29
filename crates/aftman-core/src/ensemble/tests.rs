@@ -303,6 +303,25 @@ impl Scenario {
         plan.resolve(&ctx, source).await
     }
 
+    /// The digest `build` would store for this scenario's context.
+    fn fingerprint(&self) -> String {
+        let baseline = self.baseline();
+        let input = self.input(&baseline);
+        let answers = self.answer_map();
+        super::trigger::context_fingerprint(&EnsembleContext {
+            settings: &self.settings,
+            cycle: self.cycle,
+            policy: &input,
+            registry: &self.registry,
+            definitions: &self.definitions,
+            evidence: &self.evidence,
+            answers: &answers,
+            counters: &self.ensemble,
+            reframe_available: &self.reframe,
+            finish_is_provisional: self.finish_provisional,
+        })
+    }
+
     /// Plan and resolve this scenario.
     async fn run_plan(
         &self,
@@ -517,6 +536,51 @@ fn nothing_covers_an_irreversible_opinion() {
             assert!(!mark.covers(Some(Side::Below), false), "{mark:?}");
         }
     }
+}
+
+#[tokio::test]
+async fn resolve_refuses_a_different_policy_input() {
+    // Round-3 probe N2b: a plan built with no worker, resolved with one. The baseline is
+    // identical, so only the fingerprint can tell.
+    let s = Scenario::finish_ready();
+    let plan = s.plan();
+    let mut with_worker = Scenario::finish_ready().with_worker();
+    with_worker.observation = s.observation.clone();
+    assert_eq!(with_worker.baseline(), s.baseline());
+    let result = with_worker
+        .resolve_plan(&plan, &RecordedOpinionSource::new())
+        .await;
+    assert!(
+        matches!(result, Err(super::EnsembleError::ContextMismatch(_))),
+        "{result:?}"
+    );
+    // So is a change of `finish_is_provisional`, or of the policy counters.
+    let mut provisional = Scenario::finish_ready();
+    provisional.observation = s.observation.clone();
+    provisional.finish_provisional = true;
+    let result = provisional
+        .resolve_plan(&plan, &RecordedOpinionSource::new())
+        .await;
+    assert!(
+        matches!(result, Err(super::EnsembleError::ContextMismatch(_))),
+        "{result:?}"
+    );
+    let mut counted = Scenario::finish_ready();
+    counted.observation = s.observation.clone();
+    counted.counters.workers_run = 2;
+    let result = counted
+        .resolve_plan(&plan, &RecordedOpinionSource::new())
+        .await;
+    assert!(
+        matches!(result, Err(super::EnsembleError::ContextMismatch(_))),
+        "{result:?}"
+    );
+    // The same context resolves.
+    let mut same = Scenario::finish_ready();
+    same.observation = s.observation.clone();
+    let plan = same.plan();
+    let source = answering_all(&plan, Some(0.5));
+    assert!(same.resolve_plan(&plan, &source).await.is_ok());
 }
 
 #[tokio::test]
@@ -3244,6 +3308,7 @@ async fn run_case(c: &Case, s: &mut Scenario) {
             },
             c.reframe_available,
         )],
+        s.fingerprint(),
     );
     let new_p = match c.refresh {
         RefreshAnswer::Decisive => Some(0.05),

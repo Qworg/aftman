@@ -245,6 +245,9 @@ pub struct EnsemblePlan {
     pub(super) baseline: BTreeMap<CheckKey, ResolvedCheck>,
     /// Checks with at least one trigger, in key order.
     pub(super) triggered: Vec<CheckPlan>,
+    /// A digest of the policy input the plan was built over (`context_fingerprint`), so
+    /// `resolve` can refuse a different one.
+    pub(super) context: String,
 }
 
 impl EnsemblePlan {
@@ -285,6 +288,7 @@ impl EnsemblePlan {
         counters: EnsembleCounters,
         mut baseline: BTreeMap<CheckKey, ResolvedCheck>,
         triggered: Vec<CheckPlan>,
+        context: String,
     ) -> Self {
         for plan in &triggered {
             baseline.insert(plan.check.clone(), plan.baseline.clone());
@@ -295,6 +299,7 @@ impl EnsemblePlan {
             counters,
             baseline,
             triggered,
+            context,
         }
     }
 
@@ -339,8 +344,36 @@ impl EnsemblePlan {
             counters: ctx.counters.clone(),
             baseline,
             triggered,
+            context: context_fingerprint(ctx),
         })
     }
+}
+
+/// A digest of everything in the context that policy reads besides the checks: the
+/// status, counters, configuration, observation, clock, active worker, last directive,
+/// steering grace, `ensemble_enabled`, and `finish_is_provisional`. `resolve` compares it
+/// with the plan's, so the gate cannot re-arbitrate over a different world from the one
+/// the triggers were computed in. The registry is a set of trait objects and cannot be
+/// digested: the caller must pass the same one to `build` and `resolve`.
+///
+/// `Debug` rather than a serializer: every collection involved is ordered, so it is
+/// deterministic, and unlike serialization it cannot fail.
+pub(super) fn context_fingerprint(ctx: &EnsembleContext<'_>) -> String {
+    let p = ctx.policy;
+    let text = format!(
+        "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        p.status,
+        p.counters,
+        p.config,
+        p.observation,
+        p.now,
+        p.active_worker,
+        p.last_directive,
+        p.ensemble_enabled,
+        p.steering_grace,
+        ctx.finish_is_provisional,
+    );
+    blake3::hash(text.as_bytes()).to_hex().to_string()
 }
 
 /// The baseline the ensemble starts from: Jev's own values, resolved with no opinion.

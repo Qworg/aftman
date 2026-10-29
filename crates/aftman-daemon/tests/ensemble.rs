@@ -3407,3 +3407,51 @@ async fn a_spent_budget_answered_with_recheck_is_topped_up_once_and_the_finish_i
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn command_output_a_check_selects_reaches_jev_before_a_finish_resting_on_it() -> TestResult {
+    // Integrated review, finding 3 (probe `probe_claim_only_says_measured_though_the_
+    // assessment_never_showed_the_command`). `ready_to_finish` selects `command:audit`, and
+    // the `before_finish` provider runs and prints AUDITMARK-1729. The cycle's assessment is
+    // asked over the default selection, which never carries command output, so Jev never saw
+    // it; `ClaimOnlyEvidence` used to look at the observation instead, call the check
+    // measured, and the run finished on a value no command stood behind. Computed from what
+    // the assessment actually sent, the check is claim-only, so before the Finish resting on
+    // it executes, R0 re-measures it over its own selection — and Jev sees the output.
+    let fx = Fixture::new(
+        audited_definitions()?,
+        audit("before_finish", "echo AUDITMARK-1729")?,
+    )?;
+    let model = Arc::new(R2Model::finish_ready());
+    let rt = fx.runtime(
+        config(|_| {}),
+        settings(|_| {}),
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let outcome = fx.run(rt).await?;
+    assert_eq!(outcome.status, FactoryStatus::Finished);
+    let calls = model.all_calls();
+    assert!(
+        calls
+            .iter()
+            .filter(|c| c.context.purpose == Purpose::Assessment)
+            .all(|c| !c.state.to_string().contains("AUDITMARK-1729")),
+        "the assessment never carries command output"
+    );
+    let shown: Vec<Purpose> = calls
+        .iter()
+        .filter(|c| c.state.to_string().contains("AUDITMARK-1729"))
+        .map(|c| c.context.purpose)
+        .collect();
+    assert!(shown.contains(&Purpose::Refresh), "{shown:?}");
+    // The Finish executed on that refreshed value.
+    let (_, last) = fx.resolutions().into_iter().last().ok_or("a cycle")?;
+    let ready = entry(&last, READY)?;
+    assert!(ready.triggers.contains(&EnsembleTrigger::ClaimOnlyEvidence));
+    assert!(matches!(
+        ready.resolution,
+        Resolution::EvidenceRefreshed { .. }
+    ));
+    Ok(())
+}

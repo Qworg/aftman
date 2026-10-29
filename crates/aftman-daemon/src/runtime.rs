@@ -1146,6 +1146,7 @@ impl FactoryRuntime {
                 definitions: definitions.clone(),
                 evidence: self.deps.evidence.clone(),
                 answers: answers.clone().unwrap_or_default(),
+                assessed_state: state_json.clone(),
                 ensemble: state.ensemble.clone(),
                 // Every check with an independently written negation, when R2 is a
                 // configured rung: built once, from the definitions the questions came from.

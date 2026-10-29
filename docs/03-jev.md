@@ -193,6 +193,17 @@ Why group at all, rather than one request per check?
 
 In practice the built-in responsibilities collapse to one or two groups.
 
+**As built, this is not what a cycle does.** The runtime asks every active check's question in
+**one** request over the **default** evidence selection (`state_for(default_evidence())`), and the
+default selection carries no command output. That predates M5, and it is a deviation from this
+section, named here rather than hidden. A check's own selection is honoured in two places: an
+ensemble evidence refresh (R0) asks that check's question over the default selection **plus** its
+own, command output included ([06-ensemble.md §4](06-ensemble.md)), and the `ClaimOnlyEvidence`
+trigger is computed from what the assessment actually sent — so a check that selects command
+output Jev was not shown is treated as resting on the worker's claim, and a decisive value about
+to act on it is re-measured by R0 first, within the refresh cap. Grouping requests by selection
+remains future work ([09-plan.md](09-plan.md), "Deferred").
+
 The router is the same call shape: all *conditional* responsibilities are evaluated in one request
 against the incoming job, and every threshold match activates that responsibility. Global
 responsibilities skip routing.

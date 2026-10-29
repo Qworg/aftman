@@ -15,7 +15,6 @@ use crate::assessment::{AnswerValue, ResolvedCheck, Side};
 use crate::directive::{Directive, Proposal, Stakes};
 use crate::evidence::{EvidencePlan, RunWhen};
 use crate::ids::{AssessmentSeq, CheckKey, EvidenceId};
-use crate::observation::Observation;
 use crate::policy::PolicyInput;
 use crate::responsibility::{Check, ResponsibilityRegistry};
 
@@ -113,6 +112,11 @@ pub struct EnsembleContext<'a> {
     pub evidence: &'a EvidencePlan,
     /// This cycle's raw answers, for the confidence of `Choice`/`Score` checks.
     pub answers: &'a BTreeMap<CheckKey, AnswerValue>,
+    /// The `state` document this cycle's assessment was actually asked over: what Jev saw
+    /// when it gave `answers`. `ClaimOnlyEvidence` is computed from it, never from the
+    /// observation, because command output the observation holds but the assessment did
+    /// not send is output Jev never saw.
+    pub assessed_state: &'a serde_json::Value,
     pub counters: &'a EnsembleCounters,
     /// Checks that can be asked the negated question (R2): see [`reframable_checks`].
     pub reframe_available: &'a BTreeSet<CheckKey>,
@@ -606,7 +610,7 @@ fn plan_check(
     {
         triggers.insert(EnsembleTrigger::LowConfidence);
     }
-    if !sees_command_evidence(&selection, ctx.policy.observation) {
+    if !saw_command_evidence(&selection, ctx.assessed_state) {
         triggers.insert(EnsembleTrigger::ClaimOnlyEvidence);
     }
 
@@ -742,19 +746,25 @@ fn evidence_selection(definitions: &[Check], key: &CheckKey) -> Vec<String> {
         )
 }
 
-/// Whether the check's selection reached any command evidence this cycle.
+/// Whether Jev saw command output the check selects, in the `state` the cycle's assessment
+/// actually sent (its `command_evidence`).
 ///
-/// A provider the check names but that has not run (an `on_demand` one, say) does not
-/// count: the check did not see it, so what it scored was the worker's claim.
+/// Not whether the observation holds it: a provider that ran is in the observation, but the
+/// runtime asks the cycle's questions over the default selection, which carries no command
+/// output (`docs/03-jev.md` §5), so what the check was scored on was the worker's claim. A
+/// provider the check names that has not run counts the same way.
 #[must_use]
-pub fn sees_command_evidence(selection: &[String], observation: &Observation) -> bool {
+pub fn saw_command_evidence(selection: &[String], assessed_state: &serde_json::Value) -> bool {
+    let commands = assessed_state
+        .get("command_evidence")
+        .and_then(serde_json::Value::as_object);
     selection.iter().any(|entry| {
         if entry == "command_evidence" {
-            !observation.evidence.is_empty()
+            commands.is_some_and(|commands| !commands.is_empty())
         } else {
             entry
                 .strip_prefix("command:")
-                .is_some_and(|id| observation.evidence.contains_key(id))
+                .is_some_and(|id| commands.is_some_and(|commands| commands.contains_key(id)))
         }
     })
 }

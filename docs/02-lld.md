@@ -343,7 +343,7 @@ impl EnsembleSettings { pub fn from_config_toml(source: &str)    // the [ensembl
 pub enum   EnsembleTrigger { NearThreshold, LowConfidence, ClaimOnlyEvidence, OutcomeRelevant,
     HighStakes, Irreversible, RepeatContest, HumanRecheck }
 pub struct EnsembleContext<'a> { settings, cycle, policy: &PolicyInput, registry: &ResponsibilityRegistry,
-    definitions: &[Check], evidence: &EvidencePlan, answers, counters, reframe_available,
+    definitions: &[Check], evidence: &EvidencePlan, answers, assessed_state, counters, reframe_available,
     finish_is_provisional: bool }
 pub struct EnsemblePlan { /* private; accessors cycle(), settings(), counters(), baseline(),
     triggered() -> &[CheckPlan] */ }       // only build() makes one, so a caller cannot hand the

@@ -59,6 +59,8 @@ pub struct EnsembleCycle {
     pub evidence: EvidencePlan,
     /// This cycle's raw answers.
     pub answers: BTreeMap<CheckKey, AnswerValue>,
+    /// The state document the cycle's assessment was asked over, exactly as sent.
+    pub assessed_state: serde_json::Value,
     /// The ensemble's per-run counters as they stood before this cycle.
     pub ensemble: EnsembleCounters,
     /// Checks R2 can be asked about: `reframable_checks` over `definitions` — every check
@@ -108,6 +110,7 @@ impl EnsembleCycle {
             definitions: &self.definitions,
             evidence: &self.evidence,
             answers: &self.answers,
+            assessed_state: &self.assessed_state,
             counters: &self.ensemble,
             reframe_available: &self.reframe_available,
             finish_is_provisional: self.finish_is_provisional,

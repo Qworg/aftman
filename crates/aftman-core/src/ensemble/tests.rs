@@ -244,6 +244,15 @@ impl Scenario {
         }
     }
 
+    /// What the scenario's assessment sent Jev: the default selection plus every command
+    /// output the observation holds, so that here a check sees the command evidence its
+    /// observation has (the runtime's assessment sends none; `docs/03-jev.md` §5).
+    fn assessed_state(&self) -> serde_json::Value {
+        let mut selection = crate::observation::default_evidence();
+        selection.push("command_evidence".to_owned());
+        self.observation.state_for(&selection)
+    }
+
     fn proposals(&self, checks: &BTreeMap<CheckKey, ResolvedCheck>) -> Vec<Proposal> {
         self.registry.propose(&self.input(checks))
     }
@@ -265,6 +274,7 @@ impl Scenario {
     ) -> Result<EnsemblePlan, super::EnsembleError> {
         let input = self.input(checks);
         let answers = self.answer_map();
+        let assessed = self.assessed_state();
         EnsemblePlan::build(&EnsembleContext {
             settings: &self.settings,
             cycle: self.cycle,
@@ -273,6 +283,7 @@ impl Scenario {
             definitions: &self.definitions,
             evidence: &self.evidence,
             answers: &answers,
+            assessed_state: &assessed,
             counters: &self.ensemble,
             reframe_available: &self.reframe,
             finish_is_provisional: self.finish_provisional,
@@ -288,6 +299,7 @@ impl Scenario {
         let baseline = self.baseline();
         let input = self.input(&baseline);
         let answers = self.answer_map();
+        let assessed = self.assessed_state();
         let ctx = EnsembleContext {
             settings: &self.settings,
             cycle: self.cycle,
@@ -296,6 +308,7 @@ impl Scenario {
             definitions: &self.definitions,
             evidence: &self.evidence,
             answers: &answers,
+            assessed_state: &assessed,
             counters: &self.ensemble,
             reframe_available: &self.reframe,
             finish_is_provisional: self.finish_provisional,
@@ -308,6 +321,7 @@ impl Scenario {
         let baseline = self.baseline();
         let input = self.input(&baseline);
         let answers = self.answer_map();
+        let assessed = self.assessed_state();
         super::trigger::context_fingerprint(&EnsembleContext {
             settings: &self.settings,
             cycle: self.cycle,
@@ -316,6 +330,7 @@ impl Scenario {
             definitions: &self.definitions,
             evidence: &self.evidence,
             answers: &answers,
+            assessed_state: &assessed,
             counters: &self.ensemble,
             reframe_available: &self.reframe,
             finish_is_provisional: self.finish_provisional,

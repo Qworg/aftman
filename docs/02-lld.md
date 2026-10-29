@@ -288,7 +288,8 @@ pub struct Escalation { pub id: EscalationId, pub kind: EscalationKind,
 pub enum   EscalationKind { Check, AssessmentBudget, ModelUnavailable, WorkerBlocked }
 
 // ---- model layer ------------------------------------------------------
-pub enum   Purpose { Assessment, Routing }
+pub enum   Purpose { Assessment, Routing, Opinion,
+    Refresh }   // an ensemble evidence refresh (R0): one check re-asked over fresh evidence
 pub struct Usage { pub input_tokens: Option<u64>, pub output_tokens: Option<u64> }
 pub struct ModelInfo { pub name: String, pub description: String, pub release_date: String }
 pub enum   Question { Noul   { instructions: Json },

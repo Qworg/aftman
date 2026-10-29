@@ -34,6 +34,11 @@ pub enum Purpose {
     Routing,
     /// An independent second opinion. See `docs/06-ensemble.md`.
     Opinion,
+    /// An evidence refresh (ensemble R0, `docs/06-ensemble.md` §4): one check's question
+    /// asked again over an observation rebuilt with fresh command evidence. Its own
+    /// purpose so that `aftman usage` can tell what refreshes cost; it counts against
+    /// `max_assessments` like any assessment.
+    Refresh,
 }
 
 /// Token usage for one request, when the provider reports it.

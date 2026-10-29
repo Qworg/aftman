@@ -240,7 +240,9 @@ Every request appends one line to `$XDG_STATE_HOME/aftman/jev-usage.jsonl`:
  "request_id":"...","budget":{"compacted":true,"measurements":{...}}}
 ```
 
-`purpose` is `assessment` or `routing`. `aftman usage` aggregates this file; the web UI shows the
+`purpose` is `assessment`, `routing`, or `refresh` (an ensemble evidence refresh, R0: one check asked
+again over fresh evidence; it counts against `max_assessments` like an assessment, [06-ensemble.md
+§4](06-ensemble.md)). `aftman usage` aggregates this file; the web UI shows the
 same numbers. Usage records are written **before** the answer is validated, so a malformed
 response still shows up in the bill.
 
@@ -263,7 +265,7 @@ pub trait DecisionModel: Send + Sync {
     /// One System One call. `questions` is already grouped by evidence selection.
     async fn ask(
         &self,
-        purpose: Purpose,                 // Assessment | Routing
+        purpose: Purpose,                 // Assessment | Routing | Refresh
         state: &serde_json::Value,
         questions: &BTreeMap<CheckKey, Question>,
         budget: &Budget,

@@ -536,7 +536,18 @@ fn plan_check(
         triggers.insert(EnsembleTrigger::HighStakes);
     }
 
-    let rule_would_fire = rc.permitted && world.proposals.iter().any(|p| !held.contains(p));
+    // A provisional Finish is not about to act: what follows it is the `before_finish`
+    // providers and a re-assessment, whose executed Finish is guarded in full. So it does
+    // not count here, and its conjuncts buy nothing in the ladder on its account. Any other
+    // rule on the same check — a Verify about to act, say — still counts.
+    let rule_would_fire = rc.permitted
+        && world
+            .proposals
+            .iter()
+            .filter(|p| {
+                !(ctx.finish_is_provisional && matches!(p.directive, Directive::Finish { .. }))
+            })
+            .any(|p| !held.contains(p));
 
     if rc.decisive && world.irreversible.contains(key) {
         triggers.insert(EnsembleTrigger::Irreversible);

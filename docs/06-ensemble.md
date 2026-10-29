@@ -605,13 +605,19 @@ loop:
   `RepeatContest` uses, whose question says what happened: the budget is spent, and which
   directive on which checks cannot be checked. Each held check also carries
   `EnsembleLimit::OpinionBudget`. Without the `human` rung the checks are held, as before.
-- **A provisional `Finish` is not irreversible.** When `before_finish` providers exist and have
+- **A provisional `Finish` is not about to act.** When `before_finish` providers exist and have
   not run, the runtime does not apply a selected `Finish`: it runs them and re-assesses. The
-  context says so (`EnsembleContext::finish_is_provisional`, set by the runtime), and then neither
-  the ladder's `Irreversible` trigger nor the gate treats that `Finish` as irreversible: an
-  opinion bought for it would protect nothing, and the re-assessed `Finish` that does execute is
-  guarded as usual (nothing covers an irreversible opinion). This roughly halves the opinions a
-  finish attempt costs.
+  context says so (`EnsembleContext::finish_is_provisional`, set by the runtime). Then that
+  `Finish` is not irreversible for the ladder's `Irreversible` trigger or the gate, and a
+  `Finish` proposal does not count as a rule about to act (`rule_would_fire`), so the ladder buys
+  nothing for its conjuncts on its account either: an opinion bought for it would protect
+  nothing, and the re-assessed `Finish` that does execute is guarded in full (nothing covers an
+  irreversible opinion). Any other rule on the same check still counts — a `Verify` about to act
+  on `needs_verification` still buys its opinion. Measured with every check reframable and
+  decisive (`the_cost_of_a_provisional_and_executed_finish_pair`): the provisional cycle buys
+  **0** R2 opinions and the executed one **6**, so a finish attempt costs 6, against 10 when the
+  provisional cycle's ladder still bought for the conjuncts and 12 when neither cycle was told
+  the first `Finish` was provisional.
 - **What a directive rests on** (`irreversible_dependencies`, shared by the gate and the ladder's
   `Irreversible` trigger so the two agree) is the union of two sets, because each misses cases the
   other catches:

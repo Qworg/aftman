@@ -2019,6 +2019,64 @@ async fn a_spent_budget_escalates_instead_of_holding_finish_silently() {
 }
 
 #[tokio::test]
+async fn the_cost_of_a_provisional_and_executed_finish_pair() {
+    // Round-4 item 2. Every check reframable and confirming, all decisive, Finish selected.
+    // Cycle 20 is provisional (before_finish providers pending): nothing is bought. Cycle 21
+    // is the executed Finish: the gate guards every check it rests on.
+    let mut counters = EnsembleCounters::default();
+    let mut calls = Vec::new();
+    for (i, provisional) in [true, false].into_iter().enumerate() {
+        let mut s = Scenario::finish_ready().reframable_all();
+        s.cycle = AssessmentSeq(20 + i as u64);
+        s.finish_provisional = provisional;
+        s.ensemble = counters.clone();
+        let plan = s.plan();
+        let source = answering_by(&plan, |p| Some(1.0 - p));
+        let outcome = s
+            .resolve_plan(&plan, &source)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(s.select(&outcome.checks).name(), "Finish");
+        if !provisional {
+            assert_irreversible_guarded(&s, &outcome, "executed");
+        }
+        calls.push(source.reframe_calls().len());
+        counters = outcome.counters;
+    }
+    // The figure stated in docs/06-ensemble.md §6.
+    assert_eq!(calls, [0, 6], "provisional, executed");
+
+    // A provisional Finish does not silence another rule about to act on the same check: a
+    // Verify on `needs_verification` still buys its opinion.
+    let mut s = Scenario::finish_ready()
+        .set(NEEDS_VER, 0.90)
+        .reframable(&[NEEDS_VER, READY]);
+    s.counters.verifier_completed = true;
+    s.finish_provisional = true;
+    assert_eq!(s.select(&s.baseline()).name(), "Finish");
+    assert!(
+        s.proposals(&s.baseline())
+            .iter()
+            .any(|p| p.rule.as_str() == "core.verification:warranted")
+    );
+    let plan = s.plan();
+    let source = answering_by(&plan, |p| Some(1.0 - p));
+    s.resolve_plan(&plan, &source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let asked: BTreeSet<CheckKey> = source
+        .reframe_calls()
+        .into_iter()
+        .map(|r| r.opinion.check)
+        .collect();
+    assert_eq!(
+        asked,
+        BTreeSet::from([k(NEEDS_VER)]),
+        "the Verify's check, not the Finish's"
+    );
+}
+
+#[tokio::test]
 async fn the_gate_terminates_within_its_bound() {
     // Every check reframable and decisive, Finish pending, every answer inconsistent: the
     // gate guards, contests, re-arbitrates, and stops within checks + 1 rounds.

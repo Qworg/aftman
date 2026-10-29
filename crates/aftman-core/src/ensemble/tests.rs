@@ -843,6 +843,31 @@ fn the_plan_records_what_the_ladder_could_use() {
 // ---- built-in thresholds ----------------------------------------------------
 
 #[test]
+fn insufficient_documentation_beats_finish() {
+    // docs/05 §6.3: `quality.documentation:insufficient` proposes StartWorker at 750, above
+    // Finish at 700. The bundled definition had no `priority`, so it took the
+    // `start-worker` default of 500 and lost to Finish.
+    for enabled in [false, true] {
+        let mut s = Scenario::finish_ready().set(DOCS, 0.30);
+        s.settings.enabled = enabled;
+        let proposals = s.proposals(&s.baseline());
+        let docs = proposals
+            .iter()
+            .find(|p| p.rule.as_str() == "quality.documentation:insufficient");
+        assert_eq!(
+            docs.map(|p| p.priority),
+            Some(crate::directive::priority::START_WORKER_DOCUMENTATION),
+            "enabled={enabled}"
+        );
+        assert_eq!(
+            s.select(&s.baseline()).name(),
+            "StartWorker",
+            "enabled={enabled}"
+        );
+    }
+}
+
+#[test]
 fn the_finish_disjunct_reads_needs_verification_against_its_own_threshold() {
     // docs/05 §6.2: `needs_verification < 0.65`. `core.completion` used to look the
     // threshold up among its own checks, found none, and compared against 0.75. With

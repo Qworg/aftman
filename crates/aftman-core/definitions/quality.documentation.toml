@@ -27,3 +27,5 @@ when = "quality.documentation__documentation_sufficient < 0.75"
 propose = "start-worker"
 reason = "the job requires documentation that is not yet complete"
 stakes = "high"
+# docs/05-responsibilities.md §6.3: above Finish (700), so insufficient documentation inhibits it.
+priority = 750

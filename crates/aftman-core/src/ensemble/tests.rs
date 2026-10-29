@@ -595,6 +595,42 @@ async fn resolve_refuses_a_different_set_of_reframable_checks() {
 }
 
 #[tokio::test]
+async fn resolve_refuses_a_different_observation() {
+    // Round-4 item 3 (mutation RM5): the observation is part of the policy input the gate
+    // re-arbitrates over. `observation_note` alone blocks Finish (`UnobservedRepository`);
+    // repository instructions arm `repository.instructions:drift`.
+    let s = Scenario::finish_ready().reframable_all();
+    let plan = s.plan();
+
+    let mut unobserved = Scenario::finish_ready().reframable_all();
+    unobserved.observation = s.observation.clone();
+    unobserved.observation.observation_note = Some("the repository could not be read".into());
+    assert_eq!(unobserved.baseline(), s.baseline());
+    let result = unobserved
+        .resolve_plan(&plan, &RecordedOpinionSource::new())
+        .await;
+    assert!(
+        matches!(result, Err(super::EnsembleError::ContextMismatch(_))),
+        "{result:?}"
+    );
+
+    let mut instructed = Scenario::finish_ready().reframable_all();
+    instructed.observation = s.observation.clone();
+    instructed.observation.instructions = Some(crate::observation::RepoInstructions {
+        file: "AGENTS.md".into(),
+        excerpt: "x".into(),
+        truncated: false,
+    });
+    let result = instructed
+        .resolve_plan(&plan, &RecordedOpinionSource::new())
+        .await;
+    assert!(
+        matches!(result, Err(super::EnsembleError::ContextMismatch(_))),
+        "{result:?}"
+    );
+}
+
+#[tokio::test]
 async fn resolve_refuses_a_different_policy_input() {
     // Round-3 probe N2b: a plan built with no worker, resolved with one. The baseline is
     // identical, so only the fingerprint can tell.

@@ -352,6 +352,9 @@ pub struct EnsembleOutcome { cycle, checks: BTreeMap<CheckKey, ResolvedCheck>,
     records: Vec<CheckRecord>,     // each may carry irreversible_guard { directive, outcome }
     counters: EnsembleCounters, gate_rounds: u32 }
 pub enum EnsembleError { BaselineMismatch { check }, ContextMismatch(String), Source(SourceError) }
+impl EnsembleOutcome { pub fn escalation_proposal(&self) -> Option<Proposal>; }  // one Escalate
+                     // at priority::ESCALATE_ENSEMBLE (850) for all of a cycle's escalations
+pub fn propose(registry, input, outcome) -> Vec<Proposal>;   // registry's proposals + that one
 pub fn reframe_verdict(p, p_negated, threshold, framing_tolerance, irreversible) -> Verdict;
 pub fn apply_opinions(rc: ResolvedCheck, opinions: &[Opinion]) -> ResolvedCheck; // suppress-only
 ```

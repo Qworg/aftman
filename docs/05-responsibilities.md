@@ -409,6 +409,7 @@ priority  directive      rule id                             source
  900      Stop           core.worker-health:off-track         work_off_track >= 0.80
  900      Stop           repository.instructions:drift        agents_md_drift >= 0.80
  900      Steer          (the same three rules, when a steer is permitted)
+ 850      Escalate       core.ensemble:escalate               an ensemble escalation (docs/06 §6)
  800      Retry          core.completion:retry-stopped         no worker, last directive was Stop
  800      Steer          (declarative rule with `propose = "steer"`)
  750      StartWorker    quality.documentation:insufficient   documentation_sufficient < 0.75
@@ -422,6 +423,19 @@ Tie-break order: priority desc → stakes (High first) → responsibility id →
 every rule — built-in included — has a unique id (§1), this is a total order with no ties, which is
 what makes `arbitrate()` reproducible from the event log. `docs/09-plan.md` M2 requires a test that
 asserts it: no two proposals in any built-in scenario compare equal.
+
+**Why the ensemble's escalation sits at 850.** It is not a responsibility's rule: the ensemble
+(doc 06 §6) decides that a check needs a person — held in band, or contested, for
+`consecutive_contests_before_human` cycles, or held because the opinion budget is spent — and all
+of one cycle's such checks become one `Escalate` proposal (`core.ensemble:escalate`), arbitrated
+like any other, so policy and not the runtime decides what it pre-empts. 850 puts it above every
+directive that starts work or ends the run (`Retry` 800, `StartWorker` 750 and 500, `Finish` 700,
+`Verify` 600): a check nobody can resolve is put to a person instead of burning another worker on a
+job that may be done. It stays below the worker-protection rules (900), because a rule that reads a
+held check cannot fire, so a `Stop` or `Steer` that does is acting on decisive evidence about the
+worker, and parking the run instead would leave that worker running while nobody answers; and
+below the other two escalations (950, 1000), which ask a person already. The constant is
+`directive::priority::ESCALATE_ENSEMBLE`.
 
 ### 6.4 Steering grace
 

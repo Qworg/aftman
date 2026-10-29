@@ -242,6 +242,17 @@ pub mod priority {
     pub const ESCALATE_BUDGET: u16 = 950;
     pub const STOP_OR_STEER_WORKER_HEALTH: u16 = 900;
     pub const STOP_OR_STEER_INSTRUCTIONS: u16 = 900;
+    /// The ensemble's escalation (`docs/06-ensemble.md` §6): a check held past
+    /// `consecutive_contests_before_human`, or holds caused by a spent opinion budget.
+    ///
+    /// Above everything that starts work or ends the run (`Retry` 800, `StartWorker`
+    /// 750/500, `Finish` 700, `Verify` 600), so a held check is put to a person instead of
+    /// burning another worker. Below the worker-protection rules (900): a rule that reads
+    /// a held check cannot fire, so a `Stop`/`Steer` that does is acting on decisive
+    /// evidence about the worker, and parking the run would leave that worker running
+    /// while nobody answers. Below the other escalations (950, 1000), which already ask a
+    /// person.
+    pub const ESCALATE_ENSEMBLE: u16 = 850;
     pub const RETRY_STOPPED: u16 = 800;
     pub const START_WORKER_DOCUMENTATION: u16 = 750;
     pub const FINISH: u16 = 700;

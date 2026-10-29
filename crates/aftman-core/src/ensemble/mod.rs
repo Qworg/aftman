@@ -8,6 +8,7 @@
 //! ([`crate::assessment::ResolvedCheck::from_refresh`]). Opinions can only take
 //! permission away.
 
+pub mod escalation;
 pub mod events;
 pub mod gate;
 pub mod resolve;
@@ -17,6 +18,10 @@ pub mod trigger;
 #[cfg(test)]
 mod tests;
 
+pub use escalation::{
+    ENSEMBLE_RESPONSIBILITY, ESCALATE_RULE, ESCALATION_ASK_CAP_BYTES, ESCALATION_REASON_PREFIX,
+    propose,
+};
 pub use events::{
     CheckResolvedPayload, EnsembleResolvedPayload, EnsembleTriggeredPayload,
     OpinionRecordedPayload, OpinionRequestedPayload,

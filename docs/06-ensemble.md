@@ -604,7 +604,10 @@ loop:
   `human` rung configured, every such hold in a cycle becomes **one** escalation, on the channel
   `RepeatContest` uses, whose question says what happened: the budget is spent, and which
   directive on which checks cannot be checked. Each held check also carries
-  `EnsembleLimit::OpinionBudget`. Without the `human` rung the checks are held, as before.
+  `EnsembleLimit::OpinionBudget`. Without the `human` rung the checks are held, as before. The
+  escalation reaches policy as the cycle's `core.ensemble:escalate` proposal, at priority 850
+  ([05-responsibilities.md §6.3](05-responsibilities.md)), which beats
+  `StartWorker`, so no worker is started that cycle.
 - **A provisional `Finish` is not about to act.** When `before_finish` providers exist and have
   not run, the runtime does not apply a selected `Finish`: it runs them and re-assesses. The
   context says so (`EnsembleContext::finish_is_provisional`, set by the runtime). Then that

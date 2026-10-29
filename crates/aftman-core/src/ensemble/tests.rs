@@ -4447,3 +4447,137 @@ fn opinion(verdict: Verdict) -> Opinion {
         error: None,
     }
 }
+
+// ---- stage B: escalation through policy, and the human answer ----------------
+
+impl Scenario {
+    /// What policy selects over a resolved cycle: every responsibility's proposals plus
+    /// the ensemble's escalation, arbitrated together (`super::propose`).
+    fn decide(&self, outcome: &EnsembleOutcome) -> crate::policy::PolicyDecision {
+        let input = self.input(&outcome.checks);
+        arbitrate(&input, &super::propose(&self.registry, &input, outcome))
+    }
+}
+
+#[test]
+fn the_ensemble_escalation_priority_sits_between_work_and_worker_protection() {
+    use crate::directive::priority;
+    for below in [
+        priority::RETRY_STOPPED,
+        priority::START_WORKER_DOCUMENTATION,
+        priority::FINISH,
+        priority::VERIFY,
+        priority::START_WORKER_COMPLETION,
+    ] {
+        assert!(priority::ESCALATE_ENSEMBLE > below);
+    }
+    for above in [
+        priority::STOP_OR_STEER_WORKER_HEALTH,
+        priority::STOP_OR_STEER_INSTRUCTIONS,
+        priority::ESCALATE_BUDGET,
+        priority::ESCALATE_NEEDS_HUMAN,
+    ] {
+        assert!(priority::ESCALATE_ENSEMBLE < above);
+    }
+}
+
+#[tokio::test]
+async fn one_cycles_escalations_coalesce_into_one_escalate_that_preempts_the_selection() {
+    // Two worker-health checks held in band for two cycles, each one a `Stop` away: two
+    // escalations from the ladder, one `Escalate` for policy.
+    let s = Scenario::finish_ready()
+        .with_worker()
+        .set(STUCK, 0.78)
+        .set(OFF_TRACK, 0.78)
+        .held_for(STUCK, 2)
+        .held_for(OFF_TRACK, 2);
+    let outcome = s
+        .run_plan(&RecordedOpinionSource::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(
+        outcome.escalations().count(),
+        2,
+        "the ladder escalates both"
+    );
+    assert_eq!(outcome.escalated_checks(), vec![k(OFF_TRACK), k(STUCK)]);
+    let decision = s.decide(&outcome);
+    let Directive::Escalate { reason, ask } = &decision.selected else {
+        panic!("expected one Escalate, got {:?}", decision.selected);
+    };
+    assert!(outcome.is_escalation(&decision.selected));
+    assert!(
+        reason.starts_with(super::ESCALATION_REASON_PREFIX),
+        "{reason}"
+    );
+    assert!(ask.contains(STUCK) && ask.contains(OFF_TRACK), "{ask}");
+    assert!(ask.starts_with("2 checks"), "{ask}");
+    let escalates = decision
+        .considered
+        .iter()
+        .filter(|p| matches!(p.directive, Directive::Escalate { .. }))
+        .count();
+    assert_eq!(escalates, 1, "coalesced: one proposal for the cycle");
+
+    // Pre-emption. One Finish conjunct held in band for two cycles, with nothing to
+    // refresh it: without the ensemble's proposal, policy would start another worker for a
+    // job whose only problem is that nobody can tell whether it is done.
+    let s = Scenario::finish_ready().set(TESTS, 0.71).held_for(TESTS, 2);
+    let outcome = s
+        .run_plan(&RecordedOpinionSource::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(outcome.escalations().count(), 1);
+    assert_eq!(s.select(&outcome.checks).name(), "StartWorker");
+    let decision = s.decide(&outcome);
+    assert!(outcome.is_escalation(&decision.selected), "{decision:?}");
+    assert!(decision.suppressed.iter().any(|s| {
+        s.rule.as_str() == "core.completion:work-remains"
+            && s.reason == crate::directive::SuppressionReason::HigherPriority
+    }));
+}
+
+#[tokio::test]
+async fn a_cycle_with_no_escalation_proposes_nothing_extra() {
+    let s = Scenario::finish_ready();
+    let outcome = s
+        .run_plan(&RecordedOpinionSource::new())
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(outcome.escalation_proposal().is_none());
+    let decision = s.decide(&outcome);
+    assert_eq!(decision.selected.name(), "Finish");
+    assert_eq!(
+        decision.considered,
+        s.proposals(&outcome.checks),
+        "identical to the registry's own proposals"
+    );
+}
+
+#[tokio::test]
+async fn g2_a_spent_budget_selects_one_escalate_and_burns_no_worker() {
+    // The reviewer's G2 scenario, through policy: the job is done, every check is
+    // decisive, the opinion budget is spent. The gate holds every check the Finish rests
+    // on; the cycle must ask a person once, not start a worker.
+    let mut s = Scenario::finish_ready().reframable_all();
+    s.ensemble.opinions_used = s.settings.max_opinions_per_run;
+    let plan = s.plan();
+    let outcome = s
+        .resolve_plan(&plan, &answering_by(&plan, |p| Some(1.0 - p)))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(outcome.escalations().count(), 1);
+    // The bug: arbitrating the registry's proposals alone starts a worker.
+    assert_eq!(s.select(&outcome.checks).name(), "StartWorker");
+
+    let decision = s.decide(&outcome);
+    assert!(outcome.is_escalation(&decision.selected), "{decision:?}");
+    let Directive::Escalate { ask, .. } = &decision.selected else {
+        panic!("expected an Escalate");
+    };
+    assert!(ask.contains("opinion budget"), "{ask}");
+    assert!(decision.suppressed.iter().any(|s| {
+        s.rule.as_str() == "core.completion:work-remains"
+            && s.reason == crate::directive::SuppressionReason::HigherPriority
+    }));
+}

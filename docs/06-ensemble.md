@@ -537,9 +537,10 @@ async fn resolve_check(plan: &CheckPlan, sources: &dyn OpinionSource) -> Resolve
     }
     if let Some(last) = cooldown_active(&plan.check) {
         // One opinion per check per window. The earlier opinion stands in for this
-        // one only if it COVERS it; otherwise the opinion cannot be bought, so hold.
-        return if last.covers(rc.side, plan.has(Irreversible)) { rc }
-               else { rc.suppress(Unresolved, ..) };
+        // one only if it COVERS it. Uncovered: a non-irreversible check is held; an
+        // Irreversible one is never held by the cooldown -- it buys a fresh opinion.
+        if last.covers(rc.side, plan.has(Irreversible)) { return rc; }
+        if !plan.has(Irreversible) { return rc.suppress(Unresolved, ..); }
     }
     if opinions_used + opinion_rungs.len() > max_opinions_per_run {
         return rc.suppress(Unresolved, ..);                   // cannot check it: hold it
@@ -565,10 +566,20 @@ it (`OpinionMark::covers`):
 - if this cycle's trigger is `Irreversible`, it was obtained under an `Irreversible` trigger too. A
   confirm bought to guard a `Verify` does not guard a `Finish`.
 
-Otherwise the check is **held** (`Unresolved`) for the rest of the window, as an earlier draft of
-this section held it unconditionally. Without this rule an abstention on a `Verify` in one cycle
-let the next cycle's `Finish`, resting on the same check, through with no opinion at all — an
-opinion-driven `Finish` that no single-cycle test can see.
+When the earlier opinion does not cover this one:
+
+- **For an `Irreversible` trigger the cooldown never skips or holds.** A fresh opinion is bought,
+  subject only to `max_opinions_per_run`; with the budget spent the check is held (`Unresolved`),
+  which is the fail-safe. An opinion that cannot be obtained is still a contest (§4).
+- **For any other trigger the check is held** (`Unresolved`) for the rest of the window.
+
+Both halves matter. Without the cover rule, an abstention on a `Verify` in one cycle let the next
+cycle's `Finish`, resting on the same check, through with no opinion at all — an opinion-driven
+`Finish` that no single-cycle test can see. Holding instead of buying, as a stricter draft did,
+held that `Finish` for up to `per_check_cooldown_cycles − 1` cycles after nearly every confirmed
+`Verify`: the confirm bought for the `Verify` does not cover the `Finish`, so every
+`Verify → Finish` would have stalled for the window when the ensemble is on. The cooldown exists to
+stop re-asking the same question; an irreversible action is a different question, asked once.
 
 A plan's fields are private to the ensemble and a plan is only built by `EnsemblePlan::build`, so no
 caller can hand the resolver a baseline with `permitted = true` that `from_measurement` did not
@@ -603,9 +614,10 @@ also ran the claim-only refresh before asking whether a rule would fire. Both we
   on account of a check nothing was asking about. The budget and cooldown are bounds on
   *opinions*, so they apply only where an opinion would be bought.
 - The cooldown held the check whatever the last opinion said, so a check that had just been
-  **confirmed** was held for the whole window. It now holds unless the earlier opinion *covers* the
-  one it would otherwise buy (below). It must not go further than that: letting any non-contest
-  stand would let an opinion obtained in one cycle carry an irreversible action in a later one.
+  **confirmed** was held for the whole window. It now skips only an opinion the earlier one
+  *covers*, and never holds an irreversible one (below). Letting any non-contest stand would go too
+  far the other way: an opinion obtained in one cycle would carry an irreversible action in a later
+  one.
 - Refreshing a decisive check that no rule acts on spends a command and a model call, capped per
   run, on something that cannot change the outcome.
 
@@ -648,7 +660,7 @@ Notes that follow directly from §2:
 | `max_opinions_per_run` | 20 | A run needing more opinions has a broken check, not a hard question. Counts opinion calls only; refreshes are not opinions. A decisive check a rule is about to act on, with the budget spent, is held rather than acted on unchecked |
 | `max_evidence_refreshes_per_check` | 3 | Same reason. Every attempt counts, including one whose command could not run |
 | `opinion_timeout_seconds` | 120 | An opinion must not outlive the worker it is judging |
-| `per_check_cooldown_cycles` | 10 | One opinion per check per ten cycles. Within the window the check is held unless the last opinion covers the one that would be bought: a confirm, on the same side, and under an `Irreversible` trigger if this one is (§6) |
+| `per_check_cooldown_cycles` | 10 | One opinion per check per ten cycles. Within the window an opinion the last one covers (a confirm, on the same side, and under an `Irreversible` trigger if this one is) is skipped. One it does not cover is bought afresh for an `Irreversible` trigger (budget permitting), and otherwise holds the check (§6) |
 | `consecutive_contests_before_human` | 2 | Escalate instead of re-asking |
 
 - **The `OutcomeRelevant` trigger, combined with the decisive/in-band split, is the main cost

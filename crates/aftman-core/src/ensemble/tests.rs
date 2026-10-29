@@ -1740,24 +1740,22 @@ fn finish_after_verify_cycle() -> Scenario {
     b
 }
 
-#[tokio::test]
-async fn a_cooldown_after_an_abstain_does_not_skip_the_irreversible_guard() {
-    // Review probe 3.
+/// Resolve one scenario against one source, panicking on a replay divergence.
+async fn resolved(s: &Scenario, source: &RecordedOpinionSource) -> EnsembleOutcome {
+    s.plan()
+        .resolve(source)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Cycle A answered with `p(not X) = q`, then cycle B's scenario with A's counters.
+async fn after_verify(q: Option<f32>) -> (EnsembleOutcome, Scenario) {
     let a = verify_cycle();
     assert_eq!(a.select(&a.baseline()).name(), "Verify");
-    let failing =
-        RecordedOpinionSource::new().with_reframe(reframe_key(a.cycle, NEEDS_VER), answer(None));
-    let out_a = a
-        .plan()
-        .resolve(&failing)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(failing.reframe_calls().len(), 1);
-    assert!(
-        record(&out_a, NEEDS_VER)
-            .is_some_and(|r| r.opinions[0].opinion.verdict == Verdict::Abstain)
-    );
-
+    let source =
+        RecordedOpinionSource::new().with_reframe(reframe_key(a.cycle, NEEDS_VER), answer(q));
+    let out_a = resolved(&a, &source).await;
+    assert_eq!(source.reframe_calls().len(), 1);
     let mut b = finish_after_verify_cycle();
     assert_eq!(b.select(&b.baseline()).name(), "Finish");
     assert!(
@@ -1765,77 +1763,95 @@ async fn a_cooldown_after_an_abstain_does_not_skip_the_irreversible_guard() {
             .contains(&EnsembleTrigger::Irreversible)
     );
     b.ensemble = out_a.counters.clone();
-    let source = RecordedOpinionSource::new();
-    let out_b = b
-        .plan()
-        .resolve(&source)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
-    assert_ne!(
-        b.select(&out_b.checks).name(),
-        "Finish",
-        "an abstention is not a confirm, and cannot carry a Finish through the cooldown"
-    );
-    assert!(!out_b.checks[&k(NEEDS_VER)].permitted);
-    assert!(
-        source.reframe_calls().is_empty(),
-        "the cooldown still holds the call back"
-    );
+    (out_a, b)
 }
 
 #[tokio::test]
-async fn a_cooldown_skips_an_opinion_only_when_an_earlier_confirm_covers_it() {
-    // A confirm under a non-irreversible trigger does not cover an irreversible one.
-    let a = verify_cycle();
-    let confirming = RecordedOpinionSource::new()
-        .with_reframe(reframe_key(a.cycle, NEEDS_VER), answer(Some(0.10)));
-    let out_a = a
-        .plan()
-        .resolve(&confirming)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+async fn a_cooldown_after_an_abstain_does_not_skip_the_irreversible_guard() {
+    // Review probe 3: cycle A's opinion fails and abstains. Cycle B's Finish rests on the
+    // same check. The cooldown must not let it through: the irreversible opinion is
+    // bought afresh, and when that fails too it contests.
+    let (out_a, b) = after_verify(None).await;
+    assert!(
+        record(&out_a, NEEDS_VER)
+            .is_some_and(|r| r.opinions[0].opinion.verdict == Verdict::Abstain)
+    );
+    let source =
+        RecordedOpinionSource::new().with_reframe(reframe_key(b.cycle, NEEDS_VER), answer(None));
+    let out_b = resolved(&b, &source).await;
+    assert_eq!(
+        source.reframe_calls().len(),
+        1,
+        "a fresh irreversible opinion is bought"
+    );
+    assert!(!out_b.checks[&k(NEEDS_VER)].permitted);
+    assert_ne!(b.select(&out_b.checks).name(), "Finish");
+}
+
+#[tokio::test]
+async fn a_verify_confirm_does_not_delay_the_next_finish() {
+    // Cycle A confirms the value for a Verify. That confirm does not cover the Finish in
+    // cycle B, but the cooldown does not hold B either: B buys its own irreversible
+    // opinion, and finishes on a confirm.
+    let (out_a, b) = after_verify(Some(0.10)).await;
     assert!(
         record(&out_a, NEEDS_VER).is_some_and(
             |r| r.opinions[0].opinion.verdict == Verdict::Confirm { side: Side::Above }
         )
     );
-    let mut b = finish_after_verify_cycle();
-    b.ensemble = out_a.counters.clone();
-    let out_b = b
-        .plan()
-        .resolve(&RecordedOpinionSource::new())
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
-    assert_ne!(
+    // p = 0.05, p(not X) = 0.95: consistent.
+    let source = RecordedOpinionSource::new()
+        .with_reframe(reframe_key(b.cycle, NEEDS_VER), answer(Some(0.95)));
+    let out_b = resolved(&b, &source).await;
+    assert_eq!(source.reframe_calls().len(), 1);
+    assert_eq!(
         b.select(&out_b.checks).name(),
         "Finish",
-        "not covered: held"
+        "finished on its own confirm"
     );
     assert!(record(&out_b, NEEDS_VER).is_some_and(|r| {
-        r.limits
+        !r.limits
             .iter()
-            .any(|l| matches!(l, EnsembleLimit::Cooldown { held: true, .. }))
+            .any(|l| matches!(l, EnsembleLimit::Cooldown { .. }))
     }));
 
+    // And the same cycle with a contesting answer does not finish.
+    let source = RecordedOpinionSource::new()
+        .with_reframe(reframe_key(b.cycle, NEEDS_VER), answer(Some(0.05)));
+    let out_b = resolved(&b, &source).await;
+    assert_ne!(b.select(&out_b.checks).name(), "Finish");
+}
+
+#[tokio::test]
+async fn a_spent_budget_holds_an_uncovered_irreversible_opinion() {
+    let (_, mut b) = after_verify(Some(0.10)).await;
+    b.ensemble.opinions_used = b.settings.max_opinions_per_run;
+    let source = RecordedOpinionSource::new();
+    let out_b = resolved(&b, &source).await;
+    assert!(source.reframe_calls().is_empty());
+    let rc = &out_b.checks[&k(NEEDS_VER)];
+    assert!(!rc.permitted);
+    assert_eq!(rc.suppression, Some(CheckSuppression::Unresolved));
+    assert!(record(&out_b, NEEDS_VER).is_some_and(|r| {
+        r.limits
+            .contains(&EnsembleLimit::OpinionBudget { used: 20, cap: 20 })
+    }));
+    assert_ne!(b.select(&out_b.checks).name(), "Finish");
+}
+
+#[tokio::test]
+async fn a_covering_confirm_stands_through_the_cooldown() {
     // A confirm under an irreversible trigger, on the same side, covers the next cycle.
     let mut b1 = finish_after_verify_cycle();
     b1.cycle = AssessmentSeq(20);
     let confirming = RecordedOpinionSource::new()
         .with_reframe(reframe_key(b1.cycle, NEEDS_VER), answer(Some(0.95)));
-    let out_b1 = b1
-        .plan()
-        .resolve(&confirming)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+    let out_b1 = resolved(&b1, &confirming).await;
     assert_eq!(b1.select(&out_b1.checks).name(), "Finish");
     let mut b2 = finish_after_verify_cycle();
     b2.ensemble = out_b1.counters.clone();
     let source = RecordedOpinionSource::new();
-    let out_b2 = b2
-        .plan()
-        .resolve(&source)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+    let out_b2 = resolved(&b2, &source).await;
     assert!(source.reframe_calls().is_empty());
     assert_eq!(
         b2.select(&out_b2.checks).name(),
@@ -1848,19 +1864,18 @@ async fn a_cooldown_skips_an_opinion_only_when_an_earlier_confirm_covers_it() {
             .any(|l| matches!(l, EnsembleLimit::Cooldown { held: false, .. }))
     }));
 
-    // The same confirm does not cover a value that has moved to the other side.
+    // It does not cover a value that has moved to the other side. That cycle is a
+    // Verify, not irreversible, so the cooldown holds it.
     let mut b3 = finish_after_verify_cycle().set(NEEDS_VER, 0.90);
     b3.counters.verifiers_run = 0;
     b3.ensemble = out_b1.counters.clone();
-    let out_b3 = b3
-        .plan()
-        .resolve(&RecordedOpinionSource::new())
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
     assert!(
-        b3.check_plan(NEEDS_VER)
-            .is_some_and(|p| p.wants_opinion() && p.rule_would_fire)
+        !b3.triggers(NEEDS_VER)
+            .contains(&EnsembleTrigger::Irreversible)
     );
+    let source = RecordedOpinionSource::new();
+    let out_b3 = resolved(&b3, &source).await;
+    assert!(source.reframe_calls().is_empty());
     assert!(
         !out_b3.checks[&k(NEEDS_VER)].permitted,
         "a confirm about the other side covers nothing"
@@ -1891,94 +1906,118 @@ async fn the_opinion_budget_holds_rather_than_acting_unchecked() {
 }
 
 #[tokio::test]
-async fn the_cooldown_holds_unless_an_earlier_confirm_covers_the_opinion() {
-    // Rows written from the contract (review finding 1), not from the resolver: inside
-    // the window an opinion is skipped only when the earlier one was a confirm, about the
-    // same side, obtained under an irreversible trigger if this one is irreversible.
-    // `tests_sufficient = 0.92` with a Finish pending: decisive, above, irreversible.
-    let rows = [
-        (MarkVerdict::Contest, Some(Side::Above), true, false),
-        (MarkVerdict::Abstain, Some(Side::Above), true, false),
-        (MarkVerdict::Confirm, Some(Side::Above), true, true),
-        (MarkVerdict::Confirm, Some(Side::Above), false, false),
-        (MarkVerdict::Confirm, Some(Side::Below), true, false),
-        (MarkVerdict::Confirm, None, true, false),
+async fn the_cooldown_rows_from_the_contract() {
+    // Written from the contract, not from the resolver. Inside the window an earlier
+    // opinion covers this one only if it was a confirm, about the same side, obtained under
+    // an irreversible trigger if this one is irreversible.
+    //
+    // Irreversible (`tests_sufficient = 0.92`, Finish pending): covered ⇒ it stands with no
+    // call; not covered ⇒ a fresh opinion is bought (and here it confirms).
+    //
+    // Not irreversible (`needs_verification = 0.90`, Verify pending): covered ⇒ it stands;
+    // not covered ⇒ held for the window. No call either way.
+    let marks = [
+        (MarkVerdict::Contest, Some(Side::Above), true),
+        (MarkVerdict::Abstain, Some(Side::Above), true),
+        (MarkVerdict::Confirm, Some(Side::Above), true),
+        (MarkVerdict::Confirm, Some(Side::Above), false),
+        (MarkVerdict::Confirm, Some(Side::Below), true),
+        (MarkVerdict::Confirm, None, true),
     ];
-    for (verdict, side, irreversible, stands) in rows {
-        let mut s = Scenario::finish_ready()
-            .set(TESTS, 0.92)
-            .reframable(&[TESTS]);
-        assert!(s.triggers(TESTS).contains(&EnsembleTrigger::Irreversible));
-        s.ensemble.checks.insert(
-            k(TESTS),
-            CheckCounters {
-                last_opinion: Some(OpinionMark {
-                    cycle: AssessmentSeq(CYCLE.get() - 3),
-                    verdict,
-                    side,
-                    irreversible,
-                }),
-                ..CheckCounters::default()
-            },
-        );
-        let source = RecordedOpinionSource::new();
-        let outcome = s
-            .plan()
-            .resolve(&source)
-            .await
-            .unwrap_or_else(|e| panic!("{e}"));
-        let row = format!("{verdict:?} {side:?} irreversible={irreversible}");
-        assert!(
-            source.reframe_calls().is_empty(),
-            "one opinion per window: {row}"
-        );
-        assert!(
-            record(&outcome, TESTS).is_some_and(|r| r.limits.contains(&EnsembleLimit::Cooldown {
-                last_opinion: AssessmentSeq(CYCLE.get() - 3),
-                cooldown_cycles: 10,
-                held: !stands,
-            })),
-            "{row}"
-        );
-        assert_eq!(outcome.checks[&k(TESTS)].permitted, stands, "{row}");
-        assert_eq!(
-            s.select(&outcome.checks).name() == "Finish",
-            stands,
-            "{row}"
-        );
+    // (key, value, p(not X) that confirms, expected cover per mark row)
+    let cases = [
+        (
+            TESTS,
+            0.92_f32,
+            0.08_f32,
+            true,
+            [false, false, true, false, false, false],
+        ),
+        (
+            NEEDS_VER,
+            0.90,
+            0.10,
+            false,
+            [false, false, true, true, false, false],
+        ),
+    ];
+    for (key, p, confirms, irreversible_now, covers) in cases {
+        for ((verdict, side, irreversible), covered) in marks.iter().copied().zip(covers) {
+            let mut s = Scenario::finish_ready().set(key, p).reframable(&[key]);
+            assert_eq!(
+                s.triggers(key).contains(&EnsembleTrigger::Irreversible),
+                irreversible_now
+            );
+            s.ensemble.checks.insert(
+                k(key),
+                CheckCounters {
+                    last_opinion: Some(OpinionMark {
+                        cycle: AssessmentSeq(CYCLE.get() - 3),
+                        verdict,
+                        side,
+                        irreversible,
+                    }),
+                    ..CheckCounters::default()
+                },
+            );
+            let source = RecordedOpinionSource::new()
+                .with_reframe(reframe_key(CYCLE, key), answer(Some(confirms)));
+            let outcome = resolved(&s, &source).await;
+            let row = format!("{key} {verdict:?} {side:?} irreversible={irreversible}");
+            let bought = irreversible_now && !covered;
+            assert_eq!(
+                source.reframe_calls().len(),
+                usize::from(bought),
+                "calls: {row}"
+            );
+            let permitted = covered || bought;
+            assert_eq!(
+                outcome.checks[&k(key)].permitted,
+                permitted,
+                "permitted: {row}"
+            );
+            let cooldown = record(&outcome, key).and_then(|r| {
+                r.limits.iter().find_map(|l| match l {
+                    EnsembleLimit::Cooldown { held, .. } => Some(*held),
+                    _ => None,
+                })
+            });
+            let expected_cooldown = if bought { None } else { Some(!covered) };
+            assert_eq!(cooldown, expected_cooldown, "cooldown limit: {row}");
+        }
     }
+
     // Once the window has passed, it is asked again.
     let mut s = Scenario::finish_ready()
-        .set(TESTS, 0.92)
-        .reframable(&[TESTS]);
+        .set(NEEDS_VER, 0.90)
+        .reframable(&[NEEDS_VER]);
     s.ensemble.checks.insert(
-        k(TESTS),
+        k(NEEDS_VER),
         CheckCounters {
             last_opinion: Some(OpinionMark {
                 cycle: AssessmentSeq(CYCLE.get() - 10),
                 verdict: MarkVerdict::Contest,
                 side: Some(Side::Above),
-                irreversible: true,
+                irreversible: false,
             }),
             ..CheckCounters::default()
         },
     );
-    let source =
-        RecordedOpinionSource::new().with_reframe(reframe_key(CYCLE, TESTS), answer(Some(0.08)));
-    let outcome = s
-        .plan()
-        .resolve(&source)
-        .await
-        .unwrap_or_else(|e| panic!("{e}"));
+    let source = RecordedOpinionSource::new()
+        .with_reframe(reframe_key(CYCLE, NEEDS_VER), answer(Some(0.10)));
+    let outcome = resolved(&s, &source).await;
     assert_eq!(source.reframe_calls().len(), 1);
-    assert!(outcome.checks[&k(TESTS)].permitted, "consistent: confirmed");
+    assert!(
+        outcome.checks[&k(NEEDS_VER)].permitted,
+        "consistent: confirmed"
+    );
     assert_eq!(
-        outcome.counters.check(&k(TESTS)).last_opinion,
+        outcome.counters.check(&k(NEEDS_VER)).last_opinion,
         Some(OpinionMark {
             cycle: CYCLE,
             verdict: MarkVerdict::Confirm,
             side: Some(Side::Above),
-            irreversible: true,
+            irreversible: false,
         }),
         "the new mark records what the confirm established"
     );
@@ -2360,10 +2399,13 @@ fn oracle(c: &Case) -> Expected {
         return with(done(Kind::Escalated, false));
     }
     match c.counters {
-        CounterState::CooldownAfterContest => return with(done(Kind::Unresolved, false)),
+        // An irreversible opinion is never held by the cooldown: it is bought afresh.
+        CounterState::CooldownAfterContest if !has(EnsembleTrigger::Irreversible) => {
+            return with(done(Kind::Unresolved, false));
+        }
         CounterState::CooldownAfterConfirm => return with(done(Kind::Decisive, true)),
         CounterState::BudgetSpent => return with(done(Kind::Unresolved, false)),
-        CounterState::Fresh | CounterState::RefreshCapped => {}
+        CounterState::CooldownAfterContest | CounterState::Fresh | CounterState::RefreshCapped => {}
     }
     let (contest, mark) = match c.reframe {
         ReframeKind::Consistent | ReframeKind::NearlyInconsistent => (false, MarkVerdict::Confirm),

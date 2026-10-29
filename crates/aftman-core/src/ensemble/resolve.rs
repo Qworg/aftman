@@ -410,26 +410,30 @@ async fn resolve_check(
     if let Some(last) = state.last_opinion
         && cycle.get().saturating_sub(last.cycle.get()) < settings.per_check_cooldown_cycles
     {
-        // One opinion per check per cooldown window. The earlier opinion may stand in for
-        // this one only if it covers it: a confirm, about the side Jev is on now, obtained
-        // under an `Irreversible` trigger if this cycle's is one. Otherwise the opinion
-        // that would be bought cannot be, and the check is held for the window.
+        // One opinion per check per cooldown window, with one exception. The earlier
+        // opinion stands in for this one only if it covers it: a confirm, about the side
+        // Jev is on now, obtained under an `Irreversible` trigger if this cycle's is one.
         let covered = last.covers(rc.side, irreversible);
-        record.limits.push(EnsembleLimit::Cooldown {
-            last_opinion: last.cycle,
-            cooldown_cycles: settings.per_check_cooldown_cycles,
-            held: !covered,
-        });
-        if !covered {
-            record.resolved = rc.suppress(
-                CheckSuppression::Unresolved,
-                Resolution::UnresolvedInBand {
-                    ask: ask_for(plan, None),
-                    rungs: Vec::new(),
-                },
-            );
+        if covered || !irreversible {
+            record.limits.push(EnsembleLimit::Cooldown {
+                last_opinion: last.cycle,
+                cooldown_cycles: settings.per_check_cooldown_cycles,
+                held: !covered,
+            });
+            if !covered {
+                record.resolved = rc.suppress(
+                    CheckSuppression::Unresolved,
+                    Resolution::UnresolvedInBand {
+                        ask: ask_for(plan, None),
+                        rungs: Vec::new(),
+                    },
+                );
+            }
+            return Ok(record);
         }
-        return Ok(record);
+        // The exception: an opinion an `Irreversible` trigger needs is never skipped or
+        // held by the cooldown. With no covering confirm, a fresh one is bought, subject
+        // only to the opinion budget below.
     }
 
     let needed = u32::try_from(rungs.len()).unwrap_or(u32::MAX);

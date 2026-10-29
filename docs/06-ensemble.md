@@ -253,6 +253,10 @@ error model that aftman does not have.
 For R2 the stored `p_reported` is `p(¬X)`. It enters this one comparison, which yields a verdict, and
 nothing else: `1 − p(¬X)` is never stored, never shown to policy, and never used as a probability.
 
+The comparison is made on the `f32` values, so a pair whose decimal distance is exactly the
+tolerance may contest. A decimally consistent pair (distance below the tolerance) always confirms,
+and a decimally inconsistent one never does.
+
 An R2 answer that is missing, not a number, or outside `0..=1` is unusable: **ABSTAIN**, or
 **CONTEST** for an `Irreversible` trigger, exactly as for R1. An inconsistent answer contests with
 the side `1 − p(¬X)` points to; a consistent one confirms Jev's side.
@@ -439,6 +443,13 @@ exception. The rule grammar has no other way to read a probability.
 decisive  = |p − t| >= margin      (always true when ensemble.enabled = false)
 permitted = decisive
 ```
+
+The comparison is made on the `f32` values, not on their decimal spellings. A value whose decimal
+distance from `t` is exactly the margin may therefore land on either side — `0.95` against `0.80`
+with a margin of `0.15` computes as `0.14999998` and is **held**. That is the conservative
+direction and it is kept: a value decimally inside the band is never decisive, and one decimally
+outside it is always decisive; only the exact boundary can go either way. Configure thresholds and
+margins with that in mind rather than relying on a value sitting exactly on the line.
 
 Every subsequent step can only lower it:
 

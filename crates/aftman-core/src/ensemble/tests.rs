@@ -695,6 +695,64 @@ fn reframe_verdict_is_the_documented_consistency_rule() {
 }
 
 #[test]
+fn the_f32_boundary_errs_toward_holding() {
+    // Review finding 7. Values are compared as `f32`, so a value whose decimal distance is
+    // exactly the margin (or the tolerance) may land on either side. What must never
+    // happen is the unsafe direction: a value decimally inside the band being decisive,
+    // or a decimally inconsistent R2 pair confirming. Two-decimal grid.
+    let mut boundary_held = 0;
+    for ti in 0..=100_i32 {
+        for pi in 0..=100_i32 {
+            let rc = ResolvedCheck::from_measurement(
+                k(TESTS),
+                Some(pi as f32 / 100.0),
+                Some(ti as f32 / 100.0),
+                0.15,
+                true,
+            );
+            let distance = (pi - ti).abs();
+            if distance < 15 {
+                assert!(!rc.decisive, "p={pi} t={ti} is inside the band");
+            }
+            if distance > 15 {
+                assert!(rc.decisive, "p={pi} t={ti} is outside the band");
+            }
+            if distance == 15 && !rc.decisive {
+                boundary_held += 1;
+            }
+        }
+    }
+    assert!(
+        boundary_held > 0,
+        "some exact-margin values are held, as documented"
+    );
+    for pi in 0..=100_i32 {
+        for qi in 0..=100_i32 {
+            let distance = (pi - (100 - qi)).abs();
+            let verdict = reframe_verdict(
+                pi as f32 / 100.0,
+                Some(qi as f32 / 100.0),
+                0.75,
+                0.15,
+                false,
+            );
+            if distance > 15 {
+                assert!(
+                    matches!(verdict, Verdict::Contest { .. }),
+                    "p={pi} q={qi} is inconsistent"
+                );
+            }
+            if distance < 15 {
+                assert!(
+                    matches!(verdict, Verdict::Confirm { .. }),
+                    "p={pi} q={qi} is consistent"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn an_unusable_reframe_abstains_except_on_an_irreversible_trigger() {
     for unusable in [
         None,

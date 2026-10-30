@@ -262,27 +262,10 @@ impl ResponsibilityRegistry {
     /// Grouping is the coarsest split that never sends a check evidence it did not ask
     /// for, and it collapses the built-ins to one or two requests rather than one per
     /// check.
+    /// See [`crate::observation::group_by_evidence`], which this is over the active checks.
     #[must_use]
-    pub fn grouped_by_evidence(&self) -> Vec<(Vec<EvidenceId>, Vec<Check>)> {
-        let mut groups: Vec<(Vec<EvidenceId>, Vec<Check>)> = Vec::new();
-        for check in self.checks() {
-            let selection = if check.evidence.is_empty() {
-                DEFAULT_EVIDENCE
-                    .iter()
-                    .map(|e| EvidenceId::new(*e))
-                    .collect()
-            } else {
-                check.evidence.clone()
-            };
-            match groups
-                .iter_mut()
-                .find(|(providers, _)| *providers == selection)
-            {
-                Some((_, checks)) => checks.push(check),
-                None => groups.push((selection, vec![check])),
-            }
-        }
-        groups
+    pub fn grouped_by_evidence(&self) -> Vec<(Vec<String>, Vec<Check>)> {
+        crate::observation::group_by_evidence(&self.checks())
     }
 
     /// The checks `rule` compares against a threshold. Empty for an unknown rule.

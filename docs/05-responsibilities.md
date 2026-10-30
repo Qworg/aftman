@@ -332,7 +332,9 @@ Validation rules (all fatal at load, never at assessment time):
 ## 3. Evidence providers
 
 Evidence is gathered before an assessment and selected per check. A check receives either its
-explicit `evidence` list or the default set.
+explicit `evidence` list or the default set: an explicit list replaces the default, it does not
+add to it. A cycle asks one request per distinct selection, so each check is asked over exactly
+what its selection describes ([03-jev.md §5](03-jev.md)).
 
 | Provider | Content | Default |
 | --- | --- | --- |
@@ -377,7 +379,12 @@ Rules:
 - evidence results are persisted with exit code, duration, output excerpt, and the resolved argv,
   so a model's conclusion about a test run is auditable down to the command;
 - `run_when = "before_finish"` means the check is re-evaluated with fresh evidence before `Finish`
-  is allowed — the primary defense against a worker that reports tests it never ran;
+  is allowed — the primary defense against a worker that reports tests it never ran. The
+  provisional `Finish` runs the provider and the cycle is assessed again, and that assessment shows
+  its output to every check that selects it (`command:<id>` or `command_evidence`), with the
+  ensemble on or off. A check that does not select it sees only what `test_summary` parses from
+  it; none of the bundled checks selects command output, so to have `ready_to_finish` read an
+  audit's output, an overriding definition selects it;
 - `run_when` says when a provider runs **by itself** (after a worker completes, only when asked,
   or before a `Finish`). It does not limit the ensemble: an evidence refresh (R0) may re-run any
   provider a check selects, whatever its `run_when`, as an explicit, capped re-measurement

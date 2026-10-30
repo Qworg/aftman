@@ -136,7 +136,7 @@ Precisely, for a check `k` with threshold `t` (`aftman_core::ensemble::EnsembleP
 | --- | --- |
 | `NearThreshold` | `k` has a value and is not decisive |
 | `LowConfidence` | the answer's `confidence` is below `confidence_floor`, or is not a number |
-| `ClaimOnlyEvidence` | `k`'s evidence selection reached **no command evidence Jev saw this cycle**: it names no `command:<id>` (or `command_evidence`) whose output is in the `state` the cycle's assessment actually sent (`EnsembleContext::assessed_state`, `saw_command_evidence`). Output that is in the observation but was not sent does not count, and the runtime's assessment sends none ([03-jev.md §5](03-jev.md)), so a check selecting command output is claim-only in every cycle until R0 re-measures it over its own selection. When an irreversible directive rests on such a check (it selects command output, and Jev saw none of it) and R0 cannot re-measure it this cycle, it is held, not put to R2 (§6, "Command evidence the model was never shown"). An earlier revision read the observation instead, called such a check measured though Jev had never seen the command, and finished on it. A provider `k` names that has not run yet (an `on_demand` one) does not count either — what `k` scored was the worker's claim. This is the case in §9.1 |
+| `ClaimOnlyEvidence` | `k`'s evidence selection reached **no command evidence Jev saw this cycle**: it names no `command:<id>` (or `command_evidence`) whose output is in the `state` the check's own request in the cycle's assessment actually sent (`EnsembleContext::assessed_states`, `saw_command_evidence`). Output that is in the observation but was not sent does not count. The assessment asks each check over its own selection ([03-jev.md §5](03-jev.md)), so a check selecting command output is shown it once its provider has run, in every later cycle; it is claim-only while the provider has not run (an `on_demand` provider before R0 runs it). Until grouping was built, the assessment sent no command output at all, and such a check was claim-only in every cycle until R0 re-measured it. When an irreversible directive rests on such a check (it selects command output, and Jev saw none of it) and R0 cannot re-measure it this cycle, it is held, not put to R2 (§6, "Command evidence the model was never shown"). An earlier revision read the observation instead, called such a check measured though Jev had never seen the command, and finished on it. A provider `k` names that has not run yet (an `on_demand` one) does not count either — what `k` scored was the worker's claim. This is the case in §9.1 |
 | `OutcomeRelevant` | the selected directive's kind differs between `k` pinned above and `k` pinned below |
 | `HighStakes` | `k` is in what a **pending** `stakes = "high"` directive rests on — the same definition the `Irreversible` trigger and the gate use (`rests_on`: the read set of the high-stakes proposals ∪ every decisive, permitted check whose side changes which high-stakes proposals are made), taken over the baseline, over each in-band check pinned decisively above and below alone, and over all in-band checks pinned above together and below together. The joint pins are what make two `Finish` conjuncts that are both in band each high stakes: neither alone produces a `Finish`, so a single-check counterfactual found nothing, neither escalated, and the run started worker after worker until its limit |
 | `Irreversible` | `k` is decisive, the selected directive is `Stop` or a `Finish` the runtime will execute (not a provisional one, §6), and that directive rests on `k`: a rule proposing it reads `k`, or `k`'s side changes it (`irreversible_dependencies`, §6; the gate uses the same set). Every check is load-bearing for `Finish` through `UnresolvedUncertainty`; this asks whether the directive rests on `k` itself |
@@ -358,8 +358,9 @@ Cost: one additional Jev call, same provider, same budget.
 4. **`OPINION_REQUESTED` first**, with `prompt_hash` (BLAKE3 over the canonical serialization of
    `{"purpose": "reframe", "questions": {check: negation}}`) and `state_digest` (BLAKE3 over the
    canonical serialization of the state sent, volatile fields included, §8). For a value from the
-   assessment, `state_digest` equals the `state_digest` that cycle's `ASSESSMENT_COMPLETED`
-   records. **After a refresh it does not, and must not**: the refreshed value was measured on a
+   assessment, `state_digest` equals the digest that cycle's `ASSESSMENT_COMPLETED` records for the
+   request the check was asked in (its entry in `requests`; for a cycle of one request, also the
+   top-level `state_digest`, [03-jev.md §5](03-jev.md)). **After a refresh it does not, and must not**: the refreshed value was measured on a
    rebuilt state — fresh command output, a later event history — so its reframe is asked over that
    state, and its digest equals the one the refresh records in its `EnsembleResolved` entry
    (`refresh.outcome.state_digest`). Either way the digest names the state the value under question
@@ -758,7 +759,8 @@ loop:
   untouched. `Accept` (or `Guidance`) authorises nothing: the checks stay held and the next
   cycle asks again. `Stop` ends the run.
 - **Command evidence the model was never shown.** A check that selects command output
-  (`command:<id>` or `command_evidence`) of which the cycle's assessment showed Jev none
+  (`command:<id>` or `command_evidence`) of which its request in the cycle's assessment showed Jev
+  none — its provider has not run yet ([03-jev.md §5](03-jev.md))
   (`CheckPlan::unseen_command`) rests on the worker's claim about a command. Where an irreversible
   directive rests on it — the ladder's `Irreversible` trigger, or the gate's guard — and R0 cannot
   re-measure it this cycle (the refresh cap is spent, or the refresh was rejected — every
@@ -981,7 +983,8 @@ Notes that follow directly from §2:
 1. **One materialised input.** After `ASSESSMENT_COMPLETED`, the runtime builds every value policy
    will read, once, into an `EnsembleCycle` (`aftman-daemon`, `ensemble.rs`): status, counters,
    configuration, observation, clock, active worker, last directive, steering grace, the registry's
-   checks, the answers, the state the assessment was asked over (`assessed_state`), the counters, `reframe_available` (`reframable_checks`, §4 R2), `finish_is_provisional`,
+   checks, the answers, the states the assessment was asked over, one per evidence selection, with
+   which check was asked over which (`assessed_states`, [03-jev.md §5](03-jev.md)), the counters, `reframe_available` (`reframable_checks`, §4 R2), `finish_is_provisional`,
    and the baseline (`resolve_checks` with the settings' margin and `enabled`). The plan's context,
    the resolution's context and the final arbitration's `PolicyInput` are all derived from that one
    value; nothing is re-read from the run in between. The same registry is passed to `build` and
@@ -1124,8 +1127,9 @@ Properties:
   included, because it must prove that the judge saw exactly what Jev saw
   (`aftman_core::observation::state_digest`, over the document exactly as it is handed to
   `DecisionModel::ask`; the provider's own request-budget compaction is a deterministic function
-  of it). Each cycle's `ASSESSMENT_COMPLETED` records the digest of the state its assessment was
-  asked over, and each refresh record the digest of its rebuilt state, so an opinion's digest can
+  of it). Each cycle's `ASSESSMENT_COMPLETED` records the digest of the state each of its requests
+  was asked over, with the checks it asked (`requests`, [03-jev.md §5](03-jev.md)), and each
+  refresh record the digest of its rebuilt state, so an opinion's digest can
   be checked against the measurement it is about from the log alone. Only the digest is
   persisted — repository prose must not land in the run log ([02-lld.md §3.3](02-lld.md)).
   Do not confuse it with the watcher's `observation_content_digest`, which deliberately *removes*
@@ -1429,8 +1433,8 @@ Through the runtime (S2), in the same file:
 
 - **sycophancy and provenance** (`a_reframe_asks_the_negation_over_the_assessed_state_and_never_
   shows_jevs_value`): every R2 request actually sent asks exactly the check's written negation,
-  over the byte-identical state the cycle's assessment was asked over; its `state_digest` equals
-  `ASSESSMENT_COMPLETED`'s; and the request spells none of the run's Jev values, nor `1 − p`, nor an
+  over the byte-identical state the check's request in the cycle's assessment was asked over;
+  its `state_digest` equals the one `ASSESSMENT_COMPLETED` records for that request; and the request spells none of the run's Jev values, nor `1 − p`, nor an
   earlier opinion's excerpt or answer;
 - **end to end**: a decisive `Finish` whose R2 is inconsistent is contested and the run does not
   finish; a consistent one confirms, leaves every check exactly as permitted as Jev left it, and

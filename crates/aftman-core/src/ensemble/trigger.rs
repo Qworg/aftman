@@ -112,11 +112,12 @@ pub struct EnsembleContext<'a> {
     pub evidence: &'a EvidencePlan,
     /// This cycle's raw answers, for the confidence of `Choice`/`Score` checks.
     pub answers: &'a BTreeMap<CheckKey, AnswerValue>,
-    /// The `state` document this cycle's assessment was actually asked over: what Jev saw
-    /// when it gave `answers`. `ClaimOnlyEvidence` is computed from it, never from the
-    /// observation, because command output the observation holds but the assessment did
-    /// not send is output Jev never saw.
-    pub assessed_state: &'a serde_json::Value,
+    /// The `state` documents this cycle's assessment was actually asked over, one per
+    /// evidence selection, and which check was asked over which: what Jev saw when it gave
+    /// each of `answers` (`docs/03-jev.md` §5). `ClaimOnlyEvidence` is computed from the
+    /// check's own, never from the observation, because command output the observation
+    /// holds but the check's request did not send is output Jev never saw.
+    pub assessed_states: &'a crate::observation::AssessedStates,
     pub counters: &'a EnsembleCounters,
     /// Checks that can be asked the negated question (R2): see [`reframable_checks`].
     pub reframe_available: &'a BTreeSet<CheckKey>,
@@ -615,7 +616,11 @@ fn plan_check(
     {
         triggers.insert(EnsembleTrigger::LowConfidence);
     }
-    let saw_command = saw_command_evidence(&selection, ctx.assessed_state);
+    // A check the cycle did not ask has no state; nothing was shown to it.
+    let saw_command = ctx
+        .assessed_states
+        .state_for_check(key)
+        .is_some_and(|state| saw_command_evidence(&selection, state));
     if !saw_command {
         triggers.insert(EnsembleTrigger::ClaimOnlyEvidence);
     }
@@ -757,13 +762,13 @@ fn evidence_selection(definitions: &[Check], key: &CheckKey) -> Vec<String> {
         )
 }
 
-/// Whether Jev saw command output the check selects, in the `state` the cycle's assessment
+/// Whether Jev saw command output the check selects, in the `state` the check's request
 /// actually sent (its `command_evidence`).
 ///
-/// Not whether the observation holds it: a provider that ran is in the observation, but the
-/// runtime asks the cycle's questions over the default selection, which carries no command
-/// output (`docs/03-jev.md` §5), so what the check was scored on was the worker's claim. A
-/// provider the check names that has not run counts the same way.
+/// Not whether the observation holds it: a provider that ran is in the observation, but
+/// only the output the check's request carried was shown (`docs/03-jev.md` §5). A provider
+/// the check names that has not run counts the same way: what the check was scored on was
+/// the worker's claim.
 #[must_use]
 pub fn saw_command_evidence(selection: &[String], assessed_state: &serde_json::Value) -> bool {
     let commands = assessed_state

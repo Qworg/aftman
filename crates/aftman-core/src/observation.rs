@@ -670,6 +670,89 @@ pub fn evidence_selection(check: &crate::responsibility::Check) -> Vec<String> {
     }
 }
 
+/// A check's evidence selection as a set: sorted and without repeats, so that two checks
+/// naming the same providers in a different order are one group. The `state` a selection
+/// produces does not depend on the order it is named in.
+fn selection_key(check: &crate::responsibility::Check) -> Vec<String> {
+    let mut selection = evidence_selection(check);
+    selection.sort();
+    selection.dedup();
+    selection
+}
+
+/// Group checks by the evidence they select (`docs/03-jev.md` §5): one group per distinct
+/// selection, in the order each selection first appears, each check in its own selection's
+/// group. A check's selection is its explicit `evidence` list, or the default set when it
+/// names none (`docs/05-responsibilities.md` §3). The bundled definitions all select the
+/// default, so they are one group.
+#[must_use]
+pub fn group_by_evidence(
+    checks: &[crate::responsibility::Check],
+) -> Vec<(Vec<String>, Vec<crate::responsibility::Check>)> {
+    let mut groups: Vec<(Vec<String>, Vec<crate::responsibility::Check>)> = Vec::new();
+    for check in checks {
+        let selection = selection_key(check);
+        match groups.iter_mut().find(|(other, _)| *other == selection) {
+            Some((_, members)) => members.push(check.clone()),
+            None => groups.push((selection, vec![check.clone()])),
+        }
+    }
+    groups
+}
+
+/// One model request of a cycle's assessment: the checks it asks, and the `state` it asks
+/// them over, exactly as sent.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AssessmentRequest {
+    /// The evidence selection the state was built from.
+    pub selection: Vec<String>,
+    /// The checks asked over `state`, in definition order.
+    pub checks: Vec<CheckKey>,
+    pub state: Value,
+}
+
+/// What a cycle's assessment asks, grouped by evidence selection (`docs/03-jev.md` §5):
+/// one request per distinct selection, so every check is asked over the state its own
+/// selection describes. Which state a check was asked over is what the ensemble reads
+/// (`ClaimOnlyEvidence`, and R2, which is asked over exactly that state:
+/// `docs/06-ensemble.md` §3, §4 R2).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AssessedStates {
+    requests: Vec<AssessmentRequest>,
+}
+
+impl AssessedStates {
+    /// The requests a cycle asks `checks` in, each with its state built from `observation`.
+    #[must_use]
+    pub fn group(observation: &Observation, checks: &[crate::responsibility::Check]) -> Self {
+        Self {
+            requests: group_by_evidence(checks)
+                .into_iter()
+                .map(|(selection, members)| AssessmentRequest {
+                    state: observation.state_for(&selection),
+                    checks: members.into_iter().map(|c| c.key).collect(),
+                    selection,
+                })
+                .collect(),
+        }
+    }
+
+    /// The requests, in the order they are asked.
+    #[must_use]
+    pub fn requests(&self) -> &[AssessmentRequest] {
+        &self.requests
+    }
+
+    /// The state `key` was asked over, if it was asked.
+    #[must_use]
+    pub fn state_for_check(&self, key: &CheckKey) -> Option<&Value> {
+        self.requests
+            .iter()
+            .find(|request| request.checks.contains(key))
+            .map(|request| &request.state)
+    }
+}
+
 /// A check's wire key set, for building a request.
 #[must_use]
 pub fn check_keys(checks: &[crate::responsibility::Check]) -> Vec<CheckKey> {

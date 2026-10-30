@@ -40,7 +40,7 @@ use aftman_core::ids::{AssessmentSeq, CheckKey, EscalationId, EventSeq, RunId, W
 use aftman_core::job::{FactoryStatus, Job, RunConfig, TaskKind, WorkerStatus};
 use aftman_core::log::BoundedLog;
 use aftman_core::model::{DecisionModel, Purpose, Question};
-use aftman_core::observation::{EventSummary, Observation};
+use aftman_core::observation::{AssessedStates, EventSummary, Observation};
 use aftman_core::responsibility::ResponsibilityRegistry;
 use aftman_core::routing;
 use aftman_core::run::{AnsweredEscalation, Escalation, EscalationKind, RunHeader, RunState};
@@ -1002,13 +1002,19 @@ impl FactoryRuntime {
             }
 
             // ---- ask the model ----------------------------------------------
+            //
+            // One request per distinct evidence selection (`docs/03-jev.md` §5), so every
+            // check is asked over the state its own selection describes: a check that
+            // selects `command:<id>` is shown that output once the provider has run. The
+            // bundled definitions all select the default, so they are one request, as before.
             let questions = self.questions(&registry);
             let keys: Vec<(CheckKey, Option<f32>)> = registry
                 .checks()
                 .into_iter()
                 .map(|c| (c.key, c.threshold))
                 .collect();
-            let state_json = observation.state_for(&aftman_core::observation::default_evidence());
+            let definitions = registry.checks();
+            let assessed_states = AssessedStates::group(&observation, &definitions);
 
             self.emit(
                 state,
@@ -1017,120 +1023,72 @@ impl FactoryRuntime {
             )
             .await?;
 
-            // `max_assessments` is a hard ceiling: once it is spent the model is not
-            // asked again, however the run got here. Policy is handed an empty check
-            // set, exactly as on a model failure, and its budget invariant escalates.
-            let budget_spent = ls.assessments >= self.deps.config.max_assessments;
-            if budget_spent {
-                self.emit(
-                    state,
-                    EventKind::BudgetExceeded,
-                    json!({ "max_assessments": self.deps.config.max_assessments }),
-                )
+            let asked = self
+                .ask_assessment(state, ls, run_id, &assessed_states, &questions)
                 .await?;
-            }
-            let (checks, answers, model_name, usage) = if budget_spent {
-                (
-                    BTreeMap::new(),
-                    None,
-                    "budget_exhausted".to_owned(),
-                    usage_default(),
-                )
-            } else {
-                match self
-                    .deps
-                    .model
-                    .ask(
-                        &aftman_core::model::AskContext::for_run(
-                            Purpose::Assessment,
-                            run_id,
-                            AssessmentSeq(ls.assessments.into()),
-                        ),
-                        &state_json,
-                        &questions,
-                        &self.deps.jev_budget,
-                    )
-                    .await
-                {
-                    Ok(answers) => {
-                        state.counters.consecutive_model_failures = 0;
-                        let resolved = aftman_core::model::resolve_checks(
-                            &answers,
-                            &keys,
-                            self.deps.ensemble.uncertainty_margin,
-                            self.deps.ensemble.enabled,
-                        );
-                        (
-                            resolved,
-                            Some(answers.answers),
-                            answers.model,
-                            answers.usage,
-                        )
-                    }
-                    Err(error) => {
-                        // A budget refusal is not a model failure. The request could not be
-                        // built, so the model was never asked; counting it as a model failure
-                        // made a repository too large to describe escalate as "model_unavailable:
-                        // supervision is blind", and it left no usage line, so `aftman usage`
-                        // could not show why.
-                        let refused = matches!(error, ModelError::BudgetExceeded(_));
-                        if refused {
-                            state.counters.consecutive_budget_failures += 1;
-                            state.counters.consecutive_model_failures = 0;
-                        } else {
-                            state.counters.consecutive_model_failures += 1;
-                            state.counters.consecutive_budget_failures = 0;
-                        }
-                        // A rate limit is a different operational event from a malformed
-                        // answer, and the UI shows them differently, so they are distinct
-                        // event kinds rather than one `Error` with a code inside.
-                        self.emit(state, model_error_kind(&error), model_error_payload(&error))
-                            .await?;
-                        // No guesses: an empty check set can only produce conservative
-                        // directives.
-                        (
-                            BTreeMap::new(),
-                            None,
-                            "unavailable".to_owned(),
-                            usage_default(),
-                        )
-                    }
+            state.counters.assessments = ls.assessments;
+            let (checks, answers, model_name, usage) = match asked.answers {
+                Some(answers) => {
+                    let checks = aftman_core::model::resolve_checks(
+                        &aftman_core::model::ModelAnswers {
+                            model: asked.model.clone(),
+                            usage: asked.usage,
+                            answers: answers.clone(),
+                            request_id: None,
+                            attempts: 1,
+                        },
+                        &keys,
+                        self.deps.ensemble.uncertainty_margin,
+                        self.deps.ensemble.enabled,
+                    );
+                    (checks, Some(answers), asked.model, asked.usage)
                 }
+                // No guesses: an empty check set can only produce conservative directives.
+                None => (BTreeMap::new(), None, asked.model, usage_default()),
             };
 
-            if !budget_spent {
-                ls.assessments += 1;
-            }
-            state.counters.assessments = ls.assessments;
-
             // ---- record the assessment --------------------------------------
-            self.emit(
-                state,
-                EventKind::AssessmentCompleted,
-                json!({
-                    "assessment_seq": ls.assessments,
-                    // What the model was shown for every value below (`docs/06-ensemble.md`
-                    // §8): an R2 reframe of one of them is asked over the same state, and
-                    // its `OPINION_REQUESTED` carries the same digest.
-                    "state_digest": aftman_core::observation::state_digest(&state_json),
-                    "model": model_name,
-                    "input_tokens": usage.input_tokens,
-                    "output_tokens": usage.output_tokens,
-                    "checks": checks.iter().map(|(k, v)| {
-                        json!({
-                            "key": k.to_string(),
-                            "jev_p": v.jev_p,
-                            "threshold": v.threshold,
-                            "margin": v.margin,
-                            "decisive": v.decisive,
-                            "contested": v.contested,
-                            "permitted": v.permitted,
-                            "unresolved": v.is_unresolved(),
-                        })
-                    }).collect::<Vec<_>>(),
-                }),
-            )
-            .await?;
+            //
+            // What the model was shown for every value below (`docs/06-ensemble.md` §8): an
+            // R2 reframe of one of them is asked over the state of the check's own request,
+            // and its `OPINION_REQUESTED` carries that request's digest. `state_digest` is
+            // kept for a cycle of one request, which is every cycle over the bundled
+            // definitions.
+            let requests: Vec<serde_json::Value> = assessed_states
+                .requests()
+                .iter()
+                .map(|request| {
+                    json!({
+                        "checks": request.checks.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                        "state_digest": aftman_core::observation::state_digest(&request.state),
+                    })
+                })
+                .collect();
+            let mut completed = json!({
+                "assessment_seq": ls.assessments,
+                "model": model_name,
+                "input_tokens": usage.input_tokens,
+                "output_tokens": usage.output_tokens,
+                "checks": checks.iter().map(|(k, v)| {
+                    json!({
+                        "key": k.to_string(),
+                        "jev_p": v.jev_p,
+                        "threshold": v.threshold,
+                        "margin": v.margin,
+                        "decisive": v.decisive,
+                        "contested": v.contested,
+                        "permitted": v.permitted,
+                        "unresolved": v.is_unresolved(),
+                    })
+                }).collect::<Vec<_>>(),
+            });
+            if let [only] = assessed_states.requests() {
+                completed["state_digest"] =
+                    json!(aftman_core::observation::state_digest(&only.state));
+            }
+            completed["requests"] = json!(requests);
+            self.emit(state, EventKind::AssessmentCompleted, completed)
+                .await?;
 
             // ---- materialise the cycle ----------------------------------------
             //
@@ -1145,7 +1103,6 @@ impl FactoryRuntime {
             // read by both the ensemble and that step, so the two cannot disagree.
             let finish_is_provisional =
                 !ls.before_finish_ran && !self.deps.evidence.due(RunWhen::BeforeFinish).is_empty();
-            let definitions = registry.checks();
             let cycle = EnsembleCycle {
                 cycle: AssessmentSeq(ls.assessments.into()),
                 settings: self.deps.ensemble.clone(),
@@ -1160,7 +1117,7 @@ impl FactoryRuntime {
                 definitions: definitions.clone(),
                 evidence: self.deps.evidence.clone(),
                 answers: answers.clone().unwrap_or_default(),
-                assessed_state: state_json.clone(),
+                assessed_states,
                 ensemble: state.ensemble.clone(),
                 // Every check with an independently written negation, when R2 is a
                 // configured rung: built once, from the definitions the questions came from.
@@ -1188,7 +1145,6 @@ impl FactoryRuntime {
                         &mut control,
                         &registry,
                         &questions,
-                        &state_json,
                         &cycle,
                     )
                     .await?,
@@ -2078,6 +2034,104 @@ impl FactoryRuntime {
         Ok(())
     }
 
+    /// Ask a cycle's questions: one request per evidence selection, in order
+    /// (`docs/03-jev.md` §5), each check asked over its own request's state.
+    ///
+    /// Every request is an assessment for the budget's purposes: each counts against
+    /// `max_assessments` (`ls.assessments`), goes under the request budget, and is billed by
+    /// its own usage line, written by the provider. The cycle's answers are all or nothing.
+    /// `max_assessments` is a hard ceiling: once it is spent no further request is made,
+    /// and a cycle that could not ask every request has no answers, exactly as on a model
+    /// failure — so policy is handed an empty check set and its budget invariant escalates.
+    /// A failed request ends the cycle's asking too; later requests are not made, since
+    /// their answers could not be used.
+    async fn ask_assessment(
+        &self,
+        state: &mut RunState,
+        ls: &mut Loop,
+        run_id: RunId,
+        assessed: &AssessedStates,
+        questions: &BTreeMap<CheckKey, Question>,
+    ) -> Result<CycleAnswers, RuntimeError> {
+        let mut answers = BTreeMap::new();
+        let mut model = None;
+        let mut usage = aftman_core::model::Usage::default();
+        for request in assessed.requests() {
+            if ls.assessments >= self.deps.config.max_assessments {
+                self.emit(
+                    state,
+                    EventKind::BudgetExceeded,
+                    json!({ "max_assessments": self.deps.config.max_assessments }),
+                )
+                .await?;
+                return Ok(CycleAnswers::none("budget_exhausted"));
+            }
+            let asked: BTreeMap<CheckKey, Question> = request
+                .checks
+                .iter()
+                .filter_map(|key| questions.get(key).map(|q| (key.clone(), q.clone())))
+                .collect();
+            let result = self
+                .deps
+                .model
+                .ask(
+                    &aftman_core::model::AskContext::for_run(
+                        Purpose::Assessment,
+                        run_id,
+                        AssessmentSeq(ls.assessments.into()),
+                    ),
+                    &request.state,
+                    &asked,
+                    &self.deps.jev_budget,
+                )
+                .await;
+            ls.assessments += 1;
+            match result {
+                Ok(answered) => {
+                    state.counters.consecutive_model_failures = 0;
+                    // Only what this request asked: an answer to a question it did not ask
+                    // is ignored (`AGENTS.md`, additive change), and must not stand in for
+                    // the value another request measured.
+                    for key in &request.checks {
+                        if let Some(value) = answered.answers.get(key) {
+                            answers.insert(key.clone(), value.clone());
+                        }
+                    }
+                    model.get_or_insert(answered.model);
+                    usage.input_tokens =
+                        sum_tokens(usage.input_tokens, answered.usage.input_tokens);
+                    usage.output_tokens =
+                        sum_tokens(usage.output_tokens, answered.usage.output_tokens);
+                }
+                Err(error) => {
+                    // A budget refusal is not a model failure. The request could not be
+                    // built, so the model was never asked; counting it as a model failure
+                    // made a repository too large to describe escalate as "model_unavailable:
+                    // supervision is blind", and it left no usage line, so `aftman usage`
+                    // could not show why.
+                    if matches!(error, ModelError::BudgetExceeded(_)) {
+                        state.counters.consecutive_budget_failures += 1;
+                        state.counters.consecutive_model_failures = 0;
+                    } else {
+                        state.counters.consecutive_model_failures += 1;
+                        state.counters.consecutive_budget_failures = 0;
+                    }
+                    // A rate limit is a different operational event from a malformed
+                    // answer, and the UI shows them differently, so they are distinct
+                    // event kinds rather than one `Error` with a code inside.
+                    self.emit(state, model_error_kind(&error), model_error_payload(&error))
+                        .await?;
+                    return Ok(CycleAnswers::none("unavailable"));
+                }
+            }
+        }
+        Ok(CycleAnswers {
+            answers: Some(answers),
+            model: model.unwrap_or_default(),
+            usage,
+        })
+    }
+
     fn questions(&self, registry: &ResponsibilityRegistry) -> BTreeMap<CheckKey, Question> {
         registry
             .checks()
@@ -2461,7 +2515,6 @@ impl FactoryRuntime {
         control: &mut Option<ControlReceiver>,
         registry: &ResponsibilityRegistry,
         questions: &BTreeMap<CheckKey, Question>,
-        assessed: &serde_json::Value,
         cycle: &EnsembleCycle,
     ) -> Result<Result<EnsembleOutcome, ()>, RuntimeError> {
         let input = cycle.policy_input(&cycle.checks);
@@ -2482,7 +2535,7 @@ impl FactoryRuntime {
                     job,
                     questions,
                     definitions: &cycle.definitions,
-                    assessed,
+                    assessed: &cycle.assessed_states,
                     timeout: Duration::from_secs(cycle.settings.opinion_timeout_seconds),
                     scratch: tokio::sync::Mutex::new(Scratch {
                         state: &mut *state,
@@ -2837,6 +2890,33 @@ fn model_error_kind(error: &ModelError) -> EventKind {
     }
 }
 
+/// What a cycle's assessment answered: every request's answers merged, or none.
+struct CycleAnswers {
+    answers: Option<BTreeMap<CheckKey, aftman_core::assessment::AnswerValue>>,
+    /// The model that answered, or why none did (`budget_exhausted`, `unavailable`).
+    model: String,
+    /// Summed over the cycle's requests.
+    usage: aftman_core::model::Usage,
+}
+
+impl CycleAnswers {
+    fn none(model: &str) -> Self {
+        Self {
+            answers: None,
+            model: model.to_owned(),
+            usage: aftman_core::model::Usage::default(),
+        }
+    }
+}
+
+/// Token counts summed over requests: known if any request reported them.
+fn sum_tokens(a: Option<u64>, b: Option<u64>) -> Option<u64> {
+    match (a, b) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+    }
+}
+
 fn model_error_payload(error: &ModelError) -> serde_json::Value {
     json!({
         "code": error.code(),
@@ -2921,9 +3001,9 @@ struct CycleSource<'a> {
     job: &'a Job,
     questions: &'a BTreeMap<CheckKey, Question>,
     definitions: &'a [aftman_core::responsibility::Check],
-    /// The state document this cycle's assessment was asked over: what Jev saw for every
-    /// value it measured this cycle.
-    assessed: &'a serde_json::Value,
+    /// The state documents this cycle's assessment was asked over, one per evidence
+    /// selection: what Jev saw for every value it measured this cycle.
+    assessed: &'a AssessedStates,
     timeout: Duration,
     scratch: tokio::sync::Mutex<Scratch<'a>>,
 }
@@ -3219,7 +3299,7 @@ impl CycleSource<'_> {
         let state = if request.refreshed {
             scratch.refreshed.get(check).cloned()
         } else {
-            Some(self.assessed.clone())
+            self.assessed.state_for_check(check).cloned()
         };
         let (Some(negation), Some(state)) = (negation, state) else {
             // Neither can happen for a plan built over this cycle's `reframe_available`;

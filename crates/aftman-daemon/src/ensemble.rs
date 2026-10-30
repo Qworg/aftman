@@ -25,7 +25,7 @@ use aftman_core::ensemble::{
 use aftman_core::evidence::EvidencePlan;
 use aftman_core::ids::{AssessmentSeq, CheckKey};
 use aftman_core::job::{FactoryStatus, RunConfig};
-use aftman_core::observation::{Counters, Observation};
+use aftman_core::observation::{AssessedStates, Counters, Observation};
 use aftman_core::policy::PolicyInput;
 use aftman_core::responsibility::{Check, ResponsibilityRegistry};
 use aftman_core::worker::WorkerRecord;
@@ -59,8 +59,9 @@ pub struct EnsembleCycle {
     pub evidence: EvidencePlan,
     /// This cycle's raw answers.
     pub answers: BTreeMap<CheckKey, AnswerValue>,
-    /// The state document the cycle's assessment was asked over, exactly as sent.
-    pub assessed_state: serde_json::Value,
+    /// The state documents the cycle's assessment was asked over, one per evidence
+    /// selection, exactly as sent, and which check was asked over which.
+    pub assessed_states: AssessedStates,
     /// The ensemble's per-run counters as they stood before this cycle.
     pub ensemble: EnsembleCounters,
     /// Checks R2 can be asked about: `reframable_checks` over `definitions` — every check
@@ -110,7 +111,7 @@ impl EnsembleCycle {
             definitions: &self.definitions,
             evidence: &self.evidence,
             answers: &self.answers,
-            assessed_state: &self.assessed_state,
+            assessed_states: &self.assessed_states,
             counters: &self.ensemble,
             reframe_available: &self.reframe_available,
             finish_is_provisional: self.finish_is_provisional,

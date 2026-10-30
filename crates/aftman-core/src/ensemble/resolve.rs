@@ -617,7 +617,7 @@ impl EnsemblePlan {
         let ask = cap_bytes(
             &format!(
                 "The command evidence of {} could not be shown to the model this cycle — the \
-                 assessment never carries command output, and the refresh that would show it \
+                 command has not run, and the refresh that would run it and show the output \
                  could not run — so the Finish or Stop resting on it cannot go ahead on a \
                  value no command stood behind. {what} Accept keeps it held, and this is asked \
                  again. Stop ends the run.",

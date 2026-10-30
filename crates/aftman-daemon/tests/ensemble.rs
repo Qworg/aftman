@@ -648,8 +648,13 @@ async fn the_exit_criterion_a_fake_passing_test_run_is_refreshed_into_a_decisive
     assert_eq!(refresh_calls[0].0, vec![CheckKey::from(TESTS)]);
     assert!(refresh_calls[0].1.contains("PROVIDER-PASS"));
     // ... and it counted against the assessment budget, as every R2 reframe the Finish it
-    // unmasked bought did.
-    let assessed = fx.of_kind(EventKind::AssessmentCompleted).len() as u32;
+    // unmasked bought did. `tests_sufficient` selects its own evidence, so every cycle is two
+    // requests, and each counts (`docs/03-jev.md` §5).
+    let assessed = assessment_requests(&fx);
+    assert_eq!(
+        assessed,
+        2 * fx.of_kind(EventKind::AssessmentCompleted).len() as u32
+    );
     let reframes = model.calls(Purpose::Reframe).len() as u32;
     assert_eq!(
         reframes as usize,
@@ -2154,6 +2159,9 @@ struct R2Model {
     /// A refresh's answer from the state it was shown and the assessments so far, before
     /// `refresh`.
     refresh_rule: Option<RefreshRule>,
+    /// An assessment's answer from the state it was shown and the assessments so far,
+    /// before the table.
+    assess_rule: Option<RefreshRule>,
     calls: Mutex<Vec<CallRecord>>,
 }
 
@@ -2179,6 +2187,7 @@ impl R2Model {
             asked: Mutex::new(BTreeMap::new()),
             later: BTreeMap::new(),
             refresh_rule: None,
+            assess_rule: None,
             calls: Mutex::new(Vec::new()),
         }
     }
@@ -2188,6 +2197,14 @@ impl R2Model {
         rule: impl Fn(&CheckKey, &str, usize) -> Option<f32> + Send + Sync + 'static,
     ) -> Self {
         self.refresh_rule = Some(Box::new(rule));
+        self
+    }
+
+    fn assess_rule(
+        mut self,
+        rule: impl Fn(&CheckKey, &str, usize) -> Option<f32> + Send + Sync + 'static,
+    ) -> Self {
+        self.assess_rule = Some(Box::new(rule));
         self
     }
 
@@ -2297,6 +2314,11 @@ impl DecisionModel for R2Model {
                     }
                 }
                 _ if key.as_str().ends_with("__routing") => Some(0.75),
+                Purpose::Assessment => self
+                    .assess_rule
+                    .as_ref()
+                    .and_then(|rule| rule(key, &state.to_string(), assessments))
+                    .or_else(|| table.get(key).copied()),
                 _ => table.get(key).copied(),
             };
             if let Some(p) = p {
@@ -2338,17 +2360,42 @@ fn opinions_recorded(fx: &Fixture) -> Vec<(u64, OpinionRecordedPayload)> {
         .collect()
 }
 
-/// `ASSESSMENT_COMPLETED`'s `state_digest`, by cycle.
-fn assessed_digests(fx: &Fixture) -> BTreeMap<u64, String> {
+/// How many requests the cycles' assessments made: one per evidence selection.
+fn assessment_requests(fx: &Fixture) -> u32 {
     fx.of_kind(EventKind::AssessmentCompleted)
         .iter()
-        .filter_map(|e| {
-            Some((
-                e.payload["assessment_seq"].as_u64()?,
-                e.payload["state_digest"].as_str()?.to_owned(),
-            ))
-        })
-        .collect()
+        .map(|e| e.payload["requests"].as_array().map_or(0, Vec::len) as u32)
+        .sum()
+}
+
+/// The `state_digest` `ASSESSMENT_COMPLETED` records for each check's request, by cycle and
+/// check. A cycle of one request records it as `state_digest` too, which must agree.
+fn assessed_digests(fx: &Fixture) -> BTreeMap<(u64, String), String> {
+    let mut digests = BTreeMap::new();
+    for e in fx.of_kind(EventKind::AssessmentCompleted) {
+        let Some(cycle) = e.payload["assessment_seq"].as_u64() else {
+            continue;
+        };
+        let requests = e.payload["requests"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if let [only] = requests.as_slice() {
+            assert_eq!(e.payload["state_digest"], only["state_digest"]);
+        } else {
+            assert!(e.payload.get("state_digest").is_none());
+        }
+        for request in requests {
+            let digest = request["state_digest"].as_str().unwrap_or_default();
+            for check in request["checks"].as_array().cloned().unwrap_or_default() {
+                digests.insert(
+                    (cycle, check.as_str().unwrap_or_default().to_owned()),
+                    digest.to_owned(),
+                );
+            }
+        }
+    }
+    digests
 }
 
 /// Opinions requested per cycle.
@@ -2452,9 +2499,12 @@ async fn a_reframe_asks_the_negation_over_the_assessed_state_and_never_shows_jev
         let digest = aftman_core::observation::state_digest(&call.state);
         assert_eq!(request.state_digest, digest);
         assert_eq!(
-            digests.get(&request.opinion_id.cycle.get()),
+            digests.get(&(
+                request.opinion_id.cycle.get(),
+                request.opinion_id.check.to_string()
+            )),
             Some(&digest),
-            "the digest ASSESSMENT_COMPLETED recorded for the cycle"
+            "the digest ASSESSMENT_COMPLETED recorded for the check's request"
         );
         assert!(!request.prompt_hash.is_empty());
 
@@ -2757,7 +2807,9 @@ async fn an_inconsistent_reframe_contests_a_decisive_finish_and_a_consistent_one
     Ok(())
 }
 
-/// The bundled definitions, with `ready_to_finish` selecting an `audit` command provider.
+/// The bundled definitions, with `ready_to_finish` selecting an `audit` command provider
+/// besides the default evidence: an explicit list replaces the default
+/// (`docs/05-responsibilities.md` §3), so the default is named too.
 fn audited_definitions() -> Result<DefinitionSet, Box<dyn std::error::Error>> {
     let mut set = DefinitionSet::bundled()?;
     let bundled = aftman_core::definitions::BUNDLED
@@ -2767,9 +2819,12 @@ fn audited_definitions() -> Result<DefinitionSet, Box<dyn std::error::Error>> {
         .ok_or("the bundled completion definition")?;
     let marker = "[checks.ready_to_finish]\n";
     let at = bundled.find(marker).ok_or("ready_to_finish")? + marker.len();
+    let mut selection = aftman_core::observation::default_evidence();
+    selection.push("command:audit".to_owned());
     let source = format!(
-        "{}evidence = [\"job\", \"command:audit\"]\n{}",
+        "{}evidence = {}\n{}",
         &bundled[..at],
+        serde_json::to_string(&selection)?,
         &bundled[at..]
     );
     let completion = ResponsibilityDefinition::parse("core.completion", &source, "test")?;
@@ -2849,7 +2904,7 @@ async fn n1b_a_refresh_that_unmasks_finish_is_guarded_and_r2_contests_another_co
     // The digests. `tests_sufficient`'s value is the assessment's, so its reframe saw the
     // assessment's state; `ready_to_finish`'s is the refresh's, so its reframe saw that.
     let assessed = assessed_digests(&fx)
-        .get(&cycle)
+        .get(&(cycle, TESTS.to_owned()))
         .cloned()
         .ok_or("the cycle's digest")?;
     let refreshed = ready
@@ -3430,12 +3485,13 @@ async fn a_spent_budget_answered_with_recheck_is_topped_up_once_and_the_finish_i
 async fn command_output_a_check_selects_reaches_jev_before_a_finish_resting_on_it() -> TestResult {
     // Integrated review, finding 3 (probe `probe_claim_only_says_measured_though_the_
     // assessment_never_showed_the_command`). `ready_to_finish` selects `command:audit`, and
-    // the `before_finish` provider runs and prints AUDITMARK-1729. The cycle's assessment is
-    // asked over the default selection, which never carries command output, so Jev never saw
-    // it; `ClaimOnlyEvidence` used to look at the observation instead, call the check
-    // measured, and the run finished on a value no command stood behind. Computed from what
-    // the assessment actually sent, the check is claim-only, so before the Finish resting on
-    // it executes, R0 re-measures it over its own selection — and Jev sees the output.
+    // the `before_finish` provider runs and prints AUDITMARK-1729. The cycle's assessment used
+    // to be asked over the default selection, which never carries command output, so Jev
+    // never saw it; `ClaimOnlyEvidence` looked at the observation instead, called the check
+    // measured, and the run finished on a value no command stood behind. The assessment is now
+    // grouped by evidence selection (`docs/03-jev.md` §5): `ready_to_finish` is asked over its
+    // own selection, so the re-assessment after the provider runs shows Jev the output, and
+    // `ClaimOnlyEvidence`, computed from what that request actually sent, calls it measured.
     let fx = Fixture::new(
         audited_definitions()?,
         audit("before_finish", "echo AUDITMARK-1729")?,
@@ -3450,27 +3506,30 @@ async fn command_output_a_check_selects_reaches_jev_before_a_finish_resting_on_i
     let outcome = fx.run(rt).await?;
     assert_eq!(outcome.status, FactoryStatus::Finished);
     let calls = model.all_calls();
-    assert!(
-        calls
-            .iter()
-            .filter(|c| c.context.purpose == Purpose::Assessment)
-            .all(|c| !c.state.to_string().contains("AUDITMARK-1729")),
-        "the assessment never carries command output"
-    );
-    let shown: Vec<Purpose> = calls
+    let shown: Vec<&CallRecord> = calls
         .iter()
         .filter(|c| c.state.to_string().contains("AUDITMARK-1729"))
-        .map(|c| c.context.purpose)
         .collect();
-    assert!(shown.contains(&Purpose::Refresh), "{shown:?}");
-    // The Finish executed on that refreshed value.
+    assert!(
+        shown
+            .iter()
+            .any(|c| c.context.purpose == Purpose::Assessment),
+        "the assessment carries the output"
+    );
+    // Only to the check that selects it: every other check is asked over the default.
+    for call in shown
+        .iter()
+        .filter(|c| c.context.purpose == Purpose::Assessment)
+    {
+        assert_eq!(call.keys, vec![CheckKey::from(READY)]);
+    }
+    // The Finish executed on the assessment's value: nothing was claim-only, so nothing was
+    // refreshed.
     let (_, last) = fx.resolutions().into_iter().last().ok_or("a cycle")?;
     let ready = entry(&last, READY)?;
-    assert!(ready.triggers.contains(&EnsembleTrigger::ClaimOnlyEvidence));
-    assert!(matches!(
-        ready.resolution,
-        Resolution::EvidenceRefreshed { .. }
-    ));
+    assert!(!ready.triggers.contains(&EnsembleTrigger::ClaimOnlyEvidence));
+    assert!(fx.refreshes(READY).is_empty());
+    assert!(model.calls(Purpose::Refresh).is_empty());
     Ok(())
 }
 
@@ -3765,54 +3824,58 @@ success_exit_codes = [0]
     )?)
 }
 
-/// `ready_to_finish` in band for three assessments, its refreshes keeping it there (and
-/// spending the cap of three), then decisively done — on assessments that never show the
-/// audit. Later refreshes read the audit: a failure is 0.05, a pass 0.95.
+/// `ready_to_finish` decisively done on the worker's claim. Shown the audit — by an
+/// assessment or a refresh — it scores what it was shown: a failure is 0.05, a pass 0.95.
 fn unseen_audit_model() -> R2Model {
+    fn score(key: &CheckKey, state: &str, _: usize) -> Option<f32> {
+        if *key != CheckKey::from(READY) {
+            None
+        } else if state.contains("FAILED") {
+            Some(0.05)
+        } else if state.contains("audit clean") {
+            Some(0.95)
+        } else {
+            None
+        }
+    }
     R2Model::finish_ready()
-        .with(READY, 0.79)
-        .later_at(5, READY, 0.95)
-        .refresh_rule(|key, state, assessments| {
-            (*key == CheckKey::from(READY)).then(|| {
-                if assessments < 5 {
-                    0.79
-                } else if state.contains("FAILED") {
-                    0.05
-                } else {
-                    0.95
-                }
-            })
-        })
+        .assess_rule(score)
+        .refresh_rule(score)
+}
+
+/// The ensemble on, with no refresh available until a person authorises one: a check
+/// selecting an `on_demand` provider that has never run cannot be shown its output.
+fn no_refreshes() -> EnsembleSettings {
+    settings(|s| s.max_evidence_refreshes_per_check = 0)
 }
 
 #[tokio::test]
 async fn a_finish_never_executes_over_command_evidence_jev_was_not_shown() -> TestResult {
     // Re-verification, finding 2 (probe `probe_finish_after_refresh_cap_never_shown_the_
-    // command`). `ready_to_finish` selects the `before_finish` audit and sits in band for
-    // three cycles, spending its refresh cap. Then it is decisively done — on an assessment
-    // that, like every assessment, never shows command output — while the fourth audit
-    // fails. R0 cannot re-measure it (the cap is spent), and an R2 over the same claim-only
-    // state could only judge its consistency. It used to finish anyway. A claim-only check an
-    // executed Finish rests on is held when R0 cannot re-measure it, and put to a person.
-    let fx = Fixture::new(audited_definitions()?, EvidencePlan::default())?;
-    let mut fx = fx;
-    fx.evidence = counting_audit(fx.dir.path(), 4, 1000)?;
+    // command`). `ready_to_finish` selects an audit whose output Jev has never been shown:
+    // here an `on_demand` one that has never run, which is the way left now that each check
+    // is asked over its own selection (`docs/03-jev.md` §5) — the output of a provider that
+    // has run is in every later request of the checks selecting it. It is decisively done, on
+    // the worker's claim, and the audit would fail. R0 cannot re-measure it (no refresh is
+    // available), and an R2 over the same claim-only state could only judge its consistency.
+    // It used to finish anyway. A claim-only check an executed Finish rests on is held when
+    // R0 cannot re-measure it, and put to a person.
+    let mut fx = Fixture::new(audited_definitions()?, EvidencePlan::default())?;
+    fx.evidence = counting_audit_when(fx.dir.path(), "on_demand", 1, 1000)?;
     let model = Arc::new(unseen_audit_model());
     let rt = fx.runtime(
         config(|c| c.max_workers = 8),
-        settings(|_| {}),
+        no_refreshes(),
         Arc::clone(&model) as Arc<dyn DecisionModel>,
         Arc::new(SimulatedWorker::instant()),
     );
     let outcome = fx.run(rt).await?;
     assert_ne!(outcome.status, FactoryStatus::Finished);
     assert!(!finished(&fx));
-    let ran = fx
-        .of_kind(EventKind::EvidenceCollected)
-        .iter()
-        .filter(|e| e.payload["provider"] == "audit")
-        .count();
-    assert!(ran >= 4, "the failing audit ran: {ran}");
+    assert!(
+        fx.of_kind(EventKind::EvidenceCollected).is_empty(),
+        "the audit never ran, so Jev was never shown it"
+    );
     let raised = fx.of_kind(EventKind::EscalationRaised);
     assert_eq!(raised.len(), 1);
     let ask = raised[0].payload["ask"].as_str().unwrap_or_default();
@@ -3829,24 +3892,8 @@ async fn a_finish_never_executes_over_command_evidence_jev_was_not_shown() -> Te
         ready.opinions.is_empty(),
         "no R2 over the same claim-only state"
     );
-
-    // Disabled, nothing changes: the run finishes over the failing audit it never showed
-    // Jev. That is the known limitation from before M5 (`docs/03-jev.md` §5), not a fix
-    // this ensemble change makes with the ensemble off.
-    let mut fx = Fixture::new(audited_definitions()?, EvidencePlan::default())?;
-    fx.evidence = counting_audit(fx.dir.path(), 4, 1000)?;
-    let rt = fx.runtime(
-        config(|c| c.max_workers = 8),
-        settings(|s| s.enabled = false),
-        Arc::new(unseen_audit_model()) as Arc<dyn DecisionModel>,
-        Arc::new(SimulatedWorker::instant()),
-    );
-    let outcome = fx.run(rt).await?;
-    assert_eq!(
-        outcome.status,
-        FactoryStatus::Finished,
-        "disabled is unchanged"
-    );
+    // With the ensemble off, a `before_finish` audit's output reaches the assessment of the
+    // check that selects it: `before_finish_output_reaches_the_model_with_the_ensemble_off`.
     Ok(())
 }
 
@@ -3854,15 +3901,15 @@ async fn a_finish_never_executes_over_command_evidence_jev_was_not_shown() -> Te
 async fn recheck_on_unseen_command_evidence_tops_up_a_refresh_that_must_still_measure() -> TestResult
 {
     // The same run, answered: `Recheck` authorises one more refresh of the held check, once.
-    // The next executed Finish re-runs the audit and asks again over its output: a passing
+    // The next executed Finish runs the audit and asks again over its output: a passing
     // audit finishes, a failing one does not. A person authorised cost, not the outcome.
-    for (fail_to, finishes) in [(4_u32, true), (1000, false)] {
+    for (fail_to, finishes) in [(0_u32, true), (1000, false)] {
         let mut fx = Fixture::new(audited_definitions()?, EvidencePlan::default())?;
-        fx.evidence = counting_audit(fx.dir.path(), 4, fail_to)?;
+        fx.evidence = counting_audit_when(fx.dir.path(), "on_demand", 1, fail_to)?;
         let model = Arc::new(unseen_audit_model());
         let rt = fx.runtime(
             config(|c| c.max_workers = 8),
-            settings(|_| {}),
+            no_refreshes(),
             Arc::clone(&model) as Arc<dyn DecisionModel>,
             Arc::new(SimulatedWorker::instant()),
         );
@@ -3887,6 +3934,7 @@ async fn recheck_on_unseen_command_evidence_tops_up_a_refresh_that_must_still_me
             }
             assert!(!finished(&fx));
             run.cancel().await?;
+            assert!(!finished(&fx));
         }
         let topped: Vec<_> = fx
             .of_kind(EventKind::Notification)
@@ -3913,15 +3961,16 @@ async fn a_refresh_top_up_is_spent_by_the_next_refresh_whichever_path_makes_it()
     // claim-only one — is the first to try: it used to ignore the top-up, hit the spent cap,
     // and leave the check held, so the same question came back with the top-up growing and
     // no refresh ever run. Now a granted refresh is spent by the next refresh attempt for
-    // that check, whichever path makes it: one Recheck, exactly one more refresh. (Audit runs
-    // 1-3 are the in-band refreshes; from run 4 on it passes, or it fails.)
-    for (fail_to, finishes) in [(3_u32, true), (1000, false)] {
+    // that check, whichever path makes it: one Recheck, exactly one more refresh. The audit
+    // passes, or it fails; once it has run, every later assessment of `ready_to_finish` shows
+    // it (`docs/03-jev.md` §5), so a failure is not put to a person as unseen again.
+    for (fail_to, finishes) in [(0_u32, true), (1000, false)] {
         let mut fx = Fixture::new(audited_definitions()?, EvidencePlan::default())?;
-        fx.evidence = counting_audit_when(fx.dir.path(), "on_demand", 4, fail_to)?;
+        fx.evidence = counting_audit_when(fx.dir.path(), "on_demand", 1, fail_to)?;
         let model = Arc::new(unseen_audit_model());
         let rt = fx.runtime(
             config(|c| c.max_workers = 12),
-            settings(|_| {}),
+            no_refreshes(),
             Arc::clone(&model) as Arc<dyn DecisionModel>,
             Arc::new(SimulatedWorker::instant()),
         );
@@ -3929,29 +3978,23 @@ async fn a_refresh_top_up_is_spent_by_the_next_refresh_whichever_path_makes_it()
         let id = escalation(&fx, 1).await?;
         assert_eq!(
             model.calls(Purpose::Refresh).len(),
-            3,
-            "the cap, spent in band"
+            0,
+            "no refresh was available"
         );
         run.answer(id, HumanDecision::Recheck).await?;
         if finishes {
             let outcome = run.join().await?;
             assert_eq!(outcome.status, FactoryStatus::Finished);
-            assert_eq!(model.calls(Purpose::Refresh).len(), 4, "exactly one more");
+            assert_eq!(model.calls(Purpose::Refresh).len(), 1, "exactly one more");
         } else {
-            // The re-measured audit fails: no Finish. Later Finish attempts on the
-            // claim-only value are held and asked again; each Recheck buys exactly one more
-            // refresh, spent, never an unspent top-up that keeps growing.
-            for nth in 2..=3 {
-                let id = escalation(&fx, nth).await?;
-                assert_eq!(
-                    model.calls(Purpose::Refresh).len(),
-                    3 + nth - 1,
-                    "every granted refresh was spent before asking again"
-                );
-                run.answer(id, HumanDecision::Recheck).await?;
-            }
-            let _ = escalation(&fx, 4).await?;
-            assert_eq!(model.calls(Purpose::Refresh).len(), 6);
+            // The re-measured audit fails: no Finish, and the failure is in every later
+            // assessment of the check. The run goes on to its worker limit and asks about
+            // that instead.
+            let _ = escalation(&fx, 2).await?;
+            assert_eq!(model.calls(Purpose::Refresh).len(), 1, "exactly one more");
+            let raised = fx.of_kind(EventKind::EscalationRaised);
+            let ask = raised[1].payload["ask"].as_str().unwrap_or_default();
+            assert!(!ask.contains("could not be shown to the model"), "{ask}");
             assert!(!finished(&fx));
             run.cancel().await?;
         }
@@ -3970,18 +4013,81 @@ async fn a_refresh_top_up_is_spent_by_the_next_refresh_whichever_path_makes_it()
 }
 
 #[tokio::test]
+async fn before_finish_output_reaches_the_model_with_the_ensemble_off() -> TestResult {
+    // The M5 probe, with the ensemble off (`docs/09-plan.md`, "Found during M5"). The
+    // `ready_to_finish` check selects `command:audit`, a `before_finish` provider that prints
+    // "FAILED: 2 critical vulnerabilities" and exits 1. The cycle's questions used to be asked
+    // in one request over the default selection, which carries no command output, so the
+    // re-assessment after the provider ran was the worker's claim again, and the run finished.
+    // Grouped by evidence selection (`docs/03-jev.md` §5), `ready_to_finish` is asked over its
+    // own, so the model is shown the failure and — scoring what it was shown — the run does
+    // not finish.
+    let mut fx = Fixture::new(audited_definitions()?, EvidencePlan::default())?;
+    fx.evidence = counting_audit(fx.dir.path(), 1, 1000)?;
+    let model = Arc::new(unseen_audit_model());
+    let rt = fx.runtime(
+        config(|c| c.max_workers = 3),
+        settings(|s| s.enabled = false),
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let outcome = fx.run(rt).await?;
+    assert_ne!(outcome.status, FactoryStatus::Finished);
+    assert!(!finished(&fx));
+    assert!(
+        !fx.of_kind(EventKind::EvidenceCollected).is_empty(),
+        "the before_finish audit ran"
+    );
+    let assessments = model.calls(Purpose::Assessment);
+    let shown: Vec<&CallRecord> = assessments
+        .iter()
+        .filter(|c| {
+            c.state
+                .to_string()
+                .contains("FAILED: 2 critical vulnerabilities")
+        })
+        .collect();
+    assert!(!shown.is_empty(), "the model was shown the failing audit");
+    // Only the check that selects it; the others are asked over the default, as before.
+    for call in &shown {
+        assert_eq!(call.keys, vec![CheckKey::from(READY)]);
+    }
+    // And it was asked as a request of its own in every cycle, beside the default one.
+    for e in fx.of_kind(EventKind::AssessmentCompleted) {
+        assert_eq!(e.payload["requests"].as_array().map(Vec::len), Some(2));
+    }
+    // A Finish was selected once, provisionally, on the claim; once the audit was shown it
+    // never was again.
+    let finishes = fx
+        .of_kind(EventKind::DirectiveSelected)
+        .iter()
+        .filter(|e| e.payload["directive"] == "Finish")
+        .count();
+    assert_eq!(finishes, 1);
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_check_selecting_a_worker_completed_provider_is_refreshed_and_may_finish() -> TestResult {
     // Final verification, finding 3 (probe `probe_unseen_with_a_provider_that_can_never_be_
-    // refreshed`). `ready_to_finish` selects an audit that runs when a worker completes. Its
-    // output never reaches the assessment, so before an executed Finish the check needs R0 —
-    // which only re-ran `on_demand` and `before_finish` providers. The hold was permanent and
-    // no Finish ever executed. R0 now re-runs any provider a check selects: `run_when` says
-    // when a provider runs by itself, and a refresh is an explicit, capped re-measurement.
+    // refreshed`). `ready_to_finish` selects an audit that runs when a worker completes. When
+    // its output never reached the assessment, every executed Finish needed R0 first — which
+    // only re-ran `on_demand` and `before_finish` providers. The hold was permanent and no
+    // Finish ever executed. R0 now re-runs any provider a check selects: `run_when` says when
+    // a provider runs by itself, and a refresh is an explicit, capped re-measurement. The
+    // assessment now shows the check its output (`docs/03-jev.md` §5), so here the value is
+    // in band (0.79) to make R0 run at all, and the refreshed 0.95 is consistent under
+    // reframing.
     let mut fx = Fixture::new(audited_definitions()?, EvidencePlan::default())?;
     fx.evidence = counting_audit_when(fx.dir.path(), "worker_completed", 1000, 0)?;
-    let model = Arc::new(R2Model::finish_ready().refresh_rule(|key, state, _| {
-        (*key == CheckKey::from(READY) && state.contains("audit clean")).then_some(0.95)
-    }));
+    let model = Arc::new(
+        R2Model::finish_ready()
+            .with(READY, 0.79)
+            .negated(READY, &[Some(0.05)])
+            .refresh_rule(|key, state, _| {
+                (*key == CheckKey::from(READY) && state.contains("audit clean")).then_some(0.95)
+            }),
+    );
     let rt = fx.runtime(
         config(|c| c.max_workers = 3),
         settings(|_| {}),
@@ -3996,6 +4102,23 @@ async fn a_check_selecting_a_worker_completed_provider_is_refreshed_and_may_fini
             .iter()
             .any(|c| c.state.to_string().contains("audit clean")),
         "the audit was re-run and shown"
+    );
+    let runs = fx
+        .of_kind(EventKind::EvidenceCollected)
+        .iter()
+        .filter(|e| e.payload["provider"] == "audit")
+        .count();
+    assert!(
+        runs > fx.of_kind(EventKind::WorkerCompleted).len(),
+        "the refresh ran it besides the completed workers: {runs}"
+    );
+    // And the assessment showed it to the check that selects it.
+    assert!(
+        model
+            .calls(Purpose::Assessment)
+            .iter()
+            .any(|c| c.keys == vec![CheckKey::from(READY)]
+                && c.state.to_string().contains("audit clean"))
     );
     Ok(())
 }

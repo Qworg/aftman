@@ -345,7 +345,9 @@ impl EnsembleSettings { pub fn from_config_toml(source: &str)    // the [ensembl
 pub enum   EnsembleTrigger { NearThreshold, LowConfidence, ClaimOnlyEvidence, OutcomeRelevant,
     HighStakes, Irreversible, RepeatContest, HumanRecheck }
 pub struct EnsembleContext<'a> { settings, cycle, policy: &PolicyInput, registry: &ResponsibilityRegistry,
-    definitions: &[Check], evidence: &EvidencePlan, answers, assessed_state, counters, reframe_available,
+    definitions: &[Check], evidence: &EvidencePlan, answers,
+    assessed_states: &AssessedStates,   // one state per evidence selection (doc 03 §5)
+    counters, reframe_available,
     finish_is_provisional: bool }
 pub struct EnsemblePlan { /* private; accessors cycle(), settings(), counters(), baseline(),
     triggered() -> &[CheckPlan] */ }       // only build() makes one, so a caller cannot hand the
@@ -390,7 +392,11 @@ over the state that value was measured on; never a probability. A `RefreshOutcom
 `CheckResolvedPayload` the check's `opinions` (`OpinionRecordedPayload`s, omitted when empty), which
 `describe()` renders for the surfaces. `reframable_checks(settings, checks)` is the cycle's
 `reframe_available`. `aftman_core::observation::state_digest(&Value)` is the one digest of a model
-`state` (doc 06 §8); `ASSESSMENT_COMPLETED` records it as `state_digest`.
+`state` (doc 06 §8); `ASSESSMENT_COMPLETED` records it for each request of the cycle, in
+`requests` (`{checks, state_digest}`), and as `state_digest` when the cycle made one request.
+`aftman_core::observation::AssessedStates::group(observation, checks)` is a cycle's requests, one
+per distinct evidence selection (doc 03 §5), and `state_for_check(key)` the state a check was
+asked over.
 
 `aftman_core::testing::RecordedOpinionSource` implements `OpinionSource` from recorded outcomes
 only: `from_events` refuses an incomplete log, an unrecorded call is a `SourceError`, and

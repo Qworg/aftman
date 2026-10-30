@@ -725,7 +725,6 @@ gate mean something; the schedule is what stops the snapshot going quietly stale
 | Automatic model routing across providers | Provider selection is one base URL by design. Auto-failover between *billing accounts* is a finance decision, not an architecture one. |
 | A learned ensemble weighting | Requires a labeled dataset and a joint error model. Doc 06 rejects it for cause. |
 | Windows support | Process groups, Unix sockets, and signal semantics all need a second implementation. Linux/macOS only in v1. |
-| Grouping a cycle's questions by evidence selection ([03-jev.md §5](03-jev.md)) | A cycle asks every question in one request over the default selection, which carries no command output. With the ensemble on, R0 honours a check's own selection, `ClaimOnlyEvidence` is computed from what was actually sent, and a check an executed `Finish`/`Stop` rests on is held, and put to a person, when R0 cannot show Jev its command output — so no irreversible directive executes on command output Jev did not see. **With the ensemble off it can**: a `before_finish` command's output reaches Jev only through the parsed test summary, a known limitation from before M5. Grouping would let the first assessment see the output, at the cost of a request per group. |
 | Non-git repositories | Git evidence is the observation's backbone. A fallback provider is possible but the checks would need rewriting. |
 
 ## Risk register

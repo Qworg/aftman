@@ -180,9 +180,8 @@ directive (`Continue` if the worker is still running and the budget allows, othe
 
 ## 5. Grouping and parallelism
 
-Checks are grouped by the evidence providers they select. Each group is one request, and groups
-run concurrently with `futures::future::try_join_all` bounded by `AFTMAN_JEV_MAX_CONCURRENCY`
-(default 4).
+Checks are grouped by the evidence providers they select. Each group is one request, asked over
+`state_for(selection)`: the state that selection describes and nothing else.
 
 Why group at all, rather than one request per check?
 
@@ -191,26 +190,51 @@ Why group at all, rather than one request per check?
 - grouping by provider selection is the coarsest split that never sends a check evidence it did
   not ask for.
 
-In practice the built-in responsibilities collapse to one or two groups.
+In practice the built-in responsibilities collapse to one group: every bundled check selects the
+default set, so a cycle over the bundled definitions is one request, exactly as it was before
+grouping was built. An operator's definition that names its own `evidence` adds a request.
 
-**As built, this is not what a cycle does.** The runtime asks every active check's question in
-**one** request over the **default** evidence selection (`state_for(default_evidence())`), and the
-default selection carries no command output. That predates M5, and it is a deviation from this
-section, named here rather than hidden. A check's own selection is honoured in two places: an
-ensemble evidence refresh (R0) asks that check's question over the default selection **plus** its
-own, command output included ([06-ensemble.md §4](06-ensemble.md)), and the `ClaimOnlyEvidence`
-trigger is computed from what the assessment actually sent — so a check that selects command
-output Jev was not shown is treated as resting on the worker's claim. **With the ensemble on**, a
-decisive value about to act on it is re-measured by R0 first; and when an irreversible `Finish`
-or `Stop` rests on it and R0 cannot re-measure it this cycle (the refresh cap is spent, no
-provider it names can be re-run, or the refresh was rejected), the check is held — refusing the
-`Finish` or `Stop` — and put to a person ([06-ensemble.md §6](06-ensemble.md)). So, with the
-ensemble on, no `Finish` or `Stop` executes on a value whose selected command output Jev never
-saw. **With the ensemble off this is a known limitation, unchanged from before M5:** a
-`before_finish` command's output never reaches Jev at all, except through the test summary parsed
-from it (`test_summary`), so a `Finish` can execute on a value Jev formed without seeing a failing
-`before_finish` command. Grouping requests by selection is the fix, and remains future work
-([09-plan.md](09-plan.md), "Deferred").
+**As built** (`AssessedStates::group` in `aftman-core::observation`, asked by the runtime's
+`ask_assessment`):
+
+- **A selection is a set.** A check's selection is its `evidence` list, or the default set when it
+  names none ([05-responsibilities.md §3](05-responsibilities.md)) — an explicit list *replaces*
+  the default, so a check that wants the job and the diff besides `command:audit` names them.
+  Two checks naming the same providers in a different order are one group. Groups are asked in
+  the order their selection first appears among the active checks.
+- **One request at a time.** The requests are made in turn, not concurrently, so a cycle's calls,
+  its usage lines and its `assessment_seq`s are in one deterministic order. There is no
+  `AFTMAN_JEV_MAX_CONCURRENCY`; a run whose definitions make several groups pays their latency in
+  series.
+- **Each request is an assessment.** It counts against `max_assessments`, goes under the request
+  budget (§6), and writes its own usage line (§7) with its own `assessment_seq`; the cycle's id is
+  the last. A request's answers count only for the checks it asked: an answer to a question it did
+  not ask is ignored, never allowed to stand in for another request's value.
+- **All or nothing.** A cycle that cannot make every request — the assessment budget runs out
+  part way, or a request fails — has no answers, exactly as a failed single request had: policy is
+  handed an empty check set, so only conservative directives can follow, and the budget invariant
+  escalates once the budget is spent. The requests after a failed one are not made.
+- **What was sent is recorded.** `ASSESSMENT_COMPLETED` carries `requests`: for each, the checks it
+  asked and the `state_digest` of its state ([06-ensemble.md §8](06-ensemble.md)). A cycle of one
+  request records the same digest as `state_digest`, as before; a cycle of several has none at
+  the top level, because no single state was sent. `input_tokens` and `output_tokens` are summed.
+
+So a check is shown the output of every command provider it selects that has run, in the cycle's
+own assessment. **A `before_finish` provider's output reaches the `Finish` that waited for it** —
+with the ensemble on or off — **for exactly the checks that select it**: the provisional `Finish`
+runs the provider, and the re-assessment shows its output to those checks, so a `Finish` resting
+on them is decided over it. The bundled definitions select no command output, so with them a
+`before_finish` provider reaches the model only through the test summary parsed from it
+(`test_summary`); to have a `Finish` conjunct read the output itself, an operator's definition
+selects `command:<id>` for it ([05-responsibilities.md §3](05-responsibilities.md)).
+
+The ensemble reads the same grouping. `ClaimOnlyEvidence` is computed from the state of the
+check's own request (`EnsembleContext::assessed_states`), so a check whose selected command
+output was shown is measured, and one whose provider has not run (an `on_demand` provider never
+re-measured) rests on the worker's claim; an R2 reframe is asked over that same state
+([06-ensemble.md §3, §4](06-ensemble.md)). With the ensemble on, a value resting on a claim about a
+command is re-measured by R0 before an irreversible directive acts on it, or held
+([06-ensemble.md §6](06-ensemble.md)).
 
 The router is the same call shape: all *conditional* responsibilities are evaluated in one request
 against the incoming job, and every threshold match activates that responsibility. Global
@@ -293,7 +317,8 @@ A request dropped before it was sent records nothing.
 ```rust
 #[async_trait]
 pub trait DecisionModel: Send + Sync {
-    /// One System One call. `questions` is already grouped by evidence selection.
+    /// One System One call. `questions` is one group: every check in it selects the
+    /// evidence `state` was built from (§5).
     async fn ask(
         &self,
         purpose: Purpose,                 // Assessment | Routing | Refresh | Reframe

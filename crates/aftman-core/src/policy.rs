@@ -272,6 +272,9 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
     {
         invariants.push(Invariant::VerificationIncomplete);
     }
+    if input.config.verify == crate::job::VerifyPolicy::Never {
+        invariants.push(Invariant::VerificationDisabled);
+    }
     if input.counters.attempts >= input.config.max_attempts {
         invariants.push(Invariant::AttemptsExhausted);
     }
@@ -769,6 +772,14 @@ fn refusal(
             // this closes it for a user-defined rule that proposes `verify` outright.
             if input.active_worker.is_some() {
                 return Some(SuppressionReason::Invariant(Invariant::WorkerStillActive));
+            }
+            // `verify = "never"` is the operator saying no verifier is to run. The built-in
+            // rule already proposes none; this holds a user-defined rule that proposes
+            // `verify` to the same promise.
+            if input.config.verify == crate::job::VerifyPolicy::Never {
+                return Some(SuppressionReason::Invariant(
+                    Invariant::VerificationDisabled,
+                ));
             }
             if input.counters.verified_since_code {
                 return Some(SuppressionReason::Invariant(
@@ -1608,5 +1619,51 @@ mod tests {
             "selected {:?}",
             decision.selected
         );
+    }
+
+    #[test]
+    fn verify_never_starts_no_verifier_from_any_rule() {
+        // `verify = "never"` was not enforced anywhere: the built-in rule proposed a verifier
+        // whenever the model judged one warranted, and so would any user-defined rule.
+        let registry = crate::responsibility::ResponsibilityRegistry::builtin();
+        let o = observation();
+        let config = with_verify(crate::job::VerifyPolicy::Never);
+        let checks = checks(&[
+            ("core.completion", "implementation_complete", 0.95),
+            ("core.completion", "ready_to_finish", 0.20),
+            ("core.verification", "needs_verification", 0.95),
+        ]);
+        let counters = Counters {
+            workers_run: 1,
+            ..Counters::default()
+        };
+        let user_rule = Proposal::new(
+            "my.checks",
+            "my.checks:verify",
+            Directive::Verify {
+                reason: "a user rule".into(),
+            },
+            950,
+            Stakes::High,
+        );
+        let decision = super::decide(
+            &registry,
+            &input(&o, &counters, &config, &checks),
+            std::slice::from_ref(&user_rule),
+        );
+        assert!(
+            !matches!(decision.selected, Directive::Verify { .. }),
+            "selected {:?}",
+            decision.selected
+        );
+        assert!(
+            !decision
+                .considered
+                .iter()
+                .any(|p| p.responsibility.as_str() == builtin::VERIFICATION),
+            "the built-in rule proposed a verifier"
+        );
+        assert!(decision.suppressed.iter().any(|s| s.rule == user_rule.rule
+            && s.reason == SuppressionReason::Invariant(Invariant::VerificationDisabled)));
     }
 }

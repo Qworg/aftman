@@ -141,6 +141,9 @@ pub enum Invariant {
     /// [`Invariant::VerificationAlreadyRun`] means the opposite — a verifier *has* run — and
     /// was being used for both.
     VerificationIncomplete,
+    /// `verify = never`, so no verifier may be started, by the built-in rule or by any
+    /// user-defined rule that proposes `verify`.
+    VerificationDisabled,
     /// The observation could not be compacted to fit the request budget, three cycles running.
     ///
     /// Distinct from [`Invariant::ModelUnavailable`]: the model is fine, the request is too

@@ -4613,6 +4613,31 @@ async fn verify_always_runs_a_verifier_though_the_model_judges_none_needed() -> 
 }
 
 #[tokio::test]
+async fn verify_never_runs_no_verifier_though_the_model_judges_one_needed() -> TestResult {
+    // `verify = "never"` was not enforced: the built-in rule proposed a verifier whenever the
+    // model judged one warranted. With `needs_verification` high (0.90), `never` must still
+    // run no verifier. `Finish` then rests on its other disjunct, so the run does not finish
+    // on this model; it must not get there by verifying. Ensemble off and on.
+    for enabled in [false, true] {
+        let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+        let rt = fx.runtime(
+            config(|c| c.verify = VerifyPolicy::Never),
+            settings(|s| s.enabled = enabled),
+            Arc::new(verification_model()) as Arc<dyn DecisionModel>,
+            Arc::new(VerdictsWorker::new(&[Some("PASS")])),
+        );
+        let outcome = fx.run(rt).await?;
+        assert!(
+            !tasks(&fx).iter().any(|t| t == "Verify"),
+            "enabled={enabled}: {:?}",
+            tasks(&fx)
+        );
+        assert_eq!(outcome.counters.verifiers_run, 0, "enabled={enabled}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_verifier_that_prints_only_whitespace_has_not_completed() -> TestResult {
     // Review F5. A verifier that exits successfully having printed only whitespace said
     // nothing: it has not completed, and cannot satisfy the disjunct.

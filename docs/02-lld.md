@@ -258,8 +258,8 @@ pub enum   Invariant { OverallTimeout, AttemptsExhausted, WorkerLimit, Verificat
     AssessmentBudget, ModelUnavailable, UnresolvedUncertainty,
     // No worker has ever run, so there is nothing to declare complete.
     NoWorkAttempted, WorkerStillActive,
-    // `verify = always` and no verifier has completed.
-    VerificationIncomplete,
+    // `verify = always` and no verifier has completed; `verify = never` refuses any `Verify`.
+    VerificationIncomplete, VerificationDisabled,
     ObservationTooLarge, UnobservedRepository, UnresolvedDependency }
 pub struct Routing { pub always: bool, pub instructions: Option<String>, pub threshold: f32 }
 

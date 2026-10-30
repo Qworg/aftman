@@ -952,7 +952,10 @@ fn a_check_held_for_enough_cycles_repeat_contests() {
 }
 
 #[test]
-fn refresh_providers_are_the_selected_on_demand_and_before_finish_ones() {
+fn refresh_providers_are_every_selected_provider_whatever_its_run_when() {
+    // Final verification, finding 3(a): `run_when` says when a provider runs by itself; R0
+    // may re-run any provider a check selects. (An earlier revision excluded
+    // `worker_completed`, so a check selecting one could never be re-measured.)
     let plan = EvidencePlan::new(vec![
         provider("tests", RunWhen::OnDemand),
         provider("audit", RunWhen::BeforeFinish),
@@ -969,12 +972,9 @@ fn refresh_providers_are_the_selected_on_demand_and_before_finish_ones() {
         names(&["command:audit", "command:tests"]),
         ["tests", "audit"]
     );
-    assert!(
-        names(&["command:lint"]).is_empty(),
-        "worker_completed is not a refresh"
-    );
+    assert_eq!(names(&["command:lint"]), ["lint"], "worker_completed too");
     assert!(names(&["worker_output"]).is_empty());
-    assert_eq!(names(&["command_evidence"]), ["tests", "audit"]);
+    assert_eq!(names(&["command_evidence"]), ["tests", "audit", "lint"]);
 }
 
 #[test]
@@ -1011,7 +1011,11 @@ fn the_plan_records_what_the_ladder_could_use() {
     );
     assert_eq!(
         s.check_plan(TESTS).map(|p| p.refresh_providers),
-        Some(vec![EvidenceId::new("tests"), EvidenceId::new("audit")])
+        Some(vec![
+            EvidenceId::new("tests"),
+            EvidenceId::new("audit"),
+            EvidenceId::new("lint")
+        ])
     );
     assert_eq!(
         s.check_plan(READY).map(|p| p.refresh_providers),
@@ -5451,4 +5455,36 @@ async fn an_accepted_held_stop_is_not_asked_again_but_a_different_one_is() {
         .unwrap_or_else(|e| panic!("{e}"));
     assert!(other.held_stop.as_ref().is_some_and(|held| *held != key));
     assert!(t.decide(&other).selected.name() == "Escalate");
+}
+
+#[test]
+fn a_command_selection_with_no_provider_is_named() {
+    // Final verification, finding 3(b): `command:<id>` with no provider `<id>`, and
+    // `command_evidence` with no provider at all, can never be shown to the model.
+    let checks = vec![
+        Check::new(
+            &ResponsibilityId::new("user.x"),
+            "a",
+            crate::model::Question::noul("A?"),
+            Some(0.7),
+        )
+        .with_evidence(&["job", "command:audit"]),
+        Check::new(
+            &ResponsibilityId::new("user.x"),
+            "b",
+            crate::model::Question::noul("B?"),
+            Some(0.7),
+        )
+        .with_evidence(&["command_evidence"]),
+    ];
+    let none = EvidencePlan::new(Vec::new());
+    assert_eq!(
+        super::unmatched_command_selections(&checks, &none),
+        vec![
+            (k("user.x__a"), "command:audit".to_owned()),
+            (k("user.x__b"), "command_evidence".to_owned()),
+        ]
+    );
+    let audit = EvidencePlan::new(vec![provider("audit", RunWhen::WorkerCompleted)]);
+    assert!(super::unmatched_command_selections(&checks, &audit).is_empty());
 }

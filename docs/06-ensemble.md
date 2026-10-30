@@ -179,8 +179,13 @@ trigger stops.
 Not an opinion. This is the rung that actually resolves things, and the only one that can produce a
 *decisive* value.
 
-1. Re-run the command evidence providers referenced by the trigger's check
-   (`run_when = "on_demand"` or `"before_finish"`).
+1. Re-run the command evidence providers referenced by the trigger's check — **any** it
+   selects, whatever its `run_when` (`refresh_providers`). `run_when` says when a provider runs by
+   itself; a refresh is an explicit, capped re-measurement through the same scrubbed, bounded
+   path. An earlier revision re-ran only `on_demand` and `before_finish` providers, so a check
+   selecting a `worker_completed` one could never be shown its output, and every `Finish` resting
+   on it was held for good
+   (`a_check_selecting_a_worker_completed_provider_is_refreshed_and_may_finish`).
 2. Rebuild the observation with fresh evidence.
 3. Ask Jev again with the same questions.
 4. The new assessment **supersedes** the old for this check (`supersedes: <assessment_seq>`).
@@ -756,8 +761,9 @@ loop:
   (`command:<id>` or `command_evidence`) of which the cycle's assessment showed Jev none
   (`CheckPlan::unseen_command`) rests on the worker's claim about a command. Where an irreversible
   directive rests on it — the ladder's `Irreversible` trigger, or the gate's guard — and R0 cannot
-  re-measure it this cycle (the refresh cap is spent, no provider it names can be re-run, or the
-  refresh was rejected), it is **held** (`EnsembleLimit::UnseenCommandEvidence`; in the gate,
+  re-measure it this cycle (the refresh cap is spent, or the refresh was rejected — every
+  provider a check selects can be re-run, and, with the ensemble on, a selection no configured
+  provider produces is refused at run start, [05-responsibilities.md §3](05-responsibilities.md)), it is **held** (`EnsembleLimit::UnseenCommandEvidence`; in the gate,
   `GuardOutcome::Unmeasured`), never guarded by R2: an opinion over the same claim-only state can
   judge consistency, not evidence it never saw. Held, it makes `UnresolvedUncertainty` refuse the
   `Finish` and `UnresolvedDependency` the `Stop`. With the `human` rung configured it is put to a

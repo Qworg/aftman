@@ -203,7 +203,8 @@ pub enum EnsembleLimit {
     OpinionBudget { used: u32, cap: u32 },
     /// The check selects command evidence the model was not shown this cycle, an
     /// irreversible directive rests on it, and R0 could not re-measure it (the cap is
-    /// spent, no provider it names can be re-run, or the refresh was rejected). Held: an
+    /// spent, or the refresh was rejected; every provider a check selects can be re-run, and a
+    /// selection no provider produces is refused at run start). Held: an
     /// opinion over the same state could judge only its consistency, not the evidence.
     UnseenCommandEvidence,
     /// An opinion was bought for this check within `per_check_cooldown_cycles`.

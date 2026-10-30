@@ -344,6 +344,7 @@ fn ensemble_section(ctx: &Ctx, problems: &mut bool) -> Result<(), CliError> {
                 s.consecutive_contests_before_human
             )?;
             reframable_line(ctx, &s)?;
+            unmatched_lines(ctx, &s, problems)?;
         }
         Err(error) => {
             outln!("  INVALID     {error}")?;
@@ -387,6 +388,41 @@ fn reframable_line(
         .filter(|c| c.threshold.is_some() && !reframable.contains(&c.key))
     {
         outln!("              {} has no negation", check.key)?;
+    }
+    Ok(())
+}
+
+/// Command evidence a check selects that no configured provider produces
+/// (`docs/05-responsibilities.md` §3). With the ensemble on a run is refused for it at
+/// start, so it is a problem here; off, a note.
+fn unmatched_lines(
+    ctx: &Ctx,
+    settings: &aftman_core::ensemble::EnsembleSettings,
+    problems: &mut bool,
+) -> Result<(), CliError> {
+    let (Ok(set), Ok(evidence)) = (
+        load_definitions_from(ctx.inputs.responsibilities_dir.as_deref()),
+        crate::factory::load_evidence_from(ctx.inputs.evidence_config.as_deref()),
+    ) else {
+        return Ok(());
+    };
+    let checks: Vec<aftman_core::responsibility::Check> = set
+        .enabled()
+        .flat_map(|(id, definition)| definition.checks(id))
+        .collect();
+    for (key, entry) in aftman_core::ensemble::unmatched_command_selections(&checks, &evidence) {
+        if settings.enabled {
+            *problems = true;
+            outln!(
+                "  INVALID     {key} selects {entry}, which no provider produces; a run is \
+                 refused"
+            )?;
+        } else {
+            outln!(
+                "  note        {key} selects {entry}, which no provider produces (refused at \
+                 run start with the ensemble on)"
+            )?;
+        }
     }
     Ok(())
 }

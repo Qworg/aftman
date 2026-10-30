@@ -377,7 +377,16 @@ Rules:
 - evidence results are persisted with exit code, duration, output excerpt, and the resolved argv,
   so a model's conclusion about a test run is auditable down to the command;
 - `run_when = "before_finish"` means the check is re-evaluated with fresh evidence before `Finish`
-  is allowed — the primary defense against a worker that reports tests it never ran.
+  is allowed — the primary defense against a worker that reports tests it never ran;
+- `run_when` says when a provider runs **by itself** (after a worker completes, only when asked,
+  or before a `Finish`). It does not limit the ensemble: an evidence refresh (R0) may re-run any
+  provider a check selects, whatever its `run_when`, as an explicit, capped re-measurement
+  through the same scrubbed, bounded path ([06-ensemble.md §4](06-ensemble.md));
+- **with the ensemble on**, every command evidence a check selects must be produced by a
+  configured provider: a check naming `command:<id>` with no provider `<id>`, or
+  `command_evidence` with none at all, could never be shown that output, so a run is refused at
+  start (`invalid_config`, naming the check), and `aftman doctor` reports it. With the ensemble
+  off nothing changes; `doctor` shows a note.
 
 ## 4. Observation construction
 

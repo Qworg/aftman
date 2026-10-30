@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::assessment::{AnswerValue, ResolvedCheck, Side};
 use crate::directive::{Directive, Proposal, Stakes};
-use crate::evidence::{EvidencePlan, RunWhen};
+use crate::evidence::EvidencePlan;
 use crate::ids::{AssessmentSeq, CheckKey, EvidenceId};
 use crate::policy::PolicyInput;
 use crate::responsibility::{Check, ResponsibilityRegistry};
@@ -780,6 +780,35 @@ pub fn saw_command_evidence(selection: &[String], assessed_state: &serde_json::V
     })
 }
 
+/// Every command-evidence selection that matches no configured provider: a check naming
+/// `command:<id>` with no provider `<id>`, or `command_evidence` with no provider at all.
+/// With the ensemble on such a check can never be shown its command output — no refresh
+/// can run what is not configured — so a run is refused at start
+/// (`docs/05-responsibilities.md` §3).
+#[must_use]
+pub fn unmatched_command_selections(
+    checks: &[Check],
+    evidence: &EvidencePlan,
+) -> Vec<(CheckKey, String)> {
+    let mut unmatched = Vec::new();
+    for check in checks {
+        for entry in &check.evidence {
+            let entry = entry.as_str();
+            let matched = if entry == "command_evidence" {
+                !evidence.providers().is_empty()
+            } else if let Some(id) = entry.strip_prefix("command:") {
+                evidence.providers().iter().any(|p| p.id.as_str() == id)
+            } else {
+                true
+            };
+            if !matched {
+                unmatched.push((check.key.clone(), entry.to_owned()));
+            }
+        }
+    }
+    unmatched
+}
+
 /// The checks R2 can be asked about (`EnsembleContext::reframe_available`): every check
 /// that carries an independently written negation and a threshold
 /// ([`Check::reframable`]), provided `reframe_same_model` is among the configured rungs.
@@ -797,15 +826,17 @@ pub fn reframable_checks(settings: &EnsembleSettings, checks: &[Check]) -> BTree
         .collect()
 }
 
-/// The providers an evidence refresh would run for a check: the ones its selection
-/// names (or all of them, for `command_evidence`) whose `run_when` is `on_demand` or
-/// `before_finish`, in configuration order.
+/// The providers an evidence refresh would run for a check: the ones its selection names
+/// (or all of them, for `command_evidence`), in configuration order, **whatever their
+/// `run_when`**. `run_when` says when a provider runs by itself; an R0 refresh is an
+/// explicit, capped re-measurement through the same scrubbed, bounded path, and a check that
+/// selects a `worker_completed` provider must be re-measurable too, or a value resting on
+/// output the model was never shown could never be shown it (`docs/06-ensemble.md` §4 R0).
 #[must_use]
 pub fn refresh_providers(selection: &[String], plan: &EvidencePlan) -> Vec<EvidenceId> {
     let all = selection.iter().any(|entry| entry == "command_evidence");
     plan.providers()
         .iter()
-        .filter(|provider| matches!(provider.run_when, RunWhen::OnDemand | RunWhen::BeforeFinish))
         .filter(|provider| {
             all || selection
                 .iter()

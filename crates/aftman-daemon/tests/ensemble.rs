@@ -3968,3 +3968,34 @@ async fn a_refresh_top_up_is_spent_by_the_next_refresh_whichever_path_makes_it()
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn a_check_selecting_a_worker_completed_provider_is_refreshed_and_may_finish() -> TestResult {
+    // Final verification, finding 3 (probe `probe_unseen_with_a_provider_that_can_never_be_
+    // refreshed`). `ready_to_finish` selects an audit that runs when a worker completes. Its
+    // output never reaches the assessment, so before an executed Finish the check needs R0 —
+    // which only re-ran `on_demand` and `before_finish` providers. The hold was permanent and
+    // no Finish ever executed. R0 now re-runs any provider a check selects: `run_when` says
+    // when a provider runs by itself, and a refresh is an explicit, capped re-measurement.
+    let mut fx = Fixture::new(audited_definitions()?, EvidencePlan::default())?;
+    fx.evidence = counting_audit_when(fx.dir.path(), "worker_completed", 1000, 0)?;
+    let model = Arc::new(R2Model::finish_ready().refresh_rule(|key, state, _| {
+        (*key == CheckKey::from(READY) && state.contains("audit clean")).then_some(0.95)
+    }));
+    let rt = fx.runtime(
+        config(|c| c.max_workers = 3),
+        settings(|_| {}),
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let outcome = fx.run(rt).await?;
+    assert_eq!(outcome.status, FactoryStatus::Finished);
+    let refresh = model.calls(Purpose::Refresh);
+    assert!(
+        refresh
+            .iter()
+            .any(|c| c.state.to_string().contains("audit clean")),
+        "the audit was re-run and shown"
+    );
+    Ok(())
+}

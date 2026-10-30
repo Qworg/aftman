@@ -328,6 +328,27 @@ impl CliFactory {
             .map_err(|e| config_error(e.to_string()))?;
         let ensemble = ensemble_settings(self.inputs.config_file.as_deref(), params.ensemble)
             .map_err(|e| config_error(e.to_string()))?;
+        // With the ensemble on, a check selecting command output no provider produces could
+        // never be shown it, and would hold every Finish resting on it for good. Refused here,
+        // naming the check (`docs/05-responsibilities.md` §3).
+        if ensemble.enabled {
+            let checks: Vec<aftman_core::responsibility::Check> = definitions
+                .enabled()
+                .flat_map(|(id, definition)| definition.checks(id))
+                .collect();
+            let unmatched = aftman_core::ensemble::unmatched_command_selections(&checks, &evidence);
+            if !unmatched.is_empty() {
+                return Err(config_error(format!(
+                    "with the ensemble on, every command evidence a check selects must be a \
+                     configured provider: {}",
+                    unmatched
+                        .iter()
+                        .map(|(key, entry)| format!("`{key}` selects `{entry}`"))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )));
+            }
+        }
         let evidence_temp_dir = self.data_dir.join(crate::statedir::EVIDENCE_DIR);
 
         let runtime = FactoryRuntime::new(RuntimeDeps {
@@ -872,6 +893,54 @@ mod tests {
                 "{p:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_command_selection_no_provider_makes_is_refused_with_the_ensemble_on() {
+        // Final verification, finding 3(b). `ready_to_finish` selects `command:audit`, and no
+        // provider `audit` is configured: with the ensemble on it could never be shown that
+        // output, and every Finish resting on it would be held for good. Refused at run start,
+        // naming the check. With the ensemble off, nothing changes.
+        let overrides = tempfile::tempdir().unwrap();
+        let bundled = aftman_core::definitions::BUNDLED
+            .iter()
+            .find(|(id, _)| *id == "core.completion")
+            .map(|(_, source)| *source)
+            .unwrap();
+        let marker = "[checks.ready_to_finish]\n";
+        let at = bundled.find(marker).unwrap() + marker.len();
+        std::fs::write(
+            overrides.path().join("core.completion.toml"),
+            format!(
+                "{}evidence = [\"job\", \"command:audit\"]\n{}",
+                &bundled[..at],
+                &bundled[at..]
+            ),
+        )
+        .unwrap();
+        let (dir, factory) = factory_with(
+            FactoryInputs {
+                responsibilities_dir: Some(overrides.path().to_path_buf()),
+                ..FactoryInputs::empty()
+            },
+            Mode::Embedded,
+        );
+        let mut p = params(dir.path());
+        p.ensemble = true;
+        let error = factory.prepare(&p, context()).await.err().unwrap();
+        assert_eq!(error.code, ErrorCode::InvalidConfig);
+        assert!(
+            error
+                .message
+                .contains("`core.completion__ready_to_finish` selects `command:audit`"),
+            "{}",
+            error.message
+        );
+        p.ensemble = false;
+        assert!(
+            factory.prepare(&p, context()).await.is_ok(),
+            "disabled: unchanged"
+        );
     }
 
     #[tokio::test]

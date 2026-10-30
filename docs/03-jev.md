@@ -192,7 +192,9 @@ Why group at all, rather than one request per check?
 
 In practice the built-in responsibilities collapse to one group: every bundled check selects the
 default set, so a cycle over the bundled definitions is one request, exactly as it was before
-grouping was built. An operator's definition that names its own `evidence` adds a request.
+grouping was built — until a `before_finish` provider has run (below), when the checks the
+`Finish` rule reads are a second. An operator's definition that names its own `evidence` adds a
+request once its state differs from the others.
 
 **As built** (`AssessedStates::group` in `aftman-core::observation`, asked by the runtime's
 `ask_assessment`):
@@ -242,12 +244,19 @@ worker started**, in the cycle's own assessment. The runtime drops the stored co
 worker starts, because it measured a tree that worker may change; a `worker_completed` provider
 runs again when the worker completes, and an `on_demand` or `before_finish` one is re-measured by
 R0 or by the `before_finish` step ([06-ensemble.md §3](06-ensemble.md)). **A `before_finish` provider's output reaches the `Finish` that waited for it** —
-with the ensemble on or off — **for exactly the checks that select it**: the provisional `Finish`
-runs the provider, and the re-assessment shows its output to those checks, so a `Finish` resting
-on them is decided over it. The bundled definitions select no command output, so with them a
-`before_finish` provider reaches the model only through the test summary parsed from it
-(`test_summary`); to have a `Finish` conjunct read the output itself, an operator's definition
-selects `command:<id>` for it ([05-responsibilities.md §3](05-responsibilities.md)).
+with the ensemble on or off. It **joins the selection of every check the `Finish` rule reads**
+(`core.completion:thresholds-satisfied`'s read set in `builtin::RULE_READS`: `ready_to_finish`,
+`requirements_satisfied`, `tests_sufficient`, `needs_verification`), in addition to whatever each
+of them selects — the default set, when it names none (`join_before_finish`,
+`ResponsibilityRegistry::checks_for_run`). No configuration is needed, and nothing changes when no
+`before_finish` provider is configured. The provisional `Finish` runs the provider, and the
+re-assessment shows its output to those checks, so the `Finish` resting on them is decided over
+it. Before the provider has run, the joined selection renders exactly the default state, so it
+costs no extra request; after, the `Finish` checks are a request of their own. Any other check
+sees a `before_finish` provider's output only if it selects it. An earlier revision joined
+nothing, so with the bundled definitions — which select no command output — the provider reached
+the model only through the test summary parsed from it, and a run finished over a failing audit
+it had run (`a_before_finish_provider_reaches_the_finish_checks_of_the_bundled_definitions`).
 
 The ensemble reads the same grouping. `ClaimOnlyEvidence` is computed from the state of the
 check's own request (`EnsembleContext::assessed_states`), so a check whose selected command

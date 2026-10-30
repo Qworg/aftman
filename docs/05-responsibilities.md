@@ -384,9 +384,12 @@ Rules:
   that follows a worker, since a worker that started after the providers last ran may have
   changed what they measured — and that assessment shows
   its output to every check that selects it (`command:<id>` or `command_evidence`), with the
-  ensemble on or off. A check that does not select it sees only what `test_summary` parses from
-  it; none of the bundled checks selects command output, so to have `ready_to_finish` read an
-  audit's output, an overriding definition selects it;
+  ensemble on or off. **Every check the `Finish` rule reads selects every `before_finish`
+  provider automatically**, besides its own selection (`ready_to_finish`,
+  `requirements_satisfied`, `tests_sufficient`, `needs_verification`; [03-jev.md §5](03-jev.md)),
+  so the bundled definitions need no override for the `Finish` to be decided over an audit's
+  output. Any other check sees it only if it selects it, or through what `test_summary` parses
+  from it;
 - `run_when` says when a provider runs **by itself** (after a worker completes, only when asked,
   or before a `Finish`). It does not limit the ensemble: an evidence refresh (R0) may re-run any
   provider a check selects, whatever its `run_when`, as an explicit, capped re-measurement

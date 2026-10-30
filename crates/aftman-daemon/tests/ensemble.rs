@@ -2122,6 +2122,17 @@ const NEEDS_VER: &str = "core.verification__needs_verification";
 const HUMAN: &str = "core.human-escalation__needs_human";
 const DOCS: &str = "quality.documentation__documentation_sufficient";
 
+/// The checks the `Finish` rule reads, in key order: what a `before_finish` provider's output
+/// joins (`join_before_finish`, `docs/03-jev.md` §5).
+fn finish_checks() -> Vec<CheckKey> {
+    let mut keys: Vec<CheckKey> = [READY, REQS, NEEDS_VER, TESTS]
+        .into_iter()
+        .map(CheckKey::from)
+        .collect();
+    keys.sort();
+    keys
+}
+
 /// Values no other number in a state is likely to spell, so a test can prove that none of
 /// them reaches a reframe request.
 const DISTINCT: [(&str, f32); 11] = [
@@ -3529,12 +3540,14 @@ async fn command_output_a_check_selects_reaches_jev_before_a_finish_resting_on_i
             .any(|c| c.context.purpose == Purpose::Assessment),
         "the assessment carries the output"
     );
-    // Only to the check that selects it: every other check is asked over the default.
+    // Only to the checks that select it — `ready_to_finish`, and with it, because the audit is
+    // a `before_finish` provider, every check the `Finish` rule reads (`join_before_finish`).
+    // Every other check is asked over the default.
     for call in shown
         .iter()
         .filter(|c| c.context.purpose == Purpose::Assessment)
     {
-        assert_eq!(call.keys, vec![CheckKey::from(READY)]);
+        assert_eq!(call.keys, finish_checks());
     }
     // The Finish executed on the assessment's value: nothing was claim-only, so nothing was
     // refreshed.
@@ -4072,9 +4085,11 @@ async fn before_finish_output_reaches_the_model_with_the_ensemble_off() -> TestR
         })
         .collect();
     assert!(!shown.is_empty(), "the model was shown the failing audit");
-    // Only the check that selects it; the others are asked over the default, as before.
+    // Only to the checks the `Finish` rule reads: `ready_to_finish` selects it, and a
+    // `before_finish` provider joins them all (`join_before_finish`). The others are asked
+    // over the default, as before.
     for call in &shown {
-        assert_eq!(call.keys, vec![CheckKey::from(READY)]);
+        assert_eq!(call.keys, finish_checks());
     }
     // While the audit's output is current — it ran, and no worker has started since — its
     // selection is a request of its own beside the default one; otherwise it renders the

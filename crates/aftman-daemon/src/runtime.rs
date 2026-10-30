@@ -1006,14 +1006,17 @@ impl FactoryRuntime {
             // One request per distinct evidence selection (`docs/03-jev.md` §5), so every
             // check is asked over the state its own selection describes: a check that
             // selects `command:<id>` is shown that output once the provider has run. The
-            // bundled definitions all select the default, so they are one request, as before.
+            // checks the `Finish` rule reads also select every `before_finish` provider
+            // (`join_before_finish`), so its output reaches the `Finish` that waited for it.
+            // States that render identically are one request, so the bundled definitions are
+            // one request until such a provider has run.
             let questions = self.questions(&registry);
             let keys: Vec<(CheckKey, Option<f32>)> = registry
                 .checks()
                 .into_iter()
                 .map(|c| (c.key, c.threshold))
                 .collect();
-            let definitions = registry.checks();
+            let definitions = registry.checks_for_run(&self.deps.evidence);
             let assessed_states = AssessedStates::group(&observation, &definitions);
 
             self.emit(

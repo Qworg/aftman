@@ -558,3 +558,102 @@ async fn audit_output_from_before_the_last_worker_holds_a_finish_r0_cannot_remea
     assert!(ask.contains("could not be shown to the model"), "{ask}");
     Ok(())
 }
+
+// ---- a `before_finish` provider reaches the `Finish` checks (the user's decision) -------
+
+#[tokio::test]
+async fn a_before_finish_provider_reaches_the_finish_checks_of_the_bundled_definitions()
+-> TestResult {
+    // Probe D. The bundled definitions select no command output, so a configured
+    // `before_finish` audit ran before the Finish and reached none of the checks the Finish
+    // rests on (0 of 3 states carried it), and the run finished over a failing audit. A
+    // `before_finish` provider now joins the selection of every check the `Finish` rule reads,
+    // with no configuration: the re-assessment after the audit shows it to them, and a model
+    // scoring what it was shown does not finish. With the ensemble off and on.
+    for enabled in [false, true] {
+        let fx = Fixture::new()?;
+        let evidence = EvidencePlan::from_toml(
+            "[[evidence.commands]]\nid = \"audit\"\nargv = [\"sh\", \"-c\", \"echo AUDITMARK-4242 \
+             FAILED: 2 critical vulnerabilities; exit 1\"]\nrun_when = \"before_finish\"\n\
+             success_exit_codes = [0]\n",
+            "test",
+        )?;
+        let model = Arc::new(ProbeModel::new(|key, _, text| {
+            (key == READY && text.contains("FAILED")).then_some(0.05)
+        }));
+        let rt = fx.runtime(
+            config(|c| c.max_workers = 3),
+            enabled,
+            |_| {},
+            DefinitionSet::bundled()?,
+            evidence,
+            Arc::clone(&model) as Arc<dyn DecisionModel>,
+        );
+        let outcome = fx.run(rt).await?;
+        assert_ne!(outcome.status, FactoryStatus::Finished, "enabled={enabled}");
+        let shown: Vec<Vec<CheckKey>> = model
+            .calls(Purpose::Assessment)
+            .into_iter()
+            .filter(|(_, state)| state.contains("AUDITMARK-4242"))
+            .map(|(keys, _)| keys)
+            .collect();
+        assert!(
+            !shown.is_empty(),
+            "enabled={enabled}: the audit was never shown"
+        );
+        let mut finish: Vec<CheckKey> = [
+            READY,
+            REQS,
+            "core.verification__tests_sufficient",
+            "core.verification__needs_verification",
+        ]
+        .into_iter()
+        .map(CheckKey::from)
+        .collect();
+        finish.sort();
+        for keys in shown {
+            assert_eq!(keys, finish, "enabled={enabled}: only the Finish checks");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn without_a_before_finish_provider_nothing_is_joined() -> TestResult {
+    // Nothing changes when no `before_finish` provider is configured: an `on_demand` one is
+    // not joined, so the bundled definitions stay one request every cycle and its output, if
+    // it ever ran, reaches no check that does not select it.
+    let dir = tempfile::tempdir()?;
+    let checks = ResponsibilityRegistry::builtin().checks();
+    let on_demand = counting_audit(dir.path(), "on_demand", 1000)?;
+    let joined = aftman_core::responsibility::join_before_finish(checks.clone(), &on_demand);
+    assert_eq!(joined, checks);
+    let before_finish = counting_audit(dir.path(), "before_finish", 1000)?;
+    let joined = aftman_core::responsibility::join_before_finish(checks.clone(), &before_finish);
+    let changed: Vec<String> = joined
+        .iter()
+        .zip(&checks)
+        .filter(|(a, b)| a != b)
+        .map(|(a, _)| a.key.to_string())
+        .collect();
+    assert_eq!(
+        changed,
+        vec![
+            "core.completion__ready_to_finish",
+            "core.completion__requirements_satisfied",
+            "core.verification__needs_verification",
+            "core.verification__tests_sufficient",
+        ]
+    );
+    for check in joined
+        .iter()
+        .filter(|c| changed.contains(&c.key.to_string()))
+    {
+        let selection = aftman_core::observation::evidence_selection(check);
+        assert!(selection.contains(&"command:audit".to_owned()));
+        for default in aftman_core::observation::default_evidence() {
+            assert!(selection.contains(&default), "{default}");
+        }
+    }
+    Ok(())
+}

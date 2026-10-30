@@ -287,6 +287,85 @@ impl ResponsibilityRegistry {
     }
 }
 
+impl ResponsibilityRegistry {
+    /// The active checks as a run asks them: [`join_before_finish`] over [`Self::checks`].
+    #[must_use]
+    pub fn checks_for_run(&self, evidence: &crate::evidence::EvidencePlan) -> Vec<Check> {
+        join_before_finish(self.checks(), evidence)
+    }
+}
+
+/// The rule whose read set a `before_finish` provider's output joins.
+pub const FINISH_RULE: &str = "core.completion:thresholds-satisfied";
+
+/// The checks, with every `before_finish` provider's output joined to the selection of each
+/// check the `Finish` rule reads (`ready_to_finish`, `requirements_satisfied`,
+/// `tests_sufficient`, `needs_verification`: `builtin::RULE_READS`), in addition to what each
+/// selects (`docs/03-jev.md` §5, `docs/05-responsibilities.md` §3).
+///
+/// Without it a `before_finish` provider, "the primary defence against declaring a job done
+/// on a claim", reached no `Finish` conjunct of the bundled definitions except through the
+/// parsed test summary. No configuration is needed, and nothing changes when no such
+/// provider is configured. A check selecting the default set gets the default set plus the
+/// provider, so until the provider has run its state is the default one, and the two are
+/// one request.
+#[must_use]
+pub fn join_before_finish(
+    mut checks: Vec<Check>,
+    evidence: &crate::evidence::EvidencePlan,
+) -> Vec<Check> {
+    let joined: Vec<String> = evidence
+        .due(crate::evidence::RunWhen::BeforeFinish)
+        .iter()
+        .map(|provider| format!("command:{}", provider.id))
+        .collect();
+    if joined.is_empty() {
+        return checks;
+    }
+    let reads = builtin::rule_reads(FINISH_RULE).unwrap_or_default();
+    for check in checks.iter_mut().filter(|check| reads.contains(&check.key)) {
+        if check.evidence.is_empty() {
+            check.evidence = DEFAULT_EVIDENCE
+                .iter()
+                .map(|e| EvidenceId::new(*e))
+                .collect();
+        }
+        for entry in &joined {
+            if !check.evidence.iter().any(|e| e.as_str() == entry) {
+                check.evidence.push(EvidenceId::new(entry));
+            }
+        }
+    }
+    checks
+}
+
+/// Command providers no check can ever be shown (`docs/05-responsibilities.md` §3): no check
+/// of `checks` selects `command:<id>` or `command_evidence`, once [`join_before_finish`] has
+/// joined the `before_finish` providers to the `Finish` checks. Such a provider runs and costs
+/// time, and its output reaches the model only through the test summary parsed from it, if
+/// any. `aftman doctor` and run start warn about it; it is a note, never an error.
+#[must_use]
+pub fn unseen_providers(
+    checks: Vec<Check>,
+    evidence: &crate::evidence::EvidencePlan,
+) -> Vec<EvidenceId> {
+    let checks = join_before_finish(checks, evidence);
+    let selects = |id: &str| {
+        checks.iter().any(|check| {
+            check.evidence.iter().any(|entry| {
+                entry.as_str() == "command_evidence"
+                    || entry.as_str().strip_prefix("command:") == Some(id)
+            })
+        })
+    };
+    evidence
+        .providers()
+        .iter()
+        .filter(|provider| !selects(provider.id.as_str()))
+        .map(|provider| provider.id.clone())
+        .collect()
+}
+
 /// Convenience: the ordered providers for a check, as owned strings.
 #[must_use]
 pub fn providers_for(check: &Check) -> Vec<String> {

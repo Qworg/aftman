@@ -877,8 +877,10 @@ impl WatchState {
         let seq = p.get("assessment_seq").and_then(Value::as_u64);
         let model = label(p, "model");
         if model == "budget_exhausted" {
-            // The runtime emits one of these per cycle once the budget is spent, with
-            // no model call and without advancing `assessment_seq`.
+            // The runtime emits one of these per cycle once the budget is spent, or cannot
+            // cover a whole cycle's requests, with no model call and without advancing
+            // `assessment_seq`: the budget is checked before any request is made
+            // (`docs/03-jev.md` §5).
             self.counts.budget_cycles = self.counts.budget_cycles.saturating_add(1);
         } else {
             self.counts.assessments = match seq {

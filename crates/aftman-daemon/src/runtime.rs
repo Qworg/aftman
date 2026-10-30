@@ -2048,9 +2048,10 @@ impl FactoryRuntime {
     /// Every request is an assessment for the budget's purposes: each counts against
     /// `max_assessments` (`ls.assessments`), goes under the request budget, and is billed by
     /// its own usage line, written by the provider. The cycle's answers are all or nothing.
-    /// `max_assessments` is a hard ceiling: once it is spent no further request is made,
-    /// and a cycle that could not ask every request has no answers, exactly as on a model
-    /// failure — so policy is handed an empty check set and its budget invariant escalates.
+    /// `max_assessments` is a hard ceiling, checked before any request is made: a cycle whose
+    /// requests what is left of the budget cannot all cover makes none, has no answers, and
+    /// sets `assessment_budget_short`, so policy is handed an empty check set and its budget
+    /// invariant escalates.
     /// A failed request ends the cycle's asking too; later requests are not made, since
     /// their answers could not be used. The failure counters move once per cycle: a cycle
     /// with a failed request counts once (as a model or a budget failure), and only a cycle
@@ -2067,16 +2068,26 @@ impl FactoryRuntime {
         let mut answers = BTreeMap::new();
         let mut model = None;
         let mut usage = aftman_core::model::Usage::default();
+        // All or nothing, up front: a request whose answers the cycle cannot use is never made,
+        // nor billed. When what is left of `max_assessments` does not cover every request of
+        // the cycle, none is made, and policy is told the budget cannot cover a cycle.
+        let needed = u32::try_from(assessed.requests().len()).unwrap_or(u32::MAX);
+        let max = self.deps.config.max_assessments;
+        state.counters.assessment_budget_short = ls.assessments.saturating_add(needed) > max;
+        if state.counters.assessment_budget_short {
+            self.emit(
+                state,
+                EventKind::BudgetExceeded,
+                json!({
+                    "max_assessments": max,
+                    "assessments": ls.assessments,
+                    "requests": needed,
+                }),
+            )
+            .await?;
+            return Ok(CycleAnswers::none("budget_exhausted"));
+        }
         for request in assessed.requests() {
-            if ls.assessments >= self.deps.config.max_assessments {
-                self.emit(
-                    state,
-                    EventKind::BudgetExceeded,
-                    json!({ "max_assessments": self.deps.config.max_assessments }),
-                )
-                .await?;
-                return Ok(CycleAnswers::none("budget_exhausted"));
-            }
             let asked: BTreeMap<CheckKey, Question> = request
                 .checks
                 .iter()

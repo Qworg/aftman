@@ -70,6 +70,11 @@ pub struct Counters {
     /// away. Counting them together made the supervisor escalate with "model_unavailable:
     /// supervision is blind" — the opposite of the truth, and with no usage line to show why.
     pub consecutive_budget_failures: u32,
+    /// This cycle's assessment made no request: what is left of `max_assessments` does not
+    /// cover every request the cycle would make (`docs/03-jev.md` §5). Policy treats it as
+    /// the budget spent (`Invariant::AssessmentBudget`). Set by the runtime every cycle.
+    #[serde(default)]
+    pub assessment_budget_short: bool,
     /// Elapsed wall time. Volatile: excluded from the content digest.
     pub elapsed_secs: u64,
 }

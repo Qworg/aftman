@@ -358,3 +358,46 @@ async fn a_cycle_whose_later_request_keeps_failing_still_escalates_model_unavail
     }
     Ok(())
 }
+
+// ---- the budget is checked up front (review F3a) ---------------------------------------
+
+#[tokio::test]
+async fn no_request_is_made_that_the_cycle_cannot_use() -> TestResult {
+    // Review F3 (probe C). `max_assessments = 3`, and once the audit has run every cycle is two
+    // requests. A third request used to be made, and billed, though its cycle could never use
+    // it. Now a cycle the budget left cannot cover makes no request, and policy escalates as
+    // for a spent budget, saying so.
+    let fx = Fixture::new()?;
+    let model = Arc::new(ProbeModel::new(|_, _, _| None));
+    let rt = fx.runtime(
+        config(|c| c.max_assessments = 3),
+        false,
+        |_| {},
+        audited_definitions()?,
+        counting_audit(fx.dir.path(), "worker_completed", 1000)?,
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+    );
+    let outcome = fx.run(rt).await?;
+    let completed = fx.of_kind(EventKind::AssessmentCompleted);
+    let used: usize = completed
+        .iter()
+        .filter(|e| e.payload["model"] == "probe")
+        .map(|e| e.payload["requests"].as_array().map_or(1, Vec::len))
+        .sum();
+    let made = model.calls(Purpose::Assessment).len();
+    assert_eq!(made, used, "{made} requests made, answers of {used} used");
+    assert!(made <= 3);
+    // The cycle that could not be covered made no call, and said why.
+    let last = completed.last().ok_or("a cycle")?;
+    assert_eq!(last.payload["model"], "budget_exhausted");
+    assert_eq!(outcome.status, FactoryStatus::NeedsHuman);
+    let raised = fx.of_kind(EventKind::EscalationRaised);
+    let ask = raised
+        .last()
+        .and_then(|e| e.payload["ask"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(ask.contains("assessment budget (3 model calls)"), "{ask}");
+    assert!(outcome.counters.assessment_budget_short || outcome.assessments >= 3);
+    Ok(())
+}

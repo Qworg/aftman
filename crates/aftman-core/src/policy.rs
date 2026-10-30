@@ -197,13 +197,21 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
         };
     }
 
-    if input.counters.assessments >= input.config.max_assessments {
+    // Spent, or too little of it left to ask a whole cycle, which asks one request per
+    // evidence selection (`docs/03-jev.md` §5): either way the model is not asked again.
+    let budget_spent = input.counters.assessments >= input.config.max_assessments;
+    if budget_spent || input.counters.assessment_budget_short {
         invariants.push(Invariant::AssessmentBudget);
+        let how = if budget_spent {
+            "is spent"
+        } else {
+            "has too little left to ask a whole cycle"
+        };
         return PolicyDecision {
             selected: Directive::Escalate {
                 reason: "assessment budget exhausted".into(),
                 ask: format!(
-                    "The assessment budget ({} model calls) is spent, so aftman will not ask the \
+                    "The assessment budget ({} model calls) {how}, so aftman will not ask the \
                      model again for this run. Stop ends the run. Any other answer lets the \
                      worker continue without model supervision, and this question will be \
                      raised again at the next cycle.",

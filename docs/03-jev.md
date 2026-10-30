@@ -210,10 +210,16 @@ grouping was built. An operator's definition that names its own `evidence` adds 
   budget (§6), and writes its own usage line (§7) with its own `assessment_seq`; the cycle's id is
   the last. A request's answers count only for the checks it asked: an answer to a question it did
   not ask is ignored, never allowed to stand in for another request's value.
-- **All or nothing.** A cycle that cannot make every request — the assessment budget runs out
-  part way, or a request fails — has no answers, exactly as a failed single request had: policy is
-  handed an empty check set, so only conservative directives can follow, and the budget invariant
-  escalates once the budget is spent. The requests after a failed one are not made.
+- **All or nothing.** A cycle that cannot make every request has no answers, exactly as a failed
+  single request had: policy is handed an empty check set, so only conservative directives can
+  follow. The budget is checked **up front**: when what is left of `max_assessments` does not
+  cover every request of the cycle, none is made — no request is billed whose answers the cycle
+  could not use — `ASSESSMENT_COMPLETED` records `model: "budget_exhausted"`, and the counters
+  carry `assessment_budget_short`, which policy treats as the budget spent
+  (`Invariant::AssessmentBudget`: it escalates, saying the budget "has too little left to ask a
+  whole cycle"). An earlier revision checked per request, so a cycle could make and bill a request
+  and then discard it. A request that fails ends the cycle's asking too: the requests after it
+  are not made.
 - **Failures count per cycle.** `consecutive_model_failures` and `consecutive_budget_failures`
   (§4, [05-responsibilities.md §6.1](05-responsibilities.md)) move once per cycle: a cycle with a
   failed request counts once, as a model failure or — when the request budget refused it — as a

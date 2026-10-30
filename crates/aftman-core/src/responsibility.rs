@@ -984,6 +984,26 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_selection_is_its_own_group_and_a_set() {
+        // `docs/03-jev.md` §5: an explicit list replaces the default, so it is a request of
+        // its own; two lists naming the same providers in another order are one.
+        let mut checks = ResponsibilityRegistry::builtin().checks();
+        let defaults = checks.len();
+        let base = checks[0].clone();
+        let mut audit = base.clone().with_evidence(&["job", "command:audit"]);
+        audit.key = crate::ids::CheckKey::from("user.a__audit");
+        let mut again = base.with_evidence(&["command:audit", "job", "job"]);
+        again.key = crate::ids::CheckKey::from("user.a__again");
+        checks.push(audit);
+        checks.push(again);
+        let groups = crate::observation::group_by_evidence(&checks);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].1.len(), defaults);
+        assert_eq!(groups[1].0, vec!["command:audit", "job"]);
+        assert_eq!(groups[1].1.len(), 2);
+    }
+
+    #[test]
     fn each_builtin_declares_an_id_routing_and_checks() {
         for r in ResponsibilityRegistry::builtin().active() {
             assert!(!r.id().as_str().is_empty());

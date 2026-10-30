@@ -229,7 +229,10 @@ pub struct EventSummary { pub seq: EventSeq, pub at: OffsetDateTime, pub kind: E
 pub struct PriorDecision { pub assessment_seq: AssessmentSeq, pub directive: Directive,
     pub reason: String }
 pub struct Counters { pub workers_run: u32, pub attempts: u32, pub failures: u32,
-    pub verifiers_run: u32, pub verifier_completed: bool, pub steers_sent: u32,
+    pub verifiers_run: u32,
+    pub verifier_completed: bool,   // a verify worker ended with output, no code worker since
+                                    // (doc 05 §6.2); #[serde(default)]
+    pub steers_sent: u32,
     pub assessments: u32, pub elapsed: Duration, pub consecutive_model_failures: u32 }
 pub struct EvidenceResult { pub provider: EvidenceId, pub argv: Vec<String>,
     pub exit_code: Option<i32>, pub duration: Duration, pub output_excerpt: String,

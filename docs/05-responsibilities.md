@@ -474,6 +474,22 @@ and ( verification_completed  or  ( needs_verification < 0.65  and  permitted ) 
 and no worker is active
 ```
 
+**`verification_completed`** is `counters.verifier_completed`: a verify worker ran to its end —
+it exited successfully and produced output — and no code worker has started since. It means the
+verifier *completed*, not that it *passed*. [04-workers.md §6](04-workers.md) is explicit that a
+verifier produces evidence and its verdict never short-circuits policy, and is silent on what
+"completed" means, so it is read in the way that keeps that rule: the verifier's report is the
+most recent worker's output, which every following assessment is shown, and the three conjuncts
+above are scored over it. A verifier that reports FAIL satisfies this disjunct and nothing else;
+`ready_to_finish`, shown the failure, carries it, and the run does not finish
+(`a_failing_verdict_does_not_finish_through_the_verification_disjunct`). A verifier that failed,
+timed out, was stopped, or said nothing has not completed. A code worker started afterwards resets
+it, because what the verifier checked is no longer the tree; and since a verifier runs at most
+once per run, the disjunct cannot carry a `Finish` again in that run — with `verify = "always"`
+(`Invariant::VerificationIncomplete`), such a run cannot finish after a later code worker. It is a run
+counter, persisted with the run state (`#[serde(default)]`, so a snapshot without it decodes as
+not completed). Until it was set by the runtime this disjunct was unreachable.
+
 `permitted` is `true` only when the value is decisively outside the uncertainty band (or the
 ensemble is disabled). So with `ensemble.enabled = true`, a `ready_to_finish` of `0.79` against a
 `0.75` threshold is **in band** and cannot finish: the run either refreshes evidence (R0) or

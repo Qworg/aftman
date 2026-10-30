@@ -2308,6 +2308,20 @@ impl FactoryRuntime {
         // (it carries the prose, the tool calls and the token count); for a backend with no
         // structured stream, "it printed nothing at all" is the only signal there is.
         let empty = Self::produced_nothing(activity.as_ref(), &snapshot);
+        // A verifier that ran to its end and reported something has completed: its report is
+        // the most recent worker's output, which every following assessment is shown
+        // (`docs/04-workers.md` §6). Completed is not passed — the `Finish` conjuncts are
+        // scored over that report, and carry it (`docs/05-responsibilities.md` §6.2). One
+        // that failed, timed out, was stopped, or said nothing has not.
+        if outcome.is_success()
+            && !empty
+            && state
+                .workers
+                .iter()
+                .any(|w| w.id == id && w.task == TaskKind::Verify)
+        {
+            state.counters.verifier_completed = true;
+        }
         if let Some(record) = state.workers.iter_mut().find(|w| w.id == id) {
             record.status = outcome.status();
             record.exit = outcome.exit();
@@ -2649,6 +2663,8 @@ impl FactoryRuntime {
         state.counters.workers_run += 1;
         if task == TaskKind::Code {
             state.counters.attempts += 1;
+            // What a verifier checked is no longer the tree once code work starts again.
+            state.counters.verifier_completed = false;
         } else {
             state.counters.verifiers_run += 1;
         }

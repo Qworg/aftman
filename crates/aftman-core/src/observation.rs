@@ -53,6 +53,10 @@ pub struct Counters {
     pub attempts: u32,
     pub failures: u32,
     pub verifiers_run: u32,
+    /// A verify worker ran to its end and reported something, and no code worker has started
+    /// since: its report is evidence the `Finish` conjuncts are scored over. Not "it passed"
+    /// (`docs/05-responsibilities.md` §6.2). Defaulted, so a snapshot without it decodes.
+    #[serde(default)]
     pub verifier_completed: bool,
     pub steers_sent: u32,
     pub assessments: u32,
@@ -866,6 +870,22 @@ mod tests {
             with_commands.get("command_evidence").is_none(),
             "no evidence recorded, so nothing to include"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn counters_without_verifier_completed_decode_as_not_completed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // A run snapshot written before the field was ever set: it decodes, as false.
+        let mut json = serde_json::to_value(Counters {
+            verifier_completed: true,
+            ..Counters::default()
+        })?;
+        json.as_object_mut()
+            .ok_or("an object")?
+            .remove("verifier_completed");
+        let counters: Counters = serde_json::from_value(json)?;
+        assert!(!counters.verifier_completed);
         Ok(())
     }
 

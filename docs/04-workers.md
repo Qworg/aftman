@@ -263,6 +263,12 @@ Rules:
   that answer becomes an `EvidenceResult`, not a probability fed to Jev. Jev still decides whether
   the *run* is finished.
 
+A verifier that exits successfully and produces output has **completed**
+(`counters.verifier_completed`, until a code worker starts again): that satisfies the
+`verification_completed` disjunct of the `Finish` precondition, and nothing more. Completed is not
+passed — the verdict reaches policy only through the `Finish` conjuncts, scored over the
+verifier's report ([05-responsibilities.md §6.2](05-responsibilities.md)).
+
 That last point is the architectural rule: a verifier produces **evidence**. Jev produces
 **probabilities**. Policy produces **actions**. A verifier verdict never short-circuits policy.
 

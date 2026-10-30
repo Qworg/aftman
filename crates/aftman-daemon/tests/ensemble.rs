@@ -4198,3 +4198,181 @@ async fn a_second_finish_after_a_later_worker_runs_the_before_finish_providers_a
     }
     Ok(())
 }
+
+// ---- the verifier ------------------------------------------------------------------------
+
+/// A worker that does the work, or — given a verify mission — reports a verdict. Its output
+/// stays in the shape `R2Model` reads as "a worker has run".
+struct VerdictWorker {
+    verdict: &'static str,
+}
+
+#[async_trait]
+impl Worker for VerdictWorker {
+    fn kind(&self) -> WorkerKind {
+        WorkerKind::Simulated
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    async fn run(
+        &self,
+        ctx: aftman_core::worker::WorkerCtx,
+        sink: aftman_core::worker::WorkerEventSink,
+    ) -> Result<aftman_core::worker::WorkerOutcome, aftman_core::worker::WorkerError> {
+        let text = match ctx.task {
+            aftman_core::job::TaskKind::Verify => {
+                format!("ran the suite: 3 passed\nVERDICT: {}\n", self.verdict)
+            }
+            _ => "implemented it; 3 passed\n".to_owned(),
+        };
+        ctx.output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(aftman_core::log::Stream::Stdout, &text);
+        sink.activity();
+        Ok(aftman_core::worker::WorkerOutcome::Completed)
+    }
+
+    async fn steer(
+        &self,
+        _message: &str,
+    ) -> Result<aftman_core::worker::SteerOutcome, aftman_core::worker::WorkerError> {
+        Ok(aftman_core::worker::SteerOutcome::Unsupported)
+    }
+
+    async fn terminate(
+        &self,
+        _reason: aftman_core::worker::TerminateReason,
+    ) -> Result<(), aftman_core::worker::WorkerError> {
+        Ok(())
+    }
+}
+
+const NEEDS_VERIFICATION: &str = "core.verification__needs_verification";
+
+/// Everything done, but an independent verification is always warranted; and
+/// `ready_to_finish` reads the verifier's report when it is shown one: a failing verdict is
+/// not ready.
+fn verification_model() -> R2Model {
+    R2Model::finish_ready()
+        .with(NEEDS_VERIFICATION, 0.90)
+        .assess_rule(|key, state, _| {
+            (*key == CheckKey::from(READY) && state.contains("VERDICT: FAIL")).then_some(0.10)
+        })
+}
+
+/// Whether the model was ever shown `verifier_completed: true`.
+fn shown_verifier_completed(model: &R2Model) -> bool {
+    model
+        .calls(Purpose::Assessment)
+        .iter()
+        .any(|c| c.state["factory_status"]["verifier_completed"] == Value::Bool(true))
+}
+
+#[tokio::test]
+async fn a_completed_verifier_satisfies_the_verification_disjunct_of_finish() -> TestResult {
+    // `docs/09-plan.md`, "Found during M5": the runtime never set `verifier_completed`, so the
+    // `verification_completed` disjunct of `Finish` (`docs/05-responsibilities.md` §6.2) was
+    // unreachable. `needs_verification` stays high (0.90), so only that disjunct can carry the
+    // Finish: a verifier runs, ends, reports PASS, and the run finishes on the conjuncts
+    // scored over its report. With the ensemble off and on.
+    for enabled in [false, true] {
+        let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+        let model = Arc::new(verification_model());
+        let rt = fx.runtime(
+            config(|c| c.max_workers = 5),
+            settings(|s| s.enabled = enabled),
+            Arc::clone(&model) as Arc<dyn DecisionModel>,
+            Arc::new(VerdictWorker { verdict: "PASS" }),
+        );
+        let outcome = fx.run(rt).await?;
+        assert_eq!(outcome.status, FactoryStatus::Finished, "enabled={enabled}");
+        assert_eq!(outcome.counters.verifiers_run, 1);
+        assert!(outcome.counters.verifier_completed);
+        assert!(shown_verifier_completed(&model));
+        // The verifier was the last worker, and the Finish followed it.
+        let started: Vec<String> = fx
+            .of_kind(EventKind::WorkerStarted)
+            .iter()
+            .filter_map(|e| e.payload["task"].as_str().map(ToOwned::to_owned))
+            .collect();
+        assert_eq!(
+            started.last().map(String::as_str),
+            Some("Verify"),
+            "{started:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The run where the verifier reports FAIL.
+async fn failing_verdict(
+    enabled: bool,
+) -> Result<(Fixture, RunOutcome, Arc<R2Model>), Box<dyn std::error::Error>> {
+    let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+    let model = Arc::new(verification_model());
+    let rt = fx.runtime(
+        config(|c| c.max_workers = 4),
+        settings(|s| s.enabled = enabled),
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+        Arc::new(VerdictWorker { verdict: "FAIL" }),
+    );
+    let outcome = fx.run(rt).await?;
+    Ok((fx, outcome, model))
+}
+
+#[tokio::test]
+async fn a_failing_verdict_does_not_finish_through_the_verification_disjunct() -> TestResult {
+    // The verifier completes — so the disjunct holds — but reports FAIL. `verifier_completed`
+    // means the verifier ran to its end and its report is evidence, not that it passed; the
+    // other conjuncts are scored over that report, and `ready_to_finish`, shown FAIL, is not
+    // ready. No Finish is ever selected. With the ensemble off and on.
+    for enabled in [false, true] {
+        let (fx, outcome, model) = failing_verdict(enabled).await?;
+        assert_ne!(outcome.status, FactoryStatus::Finished, "enabled={enabled}");
+        assert!(!finished(&fx));
+        assert!(shown_verifier_completed(&model), "the disjunct held");
+        assert!(
+            !fx.of_kind(EventKind::DirectiveSelected)
+                .iter()
+                .any(|e| e.payload["directive"] == "Finish"),
+            "enabled={enabled}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_later_code_worker_resets_verifier_completed() -> TestResult {
+    // After the failing verdict the run starts another code worker: what the verifier checked
+    // is no longer the tree, so `verifier_completed` is false again, and — the verifier runs
+    // once per run — the disjunct cannot carry a Finish for the rest of the run.
+    for enabled in [false, true] {
+        let (fx, outcome, model) = failing_verdict(enabled).await?;
+        let started: Vec<String> = fx
+            .of_kind(EventKind::WorkerStarted)
+            .iter()
+            .filter_map(|e| e.payload["task"].as_str().map(ToOwned::to_owned))
+            .collect();
+        let verify = started
+            .iter()
+            .position(|t| t == "Verify")
+            .ok_or("a verifier ran")?;
+        assert!(
+            started[verify + 1..].iter().any(|t| t == "Code"),
+            "a code worker after the verifier: {started:?}"
+        );
+        assert!(shown_verifier_completed(&model));
+        assert!(!outcome.counters.verifier_completed, "enabled={enabled}");
+        // The last assessment was shown it reset.
+        let last = model
+            .calls(Purpose::Assessment)
+            .last()
+            .map(|c| c.state["factory_status"]["verifier_completed"].clone());
+        assert_eq!(last, Some(Value::Bool(false)));
+    }
+    Ok(())
+}

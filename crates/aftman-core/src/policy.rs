@@ -262,7 +262,7 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
     if workers_exhausted {
         invariants.push(Invariant::WorkerLimit);
     }
-    if input.counters.verified_since_code {
+    if verification_already_run(input) {
         invariants.push(Invariant::VerificationAlreadyRun);
     }
     if input.active_worker.is_some() {
@@ -494,6 +494,24 @@ pub const NOTHING_SURVIVED_ASK_CAP_BYTES: usize = 2048;
 /// more than [`NOTHING_SURVIVED_ASK_CAP_BYTES`]. The values are Jev's own, unmodified.
 fn nothing_survived_ask(input: &PolicyInput<'_>, suppressed: &[Suppression]) -> String {
     const GENERIC: &str = "No worker is running and every proposal was refused.";
+    let held_by_verification = suppressed.iter().any(|s| {
+        matches!(
+            s.reason,
+            SuppressionReason::Invariant(Invariant::VerificationIncomplete)
+        )
+    });
+    if held_by_verification {
+        let why = if input.counters.verified_since_code {
+            "the verifier that ran did not complete (it failed, timed out, was stopped, or \
+             printed nothing)"
+        } else {
+            "no verifier could be started"
+        };
+        return format!(
+            "No worker is running and every proposal was refused. Finish is held because \
+             verify = \"always\" requires a verifier to complete first, and {why}."
+        );
+    }
     let held_finish = suppressed.iter().any(|s| {
         matches!(
             s.reason,
@@ -706,6 +724,18 @@ fn resolution_changes(
     })
 }
 
+/// A verifier has started since the last code worker, so another would check the same code.
+///
+/// Except under `verify = "always"` when that verifier did not complete (it failed, timed
+/// out, was stopped, or said nothing): `always` refuses every `Finish` until one completes,
+/// so refusing the retry as well would leave nothing that can make progress. A retry still
+/// costs a worker, so `max_workers` bounds it.
+fn verification_already_run(input: &PolicyInput<'_>) -> bool {
+    input.counters.verified_since_code
+        && !(input.config.verify == crate::job::VerifyPolicy::Always
+            && !input.counters.verifier_completed)
+}
+
 /// Whether a proposal is refused by a hard invariant. `None` means it survives.
 fn refusal(
     input: &PolicyInput<'_>,
@@ -788,7 +818,7 @@ fn refusal(
             if input.counters.code_workers_run() == 0 {
                 return Some(SuppressionReason::Invariant(Invariant::NoWorkAttempted));
             }
-            if input.counters.verified_since_code {
+            if verification_already_run(input) {
                 return Some(SuppressionReason::Invariant(
                     Invariant::VerificationAlreadyRun,
                 ));
@@ -1582,31 +1612,37 @@ mod tests {
     }
 
     #[test]
-    fn verify_always_waits_for_implementation_before_requiring_a_verifier() {
-        // The required verifier judges finished work, not work in progress: below the
-        // implementation threshold it is not proposed, and the run keeps working.
+    fn verify_always_requires_a_verifier_only_once_the_work_is_otherwise_ready() {
+        // The required verifier judges work that is otherwise ready to finish: while a
+        // `Finish` conjunct that does not depend on a verifier is unmet, it is not proposed and
+        // the run keeps working. `implementation_complete` does not gate it — `Finish` does
+        // not read it, and gating on it left a run whose model scored it low but every
+        // `Finish` conjunct high with nothing that could make progress.
         let registry = crate::responsibility::ResponsibilityRegistry::builtin();
         let o = observation();
         let config = with_verify(crate::job::VerifyPolicy::Always);
-        let mut checks = finish_ready_needing_no_verification();
-        checks.extend(self::checks(&[(
-            "core.completion",
-            "implementation_complete",
-            0.20,
-        )]));
         let counters = Counters {
             workers_run: 1,
             ..Counters::default()
         };
-        let decision = super::decide(&registry, &input(&o, &counters, &config, &checks), &[]);
-        assert!(
-            !decision
+        let verify_proposed = |checks: &BTreeMap<CheckKey, ResolvedCheck>| {
+            super::decide(&registry, &input(&o, &counters, &config, checks), &[])
                 .considered
                 .iter()
-                .any(|p| matches!(p.directive, Directive::Verify { .. })),
-            "considered {:?}",
-            decision.considered
-        );
+                .any(|p| matches!(p.directive, Directive::Verify { .. }))
+        };
+
+        let mut not_ready = finish_ready_needing_no_verification();
+        not_ready.extend(checks(&[("core.completion", "ready_to_finish", 0.20)]));
+        assert!(!verify_proposed(&not_ready));
+
+        let mut implementation_low = finish_ready_needing_no_verification();
+        implementation_low.extend(checks(&[(
+            "core.completion",
+            "implementation_complete",
+            0.20,
+        )]));
+        assert!(verify_proposed(&implementation_low));
     }
 
     #[test]
@@ -1672,6 +1708,89 @@ mod tests {
             );
             assert!(decision.invariants.contains(&Invariant::NoWorkAttempted));
         }
+    }
+
+    #[test]
+    fn verify_always_retries_a_verifier_that_did_not_complete() {
+        // `always` refuses every `Finish` until a verifier completes. A verifier that failed,
+        // timed out, was stopped or said nothing used to be refused a retry as well
+        // (`VerificationAlreadyRun`), leaving nothing that could make progress. Under `always`
+        // it may run again; `when_asked` keeps the once-per-code rule.
+        let registry = crate::responsibility::ResponsibilityRegistry::builtin();
+        let o = observation();
+        let checks = finish_ready_needing_no_verification();
+        let did_not_complete = Counters {
+            workers_run: 2,
+            verifiers_run: 1,
+            verified_since_code: true,
+            verifier_completed: false,
+            ..Counters::default()
+        };
+        let always = with_verify(crate::job::VerifyPolicy::Always);
+        let decision = super::decide(
+            &registry,
+            &input(&o, &did_not_complete, &always, &checks),
+            &[],
+        );
+        assert!(
+            matches!(decision.selected, Directive::Verify { .. }),
+            "selected {:?}",
+            decision.selected
+        );
+        assert!(
+            !decision
+                .invariants
+                .contains(&Invariant::VerificationAlreadyRun)
+        );
+
+        let mut asked = finish_ready_needing_no_verification();
+        asked.extend(self::checks(&[(
+            "core.verification",
+            "needs_verification",
+            0.95,
+        )]));
+        let when_asked = with_verify(crate::job::VerifyPolicy::WhenAsked);
+        let user_rule = Proposal::new(
+            "my.checks",
+            "my.checks:verify",
+            Directive::Verify {
+                reason: "a user rule".into(),
+            },
+            950,
+            Stakes::High,
+        );
+        let decision = super::decide(
+            &registry,
+            &input(&o, &did_not_complete, &when_asked, &asked),
+            std::slice::from_ref(&user_rule),
+        );
+        assert!(decision.suppressed.iter().any(|s| s.rule == user_rule.rule
+            && s.reason == SuppressionReason::Invariant(Invariant::VerificationAlreadyRun)));
+    }
+
+    #[test]
+    fn a_finish_held_by_verify_always_says_so() {
+        // When `always` is what holds the `Finish` and nothing else can run (here the worker
+        // limit refuses the verifier), the question says so rather than the generic line.
+        let o = observation();
+        let config = RunConfig {
+            verify: crate::job::VerifyPolicy::Always,
+            max_workers: 2,
+            ..RunConfig::default()
+        };
+        let counters = Counters {
+            workers_run: 2,
+            verifiers_run: 1,
+            verified_since_code: true,
+            ..Counters::default()
+        };
+        let checks = finish_ready_needing_no_verification();
+        let decision = arbitrate(&input(&o, &counters, &config, &checks), &[finish()]);
+        let Directive::Escalate { ask, .. } = &decision.selected else {
+            panic!("selected {:?}", decision.selected);
+        };
+        assert!(ask.contains("verify = \"always\""), "{ask}");
+        assert!(ask.contains("did not complete"), "{ask}");
     }
 
     #[test]

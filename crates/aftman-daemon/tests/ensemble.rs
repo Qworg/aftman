@@ -4659,6 +4659,52 @@ async fn a_run_never_finishes_on_a_verifier_alone() -> TestResult {
 }
 
 #[tokio::test]
+async fn verify_always_runs_a_verifier_when_only_verification_is_missing() -> TestResult {
+    // Review of the `verify = always` fix, case A. The required verifier waited for
+    // `implementation_complete`, which `Finish` does not read: a model that scored it low but
+    // every `Finish` conjunct high left a run under `always` with nothing that could make
+    // progress, though `when_asked` finished. It now waits for the `Finish` conjuncts.
+    for enabled in [false, true] {
+        let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+        let rt = fx.runtime(
+            config(|c| c.verify = VerifyPolicy::Always),
+            settings(|s| s.enabled = enabled),
+            Arc::new(R2Model::finish_ready().with(IMPL, 0.50)) as Arc<dyn DecisionModel>,
+            Arc::new(VerdictsWorker::new(&[Some("PASS")])),
+        );
+        let outcome = fx.run(rt).await?;
+        assert_eq!(outcome.status, FactoryStatus::Finished, "enabled={enabled}");
+        assert_eq!(tasks(&fx), vec!["Code", "Verify"], "enabled={enabled}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn verify_always_retries_a_verifier_that_said_nothing() -> TestResult {
+    // Review of the `verify = always` fix, case B. A verifier that exits having printed only
+    // whitespace has not completed, so `always` still refuses `Finish` — and the retry was
+    // refused too (`VerificationAlreadyRun`), leaving nothing that could make progress. Under
+    // `always` it is retried, within `max_workers`: Code, Verify (silent), Verify (PASS).
+    for enabled in [false, true] {
+        let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+        let rt = fx.runtime(
+            config(|c| c.verify = VerifyPolicy::Always),
+            settings(|s| s.enabled = enabled),
+            Arc::new(R2Model::finish_ready()) as Arc<dyn DecisionModel>,
+            Arc::new(VerdictsWorker::new(&[None, Some("PASS")])),
+        );
+        let outcome = fx.run(rt).await?;
+        assert_eq!(outcome.status, FactoryStatus::Finished, "enabled={enabled}");
+        assert_eq!(
+            tasks(&fx),
+            vec!["Code", "Verify", "Verify"],
+            "enabled={enabled}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn verify_never_runs_no_verifier_though_the_model_judges_one_needed() -> TestResult {
     // `verify = "never"` was not enforced: the built-in rule proposed a verifier whenever the
     // model judged one warranted. With `needs_verification` high (0.90), `never` must still

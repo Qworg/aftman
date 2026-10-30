@@ -463,9 +463,9 @@ Applied before any priority comparison. They cannot be overridden by a score:
 | **`permitted == false` for a check** | Every rule that reads that check is suppressed (`SuppressionReason::NotPermitted`), in both comparison directions, regardless of how far the value is from the threshold. This is how the ensemble's guarantee is enforced (doc 06 §2.2). |
 | `attempts >= max_attempts` | `Retry` suppressed |
 | `workers >= max_workers` | `StartWorker` / `Verify` / `Retry` suppressed → `Escalate`. And a `Finish` cannot win because of it: when one of those, refused by the limit, would have outranked the `Finish`, policy escalates instead (§6.3) |
-| a verifier has started since the last code worker (`verified_since_code`) | `Verify` suppressed (`VerificationAlreadyRun`); a later code worker lifts it |
+| a verifier has started since the last code worker (`verified_since_code`) | `Verify` suppressed (`VerificationAlreadyRun`); a later code worker lifts it. Under `verify = "always"` a verifier that did not complete — it failed, timed out, was stopped, or printed nothing — may be retried, because `always` refuses every `Finish` until one completes; `max_workers` bounds the retries |
 | no code worker has run yet | `Verify` suppressed (`NoWorkAttempted`), whichever rule proposes it: there is no work to verify. A model optimistic about the untouched repository on the first cycle used to get a verifier started as the run's first worker |
-| `verify = "always"` and no verifier has completed since the last code worker | `Finish` suppressed (`VerificationIncomplete`). So that this cannot strand a run, `core.verification:required` proposes the verifier itself once `implementation_complete` holds, without waiting for `needs_verification`: a model that judged none needed used to leave nothing that could make progress, and the run escalated "nothing can make progress" after its first worker |
+| `verify = "always"` and no verifier has completed since the last code worker | `Finish` suppressed (`VerificationIncomplete`). `core.verification:required` proposes the verifier itself once the work is otherwise ready to finish — `ready_to_finish`, `requirements_satisfied` and `tests_sufficient` hold — without waiting for `needs_verification`: a model that judged none needed used to leave nothing that could make progress, and the run escalated "nothing can make progress" after its first worker. When `always` is still what holds the `Finish` and nothing can run (the worker limit refuses the verifier, say), the "nothing can make progress" question says so, and whether a verifier ran without completing |
 | `verify = "never"` | `Verify` suppressed (`VerificationDisabled`), whichever rule proposes it, built-in or declarative; the built-in rule proposes none. Before this was enforced, the built-in rule started a verifier under `never` whenever the model judged one warranted |
 | Assessment budget exhausted, or too little of it left to ask a whole cycle (`assessment_budget_short`, [03-jev.md §5](03-jev.md)) | `Stop`, or `Escalate` when verification is pending |
 | Model error this cycle | only conservative directives are permitted (see §7) |
@@ -539,7 +539,8 @@ priority  directive      rule id                             source
  750      StartWorker    quality.documentation:insufficient   documentation_sufficient < 0.75
  700      Finish         core.completion:thresholds-satisfied §6.2 holds
  600      Verify         core.verification:warranted          needs_verification >= 0.65
- 600      Verify         core.verification:required           verify = always, no verifier completed, implementation_complete >= 0.75
+ 600      Verify         core.verification:required           verify = always, no verifier completed since the last code worker,
+                                                              ready_to_finish, requirements_satisfied, tests_sufficient hold
  500      StartWorker    core.completion:work-remains         no worker, thresholds unmet
    0      Continue       runtime:default
 ```

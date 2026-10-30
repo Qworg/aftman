@@ -441,7 +441,11 @@ pub mod builtin {
         ),
         (
             "core.verification:required",
-            &[(COMPLETION, "implementation_complete")],
+            &[
+                (COMPLETION, "ready_to_finish"),
+                (COMPLETION, "requirements_satisfied"),
+                (VERIFICATION, "tests_sufficient"),
+            ],
         ),
         (
             "core.worker-health:stuck",
@@ -771,31 +775,32 @@ pub mod builtin {
         }
 
         fn propose(&self, input: &PolicyInput<'_>) -> Vec<Proposal> {
-            // A verifier is only warranted once implementation looks complete, and never twice
-            // for the same code: once more after each later code worker
-            // (`docs/04-workers.md` §6). `verify = "never"` proposes none.
+            // A verifier checks code work: none while a worker runs, none before a code worker
+            // has run, and none under `verify = "never"`.
             if input.active_worker.is_some()
-                || input.counters.verified_since_code
                 || input.counters.code_workers_run() == 0
                 || input.config.verify == VerifyPolicy::Never
             {
                 return Vec::new();
             }
-            let implemented = input.check_ge(
-                &key(COMPLETION, "implementation_complete"),
-                rule_threshold(
-                    input,
-                    &self.checks,
-                    &key(COMPLETION, "implementation_complete"),
-                ),
-            );
             // `verify = "always"` refuses every `Finish` until a verifier has completed
             // (`Invariant::VerificationIncomplete`), so it cannot also wait for the model to
             // judge one warranted: a model that says "no verification needed" would leave the
-            // run with nothing that can make progress. Its own rule, reading only
-            // `implementation_complete`, so the read list says what it acts on.
+            // run with nothing that can make progress. It proposes the verifier when the work
+            // is otherwise ready to finish — the `Finish` conjuncts that do not depend on a
+            // verifier hold — so that verification is the one thing missing. Its own rule, so
+            // its read list says what it acts on. A verifier that ran since the last code
+            // worker but did not complete may be retried (`verification_already_run` in
+            // policy); `max_workers` bounds that.
             if input.config.verify == VerifyPolicy::Always && !input.counters.verifier_completed {
-                if implemented {
+                let ready = [
+                    key(COMPLETION, "ready_to_finish"),
+                    key(COMPLETION, "requirements_satisfied"),
+                    key(VERIFICATION, "tests_sufficient"),
+                ]
+                .iter()
+                .all(|check| input.check_ge(check, rule_threshold(input, &self.checks, check)));
+                if ready {
                     return vec![proposal(
                         &self.id,
                         "core.verification:required",
@@ -807,6 +812,20 @@ pub mod builtin {
                 }
                 return Vec::new();
             }
+            // Otherwise a verifier is warranted once implementation looks complete and the
+            // model judges one needed, and never twice for the same code: once more after
+            // each later code worker (`docs/04-workers.md` §6).
+            if input.counters.verified_since_code {
+                return Vec::new();
+            }
+            let implemented = input.check_ge(
+                &key(COMPLETION, "implementation_complete"),
+                rule_threshold(
+                    input,
+                    &self.checks,
+                    &key(COMPLETION, "implementation_complete"),
+                ),
+            );
             let needed = input.check_ge(
                 &key(VERIFICATION, "needs_verification"),
                 rule_threshold(

@@ -3668,7 +3668,7 @@ async fn a_stuck_worker_held_by_an_uncertain_inhibitor_is_put_to_a_person() -> T
             ask.contains("The worker appears stuck or off track"),
             "{ask}"
         );
-        assert!(ask.contains("Answer Stop to stop the worker"), "{ask}");
+        assert!(ask.contains("Answering Stop ends the run"), "{ask}");
         assert_eq!(raised[0].payload["checks"][0], HUMAN);
         assert!(
             selected_with_a_worker(&fx).iter().all(|d| d != "Continue"),

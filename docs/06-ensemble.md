@@ -933,9 +933,10 @@ Notes that follow directly from §2:
     refusal into the cycle's coalesced ensemble escalation, attached to the first check holding
     it — whether or not the `human` rung is configured. The question says that the worker
     appears stuck or off track (the `Stop`'s reason and the values its rule read), which
-    uncertain checks hold the `Stop` and their values, that answering **`Stop`** stops the
-    worker (a person may always stop work), and that **`Accept`** leaves a worker that appears
-    stuck running. Without a person to answer, the run ends `NeedsHuman` and its worker is
+    uncertain checks hold the `Stop` and their values, that answering **`Stop`** ends the run —
+    a person's `Stop` cancels it (`Cancelled`, "stopped by operator", §4 R3), worker and all; a
+    person may always stop work — and that **`Accept`** leaves a worker that appears stuck
+    running. Without a person to answer, the run ends `NeedsHuman` and its worker is
     stopped. After `Accept` (or `Guidance`) to **this** question, it is not asked again: the
     answer is remembered separately (`EnsembleCounters::held_stops_accepted`, `serde(default)`),
     keyed by the refused `Stop`'s rule and the checks holding it (`EnsembleOutcome::held_stop`,

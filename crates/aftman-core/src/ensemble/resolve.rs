@@ -636,8 +636,8 @@ impl EnsemblePlan {
     /// escalation (`docs/06-ensemble.md` §6). Refusing it and selecting nothing in its place
     /// left a worker that appears stuck running unchecked, with nobody told. The question
     /// says what aftman would do and why it does not, names the checks holding it with their
-    /// values, and says what each answer does: `Stop` stops the worker (a person may always
-    /// stop work), `Accept` leaves it running. It is asked whether or not the `human` rung is
+    /// values, and says what each answer does: `Stop` ends the run, cancelling it and the
+    /// worker with it (a person may always stop work), `Accept` leaves the worker running. It is asked whether or not the `human` rung is
     /// configured — without a person to answer, the run ends `NeedsHuman` and its worker is
     /// stopped — and is not asked again once a person has accepted *this* question: the same
     /// `Stop`'s rule, held by the same checks. Returns the question's key when it was asked.
@@ -713,8 +713,9 @@ impl EnsemblePlan {
         let ask = cap_bytes(
             &format!(
                 "The worker appears stuck or off track ({reason}: {finding}), and aftman would \
-                 stop it, but the Stop rests on checks it cannot act on: {holding}. Answer Stop \
-                 to stop the worker — a person may always stop work. Accept leaves the worker \
+                 stop it, but the Stop rests on checks it cannot act on: {holding}. Answering \
+                 Stop ends the run — it is cancelled, \"stopped by operator\", and the worker \
+                 with it; a person may always stop work. Accept leaves the worker \
                  running although it appears stuck or off track, and this question is not \
                  asked again while the same checks hold this Stop. Recheck asks for those \
                  checks to be measured again."

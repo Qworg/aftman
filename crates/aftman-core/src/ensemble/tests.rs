@@ -5351,11 +5351,16 @@ async fn a_stop_held_by_an_unresolved_check_is_put_to_a_person() {
             "The worker appears stuck or off track",
             "`core.worker-health__worker_stuck` = 0.97",
             "`core.human-escalation__needs_human` = 0.75 (threshold 0.80, in the uncertainty band)",
-            "Answer Stop to stop the worker",
+            // A person's Stop cancels the whole run (final verification, finding 4).
+            "Answering Stop ends the run",
             "Accept leaves the worker running although it appears stuck",
         ] {
             assert!(ask.contains(needle), "{needle}: {ask}");
         }
+        assert!(
+            !ask.contains("to stop the worker"),
+            "it ends the run: {ask}"
+        );
 
         // Accepted: the worker runs on, and the question is not asked again. (The runtime
         // records the answer against the check and against the held Stop's question.)

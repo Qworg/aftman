@@ -100,7 +100,7 @@ Does the current state warrant an independent verification pass before finishing
 """
 min_threshold = 0.65
 negation = """
-Could the work be closed safely as it stands, with no independent verification pass first?
+Can the work be finished as it stands, without an independent verification pass first?
 """
 ```
 
@@ -121,7 +121,7 @@ Does the active or most recent worker appear stuck, looping, or unable to advanc
 min_threshold = 0.80
 negation = """
 Is the active or most recent worker moving forward, each step building on the last rather than
-repeating itself or stalling? Answer yes when no worker has run.
+repeating itself or stalling?
 """
 
 [checks.work_off_track]
@@ -131,7 +131,7 @@ Is the current work drifting from the original job or making unrelated changes?
 min_threshold = 0.80
 negation = """
 Is every change in the current work in service of the original job, with nothing unrelated
-added? Answer yes when no work has been done yet.
+added?
 """
 
 [settings]
@@ -151,8 +151,8 @@ Does this situation require human judgment, credentials, clarification, or permi
 """
 min_threshold = 0.80
 negation = """
-Can the work go on to completion without a person: no credential, permission, clarification,
-or judgment call that only a human can supply?
+Is this situation free of anything only a person can provide: human judgment, credentials,
+clarification, or permission?
 """
 ```
 
@@ -224,8 +224,12 @@ way. Each negation asks the opposite claim in its own words (`ready_to_finish`: 
 job still need more work before it can be declared complete?"), and each keeps the original's
 not-applicable case pointing the opposite way (`agents_md_drift`: "answer **yes** when no AGENTS.md
 instructions are present"), so the two answers stay complementary when the evidence is absent
-(§1.2). A negation must not add a condition the question does not have: `tests_sufficient`'s does
-not ask whether the evidence is a claim — that is R0's question, not a framing one.
+(§1.2). A negation must not add a condition the question does not have, nor drop one: `tests_sufficient`'s
+does not ask whether the evidence is a claim — that is R0's question, not a framing one; a
+not-applicable clause is in both or in neither (`agents_md_drift` has it in both, `worker_stuck`
+and `work_off_track` in neither); and `needs_human`'s asks whether anything needs a person, not
+whether the work can be completed without one, which is a different question
+(`every_bundled_negation_is_a_symmetric_complement`).
 
 `aftman responsibilities show <id>` marks each reframable check, and `aftman doctor` reports how
 many thresholded checks are reframable (`reframable  10 of 10 thresholded checks (R2)` for the

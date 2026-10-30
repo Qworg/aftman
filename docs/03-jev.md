@@ -288,7 +288,7 @@ pub trait DecisionModel: Send + Sync {
     /// One System One call. `questions` is already grouped by evidence selection.
     async fn ask(
         &self,
-        purpose: Purpose,                 // Assessment | Routing | Refresh
+        purpose: Purpose,                 // Assessment | Routing | Refresh | Reframe
         state: &serde_json::Value,
         questions: &BTreeMap<CheckKey, Question>,
         budget: &Budget,

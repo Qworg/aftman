@@ -980,6 +980,47 @@ mod tests {
     }
 
     #[test]
+    fn every_bundled_negation_is_a_symmetric_complement() -> TestResult {
+        // Integrated review, finding 6. A negation that adds a condition its question lacks
+        // is not "not X": `worker_stuck`'s and `work_off_track`'s said "answer yes when no
+        // worker has run / no work has been done" where their questions said nothing, and
+        // `needs_human`'s asked whether the work could go on to completion — feasibility —
+        // rather than whether a person is needed. A not-applicable clause is in both or in
+        // neither (`agents_md_drift` has it in both), and the needs-a-person negation is
+        // about a person and nothing else.
+        let set = DefinitionSet::bundled()?;
+        for (id, definition) in &set.definitions {
+            for check in definition.checks(id) {
+                let (
+                    crate::model::Question::Noul {
+                        instructions: question,
+                    },
+                    Some(crate::model::Question::Noul {
+                        instructions: negation,
+                    }),
+                ) = (&check.question, &check.negation)
+                else {
+                    continue;
+                };
+                assert_eq!(
+                    question.contains("Answer "),
+                    negation.contains("Answer "),
+                    "{}: a not-applicable clause in one but not the other",
+                    check.key
+                );
+                for added in ["safely", "completion", "feasible"] {
+                    assert!(
+                        question.contains(added) || !negation.contains(added),
+                        "{}: the negation adds `{added}`: {negation}",
+                        check.key
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn a_negation_is_refused_where_r2_cannot_use_it() {
         let parse = |check: &str| {
             ResponsibilityDefinition::parse("user.x", &format!("[checks.c]\n{check}\n"), "t")

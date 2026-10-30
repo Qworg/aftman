@@ -9,6 +9,6 @@ Does this situation require human judgment, credentials, clarification, or permi
 """
 min_threshold = 0.80
 negation = """
-Can the work go on to completion without a person: no credential, permission, clarification,
-or judgment call that only a human can supply?
+Is this situation free of anything only a person can provide: human judgment, credentials,
+clarification, or permission?
 """

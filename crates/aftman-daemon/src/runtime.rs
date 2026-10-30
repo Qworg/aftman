@@ -2367,8 +2367,12 @@ impl FactoryRuntime {
         // (`docs/04-workers.md` §6). Completed is not passed — the `Finish` conjuncts are
         // scored over that report, and carry it (`docs/05-responsibilities.md` §6.2). One
         // that failed, timed out, was stopped, or said nothing has not.
+        // Output that is only whitespace said nothing.
+        let said_something = !snapshot.head(usize::MAX).trim().is_empty()
+            || !snapshot.tail(usize::MAX).trim().is_empty();
         if outcome.is_success()
             && !empty
+            && said_something
             && state
                 .workers
                 .iter()
@@ -2719,8 +2723,10 @@ impl FactoryRuntime {
             state.counters.attempts += 1;
             // What a verifier checked is no longer the tree once code work starts again.
             state.counters.verifier_completed = false;
+            state.counters.verified_since_code = false;
         } else {
             state.counters.verifiers_run += 1;
+            state.counters.verified_since_code = true;
         }
 
         self.emit(

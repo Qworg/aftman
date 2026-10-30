@@ -58,6 +58,11 @@ pub struct Counters {
     /// (`docs/05-responsibilities.md` §6.2). Defaulted, so a snapshot without it decodes.
     #[serde(default)]
     pub verifier_completed: bool,
+    /// A verify worker has started since the last code worker did. A verifier runs at most
+    /// once per state of the code: once a later code worker has started, `Verify` may be
+    /// proposed again (`docs/04-workers.md` §6). Defaulted, so a snapshot without it decodes.
+    #[serde(default)]
+    pub verified_since_code: bool,
     pub steers_sent: u32,
     pub assessments: u32,
     /// Cycles skipped because the observation content was unchanged.

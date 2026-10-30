@@ -25,7 +25,7 @@ use aftman_core::error::ModelError;
 use aftman_core::event::{EventEnvelope, EventKind};
 use aftman_core::evidence::EvidencePlan;
 use aftman_core::ids::{CheckKey, EscalationId, ResponsibilityId};
-use aftman_core::job::{FactoryStatus, Job, JobSource, RunConfig, WorkerKind};
+use aftman_core::job::{FactoryStatus, Job, JobSource, RunConfig, VerifyPolicy, WorkerKind};
 use aftman_core::model::{
     AskContext, Budget, DecisionModel, ModelAnswers, Purpose, Question, Usage,
 };
@@ -4392,10 +4392,11 @@ async fn a_failing_verdict_does_not_finish_through_the_verification_disjunct() -
 #[tokio::test]
 async fn a_later_code_worker_resets_verifier_completed() -> TestResult {
     // After the failing verdict the run starts another code worker: what the verifier checked
-    // is no longer the tree, so `verifier_completed` is false again, and — the verifier runs
-    // once per run — the disjunct cannot carry a Finish for the rest of the run.
+    // is no longer the tree, so `verifier_completed` is false again — every assessment after
+    // that code worker and before the next verifier is shown it reset — and the next verifier
+    // must complete again before the disjunct can carry a Finish.
     for enabled in [false, true] {
-        let (fx, outcome, model) = failing_verdict(enabled).await?;
+        let (fx, _outcome, model) = failing_verdict(enabled).await?;
         let started: Vec<String> = fx
             .of_kind(EventKind::WorkerStarted)
             .iter()
@@ -4410,13 +4411,15 @@ async fn a_later_code_worker_resets_verifier_completed() -> TestResult {
             "a code worker after the verifier: {started:?}"
         );
         assert!(shown_verifier_completed(&model));
-        assert!(!outcome.counters.verifier_completed, "enabled={enabled}");
-        // The last assessment was shown it reset.
-        let last = model
-            .calls(Purpose::Assessment)
-            .last()
-            .map(|c| c.state["factory_status"]["verifier_completed"].clone());
-        assert_eq!(last, Some(Value::Bool(false)));
+        // Shown reset: a verifier has run, a code worker has started since, and none has
+        // completed again.
+        let reset = model.calls(Purpose::Assessment).iter().any(|c| {
+            let status = &c.state["factory_status"];
+            status["verifiers_run"].as_u64() >= Some(1)
+                && status["attempts"].as_u64() >= Some(2)
+                && status["verifier_completed"] == Value::Bool(false)
+        });
+        assert!(reset, "enabled={enabled}");
     }
     Ok(())
 }
@@ -4467,6 +4470,148 @@ async fn insufficient_documentation_at_the_worker_limit_escalates_naming_the_rul
             "{reason}"
         );
         assert!(ask.contains("quality.documentation:insufficient"), "{ask}");
+    }
+    Ok(())
+}
+
+/// A worker whose verifiers report, in turn, the verdicts in `verdicts` (the last repeats);
+/// a verdict of `None` prints only whitespace. Code work prints what `R2Model` reads as done.
+struct VerdictsWorker {
+    verdicts: Vec<Option<&'static str>>,
+    verified: std::sync::atomic::AtomicUsize,
+}
+
+impl VerdictsWorker {
+    fn new(verdicts: &[Option<&'static str>]) -> Self {
+        Self {
+            verdicts: verdicts.to_vec(),
+            verified: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+
+#[async_trait]
+impl Worker for VerdictsWorker {
+    fn kind(&self) -> WorkerKind {
+        WorkerKind::Simulated
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    async fn run(
+        &self,
+        ctx: aftman_core::worker::WorkerCtx,
+        sink: aftman_core::worker::WorkerEventSink,
+    ) -> Result<aftman_core::worker::WorkerOutcome, aftman_core::worker::WorkerError> {
+        let text = match ctx.task {
+            aftman_core::job::TaskKind::Verify => {
+                let nth = self
+                    .verified
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let verdict = self
+                    .verdicts
+                    .get(nth)
+                    .or(self.verdicts.last())
+                    .copied()
+                    .flatten();
+                verdict.map_or_else(
+                    || " \n\t\n".to_owned(),
+                    |verdict| format!("ran the suite: 3 passed\nVERDICT: {verdict}\n"),
+                )
+            }
+            _ => "implemented it; 3 passed\n".to_owned(),
+        };
+        ctx.output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(aftman_core::log::Stream::Stdout, &text);
+        sink.activity();
+        Ok(aftman_core::worker::WorkerOutcome::Completed)
+    }
+
+    async fn steer(
+        &self,
+        _message: &str,
+    ) -> Result<aftman_core::worker::SteerOutcome, aftman_core::worker::WorkerError> {
+        Ok(aftman_core::worker::SteerOutcome::Unsupported)
+    }
+
+    async fn terminate(
+        &self,
+        _reason: aftman_core::worker::TerminateReason,
+    ) -> Result<(), aftman_core::worker::WorkerError> {
+        Ok(())
+    }
+}
+
+/// The tasks of the workers a run started, in order.
+fn tasks(fx: &Fixture) -> Vec<String> {
+    fx.of_kind(EventKind::WorkerStarted)
+        .iter()
+        .filter_map(|e| e.payload["task"].as_str().map(ToOwned::to_owned))
+        .collect()
+}
+
+#[tokio::test]
+async fn after_a_failing_verdict_and_a_fix_the_verifier_runs_again_and_may_finish() -> TestResult {
+    // Review F5. After a FAIL verdict and a later code worker, `verifier_completed` was reset
+    // but nothing proposed `Verify` again: a verifier ran once per run. The run burned its
+    // workers on work-remains and escalated "worker limit reached". Once a code worker has
+    // started since the last verifier, the verification rule proposes `Verify` again under its
+    // normal conditions, bounded by `max_workers`: FAIL, a fix, Verify again, PASS, Finish.
+    // With `verify = always` and `when_asked`, the ensemble off and on.
+    for verify in [VerifyPolicy::Always, VerifyPolicy::WhenAsked] {
+        for enabled in [false, true] {
+            let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+            let rt = fx.runtime(
+                config(|c| {
+                    c.max_workers = 6;
+                    c.verify = verify;
+                }),
+                settings(|s| s.enabled = enabled),
+                Arc::new(verification_model()) as Arc<dyn DecisionModel>,
+                Arc::new(VerdictsWorker::new(&[Some("FAIL"), Some("PASS")])),
+            );
+            let outcome = fx.run(rt).await?;
+            let what = format!("verify={verify:?} enabled={enabled}");
+            assert_eq!(outcome.status, FactoryStatus::Finished, "{what}");
+            assert_eq!(
+                tasks(&fx),
+                vec!["Code", "Verify", "Code", "Verify"],
+                "{what}"
+            );
+            assert_eq!(outcome.counters.verifiers_run, 2, "{what}");
+            assert!(outcome.counters.verifier_completed, "{what}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_verifier_that_prints_only_whitespace_has_not_completed() -> TestResult {
+    // Review F5. A verifier that exits successfully having printed only whitespace said
+    // nothing: it has not completed, and cannot satisfy the disjunct.
+    for enabled in [false, true] {
+        let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+        let rt = fx.runtime(
+            config(|c| c.max_workers = 2),
+            settings(|s| s.enabled = enabled),
+            Arc::new(verification_model()) as Arc<dyn DecisionModel>,
+            Arc::new(VerdictsWorker::new(&[None])),
+        );
+        let outcome = fx.run(rt).await?;
+        assert_ne!(outcome.status, FactoryStatus::Finished, "enabled={enabled}");
+        // Code, then the verifier, and no worker after it to reset what it left.
+        assert_eq!(tasks(&fx), vec!["Code", "Verify"], "enabled={enabled}");
+        assert!(!outcome.counters.verifier_completed, "enabled={enabled}");
+        assert!(
+            !fx.of_kind(EventKind::DirectiveSelected)
+                .iter()
+                .any(|e| e.payload["directive"] == "Finish"),
+            "enabled={enabled}"
+        );
     }
     Ok(())
 }

@@ -254,7 +254,13 @@ Rules:
 
 - the verifier **must not** be the same backend as the coding worker; the runtime enforces this
   (configurable, and the config records the override);
-- the verifier runs at most once per run;
+- the verifier runs at most once per state of the code: once a verifier has started, `Verify` is
+  not proposed again (`Invariant::VerificationAlreadyRun`) until a later code worker has started
+  (`counters.verified_since_code`). Then the verification rule may propose it again under its
+  normal conditions, bounded by `max_workers`, so a FAIL, a fix and a PASS can finish. An
+  earlier revision allowed one verifier per run: after a FAIL and a fix nothing proposed `Verify`
+  again, and the run spent its workers and escalated
+  (`after_a_failing_verdict_and_a_fix_the_verifier_runs_again_and_may_finish`);
 - a verifier that modifies the repository is a policy violation: the runtime diffs the tree before
   and after and records `verifier_mutated_repo` as an event, and the verification is treated as
   inconclusive rather than as a pass;
@@ -263,8 +269,8 @@ Rules:
   that answer becomes an `EvidenceResult`, not a probability fed to Jev. Jev still decides whether
   the *run* is finished.
 
-A verifier that exits successfully and produces output has **completed**
-(`counters.verifier_completed`, until a code worker starts again): that satisfies the
+A verifier that exits successfully and produces output that is not only whitespace has
+**completed** (`counters.verifier_completed`, until a code worker starts again): that satisfies the
 `verification_completed` disjunct of the `Finish` precondition, and nothing more. Completed is not
 passed — the verdict reaches policy only through the `Finish` conjuncts, scored over the
 verifier's report ([05-responsibilities.md §6.2](05-responsibilities.md)).

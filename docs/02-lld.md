@@ -232,6 +232,10 @@ pub struct Counters { pub workers_run: u32, pub attempts: u32, pub failures: u32
     pub verifiers_run: u32,
     pub verifier_completed: bool,   // a verify worker ended with output, no code worker since
                                     // (doc 05 §6.2); #[serde(default)]
+    pub verified_since_code: bool,  // a verify worker started since the last code worker
+                                    // (doc 04 §6); #[serde(default)]
+    pub assessment_budget_short: bool, // this cycle's requests exceeded what is left of
+                                    // max_assessments (doc 03 §5); #[serde(default)]
     pub steers_sent: u32,
     pub assessments: u32, pub elapsed: Duration, pub consecutive_model_failures: u32 }
 pub struct EvidenceResult { pub provider: EvidenceId, pub argv: Vec<String>,

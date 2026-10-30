@@ -766,9 +766,10 @@ pub mod builtin {
         }
 
         fn propose(&self, input: &PolicyInput<'_>) -> Vec<Proposal> {
-            // A verifier is only warranted once implementation looks complete, and never
-            // twice.
-            if input.active_worker.is_some() || input.counters.verifiers_run > 0 {
+            // A verifier is only warranted once implementation looks complete, and never twice
+            // for the same code: once more after each later code worker
+            // (`docs/04-workers.md` §6).
+            if input.active_worker.is_some() || input.counters.verified_since_code {
                 return Vec::new();
             }
             let needed = input.check_ge(

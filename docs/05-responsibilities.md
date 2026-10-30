@@ -463,7 +463,7 @@ Applied before any priority comparison. They cannot be overridden by a score:
 | **`permitted == false` for a check** | Every rule that reads that check is suppressed (`SuppressionReason::NotPermitted`), in both comparison directions, regardless of how far the value is from the threshold. This is how the ensemble's guarantee is enforced (doc 06 §2.2). |
 | `attempts >= max_attempts` | `Retry` suppressed |
 | `workers >= max_workers` | `StartWorker` / `Verify` / `Retry` suppressed → `Escalate`. And a `Finish` cannot win because of it: when one of those, refused by the limit, would have outranked the `Finish`, policy escalates instead (§6.3) |
-| `verification_started` | `Verify` suppressed |
+| a verifier has started since the last code worker (`verified_since_code`) | `Verify` suppressed (`VerificationAlreadyRun`); a later code worker lifts it |
 | Assessment budget exhausted, or too little of it left to ask a whole cycle (`assessment_budget_short`, [03-jev.md §5](03-jev.md)) | `Stop`, or `Escalate` when verification is pending |
 | Model error this cycle | only conservative directives are permitted (see §7) |
 | **Any active check unresolved** (`UnresolvedInBand`, `SuppressedByContest`, `Unresolved`) | `Finish` suppressed (`Invariant::UnresolvedUncertainty`). A high-priority inhibitor rule that cannot fire because its own measurement is uncertain must not silently disarm: uncertainty about a blocker blocks, it does not permit. |
@@ -493,11 +493,11 @@ most recent worker's output, which every following assessment is shown, and the 
 above are scored over it. A verifier that reports FAIL satisfies this disjunct and nothing else;
 `ready_to_finish`, shown the failure, carries it, and the run does not finish
 (`a_failing_verdict_does_not_finish_through_the_verification_disjunct`). A verifier that failed,
-timed out, was stopped, or said nothing has not completed. A code worker started afterwards resets
-it, because what the verifier checked is no longer the tree; and since a verifier runs at most
-once per run, the disjunct cannot carry a `Finish` again in that run — with `verify = "always"`
-(`Invariant::VerificationIncomplete`), such a run cannot finish after a later code worker. It is a run
-counter, persisted with the run state (`#[serde(default)]`, so a snapshot without it decodes as
+timed out, was stopped, or said nothing — no output, or only whitespace — has not completed. A
+code worker started afterwards resets it, because what the verifier checked is no longer the
+tree; and the verification rule may then propose `Verify` again under its normal conditions,
+bounded by `max_workers` ([04-workers.md §6](04-workers.md)), so the disjunct can carry a `Finish`
+again once a new verifier completes over the new code. It is a run counter, persisted with the run state (`#[serde(default)]`, so a snapshot without it decodes as
 not completed). Until it was set by the runtime this disjunct was unreachable.
 
 `permitted` is `true` only when the value is decisively outside the uncertainty band (or the

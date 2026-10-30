@@ -262,7 +262,7 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
     if workers_exhausted {
         invariants.push(Invariant::WorkerLimit);
     }
-    if input.counters.verifiers_run > 0 {
+    if input.counters.verified_since_code {
         invariants.push(Invariant::VerificationAlreadyRun);
     }
     if input.active_worker.is_some() {
@@ -770,7 +770,7 @@ fn refusal(
             if input.active_worker.is_some() {
                 return Some(SuppressionReason::Invariant(Invariant::WorkerStillActive));
             }
-            if input.counters.verifiers_run > 0 {
+            if input.counters.verified_since_code {
                 return Some(SuppressionReason::Invariant(
                     Invariant::VerificationAlreadyRun,
                 ));
@@ -1052,7 +1052,7 @@ mod tests {
         assert_eq!(decision.selected, finish().directive);
 
         // Nor does one refused for another reason: a second verifier is refused because one
-        // already ran, whatever the limit.
+        // already ran since the last code worker, whatever the limit.
         let verify = Proposal::new(
             "user.check",
             "user.check:verify-again",
@@ -1064,6 +1064,7 @@ mod tests {
         );
         let ran = Counters {
             verifiers_run: 1,
+            verified_since_code: true,
             ..counters.clone()
         };
         let decision = arbitrate(&input(&o, &ran, &config, &checks), &[verify, finish()]);

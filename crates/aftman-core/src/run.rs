@@ -126,6 +126,11 @@ pub struct Escalation {
     /// Zero for any other escalation, and in snapshots written before it existed.
     #[serde(default)]
     pub opinion_topup: u32,
+    /// For an ensemble escalation about command evidence the model was never shown: the
+    /// checks a `Recheck` or `ClaimComplete` answer grants one more refresh each
+    /// (`EnsembleOutcome::refresh_topup`). Empty otherwise, and in older snapshots.
+    #[serde(default)]
+    pub refresh_topup: Vec<CheckKey>,
     pub ask: String,
     pub jev_p: Option<f32>,
     pub opinions: Vec<Opinion>,
@@ -295,6 +300,7 @@ mod tests {
             check: Some(CheckKey::from("core.completion__ready_to_finish")),
             ensemble_checks: Vec::new(),
             opinion_topup: 0,
+            refresh_topup: Vec::new(),
             ask: "is it done?".into(),
             jev_p: Some(0.71),
             opinions: Vec::new(),
@@ -320,6 +326,7 @@ mod tests {
             check: None,
             ensemble_checks: Vec::new(),
             opinion_topup: 0,
+            refresh_topup: Vec::new(),
             ask: "budget exhausted".into(),
             jev_p: None,
             opinions: Vec::new(),

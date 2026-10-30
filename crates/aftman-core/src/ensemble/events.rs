@@ -419,6 +419,9 @@ impl CheckResolvedPayload {
                 EnsembleLimit::OpinionBudget { used, cap } => {
                     format!("limit: opinion budget spent ({used}/{cap})")
                 }
+                EnsembleLimit::UnseenCommandEvidence => "limit: its command evidence was never \
+                     shown to the model and could not be re-measured; held"
+                    .to_owned(),
                 EnsembleLimit::Cooldown {
                     last_opinion,
                     cooldown_cycles,

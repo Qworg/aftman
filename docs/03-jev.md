@@ -200,9 +200,17 @@ section, named here rather than hidden. A check's own selection is honoured in t
 ensemble evidence refresh (R0) asks that check's question over the default selection **plus** its
 own, command output included ([06-ensemble.md §4](06-ensemble.md)), and the `ClaimOnlyEvidence`
 trigger is computed from what the assessment actually sent — so a check that selects command
-output Jev was not shown is treated as resting on the worker's claim, and a decisive value about
-to act on it is re-measured by R0 first, within the refresh cap. Grouping requests by selection
-remains future work ([09-plan.md](09-plan.md), "Deferred").
+output Jev was not shown is treated as resting on the worker's claim. **With the ensemble on**, a
+decisive value about to act on it is re-measured by R0 first; and when an irreversible `Finish`
+or `Stop` rests on it and R0 cannot re-measure it this cycle (the refresh cap is spent, no
+provider it names can be re-run, or the refresh was rejected), the check is held — refusing the
+`Finish` or `Stop` — and put to a person ([06-ensemble.md §6](06-ensemble.md)). So, with the
+ensemble on, no `Finish` or `Stop` executes on a value whose selected command output Jev never
+saw. **With the ensemble off this is a known limitation, unchanged from before M5:** a
+`before_finish` command's output never reaches Jev at all, except through the test summary parsed
+from it (`test_summary`), so a `Finish` can execute on a value Jev formed without seeing a failing
+`before_finish` command. Grouping requests by selection is the fix, and remains future work
+([09-plan.md](09-plan.md), "Deferred").
 
 The router is the same call shape: all *conditional* responsibilities are evaluated in one request
 against the incoming job, and every threshold match activates that responsibility. Global

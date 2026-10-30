@@ -276,6 +276,33 @@ impl EnsembleCounters {
         }
     }
 
+    /// Apply a person's answer to an escalation about checks whose command evidence the
+    /// model was never shown and R0 could not re-measure (`EnsembleOutcome::refresh_topup`),
+    /// and return the checks granted a refresh (`docs/06-ensemble.md` §6).
+    ///
+    /// `Recheck` and `ClaimComplete` authorise one more refresh of each, once for that
+    /// escalation — cost, not an outcome: the refreshed value must clear the band on its own
+    /// before anything acts on it. `Accept`, `Guidance` and `Stop` grant nothing; the checks
+    /// stay held.
+    pub fn record_refresh_answer(
+        &mut self,
+        checks: &[CheckKey],
+        decision: &HumanDecision,
+    ) -> Vec<CheckKey> {
+        match decision {
+            HumanDecision::Recheck | HumanDecision::ClaimComplete => {
+                for key in checks {
+                    let entry = self.checks.entry(key.clone()).or_default();
+                    entry.refresh_topup = entry.refresh_topup.saturating_add(1);
+                }
+                checks.to_vec()
+            }
+            HumanDecision::Accept | HumanDecision::Guidance { .. } | HumanDecision::Stop => {
+                Vec::new()
+            }
+        }
+    }
+
     /// The counters for one check, or zeros.
     #[must_use]
     pub fn check(&self, key: &CheckKey) -> CheckCounters {
@@ -368,6 +395,14 @@ pub struct CheckCounters {
     /// that cycle.
     #[serde(default)]
     pub recheck: bool,
+    /// Refreshes a person has authorised beyond `max_evidence_refreshes_per_check`, by
+    /// answering an escalation about command evidence the model was never shown with
+    /// `Recheck` or `ClaimComplete` (`EnsembleCounters::record_refresh_answer`). Spent only
+    /// where it is needed: re-measuring the check before an irreversible directive that
+    /// rests on it. Cost, never an outcome — the refresh must still produce a decisive value
+    /// on its own.
+    #[serde(default)]
+    pub refresh_topup: u32,
 }
 
 /// When an opinion was last bought for a check, and what it established.

@@ -1707,6 +1707,26 @@ impl FactoryRuntime {
         }
         // A spent opinion budget: a person may authorise the cost of checking what it held,
         // never the outcome (`docs/06-ensemble.md` §6). Core decides what is granted.
+        // Command evidence the model was never shown: a person may authorise one more
+        // refresh of each listed check, never the outcome (`docs/06-ensemble.md` §6).
+        let listed = state.escalations[index].refresh_topup.clone();
+        let refreshes = state.ensemble.record_refresh_answer(&listed, &decision);
+        if !refreshes.is_empty() {
+            self.emit(
+                state,
+                EventKind::Notification,
+                json!({
+                    "code": "refresh_cap_topped_up",
+                    "message": format!(
+                        "one more refresh authorised for {} check(s)",
+                        refreshes.len()
+                    ),
+                    "escalation_id": escalation_id.to_string(),
+                    "checks": refreshes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                }),
+            )
+            .await?;
+        }
         let topup = state.escalations[index].opinion_topup;
         let granted = state.ensemble.record_budget_answer(topup, &decision);
         if granted > 0 {
@@ -2749,6 +2769,7 @@ impl FactoryRuntime {
                     check,
                     ensemble_checks: escalated.checks.clone(),
                     opinion_topup: escalated.opinion_topup,
+                    refresh_topup: escalated.refresh_topup.clone(),
                     ask: ask.clone(),
                     jev_p,
                     opinions: escalated.opinions.clone(),
@@ -2764,6 +2785,15 @@ impl FactoryRuntime {
                 });
                 if escalated.opinion_topup > 0 {
                     payload["opinion_topup"] = json!(escalated.opinion_topup);
+                }
+                if !escalated.refresh_topup.is_empty() {
+                    payload["refresh_topup"] = json!(
+                        escalated
+                            .refresh_topup
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                    );
                 }
                 if !escalated.checks.is_empty() {
                     payload["checks"] = json!(
@@ -2811,6 +2841,8 @@ struct EscalatedChecks {
     opinions: Vec<aftman_core::assessment::Opinion>,
     /// What a `Recheck` or `ClaimComplete` answer would authorise, for a spent budget.
     opinion_topup: u32,
+    /// The checks such an answer would grant a refresh, for unseen command evidence.
+    refresh_topup: Vec<CheckKey>,
 }
 
 impl EscalatedChecks {
@@ -2826,6 +2858,7 @@ impl EscalatedChecks {
             checks,
             opinions,
             opinion_topup: outcome.opinion_topup,
+            refresh_topup: outcome.refresh_topup.clone(),
         }
     }
 }

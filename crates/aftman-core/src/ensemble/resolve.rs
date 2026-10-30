@@ -201,6 +201,11 @@ pub enum EnsembleLimit {
     RefreshCap { used: u32, cap: u32 },
     /// `max_opinions_per_run` would be exceeded. The check is held.
     OpinionBudget { used: u32, cap: u32 },
+    /// The check selects command evidence the model was not shown this cycle, an
+    /// irreversible directive rests on it, and R0 could not re-measure it (the cap is
+    /// spent, no provider it names can be re-run, or the refresh was rejected). Held: an
+    /// opinion over the same state could judge only its consistency, not the evidence.
+    UnseenCommandEvidence,
     /// An opinion was bought for this check within `per_check_cooldown_cycles`.
     /// `held` says whether the check was held for it (the last opinion contested).
     Cooldown {
@@ -286,6 +291,12 @@ pub struct EnsembleOutcome {
     /// ([`EnsembleCounters::record_budget_answer`]). Zero otherwise.
     #[serde(default)]
     pub opinion_topup: u32,
+    /// When this cycle escalated checks held for command evidence the model was never
+    /// shown: those a refresh could re-measure, each of which a `Recheck` or
+    /// `ClaimComplete` answer grants one more refresh
+    /// ([`EnsembleCounters::record_refresh_answer`]). Empty otherwise.
+    #[serde(default)]
+    pub refresh_topup: Vec<CheckKey>,
 }
 
 impl EnsembleOutcome {
@@ -362,6 +373,11 @@ impl EnsemblePlan {
         } else {
             0
         };
+        let refresh_topup = if self.settings.enabled {
+            self.escalate_unseen(&mut records)
+        } else {
+            Vec::new()
+        };
         if self.settings.enabled {
             self.escalate_held_stop(ctx, &checks, &mut records, &counters);
         }
@@ -403,6 +419,7 @@ impl EnsemblePlan {
             counters,
             gate_rounds,
             opinion_topup,
+            refresh_topup,
         })
     }
 }
@@ -526,6 +543,85 @@ impl EnsemblePlan {
 }
 
 impl EnsemblePlan {
+    /// Checks held because an irreversible directive rests on command evidence the model was
+    /// never shown and R0 could not re-measure (`EnsembleLimit::UnseenCommandEvidence`) are
+    /// put to a person, like a spent budget, where the `human` rung is configured: one
+    /// question, attached to the first, naming each check and what its answers do. Returns
+    /// the checks a refresh could re-measure — what a `Recheck` or `ClaimComplete` grants a
+    /// refresh each; empty when nothing was escalated.
+    fn escalate_unseen(&self, records: &mut [CheckRecord]) -> Vec<CheckKey> {
+        if !self.settings.has(Rung::Human) {
+            return Vec::new();
+        }
+        let held: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| {
+                !r.resolved.permitted
+                    && r.escalation.is_none()
+                    && r.limits
+                        .iter()
+                        .any(|l| matches!(l, EnsembleLimit::UnseenCommandEvidence))
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let Some(first) = held.first().copied() else {
+            return Vec::new();
+        };
+        let plan_of = |key: &CheckKey| self.triggered.iter().find(|plan| plan.check == *key);
+        let mut refreshable = Vec::new();
+        let mut named = Vec::new();
+        for index in &held {
+            let key = &records[*index].check;
+            let providers = plan_of(key)
+                .map(|plan| plan.refresh_providers.clone())
+                .unwrap_or_default();
+            if providers.is_empty() {
+                named.push(format!("`{key}` (no provider it selects can be re-run)"));
+            } else {
+                named.push(format!(
+                    "`{key}` (its {})",
+                    providers
+                        .iter()
+                        .map(|p| format!("`{p}` output"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ));
+                refreshable.push(key.clone());
+            }
+        }
+        let what = if refreshable.is_empty() {
+            "Recheck cannot help: none of these can be re-measured.".to_owned()
+        } else {
+            format!(
+                "Recheck or ClaimComplete authorises one more refresh of each of {}, once: \
+                 before the next Finish or Stop resting on it, its command is run again and \
+                 the model asked over the output; that finishes or stops nothing by itself, \
+                 and the value must clear the band on its own.",
+                refreshable
+                    .iter()
+                    .map(|key| format!("`{key}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let ask = cap_bytes(
+            &format!(
+                "The command evidence of {} could not be shown to the model this cycle — the \
+                 assessment never carries command output, and the refresh that would show it \
+                 could not run — so the Finish or Stop resting on it cannot go ahead on a \
+                 value no command stood behind. {what} Accept keeps it held, and this is asked \
+                 again. Stop ends the run.",
+                named.join(", ")
+            ),
+            REFRESH_ERROR_CAP_BYTES,
+        );
+        let record = &mut records[first];
+        record.rungs_used.push(Rung::Human);
+        record.escalation = Some(ask);
+        refreshable
+    }
+
     /// A `Stop` policy refuses because a check it rests on is unresolved
     /// (`Invariant::UnresolvedDependency`) is put to a person, through the coalesced
     /// escalation (`docs/06-ensemble.md` §6). Refusing it and selecting nothing in its place
@@ -723,13 +819,29 @@ async fn resolve_check(
     }
 
     // Measuring beats second-guessing: a decisive value about to act on a bare claim is
-    // re-measured first.
+    // re-measured first. Before an irreversible directive, a refresh a person authorised
+    // past the cap may be spent here, and only here.
+    let unseen = plan.unseen_command && plan.has(EnsembleTrigger::Irreversible);
     if plan.has(EnsembleTrigger::ClaimOnlyEvidence)
         && !refresh_tried
         && let Some(refreshed) =
-            refresh(plan, cycle, settings, counters, source, &mut record).await?
+            refresh_within(plan, cycle, settings, counters, source, &mut record, unseen).await?
     {
         record.resolved = refreshed;
+        return Ok(record);
+    }
+    // Command output the model was never shown, an irreversible directive resting on it,
+    // and R0 could not show it this cycle: held, not put to R2 — an opinion over the same
+    // claim-only state can judge consistency, not the evidence it never saw.
+    if unseen {
+        record.limits.push(EnsembleLimit::UnseenCommandEvidence);
+        record.resolved = rc.suppress(
+            CheckSuppression::Unresolved,
+            Resolution::UnresolvedInBand {
+                ask: ask_for(plan, None),
+                rungs: Vec::new(),
+            },
+        );
         return Ok(record);
     }
 
@@ -874,15 +986,33 @@ async fn refresh(
     source: &dyn OpinionSource,
     record: &mut CheckRecord,
 ) -> Result<Option<ResolvedCheck>, SourceError> {
+    refresh_within(plan, cycle, settings, counters, source, record, false).await
+}
+
+/// R0, with the cap raised by the refreshes a person authorised for this check when
+/// `topped_up` (`CheckCounters::refresh_topup`).
+async fn refresh_within(
+    plan: &CheckPlan,
+    cycle: AssessmentSeq,
+    settings: &EnsembleSettings,
+    counters: &mut EnsembleCounters,
+    source: &dyn OpinionSource,
+    record: &mut CheckRecord,
+    topped_up: bool,
+) -> Result<Option<ResolvedCheck>, SourceError> {
     if !settings.has(Rung::RefreshEvidence) || plan.refresh_providers.is_empty() {
         return Ok(None);
     }
     let used = counters.check(&plan.check).refreshes;
-    if used >= settings.max_evidence_refreshes_per_check {
-        record.limits.push(EnsembleLimit::RefreshCap {
-            used,
-            cap: settings.max_evidence_refreshes_per_check,
-        });
+    let cap = if topped_up {
+        settings
+            .max_evidence_refreshes_per_check
+            .saturating_add(counters.check(&plan.check).refresh_topup)
+    } else {
+        settings.max_evidence_refreshes_per_check
+    };
+    if used >= cap {
+        record.limits.push(EnsembleLimit::RefreshCap { used, cap });
         return Ok(None);
     }
     counters

@@ -136,7 +136,7 @@ Precisely, for a check `k` with threshold `t` (`aftman_core::ensemble::EnsembleP
 | --- | --- |
 | `NearThreshold` | `k` has a value and is not decisive |
 | `LowConfidence` | the answer's `confidence` is below `confidence_floor`, or is not a number |
-| `ClaimOnlyEvidence` | `k`'s evidence selection reached **no command evidence Jev saw this cycle**: it names no `command:<id>` (or `command_evidence`) whose output is in the `state` the cycle's assessment actually sent (`EnsembleContext::assessed_state`, `saw_command_evidence`). Output that is in the observation but was not sent does not count, and the runtime's assessment sends none ([03-jev.md §5](03-jev.md)), so a check selecting command output is claim-only in every cycle until R0 re-measures it over its own selection. An earlier revision read the observation instead, called such a check measured though Jev had never seen the command, and finished on it. A provider `k` names that has not run yet (an `on_demand` one) does not count either — what `k` scored was the worker's claim. This is the case in §9.1 |
+| `ClaimOnlyEvidence` | `k`'s evidence selection reached **no command evidence Jev saw this cycle**: it names no `command:<id>` (or `command_evidence`) whose output is in the `state` the cycle's assessment actually sent (`EnsembleContext::assessed_state`, `saw_command_evidence`). Output that is in the observation but was not sent does not count, and the runtime's assessment sends none ([03-jev.md §5](03-jev.md)), so a check selecting command output is claim-only in every cycle until R0 re-measures it over its own selection. When an irreversible directive rests on such a check (it selects command output, and Jev saw none of it) and R0 cannot re-measure it this cycle, it is held, not put to R2 (§6, "Command evidence the model was never shown"). An earlier revision read the observation instead, called such a check measured though Jev had never seen the command, and finished on it. A provider `k` names that has not run yet (an `on_demand` one) does not count either — what `k` scored was the worker's claim. This is the case in §9.1 |
 | `OutcomeRelevant` | the selected directive's kind differs between `k` pinned above and `k` pinned below |
 | `HighStakes` | `k` is in what a **pending** `stakes = "high"` directive rests on — the same definition the `Irreversible` trigger and the gate use (`rests_on`: the read set of the high-stakes proposals ∪ every decisive, permitted check whose side changes which high-stakes proposals are made), taken over the baseline, over each in-band check pinned decisively above and below alone, and over all in-band checks pinned above together and below together. The joint pins are what make two `Finish` conjuncts that are both in band each high stakes: neither alone produces a `Finish`, so a single-check counterfactual found nothing, neither escalated, and the run started worker after worker until its limit |
 | `Irreversible` | `k` is decisive, the selected directive is `Stop` or a `Finish` the runtime will execute (not a provisional one, §6), and that directive rests on `k`: a rule proposing it reads `k`, or `k`'s side changes it (`irreversible_dependencies`, §6; the gate uses the same set). Every check is load-bearing for `Finish` through `UnresolvedUncertainty`; this asks whether the directive rests on `k` itself |
@@ -752,6 +752,25 @@ loop:
   needs a fresh confirm from each of those opinions, any of which may contest, so §2.2 is
   untouched. `Accept` (or `Guidance`) authorises nothing: the checks stay held and the next
   cycle asks again. `Stop` ends the run.
+- **Command evidence the model was never shown.** A check that selects command output
+  (`command:<id>` or `command_evidence`) of which the cycle's assessment showed Jev none
+  (`CheckPlan::unseen_command`) rests on the worker's claim about a command. Where an irreversible
+  directive rests on it — the ladder's `Irreversible` trigger, or the gate's guard — and R0 cannot
+  re-measure it this cycle (the refresh cap is spent, no provider it names can be re-run, or the
+  refresh was rejected), it is **held** (`EnsembleLimit::UnseenCommandEvidence`; in the gate,
+  `GuardOutcome::Unmeasured`), never guarded by R2: an opinion over the same claim-only state can
+  judge consistency, not evidence it never saw. Held, it makes `UnresolvedUncertainty` refuse the
+  `Finish` and `UnresolvedDependency` the `Stop`. With the `human` rung configured it is put to a
+  person like a spent budget: one question naming each check and the command output it could not
+  show. `Recheck` or `ClaimComplete` grants each re-measurable listed check one more refresh,
+  once (`EnsembleOutcome::refresh_topup`, `Escalation::refresh_topup`,
+  `EnsembleCounters::record_refresh_answer`, `CheckCounters::refresh_topup`, and a `Notification`
+  with `code: "refresh_cap_topped_up"`), spent only where it is needed — re-measuring the check
+  before the next irreversible directive resting on it. It authorises cost, not an outcome: the
+  refreshed value must clear the band on its own, and a failing command keeps the run from
+  finishing (`recheck_on_unseen_command_evidence_tops_up_a_refresh_that_must_still_measure`).
+  `Accept` keeps it held, and the question is asked again. Disabled, nothing changes
+  (`a_finish_never_executes_over_command_evidence_jev_was_not_shown`).
 - **A provisional `Finish` is not about to act.** When `before_finish` providers exist and have
   not run, the runtime does not apply a selected `Finish`: it runs them and re-assesses. The
   context says so (`EnsembleContext::finish_is_provisional`, set by the runtime). Then that

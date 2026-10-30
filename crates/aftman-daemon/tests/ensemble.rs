@@ -2120,6 +2120,8 @@ const DISTINCT: [(&str, f32); 11] = [
     ("core.worker-health__meaningful_progress", 0.6173),
 ];
 
+type RefreshRule = Box<dyn Fn(&CheckKey, &str, usize) -> Option<f32> + Send + Sync>;
+
 /// Before any work: nothing is done, nobody is needed.
 const NOT_YET: [(&str, f32); 10] = [
     ("core.completion__ready_to_finish", 0.10),
@@ -2149,6 +2151,9 @@ struct R2Model {
     asked: Mutex<BTreeMap<CheckKey, usize>>,
     /// From the `n`th assessment on, the check is answered with this value instead.
     later: BTreeMap<CheckKey, (usize, f32)>,
+    /// A refresh's answer from the state it was shown and the assessments so far, before
+    /// `refresh`.
+    refresh_rule: Option<RefreshRule>,
     calls: Mutex<Vec<CallRecord>>,
 }
 
@@ -2173,8 +2178,17 @@ impl R2Model {
             negated: BTreeMap::new(),
             asked: Mutex::new(BTreeMap::new()),
             later: BTreeMap::new(),
+            refresh_rule: None,
             calls: Mutex::new(Vec::new()),
         }
+    }
+
+    fn refresh_rule(
+        mut self,
+        rule: impl Fn(&CheckKey, &str, usize) -> Option<f32> + Send + Sync + 'static,
+    ) -> Self {
+        self.refresh_rule = Some(Box::new(rule));
+        self
     }
 
     /// From the `nth` assessment on (1-based), say `p` for `key`.
@@ -2255,7 +2269,11 @@ impl DecisionModel for R2Model {
         let mut answers = BTreeMap::new();
         for key in questions.keys() {
             let p = match context.purpose {
-                Purpose::Refresh => self.refresh.get(key).or_else(|| table.get(key)).copied(),
+                Purpose::Refresh => self
+                    .refresh_rule
+                    .as_ref()
+                    .and_then(|rule| rule(key, &state.to_string(), assessments))
+                    .or_else(|| self.refresh.get(key).or_else(|| table.get(key)).copied()),
                 Purpose::Reframe => {
                     let nth = {
                         let mut asked = self.asked.lock().unwrap_or_else(|e| e.into_inner());
@@ -3698,5 +3716,181 @@ async fn a_stuck_worker_held_by_an_uncertain_inhibitor_is_put_to_a_person() -> T
         "not asked again"
     );
     run.cancel().await?;
+    Ok(())
+}
+
+// ---- command evidence Jev never saw -----------------------------------------------------
+
+/// An `audit` provider (`before_finish`) whose runs `fail_from..=fail_to` print a failure and
+/// exit 1, and whose other runs pass.
+fn counting_audit(
+    dir: &Path,
+    fail_from: u32,
+    fail_to: u32,
+) -> Result<EvidencePlan, Box<dyn std::error::Error>> {
+    let script = dir.join("audit.sh");
+    let count = dir.join("audit-runs");
+    write_script(
+        &script,
+        &format!(
+            "n=$(cat '{count}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{count}'\n\
+             if [ $n -ge {fail_from} ] && [ $n -le {fail_to} ]; then \
+             echo 'FAILED: 2 critical vulnerabilities'; exit 1; fi\n\
+             echo 'audit clean'",
+            count = count.display()
+        ),
+    )?;
+    Ok(EvidencePlan::from_toml(
+        &format!(
+            r#"
+[[evidence.commands]]
+id = "audit"
+argv = ["{}"]
+run_when = "before_finish"
+success_exit_codes = [0]
+"#,
+            script.display()
+        ),
+        "test",
+    )?)
+}
+
+/// `ready_to_finish` in band for three assessments, its refreshes keeping it there (and
+/// spending the cap of three), then decisively done — on assessments that never show the
+/// audit. Later refreshes read the audit: a failure is 0.05, a pass 0.95.
+fn unseen_audit_model() -> R2Model {
+    R2Model::finish_ready()
+        .with(READY, 0.79)
+        .later_at(5, READY, 0.95)
+        .refresh_rule(|key, state, assessments| {
+            (*key == CheckKey::from(READY)).then(|| {
+                if assessments < 5 {
+                    0.79
+                } else if state.contains("FAILED") {
+                    0.05
+                } else {
+                    0.95
+                }
+            })
+        })
+}
+
+#[tokio::test]
+async fn a_finish_never_executes_over_command_evidence_jev_was_not_shown() -> TestResult {
+    // Re-verification, finding 2 (probe `probe_finish_after_refresh_cap_never_shown_the_
+    // command`). `ready_to_finish` selects the `before_finish` audit and sits in band for
+    // three cycles, spending its refresh cap. Then it is decisively done — on an assessment
+    // that, like every assessment, never shows command output — while the fourth audit
+    // fails. R0 cannot re-measure it (the cap is spent), and an R2 over the same claim-only
+    // state could only judge its consistency. It used to finish anyway. A claim-only check an
+    // executed Finish rests on is held when R0 cannot re-measure it, and put to a person.
+    let fx = Fixture::new(audited_definitions()?, EvidencePlan::default())?;
+    let mut fx = fx;
+    fx.evidence = counting_audit(fx.dir.path(), 4, 1000)?;
+    let model = Arc::new(unseen_audit_model());
+    let rt = fx.runtime(
+        config(|c| c.max_workers = 8),
+        settings(|_| {}),
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let outcome = fx.run(rt).await?;
+    assert_ne!(outcome.status, FactoryStatus::Finished);
+    assert!(!finished(&fx));
+    let ran = fx
+        .of_kind(EventKind::EvidenceCollected)
+        .iter()
+        .filter(|e| e.payload["provider"] == "audit")
+        .count();
+    assert!(ran >= 4, "the failing audit ran: {ran}");
+    let raised = fx.of_kind(EventKind::EscalationRaised);
+    assert_eq!(raised.len(), 1);
+    let ask = raised[0].payload["ask"].as_str().unwrap_or_default();
+    assert!(ask.contains(READY), "{ask}");
+    assert!(ask.contains("could not be shown to the model"), "{ask}");
+    let (_, last) = fx.resolutions().into_iter().last().ok_or("a cycle")?;
+    let ready = entry(&last, READY)?;
+    assert!(!ready.permitted);
+    assert!(ready.limits.iter().any(|l| matches!(
+        l,
+        aftman_core::ensemble::EnsembleLimit::UnseenCommandEvidence
+    )));
+    assert!(
+        ready.opinions.is_empty(),
+        "no R2 over the same claim-only state"
+    );
+
+    // Disabled, nothing changes: the run finishes over the failing audit it never showed
+    // Jev. That is the known limitation from before M5 (`docs/03-jev.md` §5), not a fix
+    // this ensemble change makes with the ensemble off.
+    let mut fx = Fixture::new(audited_definitions()?, EvidencePlan::default())?;
+    fx.evidence = counting_audit(fx.dir.path(), 4, 1000)?;
+    let rt = fx.runtime(
+        config(|c| c.max_workers = 8),
+        settings(|s| s.enabled = false),
+        Arc::new(unseen_audit_model()) as Arc<dyn DecisionModel>,
+        Arc::new(SimulatedWorker::instant()),
+    );
+    let outcome = fx.run(rt).await?;
+    assert_eq!(
+        outcome.status,
+        FactoryStatus::Finished,
+        "disabled is unchanged"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn recheck_on_unseen_command_evidence_tops_up_a_refresh_that_must_still_measure() -> TestResult
+{
+    // The same run, answered: `Recheck` authorises one more refresh of the held check, once.
+    // The next executed Finish re-runs the audit and asks again over its output: a passing
+    // audit finishes, a failing one does not. A person authorised cost, not the outcome.
+    for (fail_to, finishes) in [(4_u32, true), (1000, false)] {
+        let mut fx = Fixture::new(audited_definitions()?, EvidencePlan::default())?;
+        fx.evidence = counting_audit(fx.dir.path(), 4, fail_to)?;
+        let model = Arc::new(unseen_audit_model());
+        let rt = fx.runtime(
+            config(|c| c.max_workers = 8),
+            settings(|_| {}),
+            Arc::clone(&model) as Arc<dyn DecisionModel>,
+            Arc::new(SimulatedWorker::instant()),
+        );
+        let mut run = RunGuard::launch(&fx, rt).await?;
+        let id = escalation(&fx, 1).await?;
+        let raised = fx.of_kind(EventKind::EscalationRaised);
+        assert_eq!(raised[0].payload["refresh_topup"][0], READY);
+        run.answer(id, HumanDecision::Recheck).await?;
+        if finishes {
+            let outcome = run.join().await?;
+            assert_eq!(outcome.status, FactoryStatus::Finished);
+        } else {
+            let deadline = tokio::time::Instant::now() + PATIENCE;
+            while !fx.refreshes(READY).iter().any(|(_, entry)| {
+                entry.refresh.as_ref().and_then(|r| r.outcome.new_p) == Some(0.05)
+            }) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no topped-up refresh"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            assert!(!finished(&fx));
+            run.cancel().await?;
+        }
+        let topped: Vec<_> = fx
+            .of_kind(EventKind::Notification)
+            .into_iter()
+            .filter(|e| e.payload["code"] == "refresh_cap_topped_up")
+            .collect();
+        assert_eq!(topped.len(), 1);
+        assert_eq!(topped[0].payload["checks"][0], READY);
+        // The audit's output reached Jev through the topped-up refresh.
+        let shown = model.calls(Purpose::Refresh).iter().any(|c| {
+            let text = c.state.to_string();
+            text.contains("audit clean") || text.contains("FAILED")
+        });
+        assert!(shown);
+    }
     Ok(())
 }

@@ -55,6 +55,10 @@ pub enum GuardOutcome {
     Unavailable,
     /// The opinion budget is spent; the check is held.
     BudgetSpent,
+    /// The check rests on command evidence the model was never shown, and it was not
+    /// refreshed this cycle; the gate never refreshes, and an R2 over the same state could
+    /// judge only consistency. Held.
+    Unmeasured,
 }
 
 /// Run the gate. Returns the number of rounds it took.
@@ -157,7 +161,15 @@ async fn guard(
         keyed.key.cycle == plan.cycle && keyed.key.rung == Rung::ReframeSameModel
     });
 
-    let outcome = if let Some(position) = existing {
+    let unseen = plan
+        .triggered
+        .iter()
+        .find(|p| p.check == *key)
+        .is_some_and(|p| p.unseen_command)
+        && !matches!(rc.resolution, Resolution::EvidenceRefreshed { .. });
+    let outcome = if unseen {
+        GuardOutcome::Unmeasured
+    } else if let Some(position) = existing {
         if record.triggers.contains(&EnsembleTrigger::Irreversible) {
             GuardOutcome::AlreadyGuarded
         } else {
@@ -206,6 +218,16 @@ async fn guard(
 
     let resolved = match outcome {
         GuardOutcome::Unavailable => rc,
+        GuardOutcome::Unmeasured => {
+            record.limits.push(EnsembleLimit::UnseenCommandEvidence);
+            rc.suppress(
+                CheckSuppression::Unresolved,
+                Resolution::UnresolvedInBand {
+                    ask: String::new(),
+                    rungs: Vec::new(),
+                },
+            )
+        }
         GuardOutcome::BudgetSpent => {
             record.limits.push(EnsembleLimit::OpinionBudget {
                 used: counters.opinions_used,

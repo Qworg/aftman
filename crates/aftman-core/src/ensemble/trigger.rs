@@ -154,6 +154,10 @@ pub struct CheckPlan {
     /// Whether R2 can be asked for this check.
     pub(super) reframe_available: bool,
     pub(super) decisive_directives: DecisiveDirectives,
+    /// The check selects command evidence (`command:<id>` or `command_evidence`) and Jev
+    /// was shown none of it this cycle: its value rests on the worker's claim about a
+    /// command, and only R0 can show it the output.
+    pub(super) unseen_command: bool,
 }
 
 impl CheckPlan {
@@ -221,6 +225,7 @@ impl CheckPlan {
                 if_above: "Finish".into(),
                 if_below: "StartWorker".into(),
             },
+            unseen_command: false,
         }
     }
 
@@ -610,9 +615,14 @@ fn plan_check(
     {
         triggers.insert(EnsembleTrigger::LowConfidence);
     }
-    if !saw_command_evidence(&selection, ctx.assessed_state) {
+    let saw_command = saw_command_evidence(&selection, ctx.assessed_state);
+    if !saw_command {
         triggers.insert(EnsembleTrigger::ClaimOnlyEvidence);
     }
+    let unseen_command = !saw_command
+        && selection
+            .iter()
+            .any(|entry| entry == "command_evidence" || entry.starts_with("command:"));
 
     // The relevance triggers. `permitted` is direction-agnostic, so "forced to fire" and
     // "forced not to fire" cannot be expressed as permitted versus not permitted: a held
@@ -668,6 +678,7 @@ fn plan_check(
         rule_would_fire,
         refresh_providers: refresh_providers(&selection, ctx.evidence),
         reframe_available: ctx.reframe_available.contains(key),
+        unseen_command,
         decisive_directives: DecisiveDirectives {
             if_above: above_selected.name().to_owned(),
             if_below: below_selected.name().to_owned(),

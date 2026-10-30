@@ -235,8 +235,10 @@ async fn guard(
             } else {
                 MarkVerdict::Confirm
             };
+            let resolution = counters.resolutions;
             counters.checks.entry(key.clone()).or_default().last_opinion = Some(OpinionMark {
                 cycle: plan.cycle,
+                resolution,
                 verdict,
                 side: rc.side,
                 irreversible: true,

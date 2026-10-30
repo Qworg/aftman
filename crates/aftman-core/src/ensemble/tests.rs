@@ -122,7 +122,12 @@ impl Scenario {
                 provider("lint", RunWhen::WorkerCompleted),
             ]),
             answers: BTreeMap::new(),
-            ensemble: EnsembleCounters::default(),
+            // The cooldown's clock starts where the cycle ids do, so a hand-built mark
+            // `cycle: CYCLE - 3` is three resolutions ago.
+            ensemble: EnsembleCounters {
+                resolutions: CYCLE.get() - 1,
+                ..EnsembleCounters::default()
+            },
             reframe: BTreeSet::new(),
             cycle: CYCLE,
             finish_provisional: false,
@@ -498,7 +503,7 @@ async fn with_the_ensemble_disabled_nothing_triggers_and_nothing_is_asked() {
         .await
         .unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(outcome.checks, s.baseline());
-    assert_eq!(outcome.counters, EnsembleCounters::default());
+    assert_eq!(outcome.counters, s.ensemble, "the counters are untouched");
     assert!(source.refresh_calls().is_empty() && source.reframe_calls().is_empty());
 }
 
@@ -540,6 +545,7 @@ fn nothing_covers_an_irreversible_opinion() {
         for irreversible_mark in [false, true] {
             let mark = OpinionMark {
                 cycle: CYCLE,
+                resolution: CYCLE.get(),
                 verdict,
                 side: Some(Side::Above),
                 irreversible: irreversible_mark,
@@ -2864,6 +2870,7 @@ async fn the_cooldown_rows_from_the_contract() {
                 CheckCounters {
                     last_opinion: Some(OpinionMark {
                         cycle: AssessmentSeq(CYCLE.get() - 3),
+                        resolution: AssessmentSeq(CYCLE.get() - 3).get(),
                         verdict,
                         side,
                         irreversible,
@@ -2907,6 +2914,7 @@ async fn the_cooldown_rows_from_the_contract() {
         CheckCounters {
             last_opinion: Some(OpinionMark {
                 cycle: AssessmentSeq(CYCLE.get() - 10),
+                resolution: AssessmentSeq(CYCLE.get() - 10).get(),
                 verdict: MarkVerdict::Contest,
                 side: Some(Side::Above),
                 irreversible: false,
@@ -2926,6 +2934,7 @@ async fn the_cooldown_rows_from_the_contract() {
         outcome.counters.check(&k(NEEDS_VER)).last_opinion,
         Some(OpinionMark {
             cycle: CYCLE,
+            resolution: CYCLE.get(),
             verdict: MarkVerdict::Confirm,
             side: Some(Side::Above),
             irreversible: false,
@@ -3424,13 +3433,17 @@ async fn run_case(c: &Case, s: &mut Scenario) {
     let key = k(TESTS);
     let baseline = ResolvedCheck::from_measurement(key.clone(), Some(c.p), Some(T), M, true);
     let mut check = CheckCounters::default();
-    let mut counters = EnsembleCounters::default();
+    let mut counters = EnsembleCounters {
+        resolutions: CYCLE.get() - 1,
+        ..EnsembleCounters::default()
+    };
     match c.counters {
         CounterState::Fresh => {}
         CounterState::RefreshCapped => check.refreshes = 3,
         CounterState::CooldownAfterContest | CounterState::CooldownAfterConfirm => {
             check.last_opinion = Some(OpinionMark {
                 cycle: AssessmentSeq(CYCLE.get() - 1),
+                resolution: AssessmentSeq(CYCLE.get() - 1).get(),
                 verdict: if matches!(c.counters, CounterState::CooldownAfterContest) {
                     MarkVerdict::Contest
                 } else {
@@ -3544,6 +3557,7 @@ async fn run_case(c: &Case, s: &mut Scenario) {
             after.last_opinion,
             Some(OpinionMark {
                 cycle: CYCLE,
+                resolution: CYCLE.get(),
                 verdict,
                 side: baseline.side,
                 irreversible: c.triggers.contains(&EnsembleTrigger::Irreversible),
@@ -5222,4 +5236,37 @@ async fn a_top_up_of_only_the_held_checks_would_never_let_the_finish_through() {
         counters = outcome.counters;
         counters.opinion_topup += u32::try_from(held).unwrap_or(u32::MAX);
     }
+}
+
+#[tokio::test]
+async fn the_cooldown_is_counted_in_cycles_not_assessment_ids() {
+    // Integrated review, finding 5. Cycle ids are assessment numbers, and a refresh's or a
+    // reframe's model call takes one too, so ids advance by two or more a cycle. A cooldown
+    // measured in ids lasted half as many cycles as configured. A Verify acting on
+    // `needs_verification` buys a (non-irreversible) opinion, which confirms; for the next
+    // `per_check_cooldown_cycles` cycles it covers, whatever ids those cycles have.
+    let mut counters = EnsembleCounters::default();
+    let mut bought = Vec::new();
+    for i in 0..11u64 {
+        let mut s = Scenario::finish_ready()
+            .set(NEEDS_VER, 0.90)
+            .reframable(&[NEEDS_VER]);
+        // Each cycle's id two past the last: its reframe took an assessment number.
+        s.cycle = AssessmentSeq(20 + 2 * i);
+        s.ensemble = counters.clone();
+        assert_eq!(s.select(&s.baseline()).name(), "Verify");
+        let plan = s.plan();
+        let source = answering_by(&plan, |p| Some(1.0 - p));
+        let outcome = s
+            .resolve_plan(&plan, &source)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        if !source.reframe_calls().is_empty() {
+            bought.push(i);
+        }
+        counters = outcome.counters;
+    }
+    let window = EnsembleSettings::default().per_check_cooldown_cycles;
+    assert_eq!(window, 10);
+    assert_eq!(bought, vec![0, 10], "once, then again after ten cycles");
 }

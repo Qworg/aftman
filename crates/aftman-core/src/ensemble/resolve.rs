@@ -339,6 +339,11 @@ impl EnsemblePlan {
             ));
         }
         let mut counters = self.counters.clone();
+        // One more cycle resolved: the cooldown's clock (`EnsembleCounters::resolutions`).
+        // Disabled, the counters are left untouched.
+        if self.settings.enabled {
+            counters.resolutions = counters.resolutions.saturating_add(1);
+        }
         let mut checks = self.baseline.clone();
         let mut records = Vec::with_capacity(self.triggered.len());
         for plan in &self.triggered {
@@ -635,7 +640,7 @@ async fn resolve_check(
     // bought fresh, on this cycle's value, subject only to the opinion budget below.
     if let Some(last) = state.last_opinion
         && !irreversible
-        && cycle.get().saturating_sub(last.cycle.get()) < settings.per_check_cooldown_cycles
+        && counters.resolutions.saturating_sub(last.resolution) < settings.per_check_cooldown_cycles
     {
         // The earlier opinion stands in for this one only if it covers it: a confirm,
         // about the side Jev is on now. Otherwise the check is held for the window.
@@ -730,6 +735,7 @@ async fn resolve_check(
         .or_default()
         .last_opinion = Some(OpinionMark {
         cycle,
+        resolution: counters.resolutions,
         verdict,
         side,
         irreversible,

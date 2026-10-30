@@ -235,6 +235,11 @@ pub struct EnsembleCounters {
     pub opinions_used: u32,
     /// Keyed by check. A check appears once the ensemble has looked at it.
     pub checks: BTreeMap<CheckKey, CheckCounters>,
+    /// How many cycles the ensemble has resolved this run (with it enabled), advanced once
+    /// at the start of each resolution: the clock the cooldown is measured on. Cycle ids
+    /// are assessment numbers, which a refresh's or a reframe's call advances too, so they
+    /// are no measure of cycles.
+    pub resolutions: u64,
     /// Opinions a person has authorised beyond `max_opinions_per_run`, by answering a
     /// spent-budget escalation with `Recheck` or `ClaimComplete`
     /// ([`EnsembleCounters::record_budget_answer`]). Cost, never an outcome: every opinion it
@@ -373,7 +378,12 @@ pub struct CheckCounters {
 /// an abstention, which covers nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OpinionMark {
+    /// The cycle (assessment id) it was bought in, for the log.
     pub cycle: AssessmentSeq,
+    /// The resolution it was bought in (`EnsembleCounters::resolutions` then): what the
+    /// cooldown counts from. Zero in a snapshot written before it existed.
+    #[serde(default)]
+    pub resolution: u64,
     /// The cycle's combined verdict: `Contest` if any opinion contested, else `Abstain`
     /// if any abstained, else `Confirm`.
     #[serde(default)]

@@ -787,8 +787,8 @@ about that cycle's value, subject only to `max_opinions_per_run` — with the bu
 is held (`Unresolved`), which is the fail-safe. An opinion that cannot be obtained is still a
 contest (§4).
 
-For a non-irreversible trigger, within `per_check_cooldown_cycles` of the last opinion bought for a
-check, no new one is bought. The earlier opinion stands in for the skipped one only if it *covers*
+For a non-irreversible trigger, within `per_check_cooldown_cycles` **cycles** (resolutions, not
+assessment ids, §6.1) of the last opinion bought for a check, no new one is bought. The earlier opinion stands in for the skipped one only if it *covers*
 it (`OpinionMark::covers`): it was a **Confirm** (every opinion that cycle confirmed; an Abstain
 covers nothing), about the **same side** of `t` that Jev's value is on now. Otherwise the check is
 held (`Unresolved`) for the rest of the window.
@@ -921,9 +921,14 @@ Notes that follow directly from §2:
    and the baseline (`resolve_checks` with the settings' margin and `enabled`). The plan's context,
    the resolution's context and the final arbitration's `PolicyInput` are all derived from that one
    value; nothing is re-read from the run in between. The same registry is passed to `build` and
-   `resolve`. The cycle id is the cycle's `assessment_seq`; a refresh's model call takes an
-   assessment number too, so ids increase but need not be consecutive, and a cooldown measured in
-   them is never longer than the same number of cycles.
+   `resolve`. The cycle id is the cycle's `assessment_seq`; a refresh's or a reframe's model call
+   takes an assessment number too, so ids increase but need not be consecutive. They are therefore
+   no clock for the cooldown: an earlier revision measured it in ids, and a 10-cycle cooldown
+   lasted 5 cycles. The cooldown counts **cycles** — `EnsembleCounters::resolutions`, advanced
+   once at the start of every resolution with the ensemble on, and stamped on each opinion mark
+   (`OpinionMark::resolution`) — so `per_check_cooldown_cycles` means what it says
+   (`the_cooldown_is_counted_in_cycles_not_assessment_ids`). Both are in the counters a replay
+   starts from, so a replay is unchanged.
 2. **`finish_is_provisional` is exactly** `!before_finish_ran && !evidence.due(BeforeFinish).is_empty()`
    for this cycle — the same expression, computed once, that the apply step reads to decide whether a
    selected `Finish` is executed or replaced by running the `before_finish` providers and

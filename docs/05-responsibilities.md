@@ -452,7 +452,7 @@ Applied before any priority comparison. They cannot be overridden by a score:
 | Overall timeout exceeded | `Stop` |
 | **`permitted == false` for a check** | Every rule that reads that check is suppressed (`SuppressionReason::NotPermitted`), in both comparison directions, regardless of how far the value is from the threshold. This is how the ensemble's guarantee is enforced (doc 06 §2.2). |
 | `attempts >= max_attempts` | `Retry` suppressed |
-| `workers >= max_workers` | `StartWorker` / `Verify` / `Retry` suppressed → `Escalate` |
+| `workers >= max_workers` | `StartWorker` / `Verify` / `Retry` suppressed → `Escalate`. And a `Finish` cannot win because of it: when one of those, refused by the limit, would have outranked the `Finish`, policy escalates instead (§6.3) |
 | `verification_started` | `Verify` suppressed |
 | Assessment budget exhausted | `Stop`, or `Escalate` when verification is pending |
 | Model error this cycle | only conservative directives are permitted (see §7) |
@@ -534,6 +534,26 @@ Tie-break order: priority desc → stakes (High first) → responsibility id →
 every rule — built-in included — has a unique id (§1), this is a total order with no ties, which is
 what makes `arbitrate()` reproducible from the event log. `docs/09-plan.md` M2 requires a test that
 asserts it: no two proposals in any built-in scenario compare equal.
+
+**The worker limit does not disarm an inhibitor.** A rule that asks for work above `Finish` —
+`quality.documentation:insufficient` at 750 over `Finish` at 700 — inhibits it by priority: while
+the documentation is decisively insufficient, the run starts a worker rather than finishing. At
+`max_workers` the `WorkerLimit` invariant refuses that `StartWorker` (§6.1), and an earlier
+revision let the `Finish` below it win, so a run finished with documentation decisively
+insufficient: "no worker left" read as "nothing left to do". Now **a `Finish` may not win just
+because a proposal that outranks it and asks for work (`StartWorker`, `Retry` or `Verify`) was
+refused by the worker limit.** Policy refuses the `Finish` too (`WorkerLimit`) and escalates,
+saying that the worker limit is reached while the named rule still asks for work: its reason is
+"worker limit reached while *rule* still asks for work", with the rule id, and its `ask` names the
+rule, its directive, priority and reason. This is general, not documentation-specific: it applies to any
+rule, built-in or declarative, whose work-starting proposal would have outranked the `Finish`. A
+work-starting proposal the `Finish` outranks (`core.completion:work-remains` at 500, the fallback
+when the precondition fails) is no reason not to finish, and one refused for another reason (a
+second `Verify`, refused because a verifier already ran) does not count. With the ensemble off
+this changes behaviour: such a run used to finish, and now asks a person
+(`insufficient_documentation_at_the_worker_limit_escalates_naming_the_rule`). The escalation is
+selected by `arbitrate`, so the ensemble's counterfactuals see it too: a check whose side decides
+between that escalation and the `Finish` is one the `Finish` rests on.
 
 **Why the ensemble's escalation sits at 850.** It is not a responsibility's rule: the ensemble
 (doc 06 §6) decides that a check needs a person — held in band, or contested, for

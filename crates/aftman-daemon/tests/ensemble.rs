@@ -4376,3 +4376,53 @@ async fn a_later_code_worker_resets_verifier_completed() -> TestResult {
     }
     Ok(())
 }
+
+// ---- the worker limit does not disarm an inhibitor ------------------------------------
+
+#[tokio::test]
+async fn insufficient_documentation_at_the_worker_limit_escalates_naming_the_rule() -> TestResult {
+    // The M5 reviewer's scenario (`docs/09-plan.md`, "Found during M5"). Documentation stays
+    // decisively insufficient (0.30) for the whole run and everything else is ready, at the
+    // default `max_workers`. `quality.documentation:insufficient` (StartWorker, 750) outranks
+    // `Finish` (700) — the inhibition `docs/05-responsibilities.md` §6.3 describes — until the
+    // worker limit refuses that StartWorker; the Finish used to survive, and the run finished
+    // with documentation decisively insufficient. Now policy escalates, naming the rule. With
+    // the ensemble off and on.
+    for enabled in [false, true] {
+        let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+        let rt = fx.runtime(
+            config(|c| c.max_workers = RunConfig::default().max_workers),
+            settings(|s| s.enabled = enabled),
+            Arc::new(R2Model::finish_ready().with(DOCS, 0.30)) as Arc<dyn DecisionModel>,
+            Arc::new(SimulatedWorker::instant()),
+        );
+        let outcome = fx.run(rt).await?;
+        assert_eq!(
+            outcome.status,
+            FactoryStatus::NeedsHuman,
+            "enabled={enabled}"
+        );
+        assert!(!finished(&fx));
+        assert_eq!(
+            outcome.counters.workers_run,
+            RunConfig::default().max_workers
+        );
+        assert!(
+            !fx.of_kind(EventKind::DirectiveSelected)
+                .iter()
+                .any(|e| e.payload["directive"] == "Finish"),
+            "enabled={enabled}"
+        );
+        let raised = fx.of_kind(EventKind::EscalationRaised);
+        let last = raised.last().ok_or("an escalation")?;
+        let reason = last.payload["reason"].as_str().unwrap_or_default();
+        let ask = last.payload["ask"].as_str().unwrap_or_default();
+        assert!(reason.contains("worker limit"), "{reason}");
+        assert!(
+            reason.contains("quality.documentation:insufficient"),
+            "{reason}"
+        );
+        assert!(ask.contains("quality.documentation:insufficient"), "{ask}");
+    }
+    Ok(())
+}

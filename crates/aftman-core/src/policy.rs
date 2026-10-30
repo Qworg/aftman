@@ -374,12 +374,96 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
         }
     }
 
+    // A `Finish` may not win just because a proposal that outranks it, asking for work, was
+    // refused by the worker limit (`docs/05-responsibilities.md` §6.3). That rule still says
+    // the job is not done — `quality.documentation:insufficient` at 750 over `Finish` at 700 is
+    // the inhibition the priority order exists for — and the limit only means aftman may not
+    // start the work it asks for. Finishing over it would read "no worker left" as "nothing
+    // left to do". So a person is asked, and told which rule still asks for work.
+    if matches!(winner.directive, Directive::Finish { .. })
+        && let Some(blocked) = refused_work_outranking(proposals, &suppressed, &winner)
+    {
+        suppressed.push(Suppression {
+            responsibility: winner.responsibility.clone(),
+            rule: winner.rule.clone(),
+            reason: SuppressionReason::Invariant(Invariant::WorkerLimit),
+        });
+        return PolicyDecision {
+            selected: Directive::Escalate {
+                reason: format!(
+                    "worker limit reached while `{}` still asks for work",
+                    blocked.rule
+                ),
+                ask: worker_limit_ask(input, blocked),
+            },
+            considered: proposals.to_vec(),
+            suppressed,
+            invariants,
+        };
+    }
+
     PolicyDecision {
         selected: winner.directive,
         considered: proposals.to_vec(),
         suppressed,
         invariants,
     }
+}
+
+/// Whether a directive asks for a worker to be started.
+const fn starts_work(directive: &Directive) -> bool {
+    matches!(
+        directive,
+        Directive::StartWorker { .. } | Directive::Retry { .. } | Directive::Verify { .. }
+    )
+}
+
+/// The highest-ranked proposal that asks for work, would have outranked `winner`, and was
+/// refused by the worker limit (and by nothing before it).
+fn refused_work_outranking<'a>(
+    proposals: &'a [Proposal],
+    suppressed: &[Suppression],
+    winner: &Proposal,
+) -> Option<&'a Proposal> {
+    proposals
+        .iter()
+        .filter(|p| starts_work(&p.directive) && p.order_key() < winner.order_key())
+        .filter(|p| {
+            suppressed.iter().any(|s| {
+                s.rule == p.rule
+                    && matches!(
+                        s.reason,
+                        SuppressionReason::Invariant(Invariant::WorkerLimit)
+                    )
+            })
+        })
+        .min_by(|a, b| a.order_key().cmp(&b.order_key()))
+}
+
+/// The most bytes the worker-limit question may have, like the others policy asks.
+pub const WORKER_LIMIT_ASK_CAP_BYTES: usize = 2048;
+
+/// The question when the worker limit refused work a rule still asks for, over a `Finish`.
+fn worker_limit_ask(input: &PolicyInput<'_>, blocked: &Proposal) -> String {
+    let mut ask = format!(
+        "The worker limit ({} workers) is reached, and `{}` still asks for work ({}, priority \
+         {}: \"{}\"), so aftman will not finish over it and cannot start that work. Stop ends \
+         the run. Any other answer resumes it, and this is asked again while the rule still \
+         asks for work.",
+        input.config.max_workers,
+        blocked.rule,
+        blocked.directive.name(),
+        blocked.priority,
+        blocked.directive.reason().unwrap_or_default(),
+    );
+    if ask.len() > WORKER_LIMIT_ASK_CAP_BYTES {
+        let mut end = WORKER_LIMIT_ASK_CAP_BYTES;
+        while !ask.is_char_boundary(end) {
+            end -= 1;
+        }
+        ask.truncate(end);
+    }
+    ask
 }
 
 /// The most unresolved checks the "nothing can make progress" question names one by one.
@@ -877,6 +961,105 @@ mod tests {
         policy_input.active_worker = Some(&worker);
         let decision = arbitrate(&policy_input, &[]);
         assert_eq!(decision.selected, Directive::Continue);
+    }
+
+    #[test]
+    fn a_finish_does_not_win_because_the_worker_limit_refused_work_that_outranks_it() {
+        // `docs/05-responsibilities.md` §6.3. Documentation is decisively insufficient, so its
+        // rule asks for a worker at 750, above `Finish` at 700. At the worker limit only that
+        // `StartWorker` is refused; the `Finish` used to survive it and win. Policy escalates
+        // instead, naming the rule that still asks for work.
+        let o = observation();
+        let config = RunConfig::default();
+        let counters = Counters {
+            workers_run: config.max_workers,
+            verifier_completed: true,
+            ..Counters::default()
+        };
+        let checks = checks(&[
+            ("core.completion", "ready_to_finish", 0.95),
+            ("core.completion", "requirements_satisfied", 0.95),
+            ("core.verification", "tests_sufficient", 0.95),
+        ]);
+        let docs = Proposal::new(
+            "quality.documentation",
+            "quality.documentation:insufficient",
+            Directive::StartWorker {
+                reason: "the job requires documentation that is not yet complete".into(),
+            },
+            750,
+            Stakes::High,
+        );
+        let decision = arbitrate(
+            &input(&o, &counters, &config, &checks),
+            &[docs.clone(), finish()],
+        );
+        let Directive::Escalate { reason, ask } = &decision.selected else {
+            panic!("expected an escalation, got {:?}", decision.selected);
+        };
+        assert_eq!(
+            reason,
+            "worker limit reached while `quality.documentation:insufficient` still asks for work"
+        );
+        assert!(
+            ask.contains("`quality.documentation:insufficient`"),
+            "{ask}"
+        );
+        assert!(ask.contains("StartWorker"), "{ask}");
+        for rule in [
+            "quality.documentation:insufficient",
+            "core.completion:thresholds-satisfied",
+        ] {
+            assert!(
+                decision.suppressed.iter().any(|s| s.rule.as_str() == rule
+                    && s.reason == SuppressionReason::Invariant(Invariant::WorkerLimit)),
+                "{rule}: {:?}",
+                decision.suppressed
+            );
+        }
+
+        // Below the limit the inhibitor simply wins, as before.
+        let below = Counters {
+            workers_run: config.max_workers - 1,
+            ..counters.clone()
+        };
+        let decision = arbitrate(&input(&o, &below, &config, &checks), &[docs, finish()]);
+        assert!(matches!(decision.selected, Directive::StartWorker { .. }));
+
+        // A refused proposal the Finish outranks does not hold it: work-remains (500) is what
+        // the completion rule falls back to, never a reason not to finish.
+        let remains = Proposal::new(
+            builtin::COMPLETION,
+            "core.completion:work-remains",
+            Directive::StartWorker {
+                reason: "meaningful implementation work remains".into(),
+            },
+            500,
+            Stakes::High,
+        );
+        let decision = arbitrate(
+            &input(&o, &counters, &config, &checks),
+            &[remains, finish()],
+        );
+        assert_eq!(decision.selected, finish().directive);
+
+        // Nor does one refused for another reason: a second verifier is refused because one
+        // already ran, whatever the limit.
+        let verify = Proposal::new(
+            "user.check",
+            "user.check:verify-again",
+            Directive::Verify {
+                reason: "again".into(),
+            },
+            800,
+            Stakes::High,
+        );
+        let ran = Counters {
+            verifiers_run: 1,
+            ..counters.clone()
+        };
+        let decision = arbitrate(&input(&o, &ran, &config, &checks), &[verify, finish()]);
+        assert_eq!(decision.selected, finish().directive);
     }
 
     #[test]

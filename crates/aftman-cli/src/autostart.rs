@@ -403,14 +403,33 @@ async fn spawn_detached(starter: &Starter) -> Result<tokio::process::Child, Auto
         .map_err(|e| AutostartError::Spawn(format!("running {}: {e}", starter.exe.display())))
 }
 
-/// Wait until no daemon holds the lock or answers on the socket, up to `limit`.
-/// `true` when the daemon is gone.
-pub async fn wait_until_gone(paths: &DaemonPaths, limit: Duration) -> bool {
+/// Wait until the daemon `pid` has let go of `paths`, up to `limit`. `true` when it is
+/// gone.
+///
+/// Gone means either nothing is left (no lock holder, nothing answering, the socket and
+/// pid file removed), or the lock is now held by a *different* daemon. The second case
+/// is not a corner: the moment a daemon releases its paths, any command that needs one
+/// starts a successor on the same paths. The gap between the two is tens of
+/// milliseconds, about one poll here, and a waiter that is not scheduled during it (a
+/// busy machine) would otherwise never see "nothing is left": it would wait out `limit`
+/// on the successor and report its own, long-gone daemon as stuck.
+///
+/// `pid` is `None` (or `0`) when the waiter does not know which daemon it is waiting
+/// for; then only "nothing is left" counts. A holder whose pid is not readable yet
+/// (`0`) is not taken for a successor.
+pub async fn wait_until_gone(paths: &DaemonPaths, pid: Option<u32>, limit: Duration) -> bool {
     let deadline = Instant::now() + limit;
+    let target = pid.filter(|&pid| pid != 0);
     loop {
-        let gone = matches!(probe(paths).await, DaemonPresence::NotRunning)
-            && tokio::fs::symlink_metadata(&paths.socket).await.is_err()
-            && tokio::fs::symlink_metadata(&paths.pid_file).await.is_err();
+        let gone = match probe(paths).await {
+            DaemonPresence::NotRunning => {
+                tokio::fs::symlink_metadata(&paths.socket).await.is_err()
+                    && tokio::fs::symlink_metadata(&paths.pid_file).await.is_err()
+            }
+            DaemonPresence::Running { pid: holder } | DaemonPresence::Busy { pid: holder } => {
+                target.is_some_and(|target| holder != 0 && holder != target)
+            }
+        };
         if gone {
             return true;
         }
@@ -560,8 +579,34 @@ mod tests {
     async fn waiting_for_shutdown_has_a_deadline() {
         let dir = tempfile::tempdir().unwrap();
         let paths = DaemonPaths::in_dir(dir.path());
-        assert!(wait_until_gone(&paths, Duration::from_millis(50)).await);
+        assert!(wait_until_gone(&paths, None, Duration::from_millis(50)).await);
         std::fs::write(&paths.pid_file, "1\n").unwrap();
-        assert!(!wait_until_gone(&paths, Duration::from_millis(100)).await);
+        assert!(!wait_until_gone(&paths, None, Duration::from_millis(100)).await);
+    }
+
+    #[tokio::test]
+    async fn a_daemon_replaced_by_a_successor_is_gone() {
+        // The daemon being waited for released its paths and another one took them
+        // before the waiter looked: the waiter must not mistake the successor for it.
+        let dir = tempfile::Builder::new()
+            .prefix("aft")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let paths = DaemonPaths::in_dir(dir.path());
+        let successor = aftman_daemon::lifecycle::lock(&paths).await.unwrap();
+        let me = std::process::id();
+        assert!(matches!(probe(&paths).await, DaemonPresence::Busy { pid } if pid == me));
+
+        let old = me.wrapping_add(1);
+        let limit = Duration::from_secs(5);
+        let started = Instant::now();
+        assert!(wait_until_gone(&paths, Some(old), limit).await);
+        assert!(started.elapsed() < limit, "it waited out the limit");
+
+        // Still the same daemon, or one we cannot tell apart: keep waiting.
+        assert!(!wait_until_gone(&paths, Some(me), Duration::from_millis(100)).await);
+        assert!(!wait_until_gone(&paths, None, Duration::from_millis(100)).await);
+        assert!(!wait_until_gone(&paths, Some(0), Duration::from_millis(100)).await);
+        drop(successor);
     }
 }

@@ -1985,6 +1985,13 @@ fn stop_and_auto_start_during_a_daemon_shutdown_wait_for_it() {
         "{}",
         status.stdout
     );
+    // The first stop is waiting for this daemon to let go. Hold it still until a successor
+    // has taken the paths: the old daemon releases them and `ls` starts a new one on them
+    // tens of milliseconds later, about one of the waiter's polls, and a waiter the machine
+    // does not schedule in that gap (a loaded suite) must still know that the daemon *it*
+    // stopped is gone, not mistake the successor for it and wait out `STOP_WAIT`. Freezing
+    // it makes that the case on every run instead of on a busy machine only.
+    first_stop.signal(Signal::SIGSTOP);
 
     // A second stop does not claim nothing is running; it waits for the first to finish.
     let second_stop = sb.run_patiently(&["stop"]);
@@ -2001,8 +2008,21 @@ fn stop_and_auto_start_during_a_daemon_shutdown_wait_for_it() {
     assert_eq!(ls.code, 0, "{}", ls.all());
     let new_pid = sb.status_pid().expect("a new daemon");
     assert_ne!(new_pid, pid);
-    let done = first_stop.wait(SLOW_PATIENCE);
+    first_stop.signal(Signal::SIGCONT);
+    // The successor is not the daemon it stopped: it reports success at once instead of
+    // waiting out `STOP_WAIT` on a daemon nobody asked to stop.
+    let done = first_stop.wait(PATIENCE);
     assert_eq!(done.code, 0, "{}", done.all());
+    assert!(
+        done.stdout.contains("aftman daemon stopped"),
+        "{}",
+        done.all()
+    );
+    assert_eq!(
+        sb.status_pid(),
+        Some(new_pid),
+        "the successor is left running"
+    );
     drop(long);
 }
 

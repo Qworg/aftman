@@ -125,7 +125,9 @@ aftman serve [--socket <path>] [--bind <addr>] [--print-url]   # foreground
   terminal, and exits with the run's status. For CI and scripts. No socket, no web, no herdr. It
   builds the run through the same `CliFactory` the daemon uses, so the two cannot drift.
 - **Shutdown:** `aftman stop` (`daemon.stop`, then waits until the socket and pid file are gone,
-  up to 75 s) or SIGTERM/SIGINT. In order: stop accepting
+  up to 75 s; it waits for the daemon it stopped, named by the pid lock, so a successor that
+  another command auto-starts on the same paths in the meantime counts as "gone", not as that
+  daemon still shutting down) or SIGTERM/SIGINT. In order: stop accepting
   connections; cancel every live run with reason `daemon shutdown` (workers are terminated via the
   normal path and each run is persisted `Cancelled`), waiting at most `shutdown_grace` (60 s), after
   which stragglers are aborted and recorded `Failed`; close every subscription (each subscriber is

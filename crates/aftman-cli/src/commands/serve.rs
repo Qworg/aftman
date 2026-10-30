@@ -230,23 +230,34 @@ fn init_tracing() {
 }
 
 /// `aftman stop`: ask the daemon to stop and wait until it is gone (nothing holds its
-/// lock, its socket and pid file are removed). Exit `0` when it stopped, and also when
-/// none was running. A daemon that is already shutting down is waited for, not
-/// reported as "not running".
+/// lock, its socket and pid file are removed, or a successor has since taken them).
+/// Exit `0` when it stopped, and also when none was running. A daemon that is already
+/// shutting down is waited for, not reported as "not running".
 ///
 /// # Errors
 /// The daemon did not finish shutting down in time.
 pub async fn stop(ctx: &Ctx) -> Result<u8, CliError> {
     let paths = ctx.paths()?;
-    match connect_existing(&paths, ctx.client).await {
+    // Which daemon this stop is about: the one holding the pid lock while we are
+    // connected to it. Once it lets go of the paths, any command may start a successor
+    // on them, and that successor is not ours to wait for. (Read from the lock rather
+    // than asked over the connection: a `daemon.status` that timed out would poison the
+    // connection the stop has to go over.)
+    let stopping = match connect_existing(&paths, ctx.client).await {
         Ok(mut client) => {
+            let pid = match probe(&paths).await {
+                DaemonPresence::Running { pid } | DaemonPresence::Busy { pid } => Some(pid),
+                DaemonPresence::NotRunning => None,
+            };
             client.stop().await?;
+            pid
         }
         Err(error) if error.is_not_running() => match probe(&paths).await {
             DaemonPresence::Busy { pid } => {
                 outln!(
                     "aftman daemon (pid {pid}) is already starting up or shutting down; waiting"
                 )?;
+                Some(pid)
             }
             _ => {
                 outln!("aftman daemon is not running")?;
@@ -254,8 +265,8 @@ pub async fn stop(ctx: &Ctx) -> Result<u8, CliError> {
             }
         },
         Err(error) => return Err(error.into()),
-    }
-    if wait_until_gone(&paths, STOP_WAIT).await {
+    };
+    if wait_until_gone(&paths, stopping, STOP_WAIT).await {
         outln!("aftman daemon stopped")?;
         Ok(exit::FINISHED)
     } else {

@@ -1707,6 +1707,10 @@ impl FactoryRuntime {
         }
         // A spent opinion budget: a person may authorise the cost of checking what it held,
         // never the outcome (`docs/06-ensemble.md` §6). Core decides what is granted.
+        // A refused Stop put to a person: their Accept is remembered for that question.
+        if let Some(key) = state.escalations[index].held_stop.clone() {
+            state.ensemble.record_held_stop_answer(&key, &decision);
+        }
         // Command evidence the model was never shown: a person may authorise one more
         // refresh of each listed check, never the outcome (`docs/06-ensemble.md` §6).
         let listed = state.escalations[index].refresh_topup.clone();
@@ -2776,6 +2780,7 @@ impl FactoryRuntime {
                     ensemble_checks: escalated.checks.clone(),
                     opinion_topup: escalated.opinion_topup,
                     refresh_topup: escalated.refresh_topup.clone(),
+                    held_stop: escalated.held_stop.clone(),
                     ask: ask.clone(),
                     jev_p,
                     opinions: escalated.opinions.clone(),
@@ -2849,6 +2854,8 @@ struct EscalatedChecks {
     opinion_topup: u32,
     /// The checks such an answer would grant a refresh, for unseen command evidence.
     refresh_topup: Vec<CheckKey>,
+    /// The held-`Stop` question's key, when the escalation includes one.
+    held_stop: Option<String>,
 }
 
 impl EscalatedChecks {
@@ -2865,6 +2872,7 @@ impl EscalatedChecks {
             opinions,
             opinion_topup: outcome.opinion_topup,
             refresh_topup: outcome.refresh_topup.clone(),
+            held_stop: outcome.held_stop.clone(),
         }
     }
 }

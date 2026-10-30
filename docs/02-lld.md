@@ -334,7 +334,8 @@ pub struct EnsembleSettings { /* the [ensemble] table */ }      // validate() ->
 pub struct EnsembleCounters { pub opinions_used: u32,
     pub checks: BTreeMap<CheckKey, CheckCounters>,               // in RunState.ensemble
     pub opinion_topup: u32,         // opinions a person authorised past max_opinions_per_run
-    pub resolutions: u64 }          // cycles resolved: the cooldown's clock (doc 06 §6.1)
+    pub resolutions: u64,           // cycles resolved: the cooldown's clock (doc 06 §6.1)
+    pub held_stops_accepted: BTreeSet<String> }  // held-Stop questions a person accepted
     // opinion_budget(settings) = max_opinions_per_run + opinion_topup;
     // record_budget_answer(topup, decision) grants `topup` on Recheck/ClaimComplete only
     // CheckCounters also remembers a person's answer: `human` (Accept/Guidance) and

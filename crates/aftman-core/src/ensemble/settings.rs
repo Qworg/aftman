@@ -245,9 +245,27 @@ pub struct EnsembleCounters {
     /// ([`EnsembleCounters::record_budget_answer`]). Cost, never an outcome: every opinion it
     /// pays for is still asked, and may still contest.
     pub opinion_topup: u32,
+    /// Held `Stop` questions a person has answered `Accept` or `Guidance`, each by its key
+    /// (`EnsembleOutcome::held_stop`: the refused `Stop`'s rule and the checks holding it).
+    /// Only that answer silences that question: acceptance of a check's uncertainty, given
+    /// to another question, does not leave a stuck worker running unasked.
+    pub held_stops_accepted: std::collections::BTreeSet<String>,
 }
 
 impl EnsembleCounters {
+    /// Remember a person's answer to a held-`Stop` question (`docs/06-ensemble.md` §6):
+    /// `Accept` or `Guidance` lets the worker run on, and the same question — the same
+    /// `Stop`'s rule, held by the same checks — is not asked again. Any other answer
+    /// remembers nothing.
+    pub fn record_held_stop_answer(&mut self, key: &str, decision: &HumanDecision) {
+        if matches!(
+            decision,
+            HumanDecision::Accept | HumanDecision::Guidance { .. }
+        ) {
+            self.held_stops_accepted.insert(key.to_owned());
+        }
+    }
+
     /// The opinion budget for this run: `max_opinions_per_run`, plus what a person has
     /// authorised since.
     #[must_use]

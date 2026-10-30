@@ -297,6 +297,11 @@ pub struct EnsembleOutcome {
     /// ([`EnsembleCounters::record_refresh_answer`]). Empty otherwise.
     #[serde(default)]
     pub refresh_topup: Vec<CheckKey>,
+    /// When this cycle put a refused `Stop` to a person: the question's key — the `Stop`'s
+    /// rule and the checks holding it — under which an `Accept` is remembered
+    /// ([`EnsembleCounters::record_held_stop_answer`]). `None` otherwise.
+    #[serde(default)]
+    pub held_stop: Option<String>,
 }
 
 impl EnsembleOutcome {
@@ -378,9 +383,11 @@ impl EnsemblePlan {
         } else {
             Vec::new()
         };
-        if self.settings.enabled {
-            self.escalate_held_stop(ctx, &checks, &mut records, &counters);
-        }
+        let held_stop = if self.settings.enabled {
+            self.escalate_held_stop(ctx, &checks, &mut records, &counters)
+        } else {
+            None
+        };
         if self.settings.enabled {
             for (key, rc) in &checks {
                 if rc.threshold.is_none() {
@@ -420,6 +427,7 @@ impl EnsemblePlan {
             gate_rounds,
             opinion_topup,
             refresh_topup,
+            held_stop,
         })
     }
 }
@@ -630,14 +638,15 @@ impl EnsemblePlan {
     /// values, and says what each answer does: `Stop` stops the worker (a person may always
     /// stop work), `Accept` leaves it running. It is asked whether or not the `human` rung is
     /// configured — without a person to answer, the run ends `NeedsHuman` and its worker is
-    /// stopped — and is not asked again once a person has accepted it for the same check.
+    /// stopped — and is not asked again once a person has accepted *this* question: the same
+    /// `Stop`'s rule, held by the same checks. Returns the question's key when it was asked.
     fn escalate_held_stop(
         &self,
         ctx: &EnsembleContext<'_>,
         checks: &BTreeMap<CheckKey, ResolvedCheck>,
         records: &mut Vec<CheckRecord>,
         counters: &EnsembleCounters,
-    ) {
+    ) -> Option<String> {
         let input = crate::policy::PolicyInput {
             checks,
             ..*ctx.policy
@@ -647,15 +656,26 @@ impl EnsemblePlan {
                 .into_iter()
                 .collect();
         let (_, held) = crate::policy::decide_with_holds(ctx.registry, &input, &extra);
-        let Some(stop) = held.first() else {
-            return;
-        };
-        let Some(first) = stop.holding.first() else {
-            return;
-        };
-        // A person who accepted this before has answered it: the worker runs on.
-        if counters.check(first).human.is_some() {
-            return;
+        let stop = held.first()?;
+        let first = stop.holding.first()?;
+        // The question, by the Stop's rule and the checks holding it. A person who accepted
+        // this question has answered it: the worker runs on. An acceptance given to another
+        // question about the same check does not answer this one.
+        let key = format!(
+            "{}|{}",
+            stop.rules
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+            stop.holding
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        if counters.held_stops_accepted.contains(&key) {
+            return None;
         }
         let describe = |key: &CheckKey| {
             let rc = checks.get(key);
@@ -694,18 +714,16 @@ impl EnsemblePlan {
                 "The worker appears stuck or off track ({reason}: {finding}), and aftman would \
                  stop it, but the Stop rests on checks it cannot act on: {holding}. Answer Stop \
                  to stop the worker — a person may always stop work. Accept leaves the worker \
-                 running although it appears stuck or off track, and this is not asked again \
-                 while the same check holds the Stop. Recheck asks for those checks to be \
-                 measured again."
+                 running although it appears stuck or off track, and this question is not \
+                 asked again while the same checks hold this Stop. Recheck asks for those \
+                 checks to be measured again."
             ),
             REFRESH_ERROR_CAP_BYTES,
         );
         let index = match records.binary_search_by(|record| record.check.cmp(first)) {
             Ok(index) => index,
             Err(index) => {
-                let Some(rc) = checks.get(first) else {
-                    return;
-                };
+                let rc = checks.get(first)?;
                 records.insert(
                     index,
                     CheckRecord {
@@ -736,6 +754,7 @@ impl EnsemblePlan {
             Some(earlier) => cap_bytes(&format!("{earlier}\n\n{ask}"), REFRESH_ERROR_CAP_BYTES),
             None => ask,
         });
+        Some(key)
     }
 }
 

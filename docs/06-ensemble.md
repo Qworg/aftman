@@ -930,8 +930,14 @@ Notes that follow directly from §2:
     uncertain checks hold the `Stop` and their values, that answering **`Stop`** stops the
     worker (a person may always stop work), and that **`Accept`** leaves a worker that appears
     stuck running. Without a person to answer, the run ends `NeedsHuman` and its worker is
-    stopped. After `Accept` (or `Guidance`), recorded against the holding check, it is not
-    asked again while that check holds the `Stop`
+    stopped. After `Accept` (or `Guidance`) to **this** question, it is not asked again: the
+    answer is remembered separately (`EnsembleCounters::held_stops_accepted`, `serde(default)`),
+    keyed by the refused `Stop`'s rule and the checks holding it (`EnsembleOutcome::held_stop`,
+    `Escalation::held_stop`). An acceptance of the check's uncertainty given to another question
+    (its in-band `RepeatContest`, say) does not silence it, and a different `Stop` held by the
+    same check — off track rather than stuck — is asked about afresh
+    (`an_earlier_accept_on_the_holding_check_does_not_silence_the_held_stop_question`,
+    `an_accepted_held_stop_is_not_asked_again_but_a_different_one_is`)
     (`a_stop_held_by_an_unresolved_check_is_put_to_a_person`,
     `a_stuck_worker_held_by_an_uncertain_inhibitor_is_put_to_a_person`).
 

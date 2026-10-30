@@ -131,6 +131,11 @@ pub struct Escalation {
     /// (`EnsembleOutcome::refresh_topup`). Empty otherwise, and in older snapshots.
     #[serde(default)]
     pub refresh_topup: Vec<CheckKey>,
+    /// For an ensemble escalation that put a refused `Stop` to a person: the question's key
+    /// (`EnsembleOutcome::held_stop`), under which an `Accept` is remembered. `None`
+    /// otherwise, and in older snapshots.
+    #[serde(default)]
+    pub held_stop: Option<String>,
     pub ask: String,
     pub jev_p: Option<f32>,
     pub opinions: Vec<Opinion>,
@@ -301,6 +306,7 @@ mod tests {
             ensemble_checks: Vec::new(),
             opinion_topup: 0,
             refresh_topup: Vec::new(),
+            held_stop: None,
             ask: "is it done?".into(),
             jev_p: Some(0.71),
             opinions: Vec::new(),
@@ -327,6 +333,7 @@ mod tests {
             ensemble_checks: Vec::new(),
             opinion_topup: 0,
             refresh_topup: Vec::new(),
+            held_stop: None,
             ask: "budget exhausted".into(),
             jev_p: None,
             opinions: Vec::new(),

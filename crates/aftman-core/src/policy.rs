@@ -489,6 +489,8 @@ pub fn decide(
 pub struct HeldStop {
     /// The refused directive.
     pub directive: Directive,
+    /// The rules whose proposals of it were refused.
+    pub rules: Vec<crate::ids::RuleId>,
     /// The checks the rules proposing it read.
     pub reads: Vec<CheckKey>,
     /// The unpermitted checks it rests on: what holds it.
@@ -550,6 +552,7 @@ pub fn decide_with_holds(
         }
         held.push(HeldStop {
             directive: decision.selected.clone(),
+            rules: stopping.iter().map(|p| p.rule.clone()).collect(),
             reads,
             holding,
         });

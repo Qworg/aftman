@@ -5353,10 +5353,15 @@ async fn a_stop_held_by_an_unresolved_check_is_put_to_a_person() {
             assert!(ask.contains(needle), "{needle}: {ask}");
         }
 
-        // Accepted: the worker runs on, and the question is not asked again.
+        // Accepted: the worker runs on, and the question is not asked again. (The runtime
+        // records the answer against the check and against the held Stop's question.)
         let keys = outcome.escalated_checks();
         let mut answered = outcome.counters.clone();
         answered.record_human_decision(&keys, &crate::assessment::HumanDecision::Accept);
+        answered.record_held_stop_answer(
+            outcome.held_stop.as_deref().unwrap_or_default(),
+            &crate::assessment::HumanDecision::Accept,
+        );
         s.ensemble = answered;
         s.cycle = AssessmentSeq(CYCLE.get() + 1);
         let plan = s.plan();
@@ -5367,4 +5372,83 @@ async fn a_stop_held_by_an_unresolved_check_is_put_to_a_person() {
         assert_eq!(next.escalations().count(), 0, "rung {human_rung}");
         assert_eq!(s.decide(&next).selected.name(), "Continue");
     }
+}
+
+#[tokio::test]
+async fn an_earlier_accept_on_the_holding_check_does_not_silence_the_held_stop_question() {
+    // Final verification, finding 2 (probe `probe_prior_accept_silences_the_held_stop_
+    // question`). A person accepted `needs_human`'s uncertainty earlier, answering an
+    // unrelated question (its in-band `RepeatContest`). Later the worker appears stuck, and
+    // the Stop rests on that same check. The earlier answer was about the uncertainty, not
+    // about leaving a stuck worker running: the held Stop is still put to a person.
+    let mut s = Scenario::finish_ready()
+        .with_worker()
+        .set(HUMAN, 0.75)
+        .set(STUCK, 0.97)
+        .reframable_all()
+        .answered(&[HUMAN], &crate::assessment::HumanDecision::Accept);
+    s.cycle = CYCLE;
+    let plan = s.plan();
+    let outcome = s
+        .resolve_plan(&plan, &answering_by(&plan, |p| Some(1.0 - p)))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let asks: Vec<&str> = outcome.escalations().map(|(_, ask)| ask).collect();
+    assert!(
+        asks.iter()
+            .any(|ask| ask.contains("The worker appears stuck or off track")),
+        "{asks:?}"
+    );
+    assert!(outcome.is_escalation(&s.decide(&outcome).selected));
+}
+
+#[tokio::test]
+async fn an_accepted_held_stop_is_not_asked_again_but_a_different_one_is() {
+    // Acceptance of a held Stop is remembered for that Stop — its rule and the checks
+    // holding it — and only for it. The same stuck worker held by the same check is not
+    // asked about again; an off-track Stop held by the same check is a different question.
+    let mut s = Scenario::finish_ready()
+        .with_worker()
+        .set(HUMAN, 0.75)
+        .set(STUCK, 0.97)
+        .reframable_all();
+    let plan = s.plan();
+    let outcome = s
+        .resolve_plan(&plan, &answering_by(&plan, |p| Some(1.0 - p)))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let key = outcome
+        .held_stop
+        .clone()
+        .unwrap_or_else(|| panic!("a held Stop"));
+    let mut counters = outcome.counters.clone();
+    counters.record_held_stop_answer(&key, &crate::assessment::HumanDecision::Accept);
+
+    // The same Stop, the same holding check: not asked again.
+    s.ensemble = counters.clone();
+    s.cycle = AssessmentSeq(CYCLE.get() + 1);
+    let plan = s.plan();
+    let again = s
+        .resolve_plan(&plan, &answering_by(&plan, |p| Some(1.0 - p)))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(again.escalations().count(), 0);
+    assert_eq!(s.decide(&again).selected.name(), "Continue");
+
+    // An off-track Stop held by the same check: asked.
+    let mut t = Scenario::finish_ready()
+        .with_worker()
+        .set(HUMAN, 0.75)
+        .set(STUCK, 0.05)
+        .set(OFF_TRACK, 0.97)
+        .reframable_all();
+    t.ensemble = counters;
+    t.cycle = AssessmentSeq(CYCLE.get() + 2);
+    let plan = t.plan();
+    let other = t
+        .resolve_plan(&plan, &answering_by(&plan, |p| Some(1.0 - p)))
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    assert!(other.held_stop.as_ref().is_some_and(|held| *held != key));
+    assert!(t.decide(&other).selected.name() == "Escalate");
 }

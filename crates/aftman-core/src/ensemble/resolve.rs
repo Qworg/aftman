@@ -819,13 +819,12 @@ async fn resolve_check(
     }
 
     // Measuring beats second-guessing: a decisive value about to act on a bare claim is
-    // re-measured first. Before an irreversible directive, a refresh a person authorised
-    // past the cap may be spent here, and only here.
+    // re-measured first.
     let unseen = plan.unseen_command && plan.has(EnsembleTrigger::Irreversible);
     if plan.has(EnsembleTrigger::ClaimOnlyEvidence)
         && !refresh_tried
         && let Some(refreshed) =
-            refresh_within(plan, cycle, settings, counters, source, &mut record, unseen).await?
+            refresh(plan, cycle, settings, counters, source, &mut record).await?
     {
         record.resolved = refreshed;
         return Ok(record);
@@ -986,31 +985,18 @@ async fn refresh(
     source: &dyn OpinionSource,
     record: &mut CheckRecord,
 ) -> Result<Option<ResolvedCheck>, SourceError> {
-    refresh_within(plan, cycle, settings, counters, source, record, false).await
-}
-
-/// R0, with the cap raised by the refreshes a person authorised for this check when
-/// `topped_up` (`CheckCounters::refresh_topup`).
-async fn refresh_within(
-    plan: &CheckPlan,
-    cycle: AssessmentSeq,
-    settings: &EnsembleSettings,
-    counters: &mut EnsembleCounters,
-    source: &dyn OpinionSource,
-    record: &mut CheckRecord,
-    topped_up: bool,
-) -> Result<Option<ResolvedCheck>, SourceError> {
     if !settings.has(Rung::RefreshEvidence) || plan.refresh_providers.is_empty() {
         return Ok(None);
     }
+    // The cap, raised by every refresh a person has authorised for this check
+    // (`CheckCounters::refresh_topup`). A granted refresh is spent by the next refresh
+    // attempt for the check, whichever path makes it — the `HumanRecheck` refresh a
+    // `Recheck` asks for, or the claim-only one before an irreversible directive — so it is
+    // never left unspent while the same question comes back.
     let used = counters.check(&plan.check).refreshes;
-    let cap = if topped_up {
-        settings
-            .max_evidence_refreshes_per_check
-            .saturating_add(counters.check(&plan.check).refresh_topup)
-    } else {
-        settings.max_evidence_refreshes_per_check
-    };
+    let cap = settings
+        .max_evidence_refreshes_per_check
+        .saturating_add(counters.check(&plan.check).refresh_topup);
     if used >= cap {
         record.limits.push(EnsembleLimit::RefreshCap { used, cap });
         return Ok(None);

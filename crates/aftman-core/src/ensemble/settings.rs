@@ -397,10 +397,10 @@ pub struct CheckCounters {
     pub recheck: bool,
     /// Refreshes a person has authorised beyond `max_evidence_refreshes_per_check`, by
     /// answering an escalation about command evidence the model was never shown with
-    /// `Recheck` or `ClaimComplete` (`EnsembleCounters::record_refresh_answer`). Spent only
-    /// where it is needed: re-measuring the check before an irreversible directive that
-    /// rests on it. Cost, never an outcome — the refresh must still produce a decisive value
-    /// on its own.
+    /// `Recheck` or `ClaimComplete` (`EnsembleCounters::record_refresh_answer`). It raises
+    /// the cap, so it is spent by the next refresh attempt for the check, whichever path
+    /// makes it. Cost, never an outcome — the refresh must still produce a decisive value on
+    /// its own.
     #[serde(default)]
     pub refresh_topup: u32,
 }

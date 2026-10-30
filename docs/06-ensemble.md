@@ -425,7 +425,7 @@ records it, the resolver applies it):
 | --- | --- |
 | `Accept` | For the rest of the run, whenever the check's measurement is not decisive it is held as `HumanDecided { Accept }` and **not escalated again**: no repeat of the question every cycle. Acceptance never permits it — it was held, it stays held, it can fire no rule — and an R0 refresh may still run within the cap. A later *decisive* measurement is Jev's own and is treated like any other: acceptance changes nothing about it in either direction, so a spent opinion budget or repeated contests on a decisive value still escalate, whatever was accepted earlier. |
 | `Guidance` | `Accept`, and the text is delivered to the worker as a human steer (or recorded as `guidance_not_delivered` when no worker is running). The check records `HumanDecided { Guidance }`; the text itself is not repeated in every `ENSEMBLE_RESOLVED` — `ESCALATION_ANSWERED` has it once. |
-| `Recheck` | The next resolved cycle runs R0 for the check (the `HumanRecheck` trigger), in either band, **within the refresh cap**: a spent cap records `limit: refresh_cap` and refreshes nothing. Forgets an earlier acceptance. The blanket M3 re-run of providers is not done: the refresh is the check's own. The `before_finish` gate is re-armed. |
+| `Recheck` | The next resolved cycle runs R0 for the check (the `HumanRecheck` trigger), in either band, **within the refresh cap** (plus any refresh a person authorised, §6): a spent cap records `limit: refresh_cap` and refreshes nothing. Forgets an earlier acceptance. The blanket M3 re-run of providers is not done: the refresh is the check's own. The `before_finish` gate is re-armed, except for an escalation about command evidence the model was never shown (§6). |
 | `ClaimComplete` | Exactly `Recheck`. It buys a measurement and **satisfies no conjunct**: a refresh that lands in the band again leaves the check held, and the run does not finish. Only a decisive fresh value can. |
 
 To an escalation raised because the opinion budget is spent, `Recheck` and `ClaimComplete` also
@@ -765,10 +765,18 @@ loop:
   show. `Recheck` or `ClaimComplete` grants each re-measurable listed check one more refresh,
   once (`EnsembleOutcome::refresh_topup`, `Escalation::refresh_topup`,
   `EnsembleCounters::record_refresh_answer`, `CheckCounters::refresh_topup`, and a `Notification`
-  with `code: "refresh_cap_topped_up"`), spent only where it is needed — re-measuring the check
-  before the next irreversible directive resting on it. It authorises cost, not an outcome: the
-  refreshed value must clear the band on its own, and a failing command keeps the run from
-  finishing (`recheck_on_unseen_command_evidence_tops_up_a_refresh_that_must_still_measure`).
+  with `code: "refresh_cap_topped_up"`). It raises the check's refresh cap, so it is spent by the
+  next refresh attempt for that check, whichever path makes it — the `HumanRecheck` refresh the
+  `Recheck` itself asks for, or the claim-only one before an irreversible directive — and never
+  left unspent while the same question comes back (an earlier revision let only the claim-only
+  path spend it, so with an `on_demand` provider each `Recheck` grew the top-up and ran nothing:
+  `a_refresh_top_up_is_spent_by_the_next_refresh_whichever_path_makes_it`). Answering this
+  escalation does not re-arm the `before_finish` providers, as other `Recheck`s do: the refresh
+  re-runs the check's own command just before the `Finish` resting on it, and re-arming would make
+  that `Finish` provisional, spend the refresh on it, and hold the executed one again. It
+  authorises cost, not an outcome: the refreshed value must clear the band on its own, and a
+  failing command keeps the run from finishing
+  (`recheck_on_unseen_command_evidence_tops_up_a_refresh_that_must_still_measure`).
   `Accept` keeps it held, and the question is asked again. Disabled, nothing changes
   (`a_finish_never_executes_over_command_evidence_jev_was_not_shown`).
 - **A provisional `Finish` is not about to act.** When `before_finish` providers exist and have

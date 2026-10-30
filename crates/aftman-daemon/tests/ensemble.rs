@@ -3728,6 +3728,16 @@ fn counting_audit(
     fail_from: u32,
     fail_to: u32,
 ) -> Result<EvidencePlan, Box<dyn std::error::Error>> {
+    counting_audit_when(dir, "before_finish", fail_from, fail_to)
+}
+
+/// [`counting_audit`], run automatically at `run_when`.
+fn counting_audit_when(
+    dir: &Path,
+    run_when: &str,
+    fail_from: u32,
+    fail_to: u32,
+) -> Result<EvidencePlan, Box<dyn std::error::Error>> {
     let script = dir.join("audit.sh");
     let count = dir.join("audit-runs");
     write_script(
@@ -3746,7 +3756,7 @@ fn counting_audit(
 [[evidence.commands]]
 id = "audit"
 argv = ["{}"]
-run_when = "before_finish"
+run_when = "{run_when}"
 success_exit_codes = [0]
 "#,
             script.display()
@@ -3891,6 +3901,70 @@ async fn recheck_on_unseen_command_evidence_tops_up_a_refresh_that_must_still_me
             text.contains("audit clean") || text.contains("FAILED")
         });
         assert!(shown);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_refresh_top_up_is_spent_by_the_next_refresh_whichever_path_makes_it() -> TestResult {
+    // Final verification, finding 1 (probe `probe_unseen_with_on_demand_provider_and_
+    // recheck`). The audit is `on_demand`, so no provisional Finish delays the executed one.
+    // `Recheck` sets `recheck`, and the next cycle's `HumanRecheck` refresh — not the
+    // claim-only one — is the first to try: it used to ignore the top-up, hit the spent cap,
+    // and leave the check held, so the same question came back with the top-up growing and
+    // no refresh ever run. Now a granted refresh is spent by the next refresh attempt for
+    // that check, whichever path makes it: one Recheck, exactly one more refresh. (Audit runs
+    // 1-3 are the in-band refreshes; from run 4 on it passes, or it fails.)
+    for (fail_to, finishes) in [(3_u32, true), (1000, false)] {
+        let mut fx = Fixture::new(audited_definitions()?, EvidencePlan::default())?;
+        fx.evidence = counting_audit_when(fx.dir.path(), "on_demand", 4, fail_to)?;
+        let model = Arc::new(unseen_audit_model());
+        let rt = fx.runtime(
+            config(|c| c.max_workers = 12),
+            settings(|_| {}),
+            Arc::clone(&model) as Arc<dyn DecisionModel>,
+            Arc::new(SimulatedWorker::instant()),
+        );
+        let mut run = RunGuard::launch(&fx, rt).await?;
+        let id = escalation(&fx, 1).await?;
+        assert_eq!(
+            model.calls(Purpose::Refresh).len(),
+            3,
+            "the cap, spent in band"
+        );
+        run.answer(id, HumanDecision::Recheck).await?;
+        if finishes {
+            let outcome = run.join().await?;
+            assert_eq!(outcome.status, FactoryStatus::Finished);
+            assert_eq!(model.calls(Purpose::Refresh).len(), 4, "exactly one more");
+        } else {
+            // The re-measured audit fails: no Finish. Later Finish attempts on the
+            // claim-only value are held and asked again; each Recheck buys exactly one more
+            // refresh, spent, never an unspent top-up that keeps growing.
+            for nth in 2..=3 {
+                let id = escalation(&fx, nth).await?;
+                assert_eq!(
+                    model.calls(Purpose::Refresh).len(),
+                    3 + nth - 1,
+                    "every granted refresh was spent before asking again"
+                );
+                run.answer(id, HumanDecision::Recheck).await?;
+            }
+            let _ = escalation(&fx, 4).await?;
+            assert_eq!(model.calls(Purpose::Refresh).len(), 6);
+            assert!(!finished(&fx));
+            run.cancel().await?;
+        }
+        assert!(
+            fx.refreshes(READY).iter().any(|(_, entry)| {
+                entry
+                    .refresh
+                    .as_ref()
+                    .and_then(|r| r.outcome.new_p)
+                    .is_some_and(|p| p > 0.9 || p < 0.1)
+            }),
+            "the audit was shown, and measured"
+        );
     }
     Ok(())
 }

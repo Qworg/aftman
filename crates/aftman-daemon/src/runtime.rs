@@ -1757,9 +1757,15 @@ impl FactoryRuntime {
                 } else {
                     // The refresh is the ladder's (R0, per check, capped), not the blanket
                     // re-run of every provider. The `before_finish` gate is re-armed all the
-                    // same: a `Finish` after a person's claim runs those providers again.
+                    // same: a `Finish` after a person's claim runs those providers again —
+                    // except for an escalation about command output the model was never
+                    // shown, whose answer buys exactly that check's refresh: re-arming would
+                    // make the next Finish provisional, spend the refresh on it, and leave
+                    // the executed Finish after it held again (`docs/06-ensemble.md` §6).
                     self.resume(state, job, ls, false).await?;
-                    ls.before_finish_ran = false;
+                    if state.escalations[index].refresh_topup.is_empty() {
+                        ls.before_finish_ran = false;
+                    }
                 }
             }
             HumanDecision::Guidance { text } => {

@@ -484,28 +484,38 @@ What the reviews turned up that the design did not:
   refused.
 - **The cycle's assessment never shows command output to the model**, contrary to
   docs/03-jev.md §5. With the ensemble on, a check whose command output was not shown is
-  re-measured by R0 before an irreversible directive, or held. With it off, the gap remains
-  (below).
+  re-measured by R0 before an irreversible directive, or held. With it off, the gap remained
+  until the follow-up below grouped the assessment by selection.
 - **A guard that cannot run must hold, not pass.** That covers a spent opinion budget, a spent
   refresh cap, and command evidence the model was never shown. A person's answer may authorise
   more *cost* (a one-time top-up of opinions or refreshes), never an outcome.
 - **Never drop a future that contains an append or a provider run** (02-lld.md §11). An outer
   timeout around a refresh crashed a run on a slow disk and orphaned provider process groups.
 
-Found during M5 and outside it (they predate M5 on `main`); tracked as follow-ups:
+Found during M5 and outside it (they predate M5 on `main`), and fixed after it:
 
-- With the ensemble **off**, `before_finish` output never reaches the model except through the
-  parsed test summary (docs/03-jev.md §5).
-- `before_finish_ran` is set once and never reset when a later worker runs, so a second `Finish`
-  skips the `before_finish` providers (`runtime.rs`).
-- The runtime never sets `counters.verifier_completed`, so the `verification_completed` disjunct of
-  `Finish` is unreachable.
-- At the worker limit, a decisively insufficient `documentation_sufficient` still lets `Finish` win,
-  because only the `StartWorker` is refused. This is not the inhibition docs/05-responsibilities.md
-  §6.3 describes.
-- `aftman-cli/tests/e2e.rs` `stop_and_auto_start_during_a_daemon_shutdown_wait_for_it`
-  intermittently exceeds its 75 s shutdown wait under full-suite load. It runs with the ensemble off,
-  and no M5 code is on its path.
+- **`before_finish` output now reaches the model with the ensemble off.** A cycle asks one request
+  per distinct evidence selection, so each check is asked over the state its own selection
+  describes (docs/03-jev.md §5, as built), and the re-assessment after a `before_finish` provider
+  runs shows its output to the checks that select it. `assessed_states` is the per-check state
+  actually sent, so `ClaimOnlyEvidence`, `CheckPlan::unseen_command` and R2 read it; every request
+  counts against the budget. An R0 refresh asks over the check's own selection too. The bundled
+  checks select no command output, so with them a `before_finish` provider still reaches the model
+  only through `test_summary`; a definition that wants `ready_to_finish` to read it selects
+  `command:<id>` (docs/05-responsibilities.md §3). `fa4aa35`, `f8d054c`, `b07e36d`.
+- **A worker starting resets `before_finish_ran`**, so a second `Finish` after a later worker runs
+  the `before_finish` providers again first (docs/06-ensemble.md §6.1). `c0183fa`.
+- **The runtime sets `counters.verifier_completed`** when a verify worker exits successfully with
+  output — completed, not passed: the `Finish` conjuncts are scored over its report — and a later
+  code worker resets it (docs/05-responsibilities.md §6.2, docs/04-workers.md §6). `13aa31b`.
+- **At the worker limit a `Finish` no longer wins because the work-starting proposal above it was
+  refused**: policy escalates, naming the rule that still asks for work. This changes behaviour
+  with the ensemble off (docs/05-responsibilities.md §6.3). `d06be92`.
+- **`aftman stop` waits for the daemon it stopped, not for any daemon on its paths.** The
+  intermittent `stop_and_auto_start_during_a_daemon_shutdown_wait_for_it` failure was this race,
+  not load: a command that auto-starts a successor on the same paths ~0.1 s after the old daemon
+  lets go left a `stop` that missed that gap waiting 75 s on the successor (docs/07-surfaces.md §1).
+  `2ecdd64`.
 
 ## M6 — herdr
 

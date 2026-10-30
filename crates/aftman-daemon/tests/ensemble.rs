@@ -4774,6 +4774,91 @@ async fn a_verifier_that_never_completes_is_retried_once_and_the_run_says_why() 
 }
 
 #[tokio::test]
+async fn recheck_authorises_one_more_verifier_after_its_retry() -> TestResult {
+    // Review round 3, M1. A verifier that failed to complete twice on finished work — two
+    // timeouts of a slow suite, say — left the run on "nothing can make progress", and
+    // `Accept`, `Recheck` and `ClaimComplete` all resumed into the same refusal: only `Stop`
+    // ended it. `Recheck` (and `ClaimComplete`) now authorise one more verifier, a cost and
+    // never an outcome: it must still complete, and here it reports PASS and the run finishes.
+    // `Accept` authorises nothing.
+    for (answer, finishes) in [
+        (HumanDecision::Recheck, true),
+        (HumanDecision::ClaimComplete, true),
+        (HumanDecision::Accept, false),
+    ] {
+        let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+        let rt = fx.runtime(
+            config(|c| c.verify = VerifyPolicy::Always),
+            no_refreshes(),
+            Arc::new(R2Model::finish_ready()) as Arc<dyn DecisionModel>,
+            Arc::new(VerdictsWorker::new(&[None, None, Some("PASS")])),
+        );
+        let mut run = RunGuard::launch(&fx, rt).await?;
+        let id = escalation(&fx, 1).await?;
+        assert_eq!(tasks(&fx), vec!["Code", "Verify", "Verify"], "{answer:?}");
+        run.answer(id, answer.clone()).await?;
+        if finishes {
+            let outcome = run.join().await?;
+            assert_eq!(outcome.status, FactoryStatus::Finished, "{answer:?}");
+            assert_eq!(
+                tasks(&fx),
+                vec!["Code", "Verify", "Verify", "Verify"],
+                "{answer:?}"
+            );
+            assert!(
+                fx.of_kind(EventKind::Notification)
+                    .iter()
+                    .any(|e| e.payload["code"] == "verifier_retry_authorised"),
+                "{answer:?}"
+            );
+        } else {
+            escalation(&fx, 2).await?;
+            assert_eq!(tasks(&fx), vec!["Code", "Verify", "Verify"], "{answer:?}");
+            run.cancel().await?;
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn under_verify_always_the_worker_limit_names_the_rule_still_asking_for_work() -> TestResult {
+    // Review round 3, M2. With documentation decisively insufficient at the worker limit,
+    // `when_asked` named `quality.documentation:insufficient` (§6.3), but under `always` the
+    // `Finish` is refused by `VerificationIncomplete` too, the named-rule path was skipped,
+    // and the question said only that verification was missing. The rule is named under both.
+    for verify in [VerifyPolicy::WhenAsked, VerifyPolicy::Always] {
+        let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+        let rt = fx.runtime(
+            config(|c| {
+                c.max_workers = RunConfig::default().max_workers;
+                c.verify = verify;
+            }),
+            settings(|s| s.enabled = false),
+            Arc::new(R2Model::finish_ready().with(DOCS, 0.30)) as Arc<dyn DecisionModel>,
+            Arc::new(SimulatedWorker::instant()),
+        );
+        let outcome = fx.run(rt).await?;
+        assert_eq!(outcome.status, FactoryStatus::NeedsHuman, "{verify:?}");
+        let raised = fx.of_kind(EventKind::EscalationRaised);
+        let last = raised.last().ok_or("an escalation")?;
+        let reason = last.payload["reason"].as_str().unwrap_or_default();
+        let ask = last.payload["ask"].as_str().unwrap_or_default();
+        assert!(
+            reason.contains("quality.documentation:insufficient"),
+            "{verify:?}: {reason}"
+        );
+        assert!(
+            ask.contains("quality.documentation:insufficient"),
+            "{verify:?}: {ask}"
+        );
+        if verify == VerifyPolicy::Always {
+            assert!(ask.contains("verify = \"always\""), "{ask}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn verify_never_runs_no_verifier_though_the_model_judges_one_needed() -> TestResult {
     // `verify = "never"` was not enforced: the built-in rule proposed a verifier whenever the
     // model judged one warranted. With `needs_verification` high (0.90), `never` must still

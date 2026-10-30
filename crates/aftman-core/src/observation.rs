@@ -65,8 +65,8 @@ pub struct Counters {
     pub verified_since_code: bool,
     /// Verify workers started since the last code worker did. Bounds the retry of a verifier
     /// that did not complete under `verify = "always"` (`docs/05-responsibilities.md` §6.1).
-    /// Defaulted, so a snapshot without it decodes (as no verifier yet, which allows one
-    /// retry at most).
+    /// Defaulted, so a snapshot without it decodes; read it through
+    /// [`Counters::verifiers_on_this_code`], which counts such a snapshot's verifier.
     #[serde(default)]
     pub verifiers_since_code: u32,
     pub steers_sent: u32,
@@ -97,6 +97,33 @@ impl Counters {
     #[must_use]
     pub const fn code_workers_run(&self) -> u32 {
         self.workers_run.saturating_sub(self.verifiers_run)
+    }
+
+    /// Verify workers started on the current code: [`Counters::verifiers_since_code`], and at
+    /// least one whenever [`Counters::verified_since_code`] says a verifier has started — a
+    /// snapshot from before the count existed decodes it as zero, which would allow it a
+    /// retry too many.
+    #[must_use]
+    pub fn verifiers_on_this_code(&self) -> u32 {
+        self.verifiers_since_code
+            .max(u32::from(self.verified_since_code))
+    }
+
+    /// Record that a worker started. A code worker is an attempt and moves the code on, so
+    /// what a verifier checked is no longer the tree; a verifier counts toward this code's.
+    /// The one place these counters move, so the runtime and the tests cannot disagree.
+    pub fn record_worker_started(&mut self, task: TaskKind) {
+        self.workers_run += 1;
+        if task == TaskKind::Code {
+            self.attempts += 1;
+            self.verifier_completed = false;
+            self.verified_since_code = false;
+            self.verifiers_since_code = 0;
+        } else {
+            self.verifiers_run += 1;
+            self.verifiers_since_code = self.verifiers_on_this_code() + 1;
+            self.verified_since_code = true;
+        }
     }
 }
 

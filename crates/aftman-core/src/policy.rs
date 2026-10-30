@@ -327,17 +327,37 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
     // specific `ask` from `core.human-escalation` was discarded in favour of
     // "worker budget is exhausted".
     if worker_limit_hit && input.active_worker.is_none() && surviving.is_empty() {
-        // When `verify = "always"` is what holds the `Finish`, the job may well look complete:
-        // say what is actually missing, a verifier that completed.
-        let ask = verification_hold(input, &suppressed).map_or_else(
-            || "The worker budget is exhausted and the job does not look complete.".to_owned(),
-            |held| format!("The worker budget is exhausted. {held}"),
-        );
+        // A rule that still asks for work over a `Finish` (§6.3) is named first, as when the
+        // `Finish` survives: under `verify = "always"` the `Finish` is refused here too, and
+        // the rule used to go unnamed. When `always` holds the `Finish`, the job may well look
+        // complete: say what is missing, a verifier that completed.
+        let held = verification_hold(input, &suppressed);
+        let blocked = proposals
+            .iter()
+            .find(|p| matches!(p.directive, Directive::Finish { .. }))
+            .and_then(|finish| refused_work_outranking(proposals, &suppressed, finish));
+        let (reason, ask) = match (blocked, held) {
+            (Some(blocked), held) => (
+                format!(
+                    "worker limit reached while `{}` still asks for work",
+                    blocked.rule
+                ),
+                held.map_or_else(
+                    || worker_limit_ask(input, blocked),
+                    |held| format!("{} {held}", worker_limit_ask(input, blocked)),
+                ),
+            ),
+            (None, Some(held)) => (
+                "worker limit reached before completion".to_owned(),
+                format!("The worker budget is exhausted. {held}"),
+            ),
+            (None, None) => (
+                "worker limit reached before completion".to_owned(),
+                "The worker budget is exhausted and the job does not look complete.".to_owned(),
+            ),
+        };
         return PolicyDecision {
-            selected: Directive::Escalate {
-                reason: "worker limit reached before completion".into(),
-                ask,
-            },
+            selected: Directive::Escalate { reason, ask },
             considered: proposals.to_vec(),
             suppressed,
             invariants,
@@ -497,7 +517,7 @@ fn verification_hold(input: &PolicyInput<'_>, suppressed: &[Suppression]) -> Opt
     if !held {
         return None;
     }
-    let why = if input.counters.verifiers_since_code > VERIFIER_RETRIES {
+    let why = if input.counters.verifiers_on_this_code() > VERIFIER_RETRIES {
         "the verifier that ran since the last code worker did not complete (it failed, timed \
          out, was stopped, or printed nothing), and neither did its retry"
     } else if input.counters.verified_since_code {
@@ -754,13 +774,29 @@ fn resolution_changes(
 fn verification_already_run(input: &PolicyInput<'_>) -> bool {
     let retry = input.config.verify == crate::job::VerifyPolicy::Always
         && !input.counters.verifier_completed
-        && input.counters.verifiers_since_code <= VERIFIER_RETRIES;
+        && input.counters.verifiers_on_this_code() <= VERIFIER_RETRIES;
     input.counters.verified_since_code && !retry
 }
 
 /// How many times `verify = "always"` retries a verifier that did not complete, per state of
 /// the code.
 pub const VERIFIER_RETRIES: u32 = 1;
+
+/// A person's `Recheck` or `ClaimComplete` authorises one more verifier when `verify =
+/// "always"` holds the `Finish` and the verifier and its retry have not completed on this
+/// code. Without it no answer but `Stop` moved such a run. Like an opinion or refresh
+/// top-up (`docs/06-ensemble.md` §6), it authorises a cost, never an outcome: the verifier
+/// must still complete, and the `Finish` still rests on what it reports. `true` when granted.
+pub fn grant_verifier_retry(counters: &mut Counters, config: &RunConfig) -> bool {
+    let held = config.verify == crate::job::VerifyPolicy::Always
+        && counters.verified_since_code
+        && !counters.verifier_completed
+        && counters.verifiers_on_this_code() > VERIFIER_RETRIES;
+    if held {
+        counters.verifiers_since_code = VERIFIER_RETRIES;
+    }
+    held
+}
 
 /// Whether a proposal is refused by a hard invariant. `None` means it survives.
 fn refusal(
@@ -1853,6 +1889,50 @@ mod tests {
             assert!(ask.contains(why), "{ask}");
             assert!(!ask.contains("does not look complete"), "{ask}");
         }
+    }
+
+    #[test]
+    fn an_old_snapshot_gets_one_verifier_retry_not_two() {
+        // Review round 3, M3. A snapshot from before `verifiers_since_code` existed, taken
+        // after a verifier started, decoded the count as zero, so the cap allowed a verifier at
+        // zero and again at one: two retries. The verifier it records now counts.
+        let registry = crate::responsibility::ResponsibilityRegistry::builtin();
+        let o = observation();
+        let config = RunConfig {
+            verify: crate::job::VerifyPolicy::Always,
+            max_workers: 10,
+            ..RunConfig::default()
+        };
+        let checks = finish_ready_needing_no_verification();
+        let current = Counters {
+            workers_run: 2,
+            attempts: 1,
+            verifiers_run: 1,
+            verified_since_code: true,
+            ..Counters::default()
+        };
+        let mut json = serde_json::to_value(&current).expect("counters serialize");
+        json.as_object_mut()
+            .expect("an object")
+            .remove("verifiers_since_code");
+        let mut counters: Counters = serde_json::from_value(json).expect("an old snapshot decodes");
+        assert_eq!(counters.verifiers_since_code, 0);
+        assert_eq!(counters.verifiers_on_this_code(), 1);
+
+        let mut retries = 0;
+        loop {
+            let decision = super::decide(&registry, &input(&o, &counters, &config, &checks), &[]);
+            match decision.selected {
+                Directive::Verify { .. } => {
+                    retries += 1;
+                    assert!(retries <= 1, "retried more than once");
+                    counters.record_worker_started(crate::job::TaskKind::Verify);
+                }
+                Directive::Escalate { .. } => break,
+                other => panic!("selected {other:?}"),
+            }
+        }
+        assert_eq!(retries, 1);
     }
 
     #[test]

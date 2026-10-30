@@ -268,7 +268,9 @@ Rules:
   a verifier that did not complete may be retried once on the same code
   (`counters.verifiers_since_code`), and a retry that does not complete either is put to a
   person, with the question saying so
-  (`a_verifier_that_never_completes_is_retried_once_and_the_run_says_why`);
+  (`a_verifier_that_never_completes_is_retried_once_and_the_run_says_why`), whose `Recheck`
+  or `ClaimComplete` authorises one more verifier and whose `Accept` does not
+  (`recheck_authorises_one_more_verifier_after_its_retry`);
 - a verifier that modifies the repository is a policy violation: the runtime diffs the tree before
   and after and records `verifier_mutated_repo` as an event, and the verification is treated as
   inconclusive rather than as a pass;

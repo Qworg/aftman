@@ -790,8 +790,9 @@ pub mod builtin {
             // depend on a verifier hold — without waiting for the model to judge one needed.
             // Without that second case, a model that said "no verification needed" left nothing
             // that could make progress. A verifier that ran since the last code worker but did
-            // not complete may be retried under `always` (`verification_already_run` in
-            // policy); `max_workers` bounds that.
+            // not complete may be retried once under `always` (`verification_already_run` and
+            // `VERIFIER_RETRIES` in policy), and a person may authorise one more
+            // (`grant_verifier_retry`).
             let always_pending =
                 input.config.verify == VerifyPolicy::Always && !input.counters.verifier_completed;
             if input.counters.verified_since_code && !always_pending {

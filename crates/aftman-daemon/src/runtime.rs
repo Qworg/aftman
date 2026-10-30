@@ -1750,6 +1750,22 @@ impl FactoryRuntime {
             }
             HumanDecision::Accept => self.resume(state, job, ls, false).await?,
             HumanDecision::Recheck | HumanDecision::ClaimComplete => {
+                // Under `verify = "always"`, with the verifier and its retry not completed on
+                // this code, the answer authorises one more verifier — a cost, never an outcome
+                // (`docs/05-responsibilities.md` §6.1). Decided in core.
+                if aftman_core::policy::grant_verifier_retry(&mut state.counters, &self.deps.config)
+                {
+                    self.emit(
+                        state,
+                        EventKind::Notification,
+                        json!({
+                            "code": "verifier_retry_authorised",
+                            "message": "one more verifier authorised by a person's answer",
+                            "escalation_id": escalation_id.to_string(),
+                        }),
+                    )
+                    .await?;
+                }
                 if ensemble_checks.is_empty() {
                     self.resume(state, job, ls, true).await?;
                 } else {
@@ -2718,18 +2734,8 @@ impl FactoryRuntime {
         record.started_at = Some(self.now());
         record.artifact_ref = self.deps.worker.artifact_ref();
         state.workers.push(record);
-        state.counters.workers_run += 1;
-        if task == TaskKind::Code {
-            state.counters.attempts += 1;
-            // What a verifier checked is no longer the tree once code work starts again.
-            state.counters.verifier_completed = false;
-            state.counters.verified_since_code = false;
-            state.counters.verifiers_since_code = 0;
-        } else {
-            state.counters.verifiers_run += 1;
-            state.counters.verified_since_code = true;
-            state.counters.verifiers_since_code += 1;
-        }
+        // What a verifier checked is no longer the tree once code work starts again.
+        state.counters.record_worker_started(task);
 
         self.emit(
             state,

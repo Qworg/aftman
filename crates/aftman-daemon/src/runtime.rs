@@ -1044,7 +1044,8 @@ impl FactoryRuntime {
                     (checks, Some(answers), asked.model, asked.usage)
                 }
                 // No guesses: an empty check set can only produce conservative directives.
-                None => (BTreeMap::new(), None, asked.model, usage_default()),
+                // The tokens are those of the requests that were made, if any.
+                None => (BTreeMap::new(), None, asked.model, asked.usage),
             };
 
             // ---- record the assessment --------------------------------------
@@ -2051,7 +2052,10 @@ impl FactoryRuntime {
     /// and a cycle that could not ask every request has no answers, exactly as on a model
     /// failure — so policy is handed an empty check set and its budget invariant escalates.
     /// A failed request ends the cycle's asking too; later requests are not made, since
-    /// their answers could not be used.
+    /// their answers could not be used. The failure counters move once per cycle: a cycle
+    /// with a failed request counts once (as a model or a budget failure), and only a cycle
+    /// whose requests all succeeded resets them. The tokens reported are summed over the
+    /// requests made, a partly failed cycle's included.
     async fn ask_assessment(
         &self,
         state: &mut RunState,
@@ -2095,7 +2099,6 @@ impl FactoryRuntime {
             ls.assessments += 1;
             match result {
                 Ok(answered) => {
-                    state.counters.consecutive_model_failures = 0;
                     // Only what this request asked: an answer to a question it did not ask
                     // is ignored (`AGENTS.md`, additive change), and must not stand in for
                     // the value another request measured.
@@ -2128,10 +2131,20 @@ impl FactoryRuntime {
                     // event kinds rather than one `Error` with a code inside.
                     self.emit(state, model_error_kind(&error), model_error_payload(&error))
                         .await?;
-                    return Ok(CycleAnswers::none("unavailable"));
+                    // The tokens of the requests that were made are still reported.
+                    return Ok(CycleAnswers {
+                        usage,
+                        ..CycleAnswers::none("unavailable")
+                    });
                 }
             }
         }
+        // The failure counters are per cycle, not per request: only a cycle whose requests
+        // all succeeded resets them. Reset by a request that succeeded before a later one
+        // failed, a model failing the same request every cycle would never count to three,
+        // and `model_unavailable` would never fire.
+        state.counters.consecutive_model_failures = 0;
+        state.counters.consecutive_budget_failures = 0;
         Ok(CycleAnswers {
             answers: Some(answers),
             model: model.unwrap_or_default(),
@@ -3569,10 +3582,6 @@ fn escalation_kind(reason: &str) -> EscalationKind {
     } else {
         EscalationKind::Check
     }
-}
-
-fn usage_default() -> aftman_core::model::Usage {
-    aftman_core::model::Usage::default()
 }
 
 /// The mission sent to a coding worker.

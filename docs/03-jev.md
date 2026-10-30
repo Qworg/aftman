@@ -214,10 +214,17 @@ grouping was built. An operator's definition that names its own `evidence` adds 
   part way, or a request fails — has no answers, exactly as a failed single request had: policy is
   handed an empty check set, so only conservative directives can follow, and the budget invariant
   escalates once the budget is spent. The requests after a failed one are not made.
+- **Failures count per cycle.** `consecutive_model_failures` and `consecutive_budget_failures`
+  (§4, [05-responsibilities.md §6.1](05-responsibilities.md)) move once per cycle: a cycle with a
+  failed request counts once, as a model failure or — when the request budget refused it — as a
+  budget failure, and only a cycle whose requests all succeeded resets both. An earlier revision
+  reset them on each request that succeeded, so a model rejecting a cycle's second request every
+  time never reached three failures, and `model_unavailable` never fired.
 - **What was sent is recorded.** `ASSESSMENT_COMPLETED` carries `requests`: for each, the checks it
   asked and the `state_digest` of its state ([06-ensemble.md §8](06-ensemble.md)). A cycle of one
   request records the same digest as `state_digest`, as before; a cycle of several has none at
-  the top level, because no single state was sent. `input_tokens` and `output_tokens` are summed.
+  the top level, because no single state was sent. `input_tokens` and `output_tokens` are summed
+  over the requests made, a partly failed cycle's included.
 
 So a check is shown the output of every command provider it selects that has run, in the cycle's
 own assessment. **A `before_finish` provider's output reaches the `Finish` that waited for it** —

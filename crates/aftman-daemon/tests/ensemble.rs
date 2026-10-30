@@ -4705,6 +4705,75 @@ async fn verify_always_retries_a_verifier_that_said_nothing() -> TestResult {
 }
 
 #[tokio::test]
+async fn verify_always_verifies_wherever_when_asked_does() -> TestResult {
+    // Review round 2, N1. The required verifier waited for every `Finish` conjunct that does
+    // not depend on a verifier, and returned before the `:warranted` logic: a calibrated model
+    // that holds `tests_sufficient` low until it has seen a verification ("…is its
+    // verification failing or absent?") and judges one needed got one under `when_asked`
+    // but, under `always`, three code workers and "the job does not look complete". `always`
+    // now verifies wherever `when_asked` does. Ensemble off and on.
+    for verify in [VerifyPolicy::WhenAsked, VerifyPolicy::Always] {
+        for enabled in [false, true] {
+            let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+            let model = R2Model::finish_ready()
+                .with(NEEDS_VERIFICATION, 0.90)
+                .assess_rule(|key, state, _| {
+                    (*key == CheckKey::from(TESTS) && !state.contains("VERDICT: PASS"))
+                        .then_some(0.40)
+                });
+            let rt = fx.runtime(
+                config(|c| c.verify = verify),
+                settings(|s| s.enabled = enabled),
+                Arc::new(model) as Arc<dyn DecisionModel>,
+                Arc::new(VerdictsWorker::new(&[Some("PASS")])),
+            );
+            let outcome = fx.run(rt).await?;
+            let what = format!("verify={verify:?} enabled={enabled}");
+            assert_eq!(outcome.status, FactoryStatus::Finished, "{what}");
+            assert_eq!(tasks(&fx), vec!["Code", "Verify"], "{what}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_verifier_that_never_completes_is_retried_once_and_the_run_says_why() -> TestResult {
+    // Review round 2, N2. A verifier that never completes was retried under `always` until
+    // the worker limit — with this fixture's `max_workers` of 30, twenty-nine verifiers in a
+    // row — and the escalation then said "the job does not look complete", though the job
+    // looked complete and a completed verifier was what was missing. It is now retried once
+    // per state of the code, and the question says what holds the `Finish`.
+    for enabled in [false, true] {
+        let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+        let rt = fx.runtime(
+            config(|c| c.verify = VerifyPolicy::Always),
+            settings(|s| s.enabled = enabled),
+            Arc::new(R2Model::finish_ready()) as Arc<dyn DecisionModel>,
+            Arc::new(VerdictsWorker::new(&[None])),
+        );
+        let outcome = fx.run(rt).await?;
+        assert_eq!(
+            outcome.status,
+            FactoryStatus::NeedsHuman,
+            "enabled={enabled}"
+        );
+        assert_eq!(
+            tasks(&fx),
+            vec!["Code", "Verify", "Verify"],
+            "enabled={enabled}"
+        );
+        let raised = fx.of_kind(EventKind::EscalationRaised);
+        let ask = raised
+            .last()
+            .and_then(|e| e.payload["ask"].as_str())
+            .unwrap_or_default();
+        assert!(ask.contains("verify = \"always\""), "{ask}");
+        assert!(ask.contains("neither did its retry"), "{ask}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn verify_never_runs_no_verifier_though_the_model_judges_one_needed() -> TestResult {
     // `verify = "never"` was not enforced: the built-in rule proposed a verifier whenever the
     // model judged one warranted. With `needs_verification` high (0.90), `never` must still

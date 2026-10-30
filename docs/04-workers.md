@@ -254,13 +254,21 @@ Rules:
 
 - the verifier **must not** be the same backend as the coding worker; the runtime enforces this
   (configurable, and the config records the override);
+- no verifier runs before a code worker has: there is no work to verify, and a verifier is not
+  an attempt at the job (`Invariant::NoWorkAttempted` counts code workers only), so it cannot
+  lift that guard on a job no code worker touched (`a_run_never_finishes_on_a_verifier_alone`);
 - the verifier runs at most once per state of the code: once a verifier has started, `Verify` is
   not proposed again (`Invariant::VerificationAlreadyRun`) until a later code worker has started
   (`counters.verified_since_code`). Then the verification rule may propose it again under its
   normal conditions, bounded by `max_workers`, so a FAIL, a fix and a PASS can finish. An
   earlier revision allowed one verifier per run: after a FAIL and a fix nothing proposed `Verify`
   again, and the run spent its workers and escalated
-  (`after_a_failing_verdict_and_a_fix_the_verifier_runs_again_and_may_finish`);
+  (`after_a_failing_verdict_and_a_fix_the_verifier_runs_again_and_may_finish`). The one
+  exception is `verify = "always"`, which refuses every `Finish` until a verifier *completes*:
+  a verifier that did not complete may be retried once on the same code
+  (`counters.verifiers_since_code`), and a retry that does not complete either is put to a
+  person, with the question saying so
+  (`a_verifier_that_never_completes_is_retried_once_and_the_run_says_why`);
 - a verifier that modifies the repository is a policy violation: the runtime diffs the tree before
   and after and records `verifier_mutated_repo` as an event, and the verification is treated as
   inconclusive rather than as a pass;

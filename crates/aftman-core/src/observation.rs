@@ -63,6 +63,12 @@ pub struct Counters {
     /// proposed again (`docs/04-workers.md` §6). Defaulted, so a snapshot without it decodes.
     #[serde(default)]
     pub verified_since_code: bool,
+    /// Verify workers started since the last code worker did. Bounds the retry of a verifier
+    /// that did not complete under `verify = "always"` (`docs/05-responsibilities.md` §6.1).
+    /// Defaulted, so a snapshot without it decodes (as no verifier yet, which allows one
+    /// retry at most).
+    #[serde(default)]
+    pub verifiers_since_code: u32,
     pub steers_sent: u32,
     pub assessments: u32,
     /// Cycles skipped because the observation content was unchanged.

@@ -234,6 +234,8 @@ pub struct Counters { pub workers_run: u32, pub attempts: u32, pub failures: u32
                                     // (doc 05 §6.2); #[serde(default)]
     pub verified_since_code: bool,  // a verify worker started since the last code worker
                                     // (doc 04 §6); #[serde(default)]
+    pub verifiers_since_code: u32,  // how many: bounds the `verify = always` retry to one
+                                    // (doc 05 §6.1); #[serde(default)]
     pub assessment_budget_short: bool, // this cycle's requests exceeded what is left of
                                     // max_assessments (doc 03 §5); #[serde(default)]
     pub steers_sent: u32,

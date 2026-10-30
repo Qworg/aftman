@@ -784,15 +784,20 @@ pub mod builtin {
                 return Vec::new();
             }
             // `verify = "always"` refuses every `Finish` until a verifier has completed
-            // (`Invariant::VerificationIncomplete`), so it cannot also wait for the model to
-            // judge one warranted: a model that says "no verification needed" would leave the
-            // run with nothing that can make progress. It proposes the verifier when the work
-            // is otherwise ready to finish — the `Finish` conjuncts that do not depend on a
-            // verifier hold — so that verification is the one thing missing. Its own rule, so
-            // its read list says what it acts on. A verifier that ran since the last code
-            // worker but did not complete may be retried (`verification_already_run` in
+            // (`Invariant::VerificationIncomplete`), so it must never verify in fewer states
+            // than `when_asked`: it proposes the verifier wherever `:warranted` would, and also
+            // when the work is otherwise ready to finish — the `Finish` conjuncts that do not
+            // depend on a verifier hold — without waiting for the model to judge one needed.
+            // Without that second case, a model that said "no verification needed" left nothing
+            // that could make progress. A verifier that ran since the last code worker but did
+            // not complete may be retried under `always` (`verification_already_run` in
             // policy); `max_workers` bounds that.
-            if input.config.verify == VerifyPolicy::Always && !input.counters.verifier_completed {
+            let always_pending =
+                input.config.verify == VerifyPolicy::Always && !input.counters.verifier_completed;
+            if input.counters.verified_since_code && !always_pending {
+                return Vec::new();
+            }
+            if always_pending {
                 let ready = [
                     key(COMPLETION, "ready_to_finish"),
                     key(COMPLETION, "requirements_satisfied"),
@@ -810,14 +815,10 @@ pub mod builtin {
                         priority::VERIFY,
                     )];
                 }
-                return Vec::new();
             }
-            // Otherwise a verifier is warranted once implementation looks complete and the
-            // model judges one needed, and never twice for the same code: once more after
-            // each later code worker (`docs/04-workers.md` §6).
-            if input.counters.verified_since_code {
-                return Vec::new();
-            }
+            // A verifier is warranted once implementation looks complete and the model judges
+            // one needed, and never twice for the same code: once more after each later code
+            // worker (`docs/04-workers.md` §6).
             let implemented = input.check_ge(
                 &key(COMPLETION, "implementation_complete"),
                 rule_threshold(

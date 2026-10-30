@@ -2724,9 +2724,11 @@ impl FactoryRuntime {
             // What a verifier checked is no longer the tree once code work starts again.
             state.counters.verifier_completed = false;
             state.counters.verified_since_code = false;
+            state.counters.verifiers_since_code = 0;
         } else {
             state.counters.verifiers_run += 1;
             state.counters.verified_since_code = true;
+            state.counters.verifiers_since_code += 1;
         }
 
         self.emit(

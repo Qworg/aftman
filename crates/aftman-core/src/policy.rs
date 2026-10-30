@@ -327,10 +327,16 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
     // specific `ask` from `core.human-escalation` was discarded in favour of
     // "worker budget is exhausted".
     if worker_limit_hit && input.active_worker.is_none() && surviving.is_empty() {
+        // When `verify = "always"` is what holds the `Finish`, the job may well look complete:
+        // say what is actually missing, a verifier that completed.
+        let ask = verification_hold(input, &suppressed).map_or_else(
+            || "The worker budget is exhausted and the job does not look complete.".to_owned(),
+            |held| format!("The worker budget is exhausted. {held}"),
+        );
         return PolicyDecision {
             selected: Directive::Escalate {
                 reason: "worker limit reached before completion".into(),
-                ask: "The worker budget is exhausted and the job does not look complete.".into(),
+                ask,
             },
             considered: proposals.to_vec(),
             suppressed,
@@ -477,6 +483,35 @@ fn worker_limit_ask(input: &PolicyInput<'_>, blocked: &Proposal) -> String {
     ask
 }
 
+/// When `verify = "always"` refused a `Finish` (`Invariant::VerificationIncomplete`), the
+/// sentence that says so: a person asked why the run stopped needs to know that the work may
+/// be done and a completed verifier is what is missing, and whether one ran without
+/// completing. `None` when the `Finish` was not held by it.
+fn verification_hold(input: &PolicyInput<'_>, suppressed: &[Suppression]) -> Option<String> {
+    let held = suppressed.iter().any(|s| {
+        matches!(
+            s.reason,
+            SuppressionReason::Invariant(Invariant::VerificationIncomplete)
+        )
+    });
+    if !held {
+        return None;
+    }
+    let why = if input.counters.verifiers_since_code > VERIFIER_RETRIES {
+        "the verifier that ran since the last code worker did not complete (it failed, timed \
+         out, was stopped, or printed nothing), and neither did its retry"
+    } else if input.counters.verified_since_code {
+        "the verifier that ran since the last code worker did not complete (it failed, timed \
+         out, was stopped, or printed nothing)"
+    } else {
+        "no verifier has completed since the last code worker"
+    };
+    Some(format!(
+        "Finish is held because verify = \"always\" requires a verifier to complete first, \
+         and {why}."
+    ))
+}
+
 /// The most unresolved checks the "nothing can make progress" question names one by one.
 pub const NAMED_UNRESOLVED_CHECKS: usize = 8;
 
@@ -494,23 +529,8 @@ pub const NOTHING_SURVIVED_ASK_CAP_BYTES: usize = 2048;
 /// more than [`NOTHING_SURVIVED_ASK_CAP_BYTES`]. The values are Jev's own, unmodified.
 fn nothing_survived_ask(input: &PolicyInput<'_>, suppressed: &[Suppression]) -> String {
     const GENERIC: &str = "No worker is running and every proposal was refused.";
-    let held_by_verification = suppressed.iter().any(|s| {
-        matches!(
-            s.reason,
-            SuppressionReason::Invariant(Invariant::VerificationIncomplete)
-        )
-    });
-    if held_by_verification {
-        let why = if input.counters.verified_since_code {
-            "the verifier that ran did not complete (it failed, timed out, was stopped, or \
-             printed nothing)"
-        } else {
-            "no verifier could be started"
-        };
-        return format!(
-            "No worker is running and every proposal was refused. Finish is held because \
-             verify = \"always\" requires a verifier to complete first, and {why}."
-        );
+    if let Some(held) = verification_hold(input, suppressed) {
+        return format!("{GENERIC} {held}");
     }
     let held_finish = suppressed.iter().any(|s| {
         matches!(
@@ -728,13 +748,19 @@ fn resolution_changes(
 ///
 /// Except under `verify = "always"` when that verifier did not complete (it failed, timed
 /// out, was stopped, or said nothing): `always` refuses every `Finish` until one completes,
-/// so refusing the retry as well would leave nothing that can make progress. A retry still
-/// costs a worker, so `max_workers` bounds it.
+/// so refusing the retry as well would leave nothing that can make progress. One retry per
+/// state of the code, [`VERIFIER_RETRIES`]: a verifier that fails to complete twice on the
+/// same code is not a fluke, and retrying it until `max_workers` spent every worker on it.
 fn verification_already_run(input: &PolicyInput<'_>) -> bool {
-    input.counters.verified_since_code
-        && !(input.config.verify == crate::job::VerifyPolicy::Always
-            && !input.counters.verifier_completed)
+    let retry = input.config.verify == crate::job::VerifyPolicy::Always
+        && !input.counters.verifier_completed
+        && input.counters.verifiers_since_code <= VERIFIER_RETRIES;
+    input.counters.verified_since_code && !retry
 }
+
+/// How many times `verify = "always"` retries a verifier that did not complete, per state of
+/// the code.
+pub const VERIFIER_RETRIES: u32 = 1;
 
 /// Whether a proposal is refused by a hard invariant. `None` means it survives.
 fn refusal(
@@ -1601,6 +1627,7 @@ mod tests {
             verifiers_run: 1,
             verifier_completed: true,
             verified_since_code: true,
+            verifiers_since_code: 1,
             ..Counters::default()
         };
         let decision = super::decide(&registry, &input(&o, &after, &config, &checks), &[]);
@@ -1694,6 +1721,7 @@ mod tests {
                 verifiers_run: 1,
                 verifier_completed: true,
                 verified_since_code: true,
+                verifiers_since_code: 1,
                 ..Counters::default()
             };
             let decision = super::decide(
@@ -1723,6 +1751,7 @@ mod tests {
             workers_run: 2,
             verifiers_run: 1,
             verified_since_code: true,
+            verifiers_since_code: 1,
             verifier_completed: false,
             ..Counters::default()
         };
@@ -1742,6 +1771,20 @@ mod tests {
                 .invariants
                 .contains(&Invariant::VerificationAlreadyRun)
         );
+
+        // Once: a verifier that fails to complete twice on the same code is not retried
+        // again, and the question says why.
+        let retried = Counters {
+            workers_run: 3,
+            verifiers_run: 2,
+            verifiers_since_code: 2,
+            ..did_not_complete
+        };
+        let decision = super::decide(&registry, &input(&o, &retried, &always, &checks), &[]);
+        let Directive::Escalate { ask, .. } = &decision.selected else {
+            panic!("selected {:?}", decision.selected);
+        };
+        assert!(ask.contains("neither did its retry"), "{ask}");
 
         let mut asked = finish_ready_needing_no_verification();
         asked.extend(self::checks(&[(
@@ -1770,27 +1813,46 @@ mod tests {
 
     #[test]
     fn a_finish_held_by_verify_always_says_so() {
-        // When `always` is what holds the `Finish` and nothing else can run (here the worker
-        // limit refuses the verifier), the question says so rather than the generic line.
+        // When `always` is what holds the `Finish` and the worker limit refuses the verifier,
+        // the escalation says so, rather than "the job does not look complete". Through
+        // `decide`, as the runtime calls it: the required verifier is proposed and refused by
+        // the limit, so this is the worker-limit escalation, not "nothing can make progress".
+        let registry = crate::responsibility::ResponsibilityRegistry::builtin();
         let o = observation();
         let config = RunConfig {
             verify: crate::job::VerifyPolicy::Always,
-            max_workers: 2,
+            max_workers: 3,
             ..RunConfig::default()
         };
-        let counters = Counters {
-            workers_run: 2,
-            verifiers_run: 1,
-            verified_since_code: true,
-            ..Counters::default()
-        };
         let checks = finish_ready_needing_no_verification();
-        let decision = arbitrate(&input(&o, &counters, &config, &checks), &[finish()]);
-        let Directive::Escalate { ask, .. } = &decision.selected else {
-            panic!("selected {:?}", decision.selected);
-        };
-        assert!(ask.contains("verify = \"always\""), "{ask}");
-        assert!(ask.contains("did not complete"), "{ask}");
+        for (counters, why) in [
+            (
+                Counters {
+                    workers_run: 3,
+                    verifiers_run: 1,
+                    verified_since_code: true,
+                    verifiers_since_code: 1,
+                    ..Counters::default()
+                },
+                "did not complete",
+            ),
+            (
+                Counters {
+                    workers_run: 3,
+                    ..Counters::default()
+                },
+                "no verifier has completed",
+            ),
+        ] {
+            let decision = super::decide(&registry, &input(&o, &counters, &config, &checks), &[]);
+            let Directive::Escalate { reason, ask } = &decision.selected else {
+                panic!("selected {:?}", decision.selected);
+            };
+            assert!(reason.contains("worker limit"), "{reason}");
+            assert!(ask.contains("verify = \"always\""), "{ask}");
+            assert!(ask.contains(why), "{ask}");
+            assert!(!ask.contains("does not look complete"), "{ask}");
+        }
     }
 
     #[test]

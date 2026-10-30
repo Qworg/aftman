@@ -3975,8 +3975,8 @@ async fn a_refresh_top_up_is_spent_by_the_next_refresh_whichever_path_makes_it()
     // and leave the check held, so the same question came back with the top-up growing and
     // no refresh ever run. Now a granted refresh is spent by the next refresh attempt for
     // that check, whichever path makes it: one Recheck, exactly one more refresh. The audit
-    // passes, or it fails; once it has run, every later assessment of `ready_to_finish` shows
-    // it (`docs/03-jev.md` §5), so a failure is not put to a person as unseen again.
+    // passes, or it fails; a failure is stale once the next worker starts, so the next Finish
+    // rests on the claim again, and is held and asked again (`docs/06-ensemble.md` §3).
     for (fail_to, finishes) in [(0_u32, true), (1000, false)] {
         let mut fx = Fixture::new(audited_definitions()?, EvidencePlan::default())?;
         fx.evidence = counting_audit_when(fx.dir.path(), "on_demand", 1, fail_to)?;
@@ -4000,14 +4000,25 @@ async fn a_refresh_top_up_is_spent_by_the_next_refresh_whichever_path_makes_it()
             assert_eq!(outcome.status, FactoryStatus::Finished);
             assert_eq!(model.calls(Purpose::Refresh).len(), 1, "exactly one more");
         } else {
-            // The re-measured audit fails: no Finish, and the failure is in every later
-            // assessment of the check. The run goes on to its worker limit and asks about
-            // that instead.
-            let _ = escalation(&fx, 2).await?;
-            assert_eq!(model.calls(Purpose::Refresh).len(), 1, "exactly one more");
-            let raised = fx.of_kind(EventKind::EscalationRaised);
-            let ask = raised[1].payload["ask"].as_str().unwrap_or_default();
-            assert!(!ask.contains("could not be shown to the model"), "{ask}");
+            // The re-measured audit fails: no Finish. The next worker makes that output stale
+            // (`docs/06-ensemble.md` §3), so the next Finish attempt rests on the claim again
+            // and is held and asked again. Each Recheck buys exactly one more refresh, spent,
+            // never an unspent top-up that keeps growing.
+            for nth in 2..=3 {
+                let id = escalation(&fx, nth).await?;
+                assert_eq!(
+                    model.calls(Purpose::Refresh).len(),
+                    nth - 1,
+                    "every granted refresh was spent before asking again"
+                );
+                let raised = fx.of_kind(EventKind::EscalationRaised);
+                let ask = raised[nth - 1].payload["ask"].as_str().unwrap_or_default();
+                assert!(ask.contains("could not be shown to the model"), "{ask}");
+                assert_eq!(raised[nth - 1].payload["refresh_topup"][0], READY);
+                run.answer(id, HumanDecision::Recheck).await?;
+            }
+            let _ = escalation(&fx, 4).await?;
+            assert_eq!(model.calls(Purpose::Refresh).len(), 3);
             assert!(!finished(&fx));
             run.cancel().await?;
         }
@@ -4065,26 +4076,36 @@ async fn before_finish_output_reaches_the_model_with_the_ensemble_off() -> TestR
     for call in &shown {
         assert_eq!(call.keys, vec![CheckKey::from(READY)]);
     }
-    // Until the audit ran, its selection rendered the default state, and was asked with it in
-    // one request; from then on, as a request of its own beside the default one.
-    let audited = fx
-        .of_kind(EventKind::EvidenceCollected)
-        .first()
-        .map(|e| e.seq.get())
-        .ok_or("the audit ran")?;
-    for e in fx.of_kind(EventKind::AssessmentCompleted) {
+    // While the audit's output is current — it ran, and no worker has started since — its
+    // selection is a request of its own beside the default one; otherwise it renders the
+    // default state and is asked with it, in one request.
+    let events = fx.events();
+    for (at, e) in events.iter().enumerate() {
+        if e.kind != EventKind::AssessmentCompleted {
+            continue;
+        }
+        let current = events[..at]
+            .iter()
+            .rev()
+            .find(|e| {
+                matches!(
+                    e.kind,
+                    EventKind::EvidenceCollected | EventKind::WorkerStarted
+                )
+            })
+            .is_some_and(|e| e.kind == EventKind::EvidenceCollected);
         let requests = e.payload["requests"].as_array().map(Vec::len);
-        let expected = if e.seq.get() < audited { 1 } else { 2 };
-        assert_eq!(requests, Some(expected), "{}", e.payload);
+        assert_eq!(requests, Some(if current { 2 } else { 1 }), "{}", e.payload);
     }
-    // A Finish was selected once, provisionally, on the claim; once the audit was shown it
-    // never was again.
+    // Each Finish was selected provisionally, on the claim after a worker; each ran the audit,
+    // which the model was then shown, and none executed.
     let finishes = fx
         .of_kind(EventKind::DirectiveSelected)
         .iter()
         .filter(|e| e.payload["directive"] == "Finish")
         .count();
-    assert_eq!(finishes, 1);
+    assert!(finishes >= 1);
+    assert_eq!(finishes, fx.of_kind(EventKind::EvidenceCollected).len());
     Ok(())
 }
 

@@ -1287,11 +1287,17 @@ impl FactoryRuntime {
                     &escalated,
                 )
                 .await?;
-            // A worker started: what the `before_finish` providers measured was the tree
-            // before it, and may no longer hold. The next `Finish` is provisional again, so
-            // they run again before it (`docs/06-ensemble.md` §6.1, item 2).
+            // A worker started: what every command provider measured was the tree before it,
+            // and may no longer hold. The next `Finish` is provisional again, so the
+            // `before_finish` providers run again before it (`docs/06-ensemble.md` §6.1, item
+            // 2), and the stored command output is dropped, so no request shows it as if it
+            // were current: a check selecting it is claim-only until its provider runs again
+            // — a `worker_completed` one when this worker completes, an `on_demand` or
+            // `before_finish` one through R0 or the `before_finish` step, before anything
+            // irreversible acts on it (`docs/06-ensemble.md` §3, `ClaimOnlyEvidence`).
             if state.counters.workers_run != workers_before {
                 ls.before_finish_ran = false;
+                ls.evidence_outcomes.clear();
             }
             // A directive that neither ended the run nor parked it leaves the run
             // supervising, so return to `Running`.

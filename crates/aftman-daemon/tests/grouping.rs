@@ -30,6 +30,7 @@ use aftman_workers::SimulatedWorker;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 const READY: &str = "core.completion__ready_to_finish";
+const REQS: &str = "core.completion__requirements_satisfied";
 
 const DONE: [(&str, f32); 11] = [
     ("core.completion__ready_to_finish", 0.95),
@@ -440,5 +441,120 @@ async fn groups_whose_states_are_identical_are_asked_once() -> TestResult {
     // The merged request asked every check, `ready_to_finish` included.
     let (first, _) = &model.calls(Purpose::Assessment)[0];
     assert!(first.contains(&CheckKey::from(READY)));
+    Ok(())
+}
+
+// ---- command output from before the last worker is not current (review F1) -------------
+
+/// `ready_to_finish` scores the audit it is shown: a failure 0.05, a pass 0.95. Shown none, it
+/// says `unshown(workers_run)`. `requirements_satisfied` is not met after the first worker,
+/// so a second one runs.
+fn audit_scoring_model(unshown: fn(Option<u64>) -> f32) -> ProbeModel {
+    ProbeModel::new(move |key, state, text| match key {
+        READY => Some(if text.contains("FAILED") {
+            0.05
+        } else if text.contains("audit clean") {
+            0.95
+        } else {
+            unshown(workers_run(state))
+        }),
+        REQS => Some(if workers_run(state) == Some(1) {
+            0.10
+        } else {
+            0.95
+        }),
+        _ => None,
+    })
+}
+
+fn audit_runs(fx: &Fixture) -> String {
+    std::fs::read_to_string(fx.dir.path().join("audit-runs"))
+        .unwrap_or_default()
+        .trim()
+        .to_owned()
+}
+
+#[tokio::test]
+async fn a_finish_does_not_execute_on_audit_output_from_before_the_last_worker() -> TestResult {
+    // Review F1 (probe A), ensemble on. `ready_to_finish` selects an `on_demand` audit. After
+    // the first worker it is in band on the claim, so R0 runs the audit (clean), but the
+    // requirements are not met and a second worker runs. From its second run on the audit
+    // fails. The stored output of run 1 used to be shown to every later request, so after the
+    // second worker the check was "measured", R0 never re-ran the audit, and the Finish
+    // executed on output from before the tree changed. Command output is dropped when a worker
+    // starts: the check is claim-only again, R0 re-measures it, and the run does not finish.
+    let fx = Fixture::new()?;
+    let model = Arc::new(audit_scoring_model(|_| 0.79));
+    let rt = fx.runtime(
+        config(|_| {}),
+        true,
+        |_| {},
+        audited_definitions()?,
+        counting_audit(fx.dir.path(), "on_demand", 2)?,
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+    );
+    let outcome = fx.run(rt).await?;
+    assert_ne!(outcome.status, FactoryStatus::Finished, "{:#?}", fx.trace());
+    assert!(outcome.counters.workers_run >= 2);
+    assert!(
+        audit_runs(&fx).parse::<u32>()? >= 2,
+        "the audit was re-run after the second worker"
+    );
+    // The failing run came after the second worker started.
+    let second = fx
+        .of_kind(EventKind::WorkerStarted)
+        .get(1)
+        .map(|e| e.seq.get())
+        .ok_or("a second worker")?;
+    let first_failure = fx
+        .of_kind(EventKind::EvidenceCollected)
+        .iter()
+        .find(|e| e.payload["success"] == false)
+        .map(|e| e.seq.get())
+        .ok_or("the failing audit")?;
+    assert!(first_failure > second);
+    Ok(())
+}
+
+#[tokio::test]
+async fn audit_output_from_before_the_last_worker_holds_a_finish_r0_cannot_remeasure() -> TestResult
+{
+    // Review F1, the held case: the scenario the unseen-evidence tests lost. The audit ran
+    // once, clean, before the second worker changed the tree; the refresh cap (1) is spent on
+    // that run. After the second worker `ready_to_finish` is decisively done on the claim, and
+    // the Finish resting on it would execute. Its command output is no longer current and R0
+    // cannot re-measure it, so it is held and put to a person — not finished on the old run.
+    let fx = Fixture::new()?;
+    let model = Arc::new(audit_scoring_model(|workers| {
+        if workers >= Some(2) { 0.95 } else { 0.79 }
+    }));
+    let rt = fx.runtime(
+        config(|_| {}),
+        true,
+        |s| s.max_evidence_refreshes_per_check = 1,
+        audited_definitions()?,
+        counting_audit(fx.dir.path(), "on_demand", 2)?,
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+    );
+    let outcome = fx.run(rt).await?;
+    assert_eq!(
+        outcome.status,
+        FactoryStatus::NeedsHuman,
+        "{:#?}",
+        fx.trace()
+    );
+    assert_eq!(
+        audit_runs(&fx),
+        "1",
+        "the audit ran once, before the second worker"
+    );
+    let raised = fx.of_kind(EventKind::EscalationRaised);
+    let ask = raised
+        .last()
+        .and_then(|e| e.payload["ask"].as_str())
+        .unwrap_or_default()
+        .to_owned();
+    assert!(ask.contains(READY), "{ask}");
+    assert!(ask.contains("could not be shown to the model"), "{ask}");
     Ok(())
 }

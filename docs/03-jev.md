@@ -237,8 +237,11 @@ grouping was built. An operator's definition that names its own `evidence` adds 
   the top level, because no single state was sent. `input_tokens` and `output_tokens` are summed
   over the requests made, a partly failed cycle's included.
 
-So a check is shown the output of every command provider it selects that has run, in the cycle's
-own assessment. **A `before_finish` provider's output reaches the `Finish` that waited for it** —
+So a check is shown the output of every command provider it selects that has run **since the last
+worker started**, in the cycle's own assessment. The runtime drops the stored command output when a
+worker starts, because it measured a tree that worker may change; a `worker_completed` provider
+runs again when the worker completes, and an `on_demand` or `before_finish` one is re-measured by
+R0 or by the `before_finish` step ([06-ensemble.md §3](06-ensemble.md)). **A `before_finish` provider's output reaches the `Finish` that waited for it** —
 with the ensemble on or off — **for exactly the checks that select it**: the provisional `Finish`
 runs the provider, and the re-assessment shows its output to those checks, so a `Finish` resting
 on them is decided over it. The bundled definitions select no command output, so with them a
@@ -248,8 +251,8 @@ selects `command:<id>` for it ([05-responsibilities.md §3](05-responsibilities.
 
 The ensemble reads the same grouping. `ClaimOnlyEvidence` is computed from the state of the
 check's own request (`EnsembleContext::assessed_states`), so a check whose selected command
-output was shown is measured, and one whose provider has not run (an `on_demand` provider never
-re-measured) rests on the worker's claim; an R2 reframe is asked over that same state
+output was shown is measured, and one whose provider has not run since the last worker started
+rests on the worker's claim; an R2 reframe is asked over that same state
 ([06-ensemble.md §3, §4](06-ensemble.md)). With the ensemble on, a value resting on a claim about a
 command is re-measured by R0 before an irreversible directive acts on it, or held
 ([06-ensemble.md §6](06-ensemble.md)).

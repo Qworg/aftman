@@ -499,10 +499,11 @@ Found during M5 and outside it (they predate M5 on `main`), and fixed after it:
   describes (docs/03-jev.md §5, as built), and the re-assessment after a `before_finish` provider
   runs shows its output to the checks that select it. `assessed_states` is the per-check state
   actually sent, so `ClaimOnlyEvidence`, `CheckPlan::unseen_command` and R2 read it; every request
-  counts against the budget. An R0 refresh asks over the check's own selection too. The bundled
-  checks select no command output, so with them a `before_finish` provider still reaches the model
-  only through `test_summary`; a definition that wants `ready_to_finish` to read it selects
-  `command:<id>` (docs/05-responsibilities.md §3). `fa4aa35`, `f8d054c`, `b07e36d`.
+  counts against the budget. An R0 refresh asks over the check's own selection too. `fa4aa35`,
+  `f8d054c`, `b07e36d`. A `before_finish` provider's output also joins the selection of every
+  check the `Finish` rule reads, so it reaches the `Finish` of the bundled definitions with no
+  configuration (the user's decision, after the bundled definitions were found to leave it unseen
+  by every `Finish` conjunct; docs/03-jev.md §5). `aeda07e`.
 - **A worker starting resets `before_finish_ran`**, so a second `Finish` after a later worker runs
   the `before_finish` providers again first (docs/06-ensemble.md §6.1). `c0183fa`.
 - **The runtime sets `counters.verifier_completed`** when a verify worker exits successfully with
@@ -516,6 +517,27 @@ Found during M5 and outside it (they predate M5 on `main`), and fixed after it:
   not load: a command that auto-starts a successor on the same paths ~0.1 s after the old daemon
   lets go left a `stop` that missed that gap waiting 75 s on the successor (docs/07-surfaces.md §1).
   `2ecdd64`.
+
+An adversarial review of those fixes found that fixes 2–4 were sound and that the grouping had two
+regressions and smaller gaps. Each probe is now a regression test (`aftman-daemon/tests/grouping.rs`
+unless named otherwise) that fails before its fix:
+
+- **Command output from before the last worker was shown as current** (HIGH, ensemble on). The
+  stored output of a provider stayed in every later request, so after a second worker a check
+  counted as measured on output from before the tree changed, R0 did not re-run it, and a `Finish`
+  executed on it. The stored command output is dropped when a worker starts, so the check is
+  claim-only until its provider runs again (docs/06-ensemble.md §3). `c034cb9`.
+- **`model_unavailable` could never fire** when a cycle's later request kept failing, because the
+  earlier request reset the failure counters. They are per cycle (docs/03-jev.md §5). `318752e`.
+- **A request the cycle could not use was made and billed** when the budget ran out part way. The
+  budget is checked up front (`assessment_budget_short`), so a `budget_exhausted` cycle makes no
+  call, as the TUI assumed. `fdcd880`. **Identical states were asked twice**: they are one
+  request. `17f3a4a`. A partly failed cycle's tokens are reported (`318752e`).
+- **A verifier never ran again after a FAIL and a fix**: `Verify` may be proposed again once a later
+  code worker has started (`verified_since_code`), and a whitespace-only verifier has not
+  completed (docs/04-workers.md §6). `a2324b1`.
+- **A provider no check can be shown** is noted by `aftman doctor` and at run start
+  (`evidence_provider_unseen`, docs/05-responsibilities.md §3). `6a5a82e`.
 
 ## M6 — herdr
 

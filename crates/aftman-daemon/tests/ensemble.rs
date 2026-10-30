@@ -4613,6 +4613,52 @@ async fn verify_always_runs_a_verifier_though_the_model_judges_none_needed() -> 
 }
 
 #[tokio::test]
+async fn a_run_never_finishes_on_a_verifier_alone() -> TestResult {
+    // Review of the `verify = always` fix, probes G and H. A model optimistic about the
+    // untouched repository from the first cycle got a verifier started as the run's first
+    // worker — under `always` through `core.verification:required`, under `when_asked` with
+    // `needs_verification` high through `:warranted` — and once that verifier completed, its
+    // worker count lifted `NoWorkAttempted` and the job finished with no code worker ever run.
+    // Now no verifier starts before a code worker, and a verifier is not work attempted.
+    for (verify, needs_verification) in [
+        (VerifyPolicy::Always, 0.10),
+        (VerifyPolicy::WhenAsked, 0.95),
+    ] {
+        for enabled in [false, true] {
+            let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+            let rt = fx.runtime(
+                config(|c| c.verify = verify),
+                settings(|s| s.enabled = enabled),
+                Arc::new(StateModel::new(|_| 0.95).with(NEEDS_VERIFICATION, needs_verification))
+                    as Arc<dyn DecisionModel>,
+                Arc::new(VerdictsWorker::new(&[Some("PASS")])),
+            );
+            let outcome = fx.run(rt).await?;
+            let what = format!("verify={verify:?} enabled={enabled}");
+            let started = tasks(&fx);
+            // No verifier before a code worker, and no `Finish` without one.
+            let first_code = started.iter().position(|t| t == "Code");
+            let first_verify = started.iter().position(|t| t == "Verify");
+            if let Some(verify_at) = first_verify {
+                assert!(
+                    first_code.is_some_and(|code_at| code_at < verify_at),
+                    "{what}: {started:?}"
+                );
+            }
+            if outcome.status == FactoryStatus::Finished {
+                assert!(first_code.is_some(), "{what}: finished on {started:?}");
+            }
+            assert_eq!(
+                outcome.counters.verifiers_run > 0,
+                first_verify.is_some(),
+                "{what}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn verify_never_runs_no_verifier_though_the_model_judges_one_needed() -> TestResult {
     // `verify = "never"` was not enforced: the built-in rule proposed a verifier whenever the
     // model judged one warranted. With `needs_verification` high (0.90), `never` must still

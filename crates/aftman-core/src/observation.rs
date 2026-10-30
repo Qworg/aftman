@@ -84,6 +84,16 @@ pub struct Counters {
     pub elapsed_secs: u64,
 }
 
+impl Counters {
+    /// Code workers started: every worker that was not a verifier. A verifier checks work;
+    /// it is not work, so it never counts as an attempt at the job
+    /// (`Invariant::NoWorkAttempted`, `docs/05-responsibilities.md` §6.1).
+    #[must_use]
+    pub const fn code_workers_run(&self) -> u32 {
+        self.workers_run.saturating_sub(self.verifiers_run)
+    }
+}
+
 /// A capped view of one worker, for the observation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerSummary {

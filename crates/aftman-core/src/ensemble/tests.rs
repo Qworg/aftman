@@ -2641,7 +2641,9 @@ fn finish_after_verify_cycle() -> Scenario {
     let mut b = Scenario::finish_ready()
         .set(NEEDS_VER, 0.05)
         .reframable(&[NEEDS_VER]);
+    // A code worker, then the verifier: the runtime counts a verifier in `workers_run` too.
     b.counters.verifiers_run = 1;
+    b.counters.workers_run += 1;
     b.cycle = AssessmentSeq(21);
     b
 }

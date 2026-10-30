@@ -776,6 +776,7 @@ pub mod builtin {
             // (`docs/04-workers.md` §6). `verify = "never"` proposes none.
             if input.active_worker.is_some()
                 || input.counters.verified_since_code
+                || input.counters.code_workers_run() == 0
                 || input.config.verify == VerifyPolicy::Never
             {
                 return Vec::new();

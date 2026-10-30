@@ -282,7 +282,7 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
     if uncertainty_blocks_finish {
         invariants.push(Invariant::UnresolvedUncertainty);
     }
-    if input.counters.workers_run == 0 {
+    if input.counters.code_workers_run() == 0 {
         invariants.push(Invariant::NoWorkAttempted);
     }
     if input.observation.observation_note.is_some() {
@@ -719,8 +719,10 @@ fn refusal(
             // Nothing has been attempted, so nothing can be finished. Without this, a
             // model that answers optimistically on the first cycle — before any worker
             // has run — ends a job that never started. This is a runtime fact, not a
-            // judgement, so it belongs here rather than in a check.
-            if input.counters.workers_run == 0 {
+            // judgement, so it belongs here rather than in a check. A verifier is not an
+            // attempt: it checks work, and a verifier run on the untouched repository used
+            // to lift this guard and let that job finish.
+            if input.counters.code_workers_run() == 0 {
                 return Some(SuppressionReason::Invariant(Invariant::NoWorkAttempted));
             }
             // The repository could not be read, so "nothing has changed" is an absence of
@@ -780,6 +782,11 @@ fn refusal(
                 return Some(SuppressionReason::Invariant(
                     Invariant::VerificationDisabled,
                 ));
+            }
+            // There is no work to verify until a code worker has run: a verifier on the
+            // untouched repository checks nothing the job asked for.
+            if input.counters.code_workers_run() == 0 {
+                return Some(SuppressionReason::Invariant(Invariant::NoWorkAttempted));
             }
             if input.counters.verified_since_code {
                 return Some(SuppressionReason::Invariant(
@@ -1600,6 +1607,71 @@ mod tests {
             "considered {:?}",
             decision.considered
         );
+    }
+
+    #[test]
+    fn no_verifier_runs_before_a_code_worker_and_a_verifier_is_not_work() {
+        // A model optimistic about the untouched repository on the first cycle used to get a
+        // verifier started as the run's first worker. That verifier lifted `NoWorkAttempted`,
+        // so once it completed the job finished with no code worker ever having run. Now a
+        // verifier is refused until a code worker has run, from any rule, and a verifier does
+        // not count as work attempted.
+        let registry = crate::responsibility::ResponsibilityRegistry::builtin();
+        let o = observation();
+        let mut checks = finish_ready_needing_no_verification();
+        checks.extend(self::checks(&[(
+            "core.verification",
+            "needs_verification",
+            0.95,
+        )]));
+        let user_rule = Proposal::new(
+            "my.checks",
+            "my.checks:verify",
+            Directive::Verify {
+                reason: "a user rule".into(),
+            },
+            950,
+            Stakes::High,
+        );
+        for verify in [
+            crate::job::VerifyPolicy::Always,
+            crate::job::VerifyPolicy::WhenAsked,
+        ] {
+            let config = with_verify(verify);
+            let nothing_run = Counters::default();
+            let decision = super::decide(
+                &registry,
+                &input(&o, &nothing_run, &config, &checks),
+                std::slice::from_ref(&user_rule),
+            );
+            assert!(
+                !matches!(decision.selected, Directive::Verify { .. }),
+                "{verify:?}: selected {:?}",
+                decision.selected
+            );
+            assert!(decision.suppressed.iter().any(|s| s.rule == user_rule.rule
+                && s.reason == SuppressionReason::Invariant(Invariant::NoWorkAttempted)));
+
+            // A verifier ran and completed, but no code worker ever did: still no `Finish`.
+            let only_a_verifier = Counters {
+                workers_run: 1,
+                verifiers_run: 1,
+                verifier_completed: true,
+                verified_since_code: true,
+                ..Counters::default()
+            };
+            let decision = super::decide(
+                &registry,
+                &input(&o, &only_a_verifier, &config, &checks),
+                &[],
+            );
+            assert!(
+                !matches!(decision.selected, Directive::Finish { .. }),
+                "{verify:?}: selected {:?}",
+                decision.selected
+            );
+            assert!(decision.invariants.contains(&Invariant::NoWorkAttempted));
+        }
     }
 
     #[test]

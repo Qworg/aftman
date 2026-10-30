@@ -1008,9 +1008,19 @@ mod tests {
                     "{}: a not-applicable clause in one but not the other",
                     check.key
                 );
-                for added in ["safely", "completion", "feasible"] {
+                // Words, not substrings: `unfinished` is not `finished`.
+                let words = |text: &str| -> std::collections::BTreeSet<String> {
+                    text.split(|c: char| !c.is_alphanumeric())
+                        .filter(|w| !w.is_empty())
+                        .map(str::to_lowercase)
+                        .collect()
+                };
+                let (asked, negated) = (words(question), words(negation));
+                // A completeness or feasibility reading the question does not have: "can
+                // the work be finished", "safely", "to completion".
+                for added in ["safely", "completion", "feasible", "finished", "finish"] {
                     assert!(
-                        question.contains(added) || !negation.contains(added),
+                        asked.contains(added) || !negated.contains(added),
                         "{}: the negation adds `{added}`: {negation}",
                         check.key
                     );

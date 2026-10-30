@@ -100,7 +100,7 @@ Does the current state warrant an independent verification pass before finishing
 """
 min_threshold = 0.65
 negation = """
-Can the work be finished as it stands, without an independent verification pass first?
+Would an independent verification pass be unwarranted in the current state?
 """
 ```
 
@@ -227,8 +227,10 @@ instructions are present"), so the two answers stay complementary when the evide
 (§1.2). A negation must not add a condition the question does not have, nor drop one: `tests_sufficient`'s
 does not ask whether the evidence is a claim — that is R0's question, not a framing one; a
 not-applicable clause is in both or in neither (`agents_md_drift` has it in both, `worker_stuck`
-and `work_off_track` in neither); and `needs_human`'s asks whether anything needs a person, not
-whether the work can be completed without one, which is a different question
+and `work_off_track` in neither); `needs_human`'s asks whether anything needs a person, not
+whether the work can be completed without one, which is a different question; and
+`needs_verification`'s asks whether a verification pass is unwarranted, not whether the work can
+be finished without one, which adds a completeness reading
 (`every_bundled_negation_is_a_symmetric_complement`).
 
 `aftman responsibilities show <id>` marks each reframable check, and `aftman doctor` reports how

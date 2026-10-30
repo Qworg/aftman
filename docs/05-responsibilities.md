@@ -399,6 +399,13 @@ Rules:
   `command_evidence` with none at all, could never be shown that output, so a run is refused at
   start (`invalid_config`, naming the check), and `aftman doctor` reports it. With the ensemble
   off nothing changes; `doctor` shows a note.
+- the other way round, **a configured provider no check can ever be shown** — no check selects
+  `command:<id>` or `command_evidence`, and it is not a `before_finish` provider, which the
+  `Finish` checks see on their own — runs and costs time for nothing the model reads except
+  what `test_summary` parses from it. `aftman doctor` notes it (`provider <id> is selected by no
+  check`), and run start records a `Notification` (`code: "evidence_provider_unseen"`,
+  `providers`). A note, never an error, with the ensemble on or off
+  (`responsibility::unseen_providers`).
 
 ## 4. Observation construction
 

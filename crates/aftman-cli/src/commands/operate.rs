@@ -392,7 +392,8 @@ fn reframable_line(
     Ok(())
 }
 
-/// Command evidence a check selects that no configured provider produces
+/// Command evidence a check selects that no configured provider produces, and providers no
+/// check can be shown
 /// (`docs/05-responsibilities.md` §3). With the ensemble on a run is refused for it at
 /// start, so it is a problem here; off, a note.
 fn unmatched_lines(
@@ -423,6 +424,15 @@ fn unmatched_lines(
                  run start with the ensemble on)"
             )?;
         }
+    }
+    // The other way round: a configured provider no check can ever be shown — none selects
+    // it, and it is not a `before_finish` provider, which the `Finish` checks see on their
+    // own. It runs for nothing the model reads but its test summary. A note, never a problem.
+    for id in aftman_core::responsibility::unseen_providers(checks, &evidence) {
+        outln!(
+            "  note        provider {id} is selected by no check, so the model is never \
+             shown its output"
+        )?;
     }
     Ok(())
 }

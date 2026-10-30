@@ -772,6 +772,27 @@ impl FactoryRuntime {
             1,
         )
         .map_err(RuntimeError::Responsibility)?;
+        // A configured provider no check can ever be shown runs and costs time for nothing
+        // the model will read (`docs/05-responsibilities.md` §3). A note, never an error.
+        let unseen =
+            aftman_core::responsibility::unseen_providers(registry.checks(), &self.deps.evidence);
+        if !unseen.is_empty() {
+            let ids: Vec<String> = unseen.iter().map(ToString::to_string).collect();
+            self.emit(
+                state,
+                EventKind::Notification,
+                json!({
+                    "code": "evidence_provider_unseen",
+                    "message": format!(
+                        "no check selects command evidence {}, so the model is never shown \
+                         its output (only what the test summary parses from it)",
+                        ids.join(", ")
+                    ),
+                    "providers": ids,
+                }),
+            )
+            .await?;
+        }
         self.transition(state, FactoryStatus::Running).await?;
 
         loop {

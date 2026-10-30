@@ -657,3 +657,36 @@ async fn without_a_before_finish_provider_nothing_is_joined() -> TestResult {
     }
     Ok(())
 }
+
+// ---- a provider no check can be shown is noted at run start ----------------------------
+
+#[tokio::test]
+async fn run_start_notes_a_provider_no_check_can_be_shown() -> TestResult {
+    // `docs/05-responsibilities.md` §3. With the bundled definitions an `on_demand` audit is
+    // selected by no check: the run notes it once, at start, and runs on. A `before_finish`
+    // audit is seen by the `Finish` checks, and is not noted.
+    for (run_when, noted) in [("on_demand", true), ("before_finish", false)] {
+        let fx = Fixture::new()?;
+        let rt = fx.runtime(
+            config(|c| c.max_workers = 1),
+            false,
+            |_| {},
+            DefinitionSet::bundled()?,
+            counting_audit(fx.dir.path(), run_when, 1000)?,
+            Arc::new(ProbeModel::new(|_, _, _| None)) as Arc<dyn DecisionModel>,
+        );
+        fx.run(rt).await?;
+        let notes: Vec<EventEnvelope> = fx
+            .of_kind(EventKind::Notification)
+            .into_iter()
+            .filter(|e| e.payload["code"] == "evidence_provider_unseen")
+            .collect();
+        if noted {
+            assert_eq!(notes.len(), 1, "{run_when}");
+            assert_eq!(notes[0].payload["providers"], serde_json::json!(["audit"]));
+        } else {
+            assert!(notes.is_empty(), "{run_when}");
+        }
+    }
+    Ok(())
+}

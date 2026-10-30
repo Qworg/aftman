@@ -930,6 +930,35 @@ fn bad_requests_exit_two_with_a_code_and_never_start_what_they_do_not_need() {
 }
 
 #[test]
+fn doctor_notes_a_provider_no_check_can_be_shown() {
+    // `docs/05-responsibilities.md` §3. `lint` is selected by no check, so the model never sees
+    // its output: a note. `audit` is a `before_finish` provider, which the checks the `Finish`
+    // rule reads see on their own: no note.
+    let sb = Sandbox::new();
+    let config = sb.dir.path().join("xdgconfig/aftman");
+    std::fs::create_dir_all(&config).expect("config dir");
+    std::fs::write(
+        config.join("evidence.toml"),
+        "[[evidence.commands]]\nid = \"lint\"\nargv = [\"true\"]\nrun_when = \"on_demand\"\n\n\
+         [[evidence.commands]]\nid = \"audit\"\nargv = [\"true\"]\nrun_when = \"before_finish\"\n",
+    )
+    .expect("evidence config");
+    let doctor = sb.run(&["doctor"]);
+    assert!(
+        doctor
+            .stdout
+            .contains("note        provider lint is selected by no check"),
+        "{}",
+        doctor.stdout
+    );
+    assert!(
+        !doctor.stdout.contains("provider audit"),
+        "{}",
+        doctor.stdout
+    );
+}
+
+#[test]
 fn purge_responsibilities_usage_and_doctor() {
     let sb = Sandbox::new();
     let out = sb.run(&sb.run_args(&[]));

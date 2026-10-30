@@ -399,7 +399,14 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
         return PolicyDecision {
             selected: Directive::Escalate {
                 reason: "no active worker and nothing left to try".into(),
-                ask: "No worker is running and no proposal can make progress.".into(),
+                // A `Finish` that `verify = "always"` holds is said so here too: this question
+                // can offer a verifier (`offers_verifier_retry`), and must name what it offers.
+                ask: verification_hold(input, &suppressed).map_or_else(
+                    || "No worker is running and no proposal can make progress.".to_owned(),
+                    |held| {
+                        format!("No worker is running and no proposal can make progress. {held}")
+                    },
+                ),
             },
             considered: proposals.to_vec(),
             suppressed,
@@ -526,7 +533,9 @@ fn verification_hold(input: &PolicyInput<'_>, suppressed: &[Suppression]) -> Opt
     }
     let why = if input.counters.verifiers_on_this_code() > VERIFIER_RETRIES {
         "the verifier that ran since the last code worker did not complete (it failed, timed \
-         out, was stopped, or printed nothing), and neither did its retry"
+         out, was stopped, or printed nothing), and neither did its retry. Recheck or \
+         ClaimComplete authorises one more verifier, which must still complete; Accept \
+         authorises none; Stop ends the run"
     } else if input.counters.verified_since_code {
         "the verifier that ran since the last code worker did not complete (it failed, timed \
          out, was stopped, or printed nothing)"
@@ -2011,8 +2020,38 @@ mod tests {
         };
         let checks = finish_ready_needing_no_verification();
         let decision = super::decide(&registry, &input(&o, &spent, &config, &checks), &[]);
-        assert!(matches!(decision.selected, Directive::Escalate { .. }));
+        let Directive::Escalate { ask, .. } = &decision.selected else {
+            panic!("selected {:?}", decision.selected);
+        };
         assert!(super::offers_verifier_retry(&decision, &spent, &config));
+        // Review round 5, P2: the question says what an answer buys.
+        assert!(
+            ask.contains("Recheck or ClaimComplete authorises one more verifier"),
+            "{ask}"
+        );
+
+        // Review round 5, P1: a user rule proposing `continue` with no worker running takes
+        // the "nothing left to try" path. That question can offer a verifier too, so it must
+        // say that `always` holds the `Finish`.
+        let wait = Proposal::new(
+            "my.rules",
+            "my.rules:wait",
+            Directive::Continue,
+            100,
+            Stakes::Low,
+        );
+        let decision = super::decide(
+            &registry,
+            &input(&o, &spent, &config, &checks),
+            std::slice::from_ref(&wait),
+        );
+        let Directive::Escalate { reason, ask } = &decision.selected else {
+            panic!("selected {:?}", decision.selected);
+        };
+        assert!(reason.contains("nothing left to try"), "{reason}");
+        assert!(super::offers_verifier_retry(&decision, &spent, &config));
+        assert!(ask.contains("verify = \"always\""), "{ask}");
+        assert!(ask.contains("one more verifier"), "{ask}");
 
         let mut human = finish_ready_needing_no_verification();
         human.extend(checks_with_threshold(&[(

@@ -867,9 +867,10 @@ Notes that follow directly from §2:
   when a check loses permission: the `core.completion` fallbacks (`work-remains`,
   `retry-stopped`), which fire because the `Finish` precondition is no longer established; and
   `core.worker-health`, which proposes only the more probable of `stuck` and `off-track`, so
-  holding the winner lets the runner-up *propose* (only if its own check is permitted and above
-  its threshold) — but never be selected as a `Stop`, below. R0 is deliberately excluded from all
-  of this: it is a measurement, not an opinion, and may move a rule either way.
+  holding the winner lets the runner-up through (only if its own check is permitted and above its
+  threshold): still a `Stop`, on a separate finding, and guarded in its own right (below). R0 is
+  deliberately excluded from all of this: it is a measurement, not an opinion, and may move a rule
+  either way.
 
   **Opinions and in-band values can never unmask an irreversible directive** (§2.2). Removing
   permission from one check can change *which* proposal wins, and an earlier revision let it: a
@@ -883,9 +884,16 @@ Notes that follow directly from §2:
   - `Stop` is refused while any check it **rests on** is not permitted — in band, contested, held
     for the budget or by a person's decision (`UnresolvedDependency`). What it rests on is the read
     set of the rules proposing it, plus every unpermitted check whose resolution to either side of
-    its threshold would change the selection. Scoped, so an unrelated check in band never prevents
-    stopping a stuck worker. A `Stop` the overall timeout selects is not a proposal and is not
-    refused; a person's `Stop` never passes through policy.
+    its threshold would change the **kind** of directive selected. Precisely: a check the `Stop`'s
+    rule does not read, whose resolution either way still selects a `Stop`, never prevents it — an
+    unrelated check in band (`documentation_sufficient`), or the worker-health runner-up in band
+    (resolving `work_off_track` above only turns `Stop{"stuck"}` into `Stop{"off track"}`: the
+    worker is stopped either way). A check whose resolution would let a different kind win does
+    hold it (`needs_human`, whose `Escalate` would outrank it). An earlier revision compared whole
+    directives, so a runner-up finding in band kept a stuck, unsteerable worker running unchecked
+    (`a_runner_up_finding_in_band_does_not_keep_a_stuck_worker_running`). A `Stop` the overall
+    timeout selects is not a proposal and is not refused; a person's `Stop` never passes through
+    policy.
 
   With the ensemble off every present check is permitted, and `decide` is exactly `arbitrate`.
   What an opinion removes, then, can only leave a less final directive selected. A *refresh* is a
@@ -896,7 +904,10 @@ Notes that follow directly from §2:
   check a rule proposing it reads, and every check whose side changes it — carries an R2 verdict
   obtained this cycle under `Irreversible` semantics, **or has no R2 available, in which case it
   stands, exactly as it would in the ladder.** A contest the gate obtains holds its check, and the
-  invariants above then refuse the directive: it never hands the run to a runner-up `Stop`.
+  invariants above then refuse a directive that rests on it. A runner-up `Stop` on a separate,
+  decisive finding does not rest on it (same kind), so it may be selected next; the gate guards
+  it in its own round with a fresh opinion of its own
+  (`the_runner_up_stop_is_guarded_in_its_own_right`).
 
   The declarative half holds because conditions are **three-valued** (Kleene,
   [05-responsibilities.md §2.1](05-responsibilities.md)): a comparison on a check that is missing or

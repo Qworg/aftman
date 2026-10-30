@@ -466,7 +466,7 @@ fn nothing_survived_ask(input: &PolicyInput<'_>, suppressed: &[Suppression]) -> 
 /// directive *rests on*. [`Invariant::UnresolvedDependency`] needs exactly that: a selected
 /// `Stop` is refused while any check it rests on is not permitted — a check a rule
 /// proposing it reads, or an unpermitted check whose resolution to either side of its
-/// threshold would change the selection. The refused `Stop` proposals are recorded as
+/// threshold would change the kind of directive selected. The refused `Stop` proposals are recorded as
 /// suppressed by that invariant and arbitration runs again without them, until what is
 /// selected is not a `Stop` or rests only on permitted checks. A `Stop` selected by a hard
 /// invariant (the overall timeout) is not a proposal and is never refused; nor is a person's
@@ -536,7 +536,10 @@ pub fn decide(
 }
 
 /// Whether resolving `key` — measuring it decisively, on either side of its threshold —
-/// would change the selection from `selected`. A plain arbitration over each side.
+/// would change the **kind** of directive selected from `selected`'s. A plain arbitration
+/// over each side. A change of reason only (`Stop{"stuck"}` for `Stop{"off track"}`, the
+/// worker-health runner-up) does not count: the worker is stopped either way. The gate's
+/// guard set keeps comparing whole directives, which only buys more opinions.
 fn resolution_changes(
     registry: &crate::responsibility::ResponsibilityRegistry,
     input: &PolicyInput<'_>,
@@ -559,7 +562,9 @@ fn resolution_changes(
         };
         let mut proposals = registry.propose(&pinned);
         proposals.extend(extra.iter().cloned());
-        arbitrate(&pinned, &proposals).selected != *selected
+        // Compared by kind: a resolution that only changes which Stop (a runner-up
+        // finding's reason) is not something the Stop rests on.
+        arbitrate(&pinned, &proposals).selected.name() != selected.name()
     })
 }
 

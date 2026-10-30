@@ -3495,3 +3495,121 @@ async fn dropping_the_run_mid_reframe_stops_the_call_it_was_waiting_for() -> Tes
     }
     Ok(())
 }
+
+// ---- a stuck worker under the dependency invariant -----------------------------------
+
+/// A worker that cannot be steered and repeats itself until it is stopped.
+#[derive(Default)]
+struct StuckWorker {
+    stopped: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait]
+impl Worker for StuckWorker {
+    fn kind(&self) -> WorkerKind {
+        WorkerKind::Simulated
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    async fn run(
+        &self,
+        ctx: aftman_core::worker::WorkerCtx,
+        sink: aftman_core::worker::WorkerEventSink,
+    ) -> Result<aftman_core::worker::WorkerOutcome, aftman_core::worker::WorkerError> {
+        let mut n = 0u32;
+        loop {
+            n += 1;
+            ctx.output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(
+                    aftman_core::log::Stream::Stdout,
+                    &format!("3 passed; retrying the same edit, attempt {n}\n"),
+                );
+            sink.activity();
+            tokio::select! {
+                () = self.stopped.notified() => {
+                    return Ok(aftman_core::worker::WorkerOutcome::Terminated {
+                        reason: aftman_core::worker::TerminateReason::Stopped,
+                    });
+                }
+                () = tokio::time::sleep(Duration::from_millis(20)) => {}
+            }
+        }
+    }
+
+    async fn steer(
+        &self,
+        _message: &str,
+    ) -> Result<aftman_core::worker::SteerOutcome, aftman_core::worker::WorkerError> {
+        Ok(aftman_core::worker::SteerOutcome::Unsupported)
+    }
+
+    async fn terminate(
+        &self,
+        _reason: aftman_core::worker::TerminateReason,
+    ) -> Result<(), aftman_core::worker::WorkerError> {
+        self.stopped.notify_waiters();
+        self.stopped.notify_one();
+        Ok(())
+    }
+}
+
+/// The directives selected while a worker was running, in order.
+fn selected_with_a_worker(fx: &Fixture) -> Vec<String> {
+    let mut running = false;
+    let mut out = Vec::new();
+    for event in fx.events() {
+        match event.kind {
+            EventKind::WorkerStarted => running = true,
+            EventKind::WorkerCompleted | EventKind::WorkerTerminated => running = false,
+            EventKind::DirectiveSelected if running => {
+                out.push(
+                    event.payload["directive"]
+                        .as_str()
+                        .unwrap_or("?")
+                        .to_owned(),
+                );
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_stuck_worker_is_stopped_though_its_runner_up_finding_is_in_band() -> TestResult {
+    // Re-verification, finding 1 (probe `probe_stuck_worker_runner_up_in_band`). An
+    // unsteerable worker, `worker_stuck` = 0.97, `work_off_track` = 0.75 (in band). With the
+    // ensemble off the worker is stopped; with it on, it used to be left running — Continue,
+    // cycle after cycle — because resolving off-track would only change which Stop.
+    for enabled in [false, true] {
+        let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+        let model = Arc::new(
+            R2Model::finish_ready()
+                .with(STUCK, 0.97)
+                .with(OFF_TRACK, 0.75),
+        );
+        let rt = fx.runtime(
+            config(|c| {
+                c.max_workers = 1;
+                c.max_attempts = 1;
+            }),
+            settings(|s| s.enabled = enabled),
+            Arc::clone(&model) as Arc<dyn DecisionModel>,
+            Arc::new(StuckWorker::default()),
+        );
+        let _ = fx.run(rt).await?;
+        let selected = selected_with_a_worker(&fx);
+        assert_eq!(
+            selected.first().map(String::as_str),
+            Some("Stop"),
+            "ensemble {enabled}: {selected:?}"
+        );
+        assert!(!selected.iter().any(|d| d == "Continue"), "{selected:?}");
+    }
+    Ok(())
+}

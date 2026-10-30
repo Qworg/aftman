@@ -1835,15 +1835,13 @@ async fn the_gate_holds_when_the_budget_is_spent_and_never_refreshes() {
 }
 
 #[tokio::test]
-async fn a_contest_in_the_gate_cannot_unmask_the_runner_up_stop() {
-    // The gate's rounds, now that a held check refuses every Stop resting on it. The
-    // worker-health Stop on `worker_stuck` is selected, and its irreversible opinion
-    // contests. An earlier revision then let the `repository.instructions` Stop on
-    // `agents_md_drift` — which lost the tie-break before — win, and guarded that in a
-    // further round. But it rests on `worker_stuck` (resolving `worker_stuck` above gives
-    // the worker-health Stop back), so with `worker_stuck` held it is refused: a contest
-    // cannot hand the run to the runner-up. The gate's first round finds nothing
-    // irreversible selected.
+async fn the_runner_up_stop_is_guarded_in_its_own_right() {
+    // The gate's rounds, with the dependency invariant comparing kinds. The worker-health
+    // Stop on `worker_stuck` is selected, and its irreversible opinion contests. The
+    // `repository.instructions` Stop on `agents_md_drift`, which lost the tie-break, now
+    // wins: the same kind of directive, on a separate, decisive finding, so the contest on
+    // `worker_stuck` does not hold it (resolving `worker_stuck` would only change which Stop).
+    // It executes only on its own fresh opinion, which the gate buys in the next round.
     let mut s = Scenario::finish_ready()
         .with_worker()
         .set(HUMAN, 0.03)
@@ -1855,22 +1853,31 @@ async fn a_contest_in_the_gate_cannot_unmask_the_runner_up_stop() {
         excerpt: "do it this way".into(),
         truncated: false,
     });
-    let baseline = s.select(&s.baseline());
-    assert_eq!(baseline.name(), "Stop");
-    let source = answering_by(&s.plan(), |p| Some(1.0 - p))
-        .with_reframe(reframe_key(CYCLE, STUCK), answer(Some(0.97)));
-    let outcome = resolved(&s, &source).await;
-    assert!(
-        !outcome.checks[&k(STUCK)].permitted,
-        "worker_stuck was contested"
-    );
-    assert_ne!(s.select(&outcome.checks).name(), "Stop");
-    assert_eq!(outcome.gate_rounds, 1, "nothing irreversible left to guard");
-    assert!(
-        record(&outcome, DRIFT).is_none_or(|r| r.irreversible_guard.is_none()),
-        "the runner-up was never selected, so never guarded"
-    );
-    assert_irreversible_guarded(&s, &outcome, "rounds");
+    assert_eq!(s.select(&s.baseline()).name(), "Stop");
+    for (drift, stops) in [(Some(0.03_f32), true), (Some(0.97), false), (None, false)] {
+        let source = answering_by(&s.plan(), |p| Some(1.0 - p))
+            .with_reframe(reframe_key(CYCLE, STUCK), answer(Some(0.97)))
+            .with_reframe(reframe_key(CYCLE, DRIFT), answer(drift));
+        let outcome = resolved(&s, &source).await;
+        assert!(
+            !outcome.checks[&k(STUCK)].permitted,
+            "worker_stuck was contested"
+        );
+        let guard = record(&outcome, DRIFT)
+            .and_then(|r| r.irreversible_guard.clone())
+            .map(|g| (g.directive, g.outcome));
+        assert_eq!(
+            guard,
+            Some(("Stop".to_owned(), super::GuardOutcome::Bought)),
+            "{drift:?}"
+        );
+        assert_eq!(
+            s.select(&outcome.checks).name() == "Stop",
+            stops,
+            "drift answered {drift:?}"
+        );
+        assert_irreversible_guarded(&s, &outcome, "rounds");
+    }
 }
 
 #[tokio::test]
@@ -5012,9 +5019,10 @@ async fn an_in_band_inhibitor_does_not_unmask_a_stop_and_its_escalation_reaches_
 
 #[test]
 fn a_stop_with_an_unrelated_check_in_band_still_stops_a_stuck_worker() {
-    // Scoped to what the Stop rests on: `documentation_sufficient` in band has nothing to do
-    // with stopping a stuck worker, and does not prevent it. (It does block `Finish`, which
-    // keeps its global `UnresolvedUncertainty`.)
+    // Scoped to what the Stop rests on: a check whose resolution would not change the
+    // *kind* of directive selected does not hold it. `documentation_sufficient` in band has
+    // nothing to do with stopping a stuck worker. (It does block `Finish`, which keeps its
+    // global `UnresolvedUncertainty`.)
     let s = Scenario::finish_ready()
         .with_worker()
         .set(HUMAN, 0.03)
@@ -5022,6 +5030,38 @@ fn a_stop_with_an_unrelated_check_in_band_still_stops_a_stuck_worker() {
         .set(DOCS, 0.72);
     assert!(!s.baseline()[&k(DOCS)].permitted);
     assert_eq!(s.select(&s.baseline()).name(), "Stop");
+}
+
+#[test]
+fn a_runner_up_finding_in_band_does_not_keep_a_stuck_worker_running() {
+    // Re-verification, finding 1 (probe `probe_runner_up_in_band_blocks_stopping_a_stuck_
+    // worker`). `worker_stuck` = 0.97 on a worker that cannot be steered; `work_off_track`
+    // anywhere in its band. Resolving off-track above only changes *which* Stop
+    // (`Stop{"off track"}` instead of `Stop{"stuck"}`): the kind is the same, so it is not
+    // something the Stop rests on. Compared as whole directives it was, the Stop was
+    // refused, and the worker ran on unchecked with nothing escalated.
+    for off_track in [0.70_f32, 0.75, 0.80, 0.90] {
+        let s = Scenario::finish_ready()
+            .with_worker()
+            .set(HUMAN, 0.03)
+            .set(STUCK, 0.97)
+            .set(OFF_TRACK, off_track);
+        assert!(
+            !s.baseline()[&k(OFF_TRACK)].permitted,
+            "{off_track} is in band"
+        );
+        let decision = {
+            let baseline = s.baseline();
+            let input = s.input(&baseline);
+            crate::policy::decide(&s.registry, &input, &[])
+        };
+        assert_eq!(decision.selected.name(), "Stop", "off-track {off_track}");
+        assert!(
+            !decision
+                .invariants
+                .contains(&crate::directive::Invariant::UnresolvedDependency)
+        );
+    }
 }
 
 #[test]

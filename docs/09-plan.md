@@ -15,7 +15,7 @@ agent appear. Every milestone ends with the full offline suite green.
 | M2 — responsibilities, policy, a real worker | **complete** | `d3730f5`, `6d4b2a9`, `450b1a6` |
 | M3 — daemon, protocol, CLI, TUI | **complete** | `cdb5b0c`, `eab59ac`, `d673a67`, `76810fe`, `160ebdc`, `d74327f`, `1169b5c` |
 | M4 — web UI | **complete** | `826e737`, `55233b3`, `36c8742`, `fc38d02`, `8ff5ede`, `425e4a8`, `82e9c50` |
-| M5 — ensemble S1 and S2 | in progress: core triggers, the R0/R2 resolver and replay (`aftman_core::ensemble`); daemon wiring and the negation question not started | — |
+| M5 — ensemble S1 and S2 | **complete** | `82e9c50..eed1bb5` (branch `m5-ensemble`) |
 | M6 — herdr | not started | — |
 | M7 — ensemble S3 and S4 | not started | — |
 | M8 — backend hardening and verifier missions | in progress: in-process repository observation, its denial-of-service bound, and the observation-note invariant | — |
@@ -465,6 +465,47 @@ answer per check, and the surfaces (docs/06-ensemble.md §4 R0, §4 R3, §6.1, �
 every thresholded bundled check carries a hand-written negation (docs/05-responsibilities.md §1.3),
 the runtime asks it under `Purpose::Reframe` over the state the value was measured on, the
 irreversible gate is live, and R2 verdicts reach every surface (docs/06-ensemble.md §4 R2).
+
+**Done.** All four exit criteria are tests, in `crates/aftman-core/src/ensemble/tests.rs` and
+`crates/aftman-daemon/tests/ensemble.rs`. The first criterion has the deliberate deviation stated
+above. At `eed1bb5`, **1322 tests pass**: clippy and fmt are clean, and the suite is green with an
+empty environment. The work was built in three stages (the pure core, R0 in the daemon, R2), each
+reviewed adversarially by probe until clean. The integrated milestone was then reviewed by a
+reviewer who had seen none of the stage reviews, and the fixes were verified twice more.
+
+What the reviews turned up that the design did not:
+
+- **Opinions could unmask a directive, not only suppress one.** A contest on `needs_human` removed
+  an `Escalate` and let a lower-priority `Stop` execute. The `Finish` was safe only because
+  `UnresolvedUncertainty` already refused it. `Stop` now has the matching invariant,
+  `UnresolvedDependency`, scoped to the checks it rests on and compared by directive kind.
+- **"A rule that would fire" has to mean "the rule whose proposal is selected".** Read as "a
+  proposal exists", it spent the whole opinion budget on `Finish` proposals that were outranked or
+  refused.
+- **The cycle's assessment never shows command output to the model**, contrary to
+  docs/03-jev.md §5. With the ensemble on, a check whose command output was not shown is
+  re-measured by R0 before an irreversible directive, or held. With it off, the gap remains
+  (below).
+- **A guard that cannot run must hold, not pass.** That covers a spent opinion budget, a spent
+  refresh cap, and command evidence the model was never shown. A person's answer may authorise
+  more *cost* (a one-time top-up of opinions or refreshes), never an outcome.
+- **Never drop a future that contains an append or a provider run** (02-lld.md §11). An outer
+  timeout around a refresh crashed a run on a slow disk and orphaned provider process groups.
+
+Found during M5 and outside it (they predate M5 on `main`); tracked as follow-ups:
+
+- With the ensemble **off**, `before_finish` output never reaches the model except through the
+  parsed test summary (docs/03-jev.md §5).
+- `before_finish_ran` is set once and never reset when a later worker runs, so a second `Finish`
+  skips the `before_finish` providers (`runtime.rs`).
+- The runtime never sets `counters.verifier_completed`, so the `verification_completed` disjunct of
+  `Finish` is unreachable.
+- At the worker limit, a decisively insufficient `documentation_sufficient` still lets `Finish` win,
+  because only the `StartWorker` is refused. This is not the inhibition docs/05-responsibilities.md
+  §6.3 describes.
+- `aftman-cli/tests/e2e.rs` `stop_and_auto_start_during_a_daemon_shutdown_wait_for_it`
+  intermittently exceeds its 75 s shutdown wait under full-suite load. It runs with the ensemble off,
+  and no M5 code is on its path.
 
 ## M6 — herdr
 

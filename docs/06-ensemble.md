@@ -894,6 +894,19 @@ Notes that follow directly from §2:
     (`a_runner_up_finding_in_band_does_not_keep_a_stuck_worker_running`). A `Stop` the overall
     timeout selects is not a proposal and is not refused; a person's `Stop` never passes through
     policy.
+  - **A refused `Stop` is put to a person.** Refusing it and selecting nothing else left a worker
+    that appears stuck running unchecked until `worker_timeout`, with nobody told. So the
+    resolution asks policy which `Stop` it refuses (`policy::decide_with_holds`) and turns the
+    refusal into the cycle's coalesced ensemble escalation, attached to the first check holding
+    it — whether or not the `human` rung is configured. The question says that the worker
+    appears stuck or off track (the `Stop`'s reason and the values its rule read), which
+    uncertain checks hold the `Stop` and their values, that answering **`Stop`** stops the
+    worker (a person may always stop work), and that **`Accept`** leaves a worker that appears
+    stuck running. Without a person to answer, the run ends `NeedsHuman` and its worker is
+    stopped. After `Accept` (or `Guidance`), recorded against the holding check, it is not
+    asked again while that check holds the `Stop`
+    (`a_stop_held_by_an_unresolved_check_is_put_to_a_person`,
+    `a_stuck_worker_held_by_an_uncertain_inhibitor_is_put_to_a_person`).
 
   With the ensemble off every present check is permitted, and `decide` is exactly `arbitrate`.
   What an opinion removes, then, can only leave a less final directive selected. A *refresh* is a

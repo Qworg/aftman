@@ -5310,3 +5310,61 @@ async fn the_cooldown_is_counted_in_cycles_not_assessment_ids() {
     assert_eq!(window, 10);
     assert_eq!(bought, vec![0, 10], "once, then again after ten cycles");
 }
+
+#[tokio::test]
+async fn a_stop_held_by_an_unresolved_check_is_put_to_a_person() {
+    // Re-verification, finding 1(b). `worker_stuck` = 0.97 on an unsteerable worker, and
+    // `needs_human` = 0.75 in band: the Stop rests on `needs_human` (its Escalate would
+    // outrank it) and is refused. Refusing it and selecting Continue left a worker that
+    // appears stuck running, unchecked, with nobody told — with or without the `human` rung.
+    // Now policy's refusal becomes the coalesced ensemble escalation, whose question says
+    // what each answer does. Once a person accepts it, it is not asked again.
+    for human_rung in [true, false] {
+        let mut s = Scenario::finish_ready()
+            .with_worker()
+            .set(HUMAN, 0.75)
+            .set(STUCK, 0.97)
+            .reframable_all();
+        if !human_rung {
+            s = s.without_rung(Rung::Human);
+        }
+        let plan = s.plan();
+        let outcome = s
+            .resolve_plan(&plan, &answering_by(&plan, |p| Some(1.0 - p)))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        let decision = s.decide(&outcome);
+        assert!(
+            outcome.is_escalation(&decision.selected),
+            "rung {human_rung}: {:?}",
+            decision.selected
+        );
+        let asks: Vec<(&CheckKey, &str)> = outcome.escalations().collect();
+        assert_eq!(asks.len(), 1, "{asks:?}");
+        assert_eq!(*asks[0].0, k(HUMAN));
+        let ask = asks[0].1;
+        for needle in [
+            "The worker appears stuck or off track",
+            "`core.worker-health__worker_stuck` = 0.97",
+            "`core.human-escalation__needs_human` = 0.75 (threshold 0.80, in the uncertainty band)",
+            "Answer Stop to stop the worker",
+            "Accept leaves the worker running although it appears stuck",
+        ] {
+            assert!(ask.contains(needle), "{needle}: {ask}");
+        }
+
+        // Accepted: the worker runs on, and the question is not asked again.
+        let keys = outcome.escalated_checks();
+        let mut answered = outcome.counters.clone();
+        answered.record_human_decision(&keys, &crate::assessment::HumanDecision::Accept);
+        s.ensemble = answered;
+        s.cycle = AssessmentSeq(CYCLE.get() + 1);
+        let plan = s.plan();
+        let next = s
+            .resolve_plan(&plan, &answering_by(&plan, |p| Some(1.0 - p)))
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(next.escalations().count(), 0, "rung {human_rung}");
+        assert_eq!(s.decide(&next).selected.name(), "Continue");
+    }
+}

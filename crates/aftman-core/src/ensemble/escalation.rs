@@ -42,41 +42,7 @@ impl EnsembleOutcome {
     /// built from keys and numbers, never from model or repository text.
     #[must_use]
     pub fn escalation_proposal(&self) -> Option<Proposal> {
-        let escalations: Vec<(&CheckKey, &str)> = self.escalations().collect();
-        if escalations.is_empty() {
-            return None;
-        }
-        let keys = escalations
-            .iter()
-            .map(|(key, _)| format!("`{key}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let reason = cap_bytes(
-            &format!("{ESCALATION_REASON_PREFIX} a person must decide about {keys}"),
-            REFRESH_ERROR_CAP_BYTES,
-        );
-        let ask = if let [(_, ask)] = escalations.as_slice() {
-            (*ask).to_owned()
-        } else {
-            let mut ask = format!(
-                "{} checks cannot be acted on until a person decides.",
-                escalations.len()
-            );
-            for (index, (_, question)) in escalations.iter().enumerate() {
-                ask.push_str(&format!("\n\n{}. {question}", index + 1));
-            }
-            ask
-        };
-        Some(Proposal::new(
-            ENSEMBLE_RESPONSIBILITY,
-            ESCALATE_RULE,
-            Directive::Escalate {
-                reason,
-                ask: cap_bytes(&ask, ESCALATION_ASK_CAP_BYTES),
-            },
-            priority::ESCALATE_ENSEMBLE,
-            Stakes::High,
-        ))
+        proposal_from_records(&self.records)
     }
 
     /// Whether `directive`, as selected, is this cycle's ensemble escalation.
@@ -100,4 +66,47 @@ pub fn propose(
     let mut proposals = registry.propose(input);
     proposals.extend(outcome.escalation_proposal());
     proposals
+}
+
+/// The coalesced `Escalate` for a set of check records: one proposal for every question the
+/// records carry, or `None`. [`EnsembleOutcome::escalation_proposal`] over a cycle's records.
+pub(super) fn proposal_from_records(records: &[super::resolve::CheckRecord]) -> Option<Proposal> {
+    let escalations: Vec<(&CheckKey, &str)> = records
+        .iter()
+        .filter_map(|record| record.escalation.as_deref().map(|ask| (&record.check, ask)))
+        .collect();
+    if escalations.is_empty() {
+        return None;
+    }
+    let keys = escalations
+        .iter()
+        .map(|(key, _)| format!("`{key}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let reason = cap_bytes(
+        &format!("{ESCALATION_REASON_PREFIX} a person must decide about {keys}"),
+        REFRESH_ERROR_CAP_BYTES,
+    );
+    let ask = if let [(_, ask)] = escalations.as_slice() {
+        (*ask).to_owned()
+    } else {
+        let mut ask = format!(
+            "{} checks cannot be acted on until a person decides.",
+            escalations.len()
+        );
+        for (index, (_, question)) in escalations.iter().enumerate() {
+            ask.push_str(&format!("\n\n{}. {question}", index + 1));
+        }
+        ask
+    };
+    Some(Proposal::new(
+        ENSEMBLE_RESPONSIBILITY,
+        ESCALATE_RULE,
+        Directive::Escalate {
+            reason,
+            ask: cap_bytes(&ask, ESCALATION_ASK_CAP_BYTES),
+        },
+        priority::ESCALATE_ENSEMBLE,
+        Stakes::High,
+    ))
 }

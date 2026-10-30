@@ -481,11 +481,34 @@ pub fn decide(
     input: &PolicyInput<'_>,
     extra: &[Proposal],
 ) -> PolicyDecision {
+    decide_with_holds(registry, input, extra).0
+}
+
+/// A `Stop` that [`decide`] refused under [`Invariant::UnresolvedDependency`], and why.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HeldStop {
+    /// The refused directive.
+    pub directive: Directive,
+    /// The checks the rules proposing it read.
+    pub reads: Vec<CheckKey>,
+    /// The unpermitted checks it rests on: what holds it.
+    pub holding: Vec<CheckKey>,
+}
+
+/// [`decide`], and every `Stop` it refused, in the order refused. What the ensemble reads to
+/// put a refused `Stop` to a person (`docs/06-ensemble.md` §6).
+#[must_use]
+pub fn decide_with_holds(
+    registry: &crate::responsibility::ResponsibilityRegistry,
+    input: &PolicyInput<'_>,
+    extra: &[Proposal],
+) -> (PolicyDecision, Vec<HeldStop>) {
+    let mut held: Vec<HeldStop> = Vec::new();
     let mut proposals = registry.propose(input);
     proposals.extend(extra.iter().cloned());
     let mut decision = arbitrate(input, &proposals);
     if !input.ensemble_enabled {
-        return decision;
+        return (decision, held);
     }
     let mut refused: Vec<Proposal> = Vec::new();
     // Each round refuses at least one Stop proposal, so this ends.
@@ -504,15 +527,32 @@ pub fn decide(
             .iter()
             .flat_map(|p| registry.reads(&p.rule))
             .collect();
-        let rests_on_unresolved = input.checks.iter().any(|(key, check)| {
-            !check.permitted
-                && check.threshold.is_some()
-                && (reads.contains(key)
-                    || resolution_changes(registry, input, extra, key, check, &decision.selected))
-        });
-        if !rests_on_unresolved {
+        let holding: Vec<CheckKey> = input
+            .checks
+            .iter()
+            .filter(|(key, check)| {
+                !check.permitted
+                    && check.threshold.is_some()
+                    && (reads.contains(key)
+                        || resolution_changes(
+                            registry,
+                            input,
+                            extra,
+                            key,
+                            check,
+                            &decision.selected,
+                        ))
+            })
+            .map(|(key, _)| key.clone())
+            .collect();
+        if holding.is_empty() {
             break;
         }
+        held.push(HeldStop {
+            directive: decision.selected.clone(),
+            reads,
+            holding,
+        });
         refused.extend(stopping.into_iter().cloned());
         let remaining: Vec<Proposal> = proposals
             .iter()
@@ -532,7 +572,7 @@ pub fn decide(
             });
         }
     }
-    decision
+    (decision, held)
 }
 
 /// Whether resolving `key` — measuring it decisively, on either side of its threshold —

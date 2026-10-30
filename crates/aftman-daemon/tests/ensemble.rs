@@ -3613,3 +3613,90 @@ async fn a_stuck_worker_is_stopped_though_its_runner_up_finding_is_in_band() -> 
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn a_stuck_worker_held_by_an_uncertain_inhibitor_is_put_to_a_person() -> TestResult {
+    // Re-verification, finding 1(b), through the runtime. The unsteerable worker appears
+    // stuck (0.97), but `needs_human` = 0.75 is in band, and the Stop rests on it. It used to
+    // select Continue until the worker timed out, escalating nothing (no `human` rung), or
+    // escalate once and then, after Accept, Continue with no further question.
+    //
+    // Without a person to answer (no control channel), the escalation ends the run
+    // `NeedsHuman` and its worker is stopped — with or without the `human` rung.
+    for human_rung in [true, false] {
+        let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+        let model = Arc::new(R2Model::finish_ready().with(STUCK, 0.97).with(HUMAN, 0.75));
+        let rt = fx.runtime(
+            config(|c| c.max_workers = 1),
+            settings(|s| {
+                if !human_rung {
+                    s.rungs
+                        .retain(|r| *r != aftman_core::assessment::Rung::Human);
+                }
+            }),
+            Arc::clone(&model) as Arc<dyn DecisionModel>,
+            Arc::new(StuckWorker::default()),
+        );
+        let outcome = fx.run(rt).await?;
+        assert_eq!(
+            outcome.status,
+            FactoryStatus::NeedsHuman,
+            "rung {human_rung}"
+        );
+        let raised = fx.of_kind(EventKind::EscalationRaised);
+        assert_eq!(raised.len(), 1, "rung {human_rung}");
+        let ask = raised[0].payload["ask"].as_str().unwrap_or_default();
+        assert!(
+            ask.contains("The worker appears stuck or off track"),
+            "{ask}"
+        );
+        assert!(ask.contains("Answer Stop to stop the worker"), "{ask}");
+        assert_eq!(raised[0].payload["checks"][0], HUMAN);
+        assert!(
+            selected_with_a_worker(&fx).iter().all(|d| d != "Continue"),
+            "{:?}",
+            selected_with_a_worker(&fx)
+        );
+        assert_eq!(
+            fx.of_kind(EventKind::WorkerTerminated).len(),
+            1,
+            "stopped at the end"
+        );
+    }
+
+    // With a person: Accept is theirs to give, and the worker runs on without the question
+    // being asked again.
+    let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+    let model = Arc::new(R2Model::finish_ready().with(STUCK, 0.97).with(HUMAN, 0.75));
+    let rt = fx.runtime(
+        config(|c| c.max_workers = 1),
+        settings(|_| {}),
+        Arc::clone(&model) as Arc<dyn DecisionModel>,
+        Arc::new(StuckWorker::default()),
+    );
+    let mut run = RunGuard::launch(&fx, rt).await?;
+    let id = escalation(&fx, 1).await?;
+    run.answer(id, HumanDecision::Accept).await?;
+    let answered_at = fx.events().len();
+    until(&fx, "five more decisions", |events| {
+        events[answered_at.min(events.len())..]
+            .iter()
+            .filter(|e| e.kind == EventKind::DirectiveSelected)
+            .count()
+            >= 5
+    })
+    .await;
+    let after: Vec<String> = fx.events()[answered_at..]
+        .iter()
+        .filter(|e| e.kind == EventKind::DirectiveSelected)
+        .filter_map(|e| e.payload["directive"].as_str().map(ToOwned::to_owned))
+        .collect();
+    assert!(after.iter().all(|d| d == "Continue"), "{after:?}");
+    assert_eq!(
+        fx.of_kind(EventKind::EscalationRaised).len(),
+        1,
+        "not asked again"
+    );
+    run.cancel().await?;
+    Ok(())
+}

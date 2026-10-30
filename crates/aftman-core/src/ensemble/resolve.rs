@@ -363,6 +363,9 @@ impl EnsemblePlan {
             0
         };
         if self.settings.enabled {
+            self.escalate_held_stop(ctx, &checks, &mut records, &counters);
+        }
+        if self.settings.enabled {
             for (key, rc) in &checks {
                 if rc.threshold.is_none() {
                     continue;
@@ -519,6 +522,124 @@ impl EnsemblePlan {
         );
         checks.insert(record.check.clone(), record.resolved.clone());
         topup
+    }
+}
+
+impl EnsemblePlan {
+    /// A `Stop` policy refuses because a check it rests on is unresolved
+    /// (`Invariant::UnresolvedDependency`) is put to a person, through the coalesced
+    /// escalation (`docs/06-ensemble.md` §6). Refusing it and selecting nothing in its place
+    /// left a worker that appears stuck running unchecked, with nobody told. The question
+    /// says what aftman would do and why it does not, names the checks holding it with their
+    /// values, and says what each answer does: `Stop` stops the worker (a person may always
+    /// stop work), `Accept` leaves it running. It is asked whether or not the `human` rung is
+    /// configured — without a person to answer, the run ends `NeedsHuman` and its worker is
+    /// stopped — and is not asked again once a person has accepted it for the same check.
+    fn escalate_held_stop(
+        &self,
+        ctx: &EnsembleContext<'_>,
+        checks: &BTreeMap<CheckKey, ResolvedCheck>,
+        records: &mut Vec<CheckRecord>,
+        counters: &EnsembleCounters,
+    ) {
+        let input = crate::policy::PolicyInput {
+            checks,
+            ..*ctx.policy
+        };
+        let extra: Vec<crate::directive::Proposal> =
+            super::escalation::proposal_from_records(records)
+                .into_iter()
+                .collect();
+        let (_, held) = crate::policy::decide_with_holds(ctx.registry, &input, &extra);
+        let Some(stop) = held.first() else {
+            return;
+        };
+        let Some(first) = stop.holding.first() else {
+            return;
+        };
+        // A person who accepted this before has answered it: the worker runs on.
+        if counters.check(first).human.is_some() {
+            return;
+        }
+        let describe = |key: &CheckKey| {
+            let rc = checks.get(key);
+            let value = rc
+                .and_then(|rc| rc.jev_p)
+                .map_or_else(|| "no value".to_owned(), |p| format!("{p:.2}"));
+            let threshold = rc
+                .and_then(|rc| rc.threshold)
+                .map_or_else(|| "no threshold".to_owned(), |t| format!("{t:.2}"));
+            let why = match rc.and_then(|rc| rc.suppression) {
+                Some(CheckSuppression::InBand) => ", in the uncertainty band",
+                Some(CheckSuppression::Contested) => ", contested",
+                Some(CheckSuppression::Unresolved) => ", unresolved",
+                _ => "",
+            };
+            format!("`{key}` = {value} (threshold {threshold}{why})")
+        };
+        let reason = match &stop.directive {
+            crate::directive::Directive::Stop { reason } => reason.clone(),
+            other => other.name().to_owned(),
+        };
+        let finding = stop
+            .reads
+            .iter()
+            .map(describe)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let holding = stop
+            .holding
+            .iter()
+            .map(describe)
+            .collect::<Vec<_>>()
+            .join("; ");
+        let ask = cap_bytes(
+            &format!(
+                "The worker appears stuck or off track ({reason}: {finding}), and aftman would \
+                 stop it, but the Stop rests on checks it cannot act on: {holding}. Answer Stop \
+                 to stop the worker — a person may always stop work. Accept leaves the worker \
+                 running although it appears stuck or off track, and this is not asked again \
+                 while the same check holds the Stop. Recheck asks for those checks to be \
+                 measured again."
+            ),
+            REFRESH_ERROR_CAP_BYTES,
+        );
+        let index = match records.binary_search_by(|record| record.check.cmp(first)) {
+            Ok(index) => index,
+            Err(index) => {
+                let Some(rc) = checks.get(first) else {
+                    return;
+                };
+                records.insert(
+                    index,
+                    CheckRecord {
+                        check: first.clone(),
+                        triggers: BTreeSet::new(),
+                        baseline: self
+                            .baseline
+                            .get(first)
+                            .cloned()
+                            .unwrap_or_else(|| rc.clone()),
+                        resolved: rc.clone(),
+                        rungs_used: Vec::new(),
+                        refresh: None,
+                        opinions: Vec::new(),
+                        limits: Vec::new(),
+                        escalation: None,
+                        irreversible_guard: None,
+                    },
+                );
+                index
+            }
+        };
+        let record = &mut records[index];
+        if !record.rungs_used.contains(&Rung::Human) {
+            record.rungs_used.push(Rung::Human);
+        }
+        record.escalation = Some(match record.escalation.take() {
+            Some(earlier) => cap_bytes(&format!("{earlier}\n\n{ask}"), REFRESH_ERROR_CAP_BYTES),
+            None => ask,
+        });
     }
 }
 

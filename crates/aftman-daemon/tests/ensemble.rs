@@ -4065,9 +4065,17 @@ async fn before_finish_output_reaches_the_model_with_the_ensemble_off() -> TestR
     for call in &shown {
         assert_eq!(call.keys, vec![CheckKey::from(READY)]);
     }
-    // And it was asked as a request of its own in every cycle, beside the default one.
+    // Until the audit ran, its selection rendered the default state, and was asked with it in
+    // one request; from then on, as a request of its own beside the default one.
+    let audited = fx
+        .of_kind(EventKind::EvidenceCollected)
+        .first()
+        .map(|e| e.seq.get())
+        .ok_or("the audit ran")?;
     for e in fx.of_kind(EventKind::AssessmentCompleted) {
-        assert_eq!(e.payload["requests"].as_array().map(Vec::len), Some(2));
+        let requests = e.payload["requests"].as_array().map(Vec::len);
+        let expected = if e.seq.get() < audited { 1 } else { 2 };
+        assert_eq!(requests, Some(expected), "{}", e.payload);
     }
     // A Finish was selected once, provisionally, on the claim; once the audit was shown it
     // never was again.

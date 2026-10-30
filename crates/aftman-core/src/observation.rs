@@ -713,9 +713,10 @@ pub fn group_by_evidence(
 /// them over, exactly as sent.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AssessmentRequest {
-    /// The evidence selection the state was built from.
+    /// The evidence selection the state was built from (for a merged request, the first
+    /// group's: every merged selection renders this same state).
     pub selection: Vec<String>,
-    /// The checks asked over `state`, in definition order.
+    /// The checks asked over `state`.
     pub checks: Vec<CheckKey>,
     pub state: Value,
 }
@@ -733,17 +734,26 @@ pub struct AssessedStates {
 impl AssessedStates {
     /// The requests a cycle asks `checks` in, each with its state built from `observation`.
     #[must_use]
+    ///
+    /// Groups whose states render byte-identically are one request: two selections that
+    /// differ only in a provider that has not run (`command:audit` before the audit ran)
+    /// describe the same state, and asking it twice would pay twice for one answer. The
+    /// merged request keeps the first group's selection.
     pub fn group(observation: &Observation, checks: &[crate::responsibility::Check]) -> Self {
-        Self {
-            requests: group_by_evidence(checks)
-                .into_iter()
-                .map(|(selection, members)| AssessmentRequest {
-                    state: observation.state_for(&selection),
-                    checks: members.into_iter().map(|c| c.key).collect(),
+        let mut requests: Vec<AssessmentRequest> = Vec::new();
+        for (selection, members) in group_by_evidence(checks) {
+            let state = observation.state_for(&selection);
+            let keys = members.into_iter().map(|c| c.key);
+            match requests.iter_mut().find(|request| request.state == state) {
+                Some(request) => request.checks.extend(keys),
+                None => requests.push(AssessmentRequest {
                     selection,
-                })
-                .collect(),
+                    checks: keys.collect(),
+                    state,
+                }),
+            }
         }
+        Self { requests }
     }
 
     /// The requests, in the order they are asked.

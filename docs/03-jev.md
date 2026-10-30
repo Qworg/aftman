@@ -202,6 +202,11 @@ grouping was built. An operator's definition that names its own `evidence` adds 
   the default, so a check that wants the job and the diff besides `command:audit` names them.
   Two checks naming the same providers in a different order are one group. Groups are asked in
   the order their selection first appears among the active checks.
+- **Identical states are one request.** Groups whose states render byte-identically (the same
+  `state_digest`) are merged into one request, which keeps the first group's selection: a
+  selection that differs from the default only in `command:audit` describes exactly the default
+  state until the audit has run, and asking it twice would pay twice for one answer. After the
+  audit has run the states differ, and the group is a request of its own.
 - **One request at a time.** The requests are made in turn, not concurrently, so a cycle's calls,
   its usage lines and its `assessment_seq`s are in one deterministic order. There is no
   `AFTMAN_JEV_MAX_CONCURRENCY`; a run whose definitions make several groups pays their latency in

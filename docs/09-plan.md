@@ -447,9 +447,15 @@ framing-consistency check catches a framing-sensitive answer.
 | Replay from `RecordedOpinionSource` | `aftman-core::testing` |
 
 **Exit criteria:** the per-check ladder requests zero opinions for a check in band or one no rule
-about to act reads (the rule whose proposal is selected — not one outranked or refused), and the irreversible gate buys an opinion only for a decisive, permitted check the
-selected `Finish`/`Stop` rests on (a check a rule proposing it reads, or one whose side changes it;
-docs/06-ensemble.md §6) — never for an in-band check; a fake passing test run
+about to act reads (the rule whose proposal is selected — not one outranked or refused), and the
+irreversible gate buys an opinion only for a decisive, permitted check the selected
+`Finish`/`Stop` rests on (a check a rule proposing it reads, or one whose side changes it;
+docs/06-ensemble.md §6) — never for an in-band check. The gate's purchases for an inhibitor no rule
+acts on — `needs_human` = 0.05, or `documentation_sufficient`, under an executed `Finish` — are a
+**deliberate deviation** from the approved criterion, which asked for zero opinions for any check
+whose rule would not fire: an executed irreversible directive must rest on fresh confirms (the
+irreversible guard, docs/06-ensemble.md §6), and it rests on an inhibitor whose side would let a
+higher-priority directive win. A fake passing test run
 converts a `0.71` into a decisive value; no input can produce an opinion-driven `Finish`; repeated
 refresh is capped and visible.
 

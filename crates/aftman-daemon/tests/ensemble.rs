@@ -4590,6 +4590,29 @@ async fn after_a_failing_verdict_and_a_fix_the_verifier_runs_again_and_may_finis
 }
 
 #[tokio::test]
+async fn verify_always_runs_a_verifier_though_the_model_judges_none_needed() -> TestResult {
+    // `verify = "always"` refuses every `Finish` until a verifier has completed, but the
+    // verification rule also waited for `needs_verification`: with a model judging none
+    // needed (0.10) it never proposed one, and the run escalated "nothing can make progress"
+    // after its first worker. It could never finish. Now `always` requires a verifier once
+    // implementation looks complete: Code, Verify, PASS, Finish. Ensemble off and on.
+    for enabled in [false, true] {
+        let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+        let rt = fx.runtime(
+            config(|c| c.verify = VerifyPolicy::Always),
+            settings(|s| s.enabled = enabled),
+            Arc::new(R2Model::finish_ready()) as Arc<dyn DecisionModel>,
+            Arc::new(VerdictsWorker::new(&[Some("PASS")])),
+        );
+        let outcome = fx.run(rt).await?;
+        assert_eq!(outcome.status, FactoryStatus::Finished, "enabled={enabled}");
+        assert_eq!(tasks(&fx), vec!["Code", "Verify"], "enabled={enabled}");
+        assert!(outcome.counters.verifier_completed, "enabled={enabled}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_verifier_that_prints_only_whitespace_has_not_completed() -> TestResult {
     // Review F5. A verifier that exits successfully having printed only whitespace said
     // nothing: it has not completed, and cannot satisfy the disjunct.

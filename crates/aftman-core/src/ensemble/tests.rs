@@ -1682,7 +1682,12 @@ fn builtin_read_lists_match_the_rules() {
         excerpt: "x".into(),
         truncated: false,
     });
+    // `core.verification:required` fires only under `verify = "always"` with no verifier
+    // completed yet.
+    let mut required = Scenario::finish_ready();
+    required.config.verify = crate::job::VerifyPolicy::Always;
     let scenarios = vec![
+        required,
         Scenario::finish_ready(),
         Scenario::finish_ready().set(READY, 0.30),
         Scenario::finish_ready().set(NEEDS_VER, 0.90),

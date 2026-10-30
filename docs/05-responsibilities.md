@@ -27,7 +27,7 @@ overridable from `$XDG_CONFIG_HOME/aftman/responsibilities/`.
 | Responsibility | `always` | Checks | Threshold | Rule ids and directives (priority) |
 | --- | --- | --- | --- | --- |
 | `core.completion` | yes | `implementation_complete`, `requirements_satisfied`, `ready_to_finish` | 0.75 | `:retry-stopped` → `Retry` (800); `:thresholds-satisfied` → `Finish` (700); `:work-remains` → `StartWorker` (500) |
-| `core.verification` | yes | `tests_sufficient`, `needs_verification` | 0.75 / 0.65 | `:warranted` → `Verify` (600) |
+| `core.verification` | yes | `tests_sufficient`, `needs_verification` | 0.75 / 0.65 | `:warranted` → `Verify` (600); `:required` → `Verify` (600), only under `verify = "always"` |
 | `core.worker-health` | yes | `meaningful_progress`, `worker_stuck`, `work_off_track` | — / 0.80 / 0.80 | `:stuck`, `:off-track` → `Steer` or `Stop` (900) |
 | `repository.instructions` | yes | `agents_md_drift` | 0.80 | `:drift` → `Steer` or `Stop` (900) |
 | `core.human-escalation` | yes | `needs_human` | 0.80 | `:needs-human` → `Escalate` (1000) |
@@ -464,6 +464,7 @@ Applied before any priority comparison. They cannot be overridden by a score:
 | `attempts >= max_attempts` | `Retry` suppressed |
 | `workers >= max_workers` | `StartWorker` / `Verify` / `Retry` suppressed → `Escalate`. And a `Finish` cannot win because of it: when one of those, refused by the limit, would have outranked the `Finish`, policy escalates instead (§6.3) |
 | a verifier has started since the last code worker (`verified_since_code`) | `Verify` suppressed (`VerificationAlreadyRun`); a later code worker lifts it |
+| `verify = "always"` and no verifier has completed since the last code worker | `Finish` suppressed (`VerificationIncomplete`). So that this cannot strand a run, `core.verification:required` proposes the verifier itself once `implementation_complete` holds, without waiting for `needs_verification`: a model that judged none needed used to leave nothing that could make progress, and the run escalated "nothing can make progress" after its first worker |
 | Assessment budget exhausted, or too little of it left to ask a whole cycle (`assessment_budget_short`, [03-jev.md §5](03-jev.md)) | `Stop`, or `Escalate` when verification is pending |
 | Model error this cycle | only conservative directives are permitted (see §7) |
 | **Any active check unresolved** (`UnresolvedInBand`, `SuppressedByContest`, `Unresolved`) | `Finish` suppressed (`Invariant::UnresolvedUncertainty`). A high-priority inhibitor rule that cannot fire because its own measurement is uncertain must not silently disarm: uncertainty about a blocker blocks, it does not permit. |
@@ -536,6 +537,7 @@ priority  directive      rule id                             source
  750      StartWorker    quality.documentation:insufficient   documentation_sufficient < 0.75
  700      Finish         core.completion:thresholds-satisfied §6.2 holds
  600      Verify         core.verification:warranted          needs_verification >= 0.65
+ 600      Verify         core.verification:required           verify = always, no verifier completed, implementation_complete >= 0.75
  500      StartWorker    core.completion:work-remains         no worker, thresholds unmet
    0      Continue       runtime:default
 ```

@@ -830,6 +830,7 @@ pub fn documented_priorities() -> Vec<(&'static str, u16)> {
         ),
         ("core.completion:thresholds-satisfied", priority::FINISH),
         ("core.verification:warranted", priority::VERIFY),
+        ("core.verification:required", priority::VERIFY),
         (
             "core.completion:work-remains",
             priority::START_WORKER_COMPLETION,
@@ -1493,5 +1494,119 @@ mod tests {
             "in band must not satisfy `>=`"
         );
         assert!(policy_input.any_unresolved());
+    }
+
+    /// Finish-ready in every respect, with the model judging no verification needed.
+    fn finish_ready_needing_no_verification() -> BTreeMap<CheckKey, ResolvedCheck> {
+        checks(&[
+            ("core.completion", "implementation_complete", 0.95),
+            ("core.completion", "ready_to_finish", 0.95),
+            ("core.completion", "requirements_satisfied", 0.95),
+            ("core.verification", "tests_sufficient", 0.95),
+            ("core.verification", "needs_verification", 0.10),
+        ])
+    }
+
+    fn with_verify(verify: crate::job::VerifyPolicy) -> RunConfig {
+        RunConfig {
+            verify,
+            ..RunConfig::default()
+        }
+    }
+
+    #[test]
+    fn verify_always_starts_a_verifier_though_the_model_judges_none_needed() {
+        // `verify = "always"` refuses every `Finish` until a verifier has completed. The
+        // verification rule used to wait for `needs_verification` as well, so a model that
+        // said "none needed" left nothing that could make progress: the run escalated
+        // "nothing can make progress" after its first worker and could never finish.
+        let registry = crate::responsibility::ResponsibilityRegistry::builtin();
+        let o = observation();
+        let config = with_verify(crate::job::VerifyPolicy::Always);
+        let checks = finish_ready_needing_no_verification();
+
+        let before = Counters {
+            workers_run: 1,
+            ..Counters::default()
+        };
+        let decision = super::decide(&registry, &input(&o, &before, &config, &checks), &[]);
+        assert!(
+            matches!(decision.selected, Directive::Verify { .. }),
+            "selected {:?}",
+            decision.selected
+        );
+        assert!(
+            decision
+                .considered
+                .iter()
+                .any(|p| p.rule.as_str() == "core.verification:required")
+        );
+        assert!(
+            decision
+                .invariants
+                .contains(&Invariant::VerificationIncomplete)
+        );
+
+        // Once it has completed, the same state finishes.
+        let after = Counters {
+            workers_run: 2,
+            verifiers_run: 1,
+            verifier_completed: true,
+            verified_since_code: true,
+            ..Counters::default()
+        };
+        let decision = super::decide(&registry, &input(&o, &after, &config, &checks), &[]);
+        assert!(
+            matches!(decision.selected, Directive::Finish { .. }),
+            "selected {:?}",
+            decision.selected
+        );
+    }
+
+    #[test]
+    fn verify_always_waits_for_implementation_before_requiring_a_verifier() {
+        // The required verifier judges finished work, not work in progress: below the
+        // implementation threshold it is not proposed, and the run keeps working.
+        let registry = crate::responsibility::ResponsibilityRegistry::builtin();
+        let o = observation();
+        let config = with_verify(crate::job::VerifyPolicy::Always);
+        let mut checks = finish_ready_needing_no_verification();
+        checks.extend(self::checks(&[(
+            "core.completion",
+            "implementation_complete",
+            0.20,
+        )]));
+        let counters = Counters {
+            workers_run: 1,
+            ..Counters::default()
+        };
+        let decision = super::decide(&registry, &input(&o, &counters, &config, &checks), &[]);
+        assert!(
+            !decision
+                .considered
+                .iter()
+                .any(|p| matches!(p.directive, Directive::Verify { .. })),
+            "considered {:?}",
+            decision.considered
+        );
+    }
+
+    #[test]
+    fn verify_when_asked_still_waits_for_the_model_to_judge_a_verifier_needed() {
+        // The default is unchanged: no verifier when the model says none is needed.
+        let registry = crate::responsibility::ResponsibilityRegistry::builtin();
+        let o = observation();
+        let config = with_verify(crate::job::VerifyPolicy::WhenAsked);
+        let checks = finish_ready_needing_no_verification();
+        let counters = Counters {
+            workers_run: 1,
+            ..Counters::default()
+        };
+        let decision = super::decide(&registry, &input(&o, &counters, &config, &checks), &[]);
+        assert!(
+            matches!(decision.selected, Directive::Finish { .. }),
+            "selected {:?}",
+            decision.selected
+        );
     }
 }

@@ -391,6 +391,7 @@ pub mod builtin {
     use super::{Check, Responsibility, Routing};
     use crate::directive::{Directive, Proposal, Stakes, SteerKind, priority};
     use crate::ids::{CheckId, CheckKey, ResponsibilityId, RuleId};
+    use crate::job::VerifyPolicy;
     use crate::policy::PolicyInput;
 
     pub const COMPLETION: &str = "core.completion";
@@ -437,6 +438,10 @@ pub mod builtin {
                 (VERIFICATION, "needs_verification"),
                 (COMPLETION, "implementation_complete"),
             ],
+        ),
+        (
+            "core.verification:required",
+            &[(COMPLETION, "implementation_complete")],
         ),
         (
             "core.worker-health:stuck",
@@ -772,20 +777,38 @@ pub mod builtin {
             if input.active_worker.is_some() || input.counters.verified_since_code {
                 return Vec::new();
             }
-            let needed = input.check_ge(
-                &key(VERIFICATION, "needs_verification"),
-                rule_threshold(
-                    input,
-                    &self.checks,
-                    &key(VERIFICATION, "needs_verification"),
-                ),
-            );
             let implemented = input.check_ge(
                 &key(COMPLETION, "implementation_complete"),
                 rule_threshold(
                     input,
                     &self.checks,
                     &key(COMPLETION, "implementation_complete"),
+                ),
+            );
+            // `verify = "always"` refuses every `Finish` until a verifier has completed
+            // (`Invariant::VerificationIncomplete`), so it cannot also wait for the model to
+            // judge one warranted: a model that says "no verification needed" would leave the
+            // run with nothing that can make progress. Its own rule, reading only
+            // `implementation_complete`, so the read list says what it acts on.
+            if input.config.verify == VerifyPolicy::Always && !input.counters.verifier_completed {
+                if implemented {
+                    return vec![proposal(
+                        &self.id,
+                        "core.verification:required",
+                        Directive::Verify {
+                            reason: "verify = always requires a verifier before finishing".into(),
+                        },
+                        priority::VERIFY,
+                    )];
+                }
+                return Vec::new();
+            }
+            let needed = input.check_ge(
+                &key(VERIFICATION, "needs_verification"),
+                rule_threshold(
+                    input,
+                    &self.checks,
+                    &key(VERIFICATION, "needs_verification"),
                 ),
             );
             if needed && implemented {
@@ -1011,6 +1034,7 @@ pub mod builtin {
             "core.completion:retry-stopped",
             "core.completion:work-remains",
             "core.verification:warranted",
+            "core.verification:required",
             "core.worker-health:stuck",
             "core.worker-health:off-track",
             "core.worker-health:grace",

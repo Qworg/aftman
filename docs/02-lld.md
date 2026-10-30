@@ -257,8 +257,10 @@ pub enum   SuppressionReason { NotPermitted, Invariant(Invariant), HigherPriorit
 pub enum   Invariant { OverallTimeout, AttemptsExhausted, WorkerLimit, VerificationAlreadyRun,
     AssessmentBudget, ModelUnavailable, UnresolvedUncertainty,
     // No worker has ever run, so there is nothing to declare complete.
-    NoWorkAttempted,
-    UnobservedRepository }
+    NoWorkAttempted, WorkerStillActive,
+    // `verify = always` and no verifier has completed.
+    VerificationIncomplete,
+    ObservationTooLarge, UnobservedRepository, UnresolvedDependency }
 pub struct Routing { pub always: bool, pub instructions: Option<String>, pub threshold: f32 }
 
 // ---- store ------------------------------------------------------------

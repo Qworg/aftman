@@ -3021,18 +3021,17 @@ struct Scratch<'a> {
 }
 
 impl CycleSource<'_> {
-    /// What the model is shown when a check's question is asked again: the cycle's usual
-    /// selection plus the check's own, so command evidence it names is in the state.
+    /// What the model is shown when a check's question is asked again: the check's own
+    /// selection, exactly as the cycle's assessment asked it (`docs/03-jev.md` §5), so the
+    /// refreshed value is measured over the same evidence as the value it supersedes, fresh.
     fn selection(&self, check: &CheckKey) -> Vec<String> {
-        let mut selection = aftman_core::observation::default_evidence();
-        if let Some(definition) = self.definitions.iter().find(|c| c.key == *check) {
-            for entry in aftman_core::observation::evidence_selection(definition) {
-                if !selection.contains(&entry) {
-                    selection.push(entry);
-                }
-            }
-        }
-        selection
+        self.definitions
+            .iter()
+            .find(|c| c.key == *check)
+            .map_or_else(
+                aftman_core::observation::default_evidence,
+                aftman_core::observation::evidence_selection,
+            )
     }
 
     /// Ask the model, bounded by `opinion_timeout_seconds` alone, watching the control

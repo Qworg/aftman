@@ -227,8 +227,12 @@ a `RefreshRequest` so:
 3. If none exited, no model call: no value.
 4. **The observation is rebuilt** exactly as a cycle builds it, with the fresh evidence, and the
    model is asked that one check's question again over `state_for(selection)`, where `selection`
-   is the cycle's own (`default_evidence`) plus the check's evidence selection — so command output
-   the check names (`command:<id>`) is in the state, as `command_evidence`.
+   is the check's own evidence selection, exactly the one its request in the cycle's assessment was
+   asked over ([03-jev.md §5](03-jev.md)) — so the refreshed value is measured over the same
+   evidence as the value it supersedes, fresh, and command output the check names
+   (`command:<id>`) is in the state, as `command_evidence`. Until the assessment was grouped by
+   selection, a refresh asked over the default selection plus the check's own, because the
+   assessment's selection was the default for every check.
 5. The call is made under `Purpose::Refresh` ([03-jev.md §7](03-jev.md)): its own purpose so that
    `aftman usage` can tell what refreshes cost, billed by the same usage line every call writes,
    sent under the same request budget (`jev_budget`), and **counted against `max_assessments`** —

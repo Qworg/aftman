@@ -647,6 +647,19 @@ async fn the_exit_criterion_a_fake_passing_test_run_is_refreshed_into_a_decisive
     assert_eq!(refresh_calls.len(), 1);
     assert_eq!(refresh_calls[0].0, vec![CheckKey::from(TESTS)]);
     assert!(refresh_calls[0].1.contains("PROVIDER-PASS"));
+    // Over the check's own selection, as its assessment was asked (`docs/03-jev.md` §5), not
+    // the default plus it.
+    let refreshed: Value = serde_json::from_str(&refresh_calls[0].1)?;
+    let shown: BTreeSet<&str> = refreshed
+        .as_object()
+        .ok_or("a state object")?
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        shown,
+        BTreeSet::from(["command_evidence", "test_results", "worker_output"])
+    );
     // ... and it counted against the assessment budget, as every R2 reframe the Finish it
     // unmasked bought did. `tests_sufficient` selects its own evidence, so every cycle is two
     // requests, and each counts (`docs/03-jev.md` §5).

@@ -4821,6 +4821,59 @@ async fn recheck_authorises_one_more_verifier_after_its_retry() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_recheck_to_an_unrelated_question_authorises_no_verifier() -> TestResult {
+    // Review round 4, N4. With the verifier and its retry spent, a `Recheck` to a
+    // `needs_human` question that came up next authorised a verifier the question never
+    // offered. Only an answer to the escalation that offered it does.
+    let asking = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+    let model = {
+        let asking = Arc::clone(&asking);
+        R2Model::finish_ready().assess_rule(move |key, _, _| {
+            (*key == CheckKey::from(HUMAN) && asking.load(std::sync::atomic::Ordering::SeqCst))
+                .then_some(0.97)
+        })
+    };
+    let rt = fx.runtime(
+        config(|c| c.verify = VerifyPolicy::Always),
+        // Off, so the `needs_human` question is the model's own and nothing reframes it.
+        settings(|s| s.enabled = false),
+        Arc::new(model) as Arc<dyn DecisionModel>,
+        Arc::new(VerdictsWorker::new(&[None, None, Some("PASS")])),
+    );
+    let mut run = RunGuard::launch(&fx, rt).await?;
+    let held = escalation(&fx, 1).await?;
+    assert_eq!(
+        fx.of_kind(EventKind::EscalationRaised)[0].payload["verifier_retry"],
+        true
+    );
+    asking.store(true, std::sync::atomic::Ordering::SeqCst);
+    run.answer(held, HumanDecision::Accept).await?;
+    let human = escalation(&fx, 2).await?;
+    let raised = fx.of_kind(EventKind::EscalationRaised);
+    assert!(
+        raised[1].payload["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("human input"),
+        "{:?}",
+        raised[1].payload
+    );
+    assert_ne!(raised[1].payload["verifier_retry"], true);
+    asking.store(false, std::sync::atomic::Ordering::SeqCst);
+    run.answer(human, HumanDecision::Recheck).await?;
+    escalation(&fx, 3).await?;
+    assert_eq!(tasks(&fx), vec!["Code", "Verify", "Verify"]);
+    assert!(
+        !fx.of_kind(EventKind::Notification)
+            .iter()
+            .any(|e| e.payload["code"] == "verifier_retry_authorised")
+    );
+    run.cancel().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn under_verify_always_the_worker_limit_names_the_rule_still_asking_for_work() -> TestResult {
     // Review round 3, M2. With documentation decisively insufficient at the worker limit,
     // `when_asked` named `quality.documentation:insufficient` (§6.3), but under `always` the

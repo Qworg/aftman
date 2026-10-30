@@ -1218,11 +1218,16 @@ impl FactoryRuntime {
                     .collect();
                 aftman_core::policy::decide(&registry, &input, &extra)
             };
-            let escalated = outcome
+            let mut escalated = outcome
                 .as_ref()
                 .filter(|outcome| outcome.is_escalation(&decision.selected))
                 .map(EscalatedChecks::from_outcome)
                 .unwrap_or_default();
+            escalated.verifier_retry = aftman_core::policy::offers_verifier_retry(
+                &decision,
+                &state.counters,
+                &self.deps.config,
+            );
 
             for proposal in &decision.considered {
                 self.emit(
@@ -1751,9 +1756,14 @@ impl FactoryRuntime {
             HumanDecision::Accept => self.resume(state, job, ls, false).await?,
             HumanDecision::Recheck | HumanDecision::ClaimComplete => {
                 // Under `verify = "always"`, with the verifier and its retry not completed on
-                // this code, the answer authorises one more verifier — a cost, never an outcome
-                // (`docs/05-responsibilities.md` §6.1). Decided in core.
-                if aftman_core::policy::grant_verifier_retry(&mut state.counters, &self.deps.config)
+                // this code, an answer to the escalation that said so authorises one more
+                // verifier — a cost, never an outcome (`docs/05-responsibilities.md` §6.1). An
+                // answer to any other question authorises nothing. Decided in core.
+                if state.escalations[index].verifier_retry
+                    && aftman_core::policy::grant_verifier_retry(
+                        &mut state.counters,
+                        &self.deps.config,
+                    )
                 {
                     self.emit(
                         state,
@@ -2925,6 +2935,7 @@ impl FactoryRuntime {
                     opinion_topup: escalated.opinion_topup,
                     refresh_topup: escalated.refresh_topup.clone(),
                     held_stop: escalated.held_stop.clone(),
+                    verifier_retry: escalated.verifier_retry,
                     ask: ask.clone(),
                     jev_p,
                     opinions: escalated.opinions.clone(),
@@ -2940,6 +2951,9 @@ impl FactoryRuntime {
                 });
                 if escalated.opinion_topup > 0 {
                     payload["opinion_topup"] = json!(escalated.opinion_topup);
+                }
+                if escalated.verifier_retry {
+                    payload["verifier_retry"] = json!(true);
                 }
                 if !escalated.refresh_topup.is_empty() {
                     payload["refresh_topup"] = json!(
@@ -3027,6 +3041,9 @@ struct EscalatedChecks {
     refresh_topup: Vec<CheckKey>,
     /// The held-`Stop` question's key, when the escalation includes one.
     held_stop: Option<String>,
+    /// Whether an answer would authorise one more verifier (`policy::offers_verifier_retry`).
+    /// Policy's own escalation, not the ensemble's, so it is set after `from_outcome`.
+    verifier_retry: bool,
 }
 
 impl EscalatedChecks {
@@ -3044,6 +3061,7 @@ impl EscalatedChecks {
             opinion_topup: outcome.opinion_topup,
             refresh_topup: outcome.refresh_topup.clone(),
             held_stop: outcome.held_stop.clone(),
+            verifier_retry: false,
         }
     }
 }

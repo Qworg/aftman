@@ -332,9 +332,16 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
         // the rule used to go unnamed. When `always` holds the `Finish`, the job may well look
         // complete: say what is missing, a verifier that completed.
         let held = verification_hold(input, &suppressed);
-        let blocked = proposals
-            .iter()
-            .find(|p| matches!(p.directive, Directive::Finish { .. }))
+        // Only when `always` holds the `Finish`: otherwise the `Finish` was refused for a
+        // reason of its own (an unread repository, say), which naming the rule would hide, and
+        // `when_asked` keeps the question it had.
+        let blocked = held
+            .as_ref()
+            .and_then(|_| {
+                proposals
+                    .iter()
+                    .find(|p| matches!(p.directive, Directive::Finish { .. }))
+            })
             .and_then(|finish| refused_work_outranking(proposals, &suppressed, finish));
         let (reason, ask) = match (blocked, held) {
             (Some(blocked), held) => (
@@ -787,15 +794,49 @@ pub const VERIFIER_RETRIES: u32 = 1;
 /// code. Without it no answer but `Stop` moved such a run. Like an opinion or refresh
 /// top-up (`docs/06-ensemble.md` §6), it authorises a cost, never an outcome: the verifier
 /// must still complete, and the `Finish` still rests on what it reports. `true` when granted.
+///
+/// Only for the escalation that offered it ([`offers_verifier_retry`], recorded on the
+/// escalation): an answer to a question about something else authorises nothing.
 pub fn grant_verifier_retry(counters: &mut Counters, config: &RunConfig) -> bool {
-    let held = config.verify == crate::job::VerifyPolicy::Always
-        && counters.verified_since_code
-        && !counters.verifier_completed
-        && counters.verifiers_on_this_code() > VERIFIER_RETRIES;
-    if held {
+    let spent = verifier_retry_spent(counters, config);
+    if spent {
         counters.verifiers_since_code = VERIFIER_RETRIES;
     }
-    held
+    spent
+}
+
+/// `verify = "always"`, a verifier has started on this code without completing, and its
+/// retry is spent.
+fn verifier_retry_spent(counters: &Counters, config: &RunConfig) -> bool {
+    config.verify == crate::job::VerifyPolicy::Always
+        && counters.verified_since_code
+        && !counters.verifier_completed
+        && counters.verifiers_on_this_code() > VERIFIER_RETRIES
+}
+
+/// Whether the escalation `decision` selected offers a person one more verifier: it is
+/// policy's own question saying that `verify = "always"` holds the `Finish`
+/// ([`verification_hold`]), not a proposal's — `core.human-escalation`'s, say, which may win
+/// the same cycle — and the retry is spent. The runtime records it on the escalation, and
+/// only an answer to that escalation calls [`grant_verifier_retry`].
+#[must_use]
+pub fn offers_verifier_retry(
+    decision: &PolicyDecision,
+    counters: &Counters,
+    config: &RunConfig,
+) -> bool {
+    matches!(decision.selected, Directive::Escalate { .. })
+        && !decision
+            .considered
+            .iter()
+            .any(|p| p.directive == decision.selected)
+        && decision.suppressed.iter().any(|s| {
+            matches!(
+                s.reason,
+                SuppressionReason::Invariant(Invariant::VerificationIncomplete)
+            )
+        })
+        && verifier_retry_spent(counters, config)
 }
 
 /// Whether a proposal is refused by a hard invariant. `None` means it survives.
@@ -1005,6 +1046,19 @@ mod tests {
                 let k = key(r, c);
                 let rc =
                     ResolvedCheck::from_measurement(k.clone(), Some(*p), Some(0.75), 0.15, true);
+                (k, rc)
+            })
+            .collect()
+    }
+
+    fn checks_with_threshold(
+        entries: &[(&str, &str, f32, f32)],
+    ) -> BTreeMap<CheckKey, ResolvedCheck> {
+        entries
+            .iter()
+            .map(|(r, c, p, t)| {
+                let k = key(r, c);
+                let rc = ResolvedCheck::from_measurement(k.clone(), Some(*p), Some(*t), 0.15, true);
                 (k, rc)
             })
             .collect()
@@ -1933,6 +1987,94 @@ mod tests {
             }
         }
         assert_eq!(retries, 1);
+    }
+
+    #[test]
+    fn only_the_question_about_verification_offers_another_verifier() {
+        // Review round 4, N4. A `Recheck` to any escalation used to authorise a verifier,
+        // including one about something else entirely — a `needs_human` question that won the
+        // same cycle. Only policy's own question saying that `verify = "always"` holds the
+        // `Finish`, with the retry spent, offers one.
+        let registry = crate::responsibility::ResponsibilityRegistry::builtin();
+        let o = observation();
+        let config = RunConfig {
+            verify: crate::job::VerifyPolicy::Always,
+            max_workers: 10,
+            ..RunConfig::default()
+        };
+        let spent = Counters {
+            workers_run: 3,
+            verifiers_run: 2,
+            verified_since_code: true,
+            verifiers_since_code: 2,
+            ..Counters::default()
+        };
+        let checks = finish_ready_needing_no_verification();
+        let decision = super::decide(&registry, &input(&o, &spent, &config, &checks), &[]);
+        assert!(matches!(decision.selected, Directive::Escalate { .. }));
+        assert!(super::offers_verifier_retry(&decision, &spent, &config));
+
+        let mut human = finish_ready_needing_no_verification();
+        human.extend(checks_with_threshold(&[(
+            "core.human-escalation",
+            "needs_human",
+            0.97,
+            0.80,
+        )]));
+        let decision = super::decide(&registry, &input(&o, &spent, &config, &human), &[]);
+        let Directive::Escalate { reason, .. } = &decision.selected else {
+            panic!("selected {:?}", decision.selected);
+        };
+        assert!(reason.contains("human input"), "{reason}");
+        assert!(!super::offers_verifier_retry(&decision, &spent, &config));
+
+        // Nor before the retry is spent: there is nothing yet to authorise.
+        let unspent = Counters {
+            verifiers_since_code: 1,
+            verifiers_run: 1,
+            workers_run: 2,
+            ..spent
+        };
+        let decision = super::decide(&registry, &input(&o, &unspent, &config, &checks), &[]);
+        assert!(!super::offers_verifier_retry(&decision, &unspent, &config));
+    }
+
+    #[test]
+    fn when_asked_keeps_its_worker_limit_question_when_the_repository_was_unread() {
+        // Review round 4, N5. Naming the rule that still asks for work at the worker limit is
+        // for a `Finish` that `verify = "always"` holds. When a `when_asked` `Finish` is
+        // refused for a reason of its own — the repository could not be read — the question
+        // is the one it was, not one that hides that reason.
+        let o = Observation {
+            observation_note: Some("the repository could not be read".into()),
+            ..observation()
+        };
+        let config = RunConfig {
+            max_workers: 3,
+            ..RunConfig::default()
+        };
+        let counters = Counters {
+            workers_run: 3,
+            ..Counters::default()
+        };
+        let checks = finish_ready_needing_no_verification();
+        let docs = Proposal::new(
+            "quality.documentation",
+            "quality.documentation:insufficient",
+            Directive::StartWorker {
+                reason: "documentation is insufficient".into(),
+            },
+            750,
+            Stakes::High,
+        );
+        let decision = arbitrate(&input(&o, &counters, &config, &checks), &[docs, finish()]);
+        assert_eq!(
+            decision.selected,
+            Directive::Escalate {
+                reason: "worker limit reached before completion".into(),
+                ask: "The worker budget is exhausted and the job does not look complete.".into(),
+            }
+        );
     }
 
     #[test]

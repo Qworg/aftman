@@ -136,6 +136,12 @@ pub struct Escalation {
     /// otherwise, and in older snapshots.
     #[serde(default)]
     pub held_stop: Option<String>,
+    /// Whether a `Recheck` or `ClaimComplete` answer authorises one more verifier: the
+    /// escalation said that `verify = "always"` holds the `Finish` and the verifier's retry
+    /// is spent (`policy::offers_verifier_retry`). `false` for any other escalation, and in
+    /// older snapshots.
+    #[serde(default)]
+    pub verifier_retry: bool,
     pub ask: String,
     pub jev_p: Option<f32>,
     pub opinions: Vec<Opinion>,
@@ -307,6 +313,7 @@ mod tests {
             opinion_topup: 0,
             refresh_topup: Vec::new(),
             held_stop: None,
+            verifier_retry: false,
             ask: "is it done?".into(),
             jev_p: Some(0.71),
             opinions: Vec::new(),
@@ -334,6 +341,7 @@ mod tests {
             opinion_topup: 0,
             refresh_topup: Vec::new(),
             held_stop: None,
+            verifier_retry: false,
             ask: "budget exhausted".into(),
             jev_p: None,
             opinions: Vec::new(),

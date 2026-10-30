@@ -380,7 +380,9 @@ Rules:
   so a model's conclusion about a test run is auditable down to the command;
 - `run_when = "before_finish"` means the check is re-evaluated with fresh evidence before `Finish`
   is allowed — the primary defense against a worker that reports tests it never ran. The
-  provisional `Finish` runs the provider and the cycle is assessed again, and that assessment shows
+  provisional `Finish` runs the provider and the cycle is assessed again — before every `Finish`
+  that follows a worker, since a worker that started after the providers last ran may have
+  changed what they measured — and that assessment shows
   its output to every check that selects it (`command:<id>` or `command_evidence`), with the
   ensemble on or off. A check that does not select it sees only what `test_summary` parses from
   it; none of the bundled checks selects command output, so to have `ready_to_finish` read an

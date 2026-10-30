@@ -1004,7 +1004,13 @@ Notes that follow directly from §2:
    for this cycle — the same expression, computed once, that the apply step reads to decide whether a
    selected `Finish` is executed or replaced by running the `before_finish` providers and
    re-assessing. It is never "`before_finish` providers are configured": once they have run it is
-   false. In a cycle where it is true a selected `Finish` is never applied; if collecting that
+   false — until a worker starts. `before_finish_ran` is set when the providers run and reset
+   whenever a worker starts (and by a person's `Recheck` or `ClaimComplete`, §4 R3), because what
+   they measured was the tree before that worker, and may no longer hold: the next `Finish` is
+   provisional again, and they run again before it
+   (`a_second_finish_after_a_later_worker_runs_the_before_finish_providers_again`). An earlier
+   revision reset it only on a person's answer, so a second `Finish`, after a later worker had
+   changed the repository, executed on the first one's audit. In a cycle where it is true a selected `Finish` is never applied; if collecting that
    evidence fails, the error ends the run there.
 3. **`build`, then `ENSEMBLE_TRIGGERED`** for each triggered check, then **`resolve`** against the
    runtime's source (§4 R0), then `OPINION_RECORDED` per opinion and one `ENSEMBLE_RESOLVED`

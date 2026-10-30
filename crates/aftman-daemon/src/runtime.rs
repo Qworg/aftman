@@ -1275,6 +1275,7 @@ impl FactoryRuntime {
                 continue;
             }
 
+            let workers_before = state.counters.workers_run;
             ls.worker = self
                 .apply(
                     state,
@@ -1285,6 +1286,12 @@ impl FactoryRuntime {
                     &escalated,
                 )
                 .await?;
+            // A worker started: what the `before_finish` providers measured was the tree
+            // before it, and may no longer hold. The next `Finish` is provisional again, so
+            // they run again before it (`docs/06-ensemble.md` §6.1, item 2).
+            if state.counters.workers_run != workers_before {
+                ls.before_finish_ran = false;
+            }
             // A directive that neither ended the run nor parked it leaves the run
             // supervising, so return to `Running`.
             if state.status == FactoryStatus::Assessing {

@@ -4135,3 +4135,66 @@ async fn a_check_selecting_a_worker_completed_provider_is_refreshed_and_may_fini
     );
     Ok(())
 }
+
+// ---- a later worker makes the `before_finish` evidence stale ---------------------------
+
+/// `ready_to_finish` per worker: with one worker run, ready until the `before_finish` audit
+/// has run (its `EVIDENCE_COLLECTED` is in the recent events) and not ready after; with a
+/// second, ready again.
+fn ready_then_not_then_ready() -> R2Model {
+    R2Model::finish_ready().assess_rule(|key, text, _| {
+        if *key != CheckKey::from(READY) {
+            return None;
+        }
+        let state: Value = serde_json::from_str(text).ok()?;
+        let first = state["factory_status"]["workers_run"].as_u64()? == 1;
+        Some(if first && text.contains("EVIDENCE_COLLECTED") {
+            0.10
+        } else {
+            0.95
+        })
+    })
+}
+
+#[tokio::test]
+async fn a_second_finish_after_a_later_worker_runs_the_before_finish_providers_again() -> TestResult
+{
+    // `docs/09-plan.md`, "Found during M5". The model says ready, so the `before_finish`
+    // audit runs before the Finish; then not ready, so a second worker runs; then ready
+    // again. `before_finish_ran` was set once and never reset, so the second Finish
+    // executed without the audit, on evidence from before the second worker changed the
+    // repository. It resets whenever a worker starts: the second Finish is provisional too,
+    // and the audit runs again first. With the ensemble off and on.
+    for enabled in [false, true] {
+        let fx = Fixture::new(
+            DefinitionSet::bundled()?,
+            audit("before_finish", "echo AUDIT-CLEAN")?,
+        )?;
+        let rt = fx.runtime(
+            config(|c| c.max_workers = 5),
+            settings(|s| s.enabled = enabled),
+            Arc::new(ready_then_not_then_ready()) as Arc<dyn DecisionModel>,
+            Arc::new(SimulatedWorker::instant()),
+        );
+        let outcome = fx.run(rt).await?;
+        assert_eq!(outcome.status, FactoryStatus::Finished, "enabled={enabled}");
+        assert_eq!(outcome.counters.workers_run, 2, "enabled={enabled}");
+        // In order: worker, audit, worker, audit, finished.
+        let order: Vec<&str> = fx
+            .events()
+            .iter()
+            .filter_map(|e| match e.kind {
+                EventKind::WorkerStarted => Some("worker"),
+                EventKind::EvidenceCollected => Some("audit"),
+                EventKind::StateChanged if e.payload["to"] == "finished" => Some("finished"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            order,
+            vec!["worker", "audit", "worker", "audit", "finished"],
+            "enabled={enabled}"
+        );
+    }
+    Ok(())
+}

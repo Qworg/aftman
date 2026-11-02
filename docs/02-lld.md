@@ -236,6 +236,9 @@ pub struct Counters { pub workers_run: u32, pub attempts: u32, pub failures: u32
                                     // (doc 04 §6); #[serde(default)]
     pub verifiers_since_code: u32,  // how many: bounds the `verify = always` retry to one
                                     // (doc 05 §6.1); #[serde(default)]
+    pub verifier_modified_repo: bool, // the last verifier wrote to the tree and no person has
+                                    // answered for it: the run is put to one (doc 05 §6.1);
+                                    // #[serde(default)]
     pub assessment_budget_short: bool, // this cycle's requests exceeded what is left of
                                     // max_assessments (doc 03 §5); #[serde(default)]
     pub steers_sent: u32,
@@ -279,7 +282,11 @@ pub struct RunState { pub header: RunHeader, pub status: FactoryStatus,
     pub human_wait_ms: u64,
     /// The ensemble's per-run counters (doc 06 §12). `#[serde(default)]`; not in `Counters`
     /// for the same reason as `human_wait_ms`.
-    pub ensemble: EnsembleCounters }
+    pub ensemble: EnsembleCounters,
+    /// What the last verifier that modified the repository changed (≤ 20 quoted paths, then
+    /// "and N more"), for the question put to a person (doc 04 §6). `#[serde(default)]`; not
+    /// in `Counters`, because the paths are worker-controlled and the counters reach the model.
+    pub verifier_edit: Vec<String> }
 pub struct RunSummary { pub id: RunId, pub status: FactoryStatus, pub created_at: OffsetDateTime,
     pub elapsed_secs: u64, pub job_excerpt: String, pub repo: PathBuf,
     pub worker: WorkerKind, pub last_directive: Option<String> /* the directive's name */ }
@@ -713,13 +720,14 @@ Payloads added for the control plane (every payload also carries `schema_version
 | `WorkerSteered` | `source` (`supervisor` \| `human`), `worker_id`, `outcome`, `accepted`, and for a human steer `excerpt` (≤ 200 chars). |
 | `WorkerCompleted` | `worker_id`, `outcome`, `success` (about the **exit code**), `empty` (about whether it said anything: no prose, no tool calls and no tokens for a structured backend; no output at all for one without a stream). The two are different questions — a worker that exits 0 having done nothing is not a completed job — and a surface should show both. See [10-live-validation.md](10-live-validation.md) step 2 for the case that motivated it. |
 | `WorkerTerminated` | Uniform: `worker_id`, `cause` (`stopped` for a `Stop` directive, `cancelled`, `superseded` for a `Retry`, `run_ended` when the run ended with a worker still live), `reason`. A worker that had already completed when its stop was seen is recorded by `WorkerCompleted` instead. |
-| `EscalationRaised` | `escalation_id` (what `run.answer` needs), `kind`, `reason`, `ask`, and for an ensemble escalation `checks` (the keys it is about; absent otherwise) and, when the opinion budget is spent, `opinion_topup` (what `Recheck`/`ClaimComplete` authorises, doc 06 §6). |
+| `EscalationRaised` | `escalation_id` (what `run.answer` needs), `kind`, `reason`, `ask`, and for an ensemble escalation `checks` (the keys it is about; absent otherwise) and, when the opinion budget is spent, `opinion_topup` (what `Recheck`/`ClaimComplete` authorises, doc 06 §6); `verifier_edit: true` for the question about a verifier that modified the repository (doc 04 §6), whose `ask` ends with what it changed. |
 | `Notification` (`code: "refresh_cap_topped_up"`) | A person's `Recheck`/`ClaimComplete` to an escalation about command evidence the model was never shown authorised one more refresh of each listed check: `escalation_id`, `checks`. `EscalationRaised` carries the listed checks as `refresh_topup`. |
 | `Notification` (`code: "evidence_provider_unseen"`) | At run start, once routing has run: configured command providers no check can ever be shown (doc 05 §3), as `providers`, and a `message`. A note: the run goes on. |
 | `Notification` (`code: "opinion_budget_topped_up"`) | A person's `Recheck`/`ClaimComplete` to a spent-budget escalation authorised more opinions: `escalation_id`, `added`, `budget` (the run's budget now). |
 | `Notification` (`code: "verifier_retry_authorised"`) | A person's `Recheck`/`ClaimComplete`, under `verify = "always"` with the verifier and its retry not completed on this code, authorised one more verifier (`policy::grant_verifier_retry`, doc 05 §6.1): `escalation_id`. Only for the escalation that offered it, whose `EscalationRaised` carries `verifier_retry: true` (`Escalation::verifier_retry`). |
 | `EnsembleTriggered`, `OpinionRequested`, `OpinionRecorded`, `EnsembleResolved` | The `aftman_core::ensemble` payload types (doc 06 §8). One assessed cycle appends, in `seq` order: `AssessmentCompleted`; one `EnsembleTriggered` per triggered check; whatever the ensemble's source appends while it works (`EvidenceCollected` per refreshed provider, `ModelError`/`RateLimited`/`BudgetExceeded` with `purpose: "refresh"` or `"reframe"` and the `check` for a failed refresh or reframe call, `OpinionRequested` before each reframe); one `OpinionRecorded` per opinion; one `EnsembleResolved`; then `DirectiveProposed`… and `DirectiveSelected`. A cycle with no answers (a failed or refused model call) appends one `EnsembleResolved` with no `cycle` and no `checks`. |
-| `Notification` (`code: "verifier_mutated_repo"`) | A verifier ended and the working tree differs from the tree it started on (doc 04 §6): `worker_id`, `head_moved`, `index_changed`, `paths` (at most 20, each quoted as `git status` quotes it and capped at 200 chars), `more_paths` (how many more), `message`. Follows that verifier's `WorkerCompleted`. The verifier has not completed (`counters.verifier_completed` stays false). |
+| `Notification` (`code: "verifier_mutated_repo"`) | A verifier ended and the working tree differs from the tree it started on (doc 04 §6): `worker_id`, `head_moved`, `index_changed`, `paths` (at most 20, each quoted as `git status` quotes it and capped at 200 chars), `more_paths` (how many more), `message`. Follows that verifier's `WorkerCompleted`. The verifier has not completed (`counters.verifier_completed` stays false), and `counters.verifier_modified_repo` puts the run to a person before anything else (doc 05 §6.1). |
+| `Notification` (`code: "verifier_edit_accepted"`) | A person answered the question about a verifier that modified the repository with anything but `Stop` (`policy::accept_verifier_edit`): the tree as it now is, the verifier's changes included, is the work, to be verified again from the start. `escalation_id`, `message`. |
 | `Notification` (`code: "verifier_tree_unverified"`) | A verifier ended and whether it modified the tree could not be established — the tree could not be fingerprinted before it started or after it ended: `worker_id`, `reason`, `message`. Treated as `verifier_mutated_repo` is: the verifier has not completed. |
 | `EscalationAnswered` | `escalation_id`, `surface`, `decision` (the serialized `HumanDecision`), `note` (≤ 2000 chars). |
 | `Notification` (`code: "guidance_not_delivered"`) | A `Guidance` answer with no active worker to receive it; recorded, not an error. |

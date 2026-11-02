@@ -69,6 +69,13 @@ pub struct Counters {
     /// [`Counters::verifiers_on_this_code`], which counts such a snapshot's verifier.
     #[serde(default)]
     pub verifiers_since_code: u32,
+    /// The last verifier wrote to the working tree it was asked to judge
+    /// (`verifier_mutated_repo`, `docs/04-workers.md` §6), and no person has answered for it
+    /// yet. Policy puts the run to a person rather than retrying the verifier: a retry would
+    /// judge the edit as though a code worker had made it (`Invariant::VerifierModifiedRepository`).
+    /// Defaulted, so a snapshot without it decodes.
+    #[serde(default)]
+    pub verifier_modified_repo: bool,
     pub steers_sent: u32,
     pub assessments: u32,
     /// Cycles skipped because the observation content was unchanged.
@@ -119,6 +126,7 @@ impl Counters {
             self.verifier_completed = false;
             self.verified_since_code = false;
             self.verifiers_since_code = 0;
+            self.verifier_modified_repo = false;
         } else {
             self.verifiers_run += 1;
             self.verifiers_since_code = self.verifiers_on_this_code() + 1;

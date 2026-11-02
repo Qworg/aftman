@@ -1250,6 +1250,7 @@ impl FactoryRuntime {
                 &state.counters,
                 &self.deps.config,
             );
+            escalated.verifier_edit = aftman_core::policy::asks_about_verifier_edit(&decision);
 
             for proposal in &decision.considered {
                 self.emit(
@@ -1767,6 +1768,26 @@ impl FactoryRuntime {
                     "escalation_id": escalation_id.to_string(),
                     "added": granted,
                     "budget": budget,
+                }),
+            )
+            .await?;
+        }
+        // The question about a verifier that modified the repository: any answer but Stop takes
+        // the tree as it now is as the work, to be verified again from the start. Only an
+        // answer to that question does (`docs/04-workers.md` §6). Decided in core.
+        if state.escalations[index].verifier_edit
+            && !matches!(decision, HumanDecision::Stop)
+            && aftman_core::policy::accept_verifier_edit(&mut state.counters)
+        {
+            state.verifier_edit.clear();
+            self.emit(
+                state,
+                EventKind::Notification,
+                json!({
+                    "code": "verifier_edit_accepted",
+                    "message": "a person took the tree as it now is, the verifier's changes \
+                                included, as the work to verify",
+                    "escalation_id": escalation_id.to_string(),
                 }),
             )
             .await?;
@@ -2468,6 +2489,26 @@ impl FactoryRuntime {
         .await?;
         match tree {
             Some(VerifierTree::Mutated(change)) => {
+                // Policy puts the run to a person next, rather than retrying the verifier over
+                // the tree it changed (`Invariant::VerifierModifiedRepository`).
+                state.counters.verifier_modified_repo = true;
+                state.verifier_edit.clone_from(&change.paths);
+                if change.more_paths > 0 {
+                    state
+                        .verifier_edit
+                        .push(format!("and {} more", change.more_paths));
+                }
+                if change.paths.is_empty() && change.more_paths == 0 {
+                    // Only HEAD, the index or what governs reading the tree moved.
+                    let mut what = Vec::new();
+                    if change.head_moved {
+                        what.push("HEAD".to_owned());
+                    }
+                    if change.index_changed {
+                        what.push("the index or the repository's configuration".to_owned());
+                    }
+                    state.verifier_edit = what;
+                }
                 self.emit(
                     state,
                     EventKind::Notification,
@@ -3030,7 +3071,13 @@ impl FactoryRuntime {
                 Ok(worker)
             }
 
-            Directive::Escalate { reason, ask } => {
+            Directive::Escalate { reason, mut ask } => {
+                // The question about a verifier's edit names what it changed. Policy has only
+                // the counters, which reach the model and must carry no worker text; the
+                // paths are the notification's, quoted and bounded.
+                if escalated.verifier_edit && !state.verifier_edit.is_empty() {
+                    ask = format!("{ask} What it changed: {}.", state.verifier_edit.join(", "));
+                }
                 let escalation_id = EscalationId::new();
                 let kind = escalation_kind(&reason);
                 // An ensemble escalation names its checks, so that the answer can be
@@ -3050,6 +3097,7 @@ impl FactoryRuntime {
                     refresh_topup: escalated.refresh_topup.clone(),
                     held_stop: escalated.held_stop.clone(),
                     verifier_retry: escalated.verifier_retry,
+                    verifier_edit: escalated.verifier_edit,
                     ask: ask.clone(),
                     jev_p,
                     opinions: escalated.opinions.clone(),
@@ -3068,6 +3116,9 @@ impl FactoryRuntime {
                 }
                 if escalated.verifier_retry {
                     payload["verifier_retry"] = json!(true);
+                }
+                if escalated.verifier_edit {
+                    payload["verifier_edit"] = json!(true);
                 }
                 if !escalated.refresh_topup.is_empty() {
                     payload["refresh_topup"] = json!(
@@ -3158,6 +3209,9 @@ struct EscalatedChecks {
     /// Whether an answer would authorise one more verifier (`policy::offers_verifier_retry`).
     /// Policy's own escalation, not the ensemble's, so it is set after `from_outcome`.
     verifier_retry: bool,
+    /// Whether this is the question about a verifier's edit
+    /// (`policy::asks_about_verifier_edit`). Set after `from_outcome`, like `verifier_retry`.
+    verifier_edit: bool,
 }
 
 impl EscalatedChecks {
@@ -3176,6 +3230,7 @@ impl EscalatedChecks {
             refresh_topup: outcome.refresh_topup.clone(),
             held_stop: outcome.held_stop.clone(),
             verifier_retry: false,
+            verifier_edit: false,
         }
     }
 }

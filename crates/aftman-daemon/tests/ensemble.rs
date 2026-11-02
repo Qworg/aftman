@@ -5001,11 +5001,21 @@ fn commit_repo(repo: &Path) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// A worker that really writes: code work modifies `a.txt` and adds `notes.txt`, so the tree a
-/// verifier starts on is already dirty. A verifier reports PASS and, when `mutate` is set,
-/// edits `a.txt` again on its way — the change a capped diff could hide, since the file
+/// verifier starts on is already dirty. A verifier reports PASS and the first `mutating` of
+/// them edit `a.txt` again on their way — the change a capped diff could hide, since the file
 /// already shows as modified.
 struct TreeWorker {
-    mutate: bool,
+    mutating: usize,
+    verified: std::sync::atomic::AtomicUsize,
+}
+
+impl TreeWorker {
+    fn new(mutating: usize) -> Self {
+        Self {
+            mutating,
+            verified: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
 }
 
 #[async_trait]
@@ -5029,7 +5039,10 @@ impl Worker for TreeWorker {
         };
         let text = match ctx.task {
             aftman_core::job::TaskKind::Verify => {
-                if self.mutate {
+                let nth = self
+                    .verified
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if nth < self.mutating {
                     // Let the clock move on, so the write lands on a new timestamp even on a
                     // filesystem with coarse ones.
                     tokio::time::sleep(Duration::from_millis(20)).await;
@@ -5092,7 +5105,7 @@ async fn a_verifier_that_leaves_the_tree_alone_completes_over_a_real_repository(
             }),
             settings(|s| s.enabled = enabled),
             Arc::new(R2Model::finish_ready()) as Arc<dyn DecisionModel>,
-            Arc::new(TreeWorker { mutate: false }),
+            Arc::new(TreeWorker::new(0)),
         );
         let outcome = fx.run(rt).await?;
         assert_eq!(outcome.status, FactoryStatus::Finished, "enabled={enabled}");
@@ -5108,8 +5121,8 @@ async fn a_verifier_that_modifies_the_repository_is_inconclusive_not_a_pass() ->
     // docs/04-workers.md §6 promised this and nothing did it: a verifier that edits the tree
     // it was asked to judge reported PASS over its own edit, and that PASS completed the
     // verification. Now the runtime fingerprints the tree before and after, records
-    // `verifier_mutated_repo`, and the verifier has not completed — so `verify = "always"`
-    // retries it once and then asks a person, saying why, and never finishes.
+    // `verifier_mutated_repo`, the verifier has not completed — and the run is put to a person
+    // at once, naming what changed, rather than retried over the edit.
     if !have_git() {
         return Ok(());
     }
@@ -5123,27 +5136,24 @@ async fn a_verifier_that_modifies_the_repository_is_inconclusive_not_a_pass() ->
             }),
             settings(|s| s.enabled = enabled),
             Arc::new(R2Model::finish_ready()) as Arc<dyn DecisionModel>,
-            Arc::new(TreeWorker { mutate: true }),
+            Arc::new(TreeWorker::new(usize::MAX)),
         );
         let outcome = fx.run(rt).await?;
         let what = format!("enabled={enabled}");
         assert_eq!(outcome.status, FactoryStatus::NeedsHuman, "{what}");
         assert!(!finished(&fx), "{what}");
-        assert_eq!(tasks(&fx), vec!["Code", "Verify", "Verify"], "{what}");
+        assert_eq!(tasks(&fx), vec!["Code", "Verify"], "{what}");
         assert!(!outcome.counters.verifier_completed, "{what}");
 
-        // Each verifier's edit is recorded, naming the file. The retry rewrites the same
-        // bytes, which is still a write.
+        // The verifier's edit is recorded, naming the file.
         let recorded = mutations(&fx);
-        assert_eq!(recorded.len(), 2, "{what}: {recorded:?}");
-        for event in &recorded {
-            assert_eq!(
-                event.payload["paths"],
-                serde_json::json!(["a.txt"]),
-                "{what}"
-            );
-            assert_eq!(event.payload["head_moved"], false, "{what}");
-        }
+        assert_eq!(recorded.len(), 1, "{what}: {recorded:?}");
+        assert_eq!(
+            recorded[0].payload["paths"],
+            serde_json::json!(["a.txt"]),
+            "{what}"
+        );
+        assert_eq!(recorded[0].payload["head_moved"], false, "{what}");
         // The notification follows the verifier's completion.
         let log: Vec<(EventKind, Value)> = fx
             .events()
@@ -5158,12 +5168,68 @@ async fn a_verifier_that_modifies_the_repository_is_inconclusive_not_a_pass() ->
             .ok_or("a mutation notification")?;
         assert_eq!(log[at - 1].0, EventKind::WorkerCompleted, "{what}");
 
-        let ask = fx
-            .of_kind(EventKind::EscalationRaised)
-            .last()
-            .and_then(|e| e.payload["ask"].as_str().map(ToOwned::to_owned))
-            .unwrap_or_default();
-        assert!(ask.contains("modified the repository"), "{what}: {ask}");
+        // The question is the one about the edit, and names what changed.
+        let raised = fx.of_kind(EventKind::EscalationRaised);
+        let last = raised.last().ok_or("an escalation")?;
+        let reason = last.payload["reason"].as_str().unwrap_or_default();
+        let ask = last.payload["ask"].as_str().unwrap_or_default();
+        assert!(
+            reason.starts_with("verifier_modified_repository"),
+            "{what}: {reason}"
+        );
+        assert!(ask.contains("What it changed: a.txt."), "{what}: {ask}");
+        assert_eq!(last.payload["verifier_edit"], true, "{what}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_verifiers_edit_is_never_finished_over_by_a_clean_retry() -> TestResult {
+    // Review of the verifier-mutation work, finding 3. The first verifier edited the tree and
+    // was retried; the retry started on the edited tree, reported PASS and completed, and the
+    // run finished over an edit no code worker made and nobody approved. Now the edit is put
+    // to a person before any retry. Any answer but Stop takes the tree as it is as the work,
+    // verified again from the start (here cleanly, so the run finishes); Stop ends the run.
+    if !have_git() {
+        return Ok(());
+    }
+    for (answer, finishes) in [
+        (HumanDecision::Accept, true),
+        (HumanDecision::Recheck, true),
+        (HumanDecision::Stop, false),
+    ] {
+        let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+        commit_repo(&fx.repo)?;
+        let rt = fx.runtime(
+            config(|c| {
+                c.worker = WorkerKind::Generic;
+                c.verify = VerifyPolicy::Always;
+            }),
+            no_refreshes(),
+            Arc::new(R2Model::finish_ready()) as Arc<dyn DecisionModel>,
+            Arc::new(TreeWorker::new(1)),
+        );
+        let mut run = RunGuard::launch(&fx, rt).await?;
+        let id = escalation(&fx, 1).await?;
+        // No retry ran over the edit before a person saw it.
+        assert_eq!(tasks(&fx), vec!["Code", "Verify"], "{answer:?}");
+        assert!(!finished(&fx), "{answer:?}");
+        run.answer(id, answer.clone()).await?;
+        let outcome = run.join().await?;
+        let accepted = fx
+            .of_kind(EventKind::Notification)
+            .iter()
+            .any(|e| e.payload["code"] == "verifier_edit_accepted");
+        if finishes {
+            assert_eq!(outcome.status, FactoryStatus::Finished, "{answer:?}");
+            assert_eq!(tasks(&fx), vec!["Code", "Verify", "Verify"], "{answer:?}");
+            assert!(outcome.counters.verifier_completed, "{answer:?}");
+            assert!(accepted, "{answer:?}");
+        } else {
+            assert!(!finished(&fx), "{answer:?}");
+            assert_eq!(tasks(&fx), vec!["Code", "Verify"], "{answer:?}");
+            assert!(!accepted, "{answer:?}");
+        }
     }
     Ok(())
 }
@@ -5188,7 +5254,7 @@ async fn under_when_asked_a_modifying_verifier_does_not_satisfy_the_verification
         }),
         no_refreshes(),
         Arc::new(R2Model::finish_ready().with(NEEDS_VERIFICATION, 0.90)) as Arc<dyn DecisionModel>,
-        Arc::new(TreeWorker { mutate: true }),
+        Arc::new(TreeWorker::new(usize::MAX)),
     );
     let outcome = fx.run(rt).await?;
     assert!(!finished(&fx), "{:?}: {:?}", outcome.status, tasks(&fx));

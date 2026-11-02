@@ -170,6 +170,14 @@ pub enum Invariant {
     /// it, and an opinion — which may only suppress — enabled an irreversible directive.
     /// Applied only with the ensemble on: off, every present check is permitted.
     UnresolvedDependency,
+    /// The last verifier wrote to the working tree it was asked to judge, and no person has
+    /// answered for it: the run is put to one (`docs/04-workers.md` §6).
+    ///
+    /// A verifier that modifies the repository has not completed, so under `verify = "always"`
+    /// it used to be retried like any verifier that did not — and the retry started on the
+    /// tree as the first one left it, so a clean retry verified, and the run could finish over,
+    /// an edit no code worker made and nobody approved.
+    VerifierModifiedRepository,
 }
 
 /// Why a proposal was not selected.

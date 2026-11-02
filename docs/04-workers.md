@@ -276,13 +276,22 @@ Rules:
   working tree before the verifier starts and again when it ends
   (`repo_observe::tree_fingerprint`), and a difference is recorded as a `Notification` with
   `code: "verifier_mutated_repo"` naming what changed. The verification is then inconclusive
-  rather than a pass: the verifier has **not completed**, whatever it reported, so under
-  `verify = "always"` it is retried once like any verifier that did not complete, and the
-  question that follows says a verifier may have modified the repository
-  (`a_verifier_that_modifies_the_repository_is_inconclusive_not_a_pass`). A tree that could not
-  be fingerprinted, before or after, is treated the same way and recorded as
+  rather than a pass: the verifier has **not completed**, whatever it reported
+  (`a_verifier_that_modifies_the_repository_is_inconclusive_not_a_pass`). And it is **not
+  retried**: the run is put to a person at once (`Invariant::VerifierModifiedRepository`, whatever
+  the `verify` policy), with a question naming what the verifier changed. A retry would start
+  on the tree as the first verifier left it, so a clean retry would verify, and the run could
+  finish over, an edit no code worker made and nobody approved
+  (`a_verifiers_edit_is_never_finished_over_by_a_clean_retry`). `Stop` ends the run. Any other
+  answer takes the tree as it now is, the verifier's changes included, as the work: a new state
+  of the code, so the verifier counters reset as when a code worker starts, and it is verified
+  again from the start before the run can finish (`policy::accept_verifier_edit`, `Notification`
+  `verifier_edit_accepted`). To reject the changes, revert them before answering. Only an answer
+  to that question does this (`Escalation::verifier_edit`). A tree that could not be
+  fingerprinted, before or after, also leaves the verifier not completed, recorded as
   `verifier_tree_unverified` with the reason — "nothing changed" is not concluded from "nothing
-  could be seen", as for `Invariant::UnobservedRepository`. Under simulation the repository is
+  could be seen", as for `Invariant::UnobservedRepository` — but it is not known to have been
+  written, so it is retried like any verifier that did not complete. Under simulation the repository is
   never read and no fingerprint is taken.
 
   The fingerprint covers what the observation does — `HEAD` and its branch, the index's entries
@@ -319,11 +328,9 @@ Rules:
   The comparison is made when a verifier **ends on its own** (it exited, failed or timed out). A
   verifier that is stopped, cancelled or superseded has not completed anyway, and is not
   fingerprinted again, so a write it made before it was stopped is seen by the next observation
-  but not recorded as `verifier_mutated_repo`. Two known gaps: a retried verifier is started on
-  the tree as the first one left it, so a first verifier's edit can be verified, and finished
-  over, by a clean retry; and a helper process a verifier leaves running after it exits (one with
-  its output redirected) can write after the comparison — the worker's process group is only
-  killed when its output does not drain. The fingerprint is the same in-process read as an observation, under the
+  but not recorded as `verifier_mutated_repo`. One known gap: a helper process a verifier leaves
+  running after it exits (one with its output redirected) can write after the comparison — the
+  worker's process group is only killed when its output does not drain. The fingerprint is the same in-process read as an observation, under the
   same bounds: one of the run's observation slots and `OBSERVATION_TIMEOUT`; an interrupted walk,
   or one recording more than 200 000 paths beyond the index's own, is refused rather than
   compared partially

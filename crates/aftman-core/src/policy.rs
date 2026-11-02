@@ -224,6 +224,30 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
         };
     }
 
+    // A verifier wrote to the tree it was asked to judge. Its report is about a tree it made,
+    // and a retry would judge that edit as if a code worker had made it, so nothing in the
+    // run can settle it: a person decides whether the edit stays (`docs/04-workers.md` §6).
+    if input.counters.verifier_modified_repo {
+        invariants.push(Invariant::VerifierModifiedRepository);
+        return PolicyDecision {
+            selected: Directive::Escalate {
+                reason: "verifier_modified_repository: the verifier changed the working tree \
+                         it was asked to judge"
+                    .into(),
+                ask: "The last verifier modified the repository: the changes it made are in \
+                      the working tree, no code worker made them, and nothing has verified \
+                      them. Revert them yourself first if they should not stay. Any answer \
+                      but Stop takes the tree as it now is, the verifier's changes included, \
+                      as the work: it is verified again from the start before the run can \
+                      finish. Stop ends the run."
+                    .into(),
+            },
+            considered: proposals.to_vec(),
+            suppressed,
+            invariants,
+        };
+    }
+
     // A repeated model failure means supervision is blind. This is deliberately a
     // *different* message from "the model thinks a human is needed": conflating
     // them is how a supervisor loses an operator's trust.
@@ -848,6 +872,34 @@ pub fn offers_verifier_retry(
             )
         })
         && verifier_retry_spent(counters, config)
+}
+
+/// Whether `decision` is the question about a verifier that modified the repository. The
+/// runtime records it on the escalation, and only an answer to that escalation calls
+/// [`accept_verifier_edit`].
+#[must_use]
+pub fn asks_about_verifier_edit(decision: &PolicyDecision) -> bool {
+    matches!(decision.selected, Directive::Escalate { .. })
+        && decision
+            .invariants
+            .contains(&Invariant::VerifierModifiedRepository)
+}
+
+/// A person answered the question about a verifier that modified the repository with
+/// anything but `Stop`: the tree as it now is, the verifier's changes included, is the work.
+/// It is a new state of the code, so what any verifier concluded about the old one no longer
+/// counts and a new verifier may be proposed under the normal rules — exactly as when a code
+/// worker starts, except that none did. Authorises a verification, never an outcome. `true`
+/// when there was such an edit to accept.
+pub fn accept_verifier_edit(counters: &mut Counters) -> bool {
+    let edited = counters.verifier_modified_repo;
+    if edited {
+        counters.verifier_modified_repo = false;
+        counters.verifier_completed = false;
+        counters.verified_since_code = false;
+        counters.verifiers_since_code = 0;
+    }
+    edited
 }
 
 /// Whether a proposal is refused by a hard invariant. `None` means it survives.
@@ -1837,6 +1889,69 @@ mod tests {
             );
             assert!(decision.invariants.contains(&Invariant::NoWorkAttempted));
         }
+    }
+
+    #[test]
+    fn a_verifier_that_modified_the_repository_is_put_to_a_person_not_retried() {
+        // Review finding: a verifier that modified the repository has not completed, so under
+        // `always` it was retried like any other — over the tree it had changed, where a clean
+        // retry completed and the run finished over an edit nobody made or approved. Now the
+        // run is put to a person first, whatever the policy and whatever would otherwise win.
+        let registry = crate::responsibility::ResponsibilityRegistry::builtin();
+        let o = observation();
+        let checks = finish_ready_needing_no_verification();
+        let edited = Counters {
+            workers_run: 2,
+            attempts: 1,
+            verifiers_run: 1,
+            verified_since_code: true,
+            verifiers_since_code: 1,
+            verifier_modified_repo: true,
+            ..Counters::default()
+        };
+        for verify in [
+            crate::job::VerifyPolicy::Always,
+            crate::job::VerifyPolicy::WhenAsked,
+        ] {
+            let config = with_verify(verify);
+            let decision = super::decide(&registry, &input(&o, &edited, &config, &checks), &[]);
+            let Directive::Escalate { reason, ask } = &decision.selected else {
+                panic!("{verify:?}: selected {:?}", decision.selected);
+            };
+            assert!(
+                reason.starts_with("verifier_modified_repository"),
+                "{reason}"
+            );
+            assert!(ask.contains("Stop ends the run"), "{ask}");
+            assert!(super::asks_about_verifier_edit(&decision), "{verify:?}");
+            // No other question is the one about the edit.
+            let other = super::decide(
+                &registry,
+                &input(&o, &Counters::default(), &config, &checks),
+                &[],
+            );
+            assert!(!super::asks_about_verifier_edit(&other), "{verify:?}");
+        }
+
+        // An answer takes the tree as the work: a new state of the code, to be verified from
+        // the start. Nothing to accept otherwise.
+        let mut answered = edited.clone();
+        assert!(super::accept_verifier_edit(&mut answered));
+        assert!(!answered.verifier_modified_repo);
+        assert!(!answered.verified_since_code && answered.verifiers_since_code == 0);
+        assert!(!answered.verifier_completed);
+        assert_eq!(
+            answered.attempts, edited.attempts,
+            "a person's answer is not an attempt"
+        );
+        let always = with_verify(crate::job::VerifyPolicy::Always);
+        let decision = super::decide(&registry, &input(&o, &answered, &always, &checks), &[]);
+        assert!(
+            matches!(decision.selected, Directive::Verify { .. }),
+            "selected {:?}",
+            decision.selected
+        );
+        assert!(!super::accept_verifier_edit(&mut answered));
     }
 
     #[test]

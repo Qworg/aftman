@@ -59,6 +59,13 @@ pub struct RunState {
     /// counters decodes with them at zero. See `docs/06-ensemble.md` §7.
     #[serde(default)]
     pub ensemble: EnsembleCounters,
+    /// What the last verifier that modified the repository changed, as its
+    /// `verifier_mutated_repo` notification named it (at most 20 quoted paths, then how many
+    /// more), for the question put to a person. Kept here and not in `Counters`: the paths are
+    /// worker-controlled and the counters reach the model. Empty otherwise, and in older
+    /// snapshots.
+    #[serde(default)]
+    pub verifier_edit: Vec<String>,
 }
 
 impl RunState {
@@ -75,6 +82,7 @@ impl RunState {
             escalations: Vec::new(),
             human_wait_ms: 0,
             ensemble: EnsembleCounters::default(),
+            verifier_edit: Vec::new(),
         }
     }
 
@@ -142,6 +150,12 @@ pub struct Escalation {
     /// older snapshots.
     #[serde(default)]
     pub verifier_retry: bool,
+    /// Whether this is the question about a verifier that modified the repository
+    /// (`policy::asks_about_verifier_edit`): an answer to it, other than `Stop`, takes the tree
+    /// as it now is as the work to verify (`policy::accept_verifier_edit`). `false` for any
+    /// other escalation, and in older snapshots.
+    #[serde(default)]
+    pub verifier_edit: bool,
     pub ask: String,
     pub jev_p: Option<f32>,
     pub opinions: Vec<Opinion>,
@@ -314,6 +328,7 @@ mod tests {
             refresh_topup: Vec::new(),
             held_stop: None,
             verifier_retry: false,
+            verifier_edit: false,
             ask: "is it done?".into(),
             jev_p: Some(0.71),
             opinions: Vec::new(),
@@ -342,6 +357,7 @@ mod tests {
             refresh_topup: Vec::new(),
             held_stop: None,
             verifier_retry: false,
+            verifier_edit: false,
             ask: "budget exhausted".into(),
             jev_p: None,
             opinions: Vec::new(),

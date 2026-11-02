@@ -26,7 +26,7 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -135,17 +135,27 @@ const MAX_STATUS_ENTRIES: usize = 2_000;
 /// The most bytes of status text. A count alone is not a bound, because paths can be long.
 const MAX_STATUS_BYTES: usize = 256 * 1024;
 
-#[derive(Default)]
 struct WalkCollector {
     tracked: Vec<Tracked>,
     untracked: Vec<Vec<u8>>,
+    /// The most untracked paths recorded ([`MAX_UNTRACKED_PATHS`] for an observation).
+    untracked_limit: usize,
     /// Set when a bound above stopped the walk from recording everything it saw.
     capped: bool,
 }
 
 impl WalkCollector {
+    const fn with_limit(untracked_limit: usize) -> Self {
+        Self {
+            tracked: Vec::new(),
+            untracked: Vec::new(),
+            untracked_limit,
+            capped: false,
+        }
+    }
+
     fn push_untracked(&mut self, path: Vec<u8>) {
-        if self.untracked.len() >= MAX_UNTRACKED_PATHS {
+        if self.untracked.len() >= self.untracked_limit {
             self.capped = true;
         } else {
             self.untracked.push(path);
@@ -496,11 +506,8 @@ fn status_short(
     (out, capped)
 }
 
-fn git_evidence(
-    repo_path: &Path,
-    caps: ObsCaps,
-    interrupt: &Arc<AtomicBool>,
-) -> Result<(GitEvidence, Vec<UntrackedExcerpt>), String> {
+/// Open the repository a job names, refusing one that is not the root of its own working tree.
+fn open_job_repository(repo_path: &Path) -> Result<(gix::Repository, PathBuf), String> {
     let repo = open_repository(repo_path)?;
     let workdir = repo
         .workdir()
@@ -525,6 +532,15 @@ fn git_evidence(
             root.display()
         ));
     }
+    Ok((repo, workdir))
+}
+
+fn git_evidence(
+    repo_path: &Path,
+    caps: ObsCaps,
+    interrupt: &Arc<AtomicBool>,
+) -> Result<(GitEvidence, Vec<UntrackedExcerpt>), String> {
+    let (repo, workdir) = open_job_repository(repo_path)?;
 
     let index_holder = repo
         .index_or_load_from_head_or_empty()
@@ -545,7 +561,6 @@ fn git_evidence(
     };
     // One empty-driver platform drives the worktree-vs-index walk, a second the diff
     // rendering. Neither can name a program.
-    let status_platform = build_platform(&repo, index, &roots)?;
     let diff_platform = build_platform(&repo, index, &roots)?;
 
     let objects =
@@ -553,72 +568,14 @@ fn git_evidence(
             format!("the object database could not be shared across threads: {err}")
         })?;
 
-    let dirwalk_options: gix::dir::walk::Options = repo
-        .dirwalk_options()
-        .map_err(|err| format!("could not read directory-walk options: {err}"))?
-        .into();
-    let pathspec = repo
-        .pathspec(
-            false,
-            None::<&str>,
-            false,
-            index,
-            gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
-        )
-        .map_err(|err| format!("could not build a pathspec: {err}"))?
-        .into_parts()
-        .0;
-
-    let git_dir_realpath = gix::path::realpath_opts(
-        repo.git_dir(),
-        repo.current_dir(),
-        gix::path::realpath::MAX_SYMLINKS,
-    )
-    .map_err(|err| format!("could not resolve the git directory: {err}"))?;
-    let fs_caps = repo
-        .filesystem_options()
-        .map_err(|err| format!("could not read filesystem options: {err}"))?;
-    let accelerate = fs_caps.ignore_case.then(|| index.prepare_icase_backing());
-
-    let mut collector = WalkCollector::default();
-    let mut progress = gix::progress::Discard;
-    gix::status::plumbing::index_as_worktree_with_renames(
+    let collector = walk_worktree(
+        &repo,
         index,
         &workdir,
-        &mut collector,
-        BoundedHashEq {
-            interrupt: interrupt.clone(),
-            max_bytes: MAX_HASH_BYTES,
-        },
-        NoSubmodules,
-        objects.clone(),
-        &mut progress,
-        iw::Context {
-            pathspec,
-            resource_cache: status_platform,
-            should_interrupt: interrupt,
-            dirwalk: iw::DirwalkContext {
-                git_dir_realpath: git_dir_realpath.as_path(),
-                current_dir: repo.current_dir(),
-                ignore_case_index_lookup: accelerate.as_ref(),
-            },
-        },
-        IwOptions {
-            sorting: Some(Sorting::ByPathCaseSensitive),
-            tracked_file_modifications: gix::status::plumbing::index_as_worktree::Options {
-                fs: fs_caps,
-                thread_limit: None,
-                stat: repo
-                    .stat_options()
-                    .map_err(|err| format!("could not read stat options: {err}"))?,
-                fscache: false,
-            },
-            fscache: false,
-            dirwalk: Some(dirwalk_options),
-            rewrites: None,
-        },
-    )
-    .map_err(|err| format!("could not walk the worktree status: {err}"))?;
+        &objects,
+        MAX_UNTRACKED_PATHS,
+        interrupt,
+    )?;
 
     let changed_files: Vec<String> = {
         let mut all: Vec<&[u8]> = collector
@@ -676,6 +633,94 @@ fn git_evidence(
         },
         untracked,
     ))
+}
+
+/// The index-vs-worktree walk: every tracked entry that differs from the index, and every
+/// untracked path, up to `untracked_limit` of them (past it the collector says it is capped).
+///
+/// Its platform has empty driver lists like every other ([`build_platform`]), so the walk can
+/// name no program.
+fn walk_worktree(
+    repo: &gix::Repository,
+    index: &gix::index::State,
+    workdir: &Path,
+    objects: &gix::OdbHandleArc,
+    untracked_limit: usize,
+    interrupt: &Arc<AtomicBool>,
+) -> Result<WalkCollector, String> {
+    let roots = WorktreeRoots {
+        old_root: None,
+        new_root: Some(workdir.to_path_buf()),
+    };
+    let status_platform = build_platform(repo, index, &roots)?;
+
+    let dirwalk_options: gix::dir::walk::Options = repo
+        .dirwalk_options()
+        .map_err(|err| format!("could not read directory-walk options: {err}"))?
+        .into();
+    let pathspec = repo
+        .pathspec(
+            false,
+            None::<&str>,
+            false,
+            index,
+            gix::worktree::stack::state::attributes::Source::WorktreeThenIdMapping,
+        )
+        .map_err(|err| format!("could not build a pathspec: {err}"))?
+        .into_parts()
+        .0;
+
+    let git_dir_realpath = gix::path::realpath_opts(
+        repo.git_dir(),
+        repo.current_dir(),
+        gix::path::realpath::MAX_SYMLINKS,
+    )
+    .map_err(|err| format!("could not resolve the git directory: {err}"))?;
+    let fs_caps = repo
+        .filesystem_options()
+        .map_err(|err| format!("could not read filesystem options: {err}"))?;
+    let accelerate = fs_caps.ignore_case.then(|| index.prepare_icase_backing());
+
+    let mut collector = WalkCollector::with_limit(untracked_limit);
+    let mut progress = gix::progress::Discard;
+    gix::status::plumbing::index_as_worktree_with_renames(
+        index,
+        workdir,
+        &mut collector,
+        BoundedHashEq {
+            interrupt: interrupt.clone(),
+            max_bytes: MAX_HASH_BYTES,
+        },
+        NoSubmodules,
+        objects.clone(),
+        &mut progress,
+        iw::Context {
+            pathspec,
+            resource_cache: status_platform,
+            should_interrupt: interrupt,
+            dirwalk: iw::DirwalkContext {
+                git_dir_realpath: git_dir_realpath.as_path(),
+                current_dir: repo.current_dir(),
+                ignore_case_index_lookup: accelerate.as_ref(),
+            },
+        },
+        IwOptions {
+            sorting: Some(Sorting::ByPathCaseSensitive),
+            tracked_file_modifications: gix::status::plumbing::index_as_worktree::Options {
+                fs: fs_caps,
+                thread_limit: None,
+                stat: repo
+                    .stat_options()
+                    .map_err(|err| format!("could not read stat options: {err}"))?,
+                fscache: false,
+            },
+            fscache: false,
+            dirwalk: Some(dirwalk_options),
+            rewrites: None,
+        },
+    )
+    .map_err(|err| format!("could not walk the worktree status: {err}"))?;
+    Ok(collector)
 }
 
 /// One line of `git diff --stat`.

@@ -1319,7 +1319,17 @@ impl PathStat {
         use std::os::unix::fs::MetadataExt as _;
         let meta = match std::fs::symlink_metadata(path) {
             Ok(meta) => meta,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            // Absent, too, when a directory on the way is no longer one — a tracked `a/b.txt`
+            // after the directory `a` was replaced by a file, an ordinary change the walk
+            // reports as a deletion — or is a symlink loop: nothing can be at such a path.
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) || err.raw_os_error() == Some(nix::libc::ELOOP) =>
+            {
+                return Ok(None);
+            }
             // The kind only: the path is worker-controlled.
             Err(err) => {
                 return Err(format!(
@@ -2355,5 +2365,28 @@ mod fingerprint_tests {
             change.paths.contains(&"vendor/src/lib.py".to_owned()),
             "{change:?}"
         );
+    }
+
+    #[test]
+    fn a_tracked_directory_replaced_by_a_file_can_still_be_fingerprinted() {
+        // Final verification. With every tracked path stat-ed, `a/b.txt` after the directory
+        // `a` became a file failed with "not a directory" rather than "not found", and the
+        // whole fingerprint was refused: no verifier could complete over an ordinary change.
+        if !have_git() {
+            return;
+        }
+        let (_dir, repo) = repo_with_work();
+        std::fs::create_dir_all(repo.join("dir")).expect("mkdir");
+        std::fs::write(repo.join("dir/b.txt"), "b\n").expect("write");
+        git(&repo, &["add", "dir"]);
+        git(&repo, &["commit", "-q", "-m", "dir"]);
+        std::fs::remove_dir_all(repo.join("dir")).expect("rm");
+        std::fs::write(repo.join("dir"), "now a file\n").expect("write");
+        let before = fingerprint(&repo);
+        assert!(fingerprint(&repo).changes_since(&before).is_empty());
+        tick();
+        std::fs::write(repo.join("dir"), "edited\n").expect("write");
+        let change = fingerprint(&repo).changes_since(&before);
+        assert!(change.paths.contains(&"dir".to_owned()), "{change:?}");
     }
 }

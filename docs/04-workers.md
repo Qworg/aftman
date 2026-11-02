@@ -308,7 +308,13 @@ Rules:
   paths already ignored when the verifier starts (a verifier's build output belongs there;
   ignores come from the committed `.gitignore` and `info/exclude`), refs other than `HEAD`, and
   submodules. Anything that writes the tree while the verifier runs counts, including a command
-  provider run in the repository meanwhile.
+  provider run in the repository meanwhile. **Caches that ignore themselves are not ignored
+  here:** pytest's `.pytest_cache/`, and mypy's and ruff's caches, mark themselves ignored with an
+  untracked `.gitignore` of their own, which `git status` honours and the fingerprint does not —
+  an uncommitted ignore file is a place a verifier could hide a write. In a repository whose
+  committed `.gitignore` does not list them, every verifier that runs such a tool is
+  inconclusive; commit the ignore line (`.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`), as
+  GitHub's Python template does.
 
   The comparison is made when a verifier **ends on its own** (it exited, failed or timed out). A
   verifier that is stopped, cancelled or superseded has not completed anyway, and is not

@@ -473,6 +473,25 @@ struct WorkerHandle {
     activity: Arc<Mutex<Option<StreamActivity>>>,
     /// The worker's task, kept so a stop can reap or abort it.
     task: tokio::task::JoinHandle<()>,
+    /// For a verifier, the working tree as it was before it started, or why it could not be
+    /// fingerprinted; compared with the tree when it ends (`docs/04-workers.md` §6). `None` for
+    /// a code worker, and under simulation, which never reads the repository.
+    tree_before: Option<TreeWatch>,
+}
+
+/// What a verifier did to the working tree it was asked to judge.
+enum VerifierTree {
+    Unchanged,
+    Mutated(crate::repo_observe::TreeChange),
+    /// The tree could not be compared, and why.
+    Unknown(String),
+}
+
+/// A verifier's working tree as it was before it started.
+struct TreeWatch {
+    repo: PathBuf,
+    /// The fingerprint, or why the tree could not be fingerprinted.
+    before: Result<crate::repo_observe::TreeFingerprint, String>,
 }
 
 impl Drop for WorkerHandle {
@@ -2392,13 +2411,26 @@ impl FactoryRuntime {
         // the most recent worker's output, which every following assessment is shown
         // (`docs/04-workers.md` §6). Completed is not passed — the `Finish` conjuncts are
         // scored over that report, and carry it (`docs/05-responsibilities.md` §6.2). One
-        // that failed, timed out, was stopped, or said nothing has not.
+        // that failed, timed out, was stopped, said nothing, or modified the repository has
+        // not.
         // Output that is only whitespace said nothing.
         let said_something = !snapshot.head(usize::MAX).trim().is_empty()
             || !snapshot.tail(usize::MAX).trim().is_empty();
+        // A verifier that wrote to the working tree is reporting on a tree it made, not on the
+        // work: its report is inconclusive, so it has not completed (`docs/04-workers.md` §6).
+        // Nor has one whose tree could not be compared — "nothing changed" must not be
+        // concluded from "nothing could be seen", exactly as for `UnobservedRepository`.
+        let tree = match &handle.tree_before {
+            Some(watch) => Some(self.verifier_tree(watch).await),
+            None => None,
+        };
+        let tree_intact = tree
+            .as_ref()
+            .is_none_or(|verdict| matches!(verdict, VerifierTree::Unchanged));
         if outcome.is_success()
             && !empty
             && said_something
+            && tree_intact
             && state
                 .workers
                 .iter()
@@ -2431,7 +2463,69 @@ impl FactoryRuntime {
             }),
         )
         .await?;
+        match tree {
+            Some(VerifierTree::Mutated(change)) => {
+                self.emit(
+                    state,
+                    EventKind::Notification,
+                    json!({
+                        "code": "verifier_mutated_repo",
+                        "worker_id": id.to_string(),
+                        "head_moved": change.head_moved,
+                        "index_changed": change.index_changed,
+                        "paths": change.paths,
+                        "more_paths": change.more_paths,
+                        "message": "the verifier modified the repository, so its verification \
+                                    is inconclusive and does not count as completed",
+                    }),
+                )
+                .await?;
+            }
+            Some(VerifierTree::Unknown(reason)) => {
+                self.emit(
+                    state,
+                    EventKind::Notification,
+                    json!({
+                        "code": "verifier_tree_unverified",
+                        "worker_id": id.to_string(),
+                        "reason": reason,
+                        "message": "whether the verifier modified the repository could not be \
+                                    established, so its verification does not count as completed",
+                    }),
+                )
+                .await?;
+            }
+            Some(VerifierTree::Unchanged) | None => {}
+        }
         Ok(())
+    }
+
+    /// Compare a verifier's working tree now with the tree it started on.
+    async fn verifier_tree(&self, watch: &TreeWatch) -> VerifierTree {
+        let before = match &watch.before {
+            Ok(before) => before,
+            Err(why) => {
+                return VerifierTree::Unknown(format!(
+                    "the tree could not be fingerprinted before the verifier started: {why}"
+                ));
+            }
+        };
+        match self.builder.tree_fingerprint(&watch.repo).await {
+            Some(Ok(after)) => {
+                let change = after.changes_since(before);
+                if change.is_empty() {
+                    VerifierTree::Unchanged
+                } else {
+                    VerifierTree::Mutated(change)
+                }
+            }
+            Some(Err(why)) => VerifierTree::Unknown(format!(
+                "the tree could not be fingerprinted after the verifier ended: {why}"
+            )),
+            // Simulation fingerprints nothing, so there is no `before` to have reached here
+            // with; were there one, nothing could have been written either.
+            None => VerifierTree::Unchanged,
+        }
     }
 
     /// Run the providers due for one trigger, recording each outcome.
@@ -2803,6 +2897,7 @@ impl FactoryRuntime {
             output,
             activity,
             task,
+            tree_before: None,
         })
     }
 
@@ -2853,10 +2948,17 @@ impl FactoryRuntime {
                     self.stop_worker(state, old, StopWhy::Superseded).await?;
                 }
                 let mission = verify_mission(job);
-                Ok(Some(
-                    self.start_worker(state, job, TaskKind::Verify, mission, None)
-                        .await?,
-                ))
+                // Taken once the superseded worker has been reaped and before the verifier
+                // exists, so a difference afterwards is something written while it ran.
+                let before = self.builder.tree_fingerprint(&job.repo).await;
+                let mut handle = self
+                    .start_worker(state, job, TaskKind::Verify, mission, None)
+                    .await?;
+                handle.tree_before = before.map(|before| TreeWatch {
+                    repo: job.repo.clone(),
+                    before,
+                });
+                Ok(Some(handle))
             }
 
             Directive::Steer { reason, .. } => {

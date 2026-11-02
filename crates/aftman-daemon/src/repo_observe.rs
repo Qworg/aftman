@@ -138,7 +138,8 @@ const MAX_STATUS_BYTES: usize = 256 * 1024;
 struct WalkCollector {
     tracked: Vec<Tracked>,
     untracked: Vec<Vec<u8>>,
-    /// The most untracked paths recorded ([`MAX_UNTRACKED_PATHS`] for an observation).
+    /// The most untracked paths recorded: [`MAX_UNTRACKED_PATHS`] for an observation,
+    /// [`MAX_FINGERPRINT_PATHS`] for a fingerprint.
     untracked_limit: usize,
     /// Set when a bound above stopped the walk from recording everything it saw.
     capped: bool,
@@ -1260,6 +1261,199 @@ fn read_instructions(repo: &Path, cap_chars: usize) -> Option<RepoInstructions> 
     None
 }
 
+/// The most untracked paths a fingerprint records. Far above [`MAX_UNTRACKED_PATHS`] because a
+/// fingerprint that missed a path could miss the change to it; past this the fingerprint is
+/// refused rather than incomplete. A path costs a few dozen bytes, so this is a few MiB at most.
+const MAX_FINGERPRINT_PATHS: usize = 200_000;
+
+/// The most changed paths a [`TreeChange`] names, and the most characters of each.
+const MAX_REPORTED_CHANGES: usize = 20;
+const MAX_REPORTED_PATH_CHARS: usize = 200;
+
+/// What a path in the working tree looked like, from its metadata alone.
+///
+/// The change time is the point: a process can put a file's modification time back, but not
+/// its change time, which moves on every write, `chmod`, rename onto it or new hard link.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PathStat {
+    /// The `S_IFMT` bits and permissions, so a file replaced by a symlink or made
+    /// executable differs.
+    mode: u32,
+    len: u64,
+    dev: u64,
+    ino: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+}
+
+impl PathStat {
+    /// `None` for a path that does not exist (a deleted tracked file). Never follows a symlink
+    /// and never opens the path, so a FIFO planted there cannot block.
+    fn of(path: &Path) -> Option<Self> {
+        use std::os::unix::fs::MetadataExt as _;
+        let meta = std::fs::symlink_metadata(path).ok()?;
+        Some(Self {
+            mode: meta.mode(),
+            len: meta.len(),
+            dev: meta.dev(),
+            ino: meta.ino(),
+            mtime: (meta.mtime(), meta.mtime_nsec()),
+            ctime: (meta.ctime(), meta.ctime_nsec()),
+        })
+    }
+}
+
+/// The state of a working tree, precise enough to say whether anything in it was written.
+///
+/// Taken before a verifier starts and again when it ends (`docs/04-workers.md` §6). It covers
+/// what the observation covers — `HEAD`, the index, every tracked path that differs from the
+/// index and every untracked path that is not ignored — and adds what the observation's capped
+/// text cannot show: the metadata of each of those paths, so a further edit to a file that was
+/// already modified, or to an untracked file, is a difference too. A tracked path that matches
+/// the index is compared by the status walk, by content: if a verifier changes it, it starts
+/// to differ from the index.
+///
+/// Ignored paths are not covered (a verifier's build output belongs there), and neither are
+/// refs other than `HEAD`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TreeFingerprint {
+    head: Option<String>,
+    branch: Option<String>,
+    /// BLAKE3 over every index entry's path, object id, mode and stage. Not its stat data,
+    /// which a `git status` run by the verifier legitimately refreshes.
+    index: [u8; 32],
+    /// Every path that differs from the index or is untracked: its status column (`M`, `D`,
+    /// `T`, `U`, `A`, or `?` for untracked) and its metadata.
+    paths: BTreeMap<Vec<u8>, (u8, Option<PathStat>)>,
+}
+
+/// How a working tree differs between two fingerprints.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct TreeChange {
+    pub head_moved: bool,
+    pub index_changed: bool,
+    /// Up to [`MAX_REPORTED_CHANGES`] paths that appeared, disappeared or were written,
+    /// quoted as `git status` would quote them and capped in length.
+    pub paths: Vec<String>,
+    /// How many more changed paths there were than `paths` names.
+    pub more_paths: usize,
+}
+
+impl TreeChange {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.head_moved && !self.index_changed && self.paths.is_empty() && self.more_paths == 0
+    }
+}
+
+impl TreeFingerprint {
+    /// What changed between `before` and `self`.
+    pub fn changes_since(&self, before: &Self) -> TreeChange {
+        let mut change = TreeChange {
+            head_moved: self.head != before.head || self.branch != before.branch,
+            index_changed: self.index != before.index,
+            ..TreeChange::default()
+        };
+        let mut changed: Vec<&[u8]> = Vec::new();
+        for (path, now) in &self.paths {
+            if before.paths.get(path) != Some(now) {
+                changed.push(path);
+            }
+        }
+        for path in before.paths.keys() {
+            if !self.paths.contains_key(path) {
+                changed.push(path);
+            }
+        }
+        changed.sort_unstable();
+        for path in &changed {
+            if change.paths.len() < MAX_REPORTED_CHANGES {
+                let (quoted, _) = cap_text(&quote_path(path, true), MAX_REPORTED_PATH_CHARS);
+                change.paths.push(quoted);
+            } else {
+                change.more_paths += 1;
+            }
+        }
+        change
+    }
+}
+
+/// Fingerprint the working tree of the repository a job names. Runs on a blocking thread
+/// under the caller's deadline, like [`observe`], and opens the repository the same way: the
+/// same refusals, the same empty driver lists, no program it could name.
+///
+/// # Errors
+/// Why the tree could not be fingerprinted: the repository could not be read, the walk was
+/// interrupted, or there were more untracked paths than [`MAX_FINGERPRINT_PATHS`].
+pub(crate) fn tree_fingerprint(
+    repo_path: &Path,
+    interrupt: &Arc<AtomicBool>,
+) -> Result<TreeFingerprint, String> {
+    let (repo, workdir) = open_job_repository(repo_path)?;
+    let index_holder = repo
+        .index_or_load_from_head_or_empty()
+        .map_err(|err| format!("could not read the index: {err}"))?;
+    let index: &gix::index::State = match &index_holder {
+        IndexPersistedOrInMemory::Persisted(index) => index,
+        IndexPersistedOrInMemory::InMemory(index) => index,
+    };
+    let objects =
+        repo.objects.clone().into_arc().map_err(|err| {
+            format!("the object database could not be shared across threads: {err}")
+        })?;
+    let collector = walk_worktree(
+        &repo,
+        index,
+        &workdir,
+        &objects,
+        MAX_FINGERPRINT_PATHS,
+        interrupt,
+    )?;
+    // An interrupted walk stops early and reports less than there is, which would read as
+    // "nothing was written" — the one wrong answer here.
+    if interrupt.load(Ordering::Relaxed) {
+        return Err("the working-tree fingerprint was interrupted by its deadline".to_owned());
+    }
+    if collector.capped {
+        return Err(format!(
+            "the working tree has more than {MAX_FINGERPRINT_PATHS} untracked paths, too many \
+             to compare"
+        ));
+    }
+
+    let mut hasher = blake3::Hasher::new();
+    for entry in index.entries() {
+        let path = entry.path(index);
+        // Length-prefixed, so no two different entry lists hash the same bytes.
+        hasher.update(&(path.len() as u64).to_le_bytes());
+        hasher.update(path);
+        hasher.update(entry.id.as_bytes());
+        hasher.update(&entry.mode.bits().to_le_bytes());
+        hasher.update(&entry.stage_raw().to_le_bytes());
+    }
+
+    let mut paths = BTreeMap::new();
+    for tracked in &collector.tracked {
+        let stat = PathStat::of(&workdir.join(OsStr::from_bytes(&tracked.path)));
+        paths.insert(tracked.path.clone(), (tracked.y, stat));
+    }
+    for untracked in &collector.untracked {
+        let stat = PathStat::of(&workdir.join(OsStr::from_bytes(untracked)));
+        paths.insert(untracked.clone(), (b'?', stat));
+    }
+
+    Ok(TreeFingerprint {
+        head: repo.head_id().ok().map(|id| id.detach().to_string()),
+        branch: repo
+            .head_name()
+            .ok()
+            .flatten()
+            .map(|name| name.as_bstr().to_string()),
+        index: *hasher.finalize().as_bytes(),
+        paths,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1385,5 +1579,222 @@ mod tests {
             render_stat(&stats),
             " bin.dat | Bin 9 -> 9 bytes\n m       |   0\n 2 files changed, 0 insertions(+), 0 deletions(-)\n"
         );
+    }
+}
+
+/// The working-tree fingerprint a verifier is judged by (`docs/04-workers.md` §6).
+///
+/// Fixtures are made with `git`; the fingerprint itself never runs it. A test the verifier's
+/// side of which needs `git` (a commit, `git status`) uses it as the *verifier* would.
+#[cfg(test)]
+mod fingerprint_tests {
+    use super::{TreeChange, TreeFingerprint, tree_fingerprint};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    fn have_git() -> bool {
+        Command::new("git")
+            .arg("--version")
+            .output()
+            .is_ok_and(|o| o.status.success())
+    }
+
+    fn git(repo: &Path, args: &[&str]) {
+        let out = Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .expect("git");
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+
+    /// A committed repository with a work in progress on top: `a.txt` modified, `new.txt`
+    /// untracked, `target/` ignored — the tree a verifier is started on.
+    fn repo_with_work() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        git(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("a.txt"), "one\n").expect("write");
+        std::fs::write(repo.join("clean.txt"), "same\n").expect("write");
+        std::fs::write(repo.join(".gitignore"), "target/\n").expect("write");
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+        std::fs::write(repo.join("a.txt"), "one\ntwo\n").expect("write");
+        std::fs::write(repo.join("new.txt"), "fresh\n").expect("write");
+        (dir, repo)
+    }
+
+    fn fingerprint(repo: &Path) -> TreeFingerprint {
+        tree_fingerprint(repo, &Arc::new(AtomicBool::new(false))).expect("fingerprint")
+    }
+
+    /// Let the clock move on, so a write lands on a different timestamp even on a
+    /// filesystem with coarse ones.
+    fn tick() {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+
+    #[test]
+    fn an_untouched_tree_is_unchanged() {
+        if !have_git() {
+            return;
+        }
+        let (_dir, repo) = repo_with_work();
+        let before = fingerprint(&repo);
+        assert_eq!(
+            fingerprint(&repo).changes_since(&before),
+            TreeChange::default()
+        );
+    }
+
+    #[test]
+    fn reading_the_tree_and_running_git_status_is_not_a_change() {
+        // The verify mission tells the verifier to inspect the tree with `git status` and
+        // `git diff`. `git status` refreshes the index's stat data and rewrites `.git/index`;
+        // that is not a change to the code, and must not make every obedient verifier
+        // inconclusive. Nor is reading a file, or writing an ignored one (build output).
+        if !have_git() {
+            return;
+        }
+        let (_dir, repo) = repo_with_work();
+        let before = fingerprint(&repo);
+        tick();
+        let _ = std::fs::read_to_string(repo.join("a.txt")).expect("read");
+        std::fs::create_dir_all(repo.join("target")).expect("mkdir");
+        std::fs::write(repo.join("target/out.o"), "built").expect("write");
+        // Same bytes into a clean tracked file: its stat moves, its content does not.
+        std::fs::write(repo.join("clean.txt"), "same\n").expect("write");
+        git(&repo, &["status", "--short"]);
+        git(&repo, &["diff"]);
+        let change = fingerprint(&repo).changes_since(&before);
+        assert!(change.is_empty(), "{change:?}");
+    }
+
+    #[test]
+    fn a_further_edit_to_a_modified_file_is_a_change() {
+        // The case the observation's capped text could miss: the file already shows as `M`
+        // and its diff may be past the excerpt's cap, so only its metadata says it moved.
+        if !have_git() {
+            return;
+        }
+        let (_dir, repo) = repo_with_work();
+        let before = fingerprint(&repo);
+        tick();
+        std::fs::write(repo.join("a.txt"), "one\nTWO\n").expect("write");
+        let change = fingerprint(&repo).changes_since(&before);
+        assert_eq!(change.paths, vec!["a.txt".to_owned()], "{change:?}");
+        assert!(!change.head_moved && !change.index_changed);
+    }
+
+    #[test]
+    fn an_untracked_file_written_or_removed_is_a_change() {
+        if !have_git() {
+            return;
+        }
+        let (_dir, repo) = repo_with_work();
+        let before = fingerprint(&repo);
+        tick();
+        std::fs::write(repo.join("scratch.txt"), "notes").expect("write");
+        std::fs::remove_file(repo.join("new.txt")).expect("remove");
+        let change = fingerprint(&repo).changes_since(&before);
+        assert_eq!(
+            change.paths,
+            vec!["new.txt".to_owned(), "scratch.txt".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_clean_tracked_file_edited_is_a_change() {
+        if !have_git() {
+            return;
+        }
+        let (_dir, repo) = repo_with_work();
+        let before = fingerprint(&repo);
+        std::fs::write(repo.join("clean.txt"), "different\n").expect("write");
+        let change = fingerprint(&repo).changes_since(&before);
+        assert_eq!(change.paths, vec!["clean.txt".to_owned()]);
+    }
+
+    #[test]
+    fn a_restored_modification_time_does_not_hide_a_write() {
+        // A process can put a file's mtime back; it cannot put back its ctime.
+        if !have_git() {
+            return;
+        }
+        let (_dir, repo) = repo_with_work();
+        let path = repo.join("new.txt");
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+        let before = fingerprint(&repo);
+        tick();
+        // Same length, so only the timestamps could tell.
+        std::fs::write(&path, "FRESH\n").expect("write");
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|f| f.set_modified(mtime))
+            .expect("set mtime");
+        let change = fingerprint(&repo).changes_since(&before);
+        assert_eq!(change.paths, vec!["new.txt".to_owned()]);
+    }
+
+    #[test]
+    fn staging_or_committing_is_a_change() {
+        if !have_git() {
+            return;
+        }
+        let (_dir, repo) = repo_with_work();
+        let before = fingerprint(&repo);
+        git(&repo, &["add", "a.txt"]);
+        let staged = fingerprint(&repo).changes_since(&before);
+        assert!(staged.index_changed, "{staged:?}");
+        assert!(!staged.head_moved);
+        git(&repo, &["commit", "-q", "-m", "verifier commits"]);
+        let committed = fingerprint(&repo).changes_since(&before);
+        assert!(
+            committed.head_moved && committed.index_changed,
+            "{committed:?}"
+        );
+    }
+
+    #[test]
+    fn a_long_list_of_changes_is_capped_and_counted() {
+        if !have_git() {
+            return;
+        }
+        let (_dir, repo) = repo_with_work();
+        let before = fingerprint(&repo);
+        for i in 0..(super::MAX_REPORTED_CHANGES + 5) {
+            std::fs::write(repo.join(format!("gen{i:03}.txt")), "x").expect("write");
+        }
+        let change = fingerprint(&repo).changes_since(&before);
+        assert_eq!(change.paths.len(), super::MAX_REPORTED_CHANGES);
+        assert_eq!(change.more_paths, 5);
+    }
+
+    #[test]
+    fn a_directory_that_is_not_a_repository_cannot_be_fingerprinted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(tree_fingerprint(dir.path(), &Arc::new(AtomicBool::new(false))).is_err());
+    }
+
+    #[test]
+    fn an_interrupted_fingerprint_is_refused_rather_than_partial() {
+        // A walk stopped early reports less than there is, which reads as "nothing written".
+        if !have_git() {
+            return;
+        }
+        let (_dir, repo) = repo_with_work();
+        let interrupted = Arc::new(AtomicBool::new(true));
+        assert!(tree_fingerprint(&repo, &interrupted).is_err());
     }
 }

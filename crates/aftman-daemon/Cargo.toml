@@ -12,6 +12,7 @@ aftman-store.workspace = true
 aftman-workers.workspace = true
 
 async-trait.workspace = true
+blake3.workspace = true
 gix.workspace = true
 nix.workspace = true
 serde.workspace = true

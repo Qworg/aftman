@@ -4962,3 +4962,237 @@ async fn a_verifier_that_prints_only_whitespace_has_not_completed() -> TestResul
     }
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// A verifier that modifies the repository is inconclusive (docs/04-workers.md §6).
+// ---------------------------------------------------------------------------
+
+fn have_git() -> bool {
+    std::process::Command::new("git")
+        .arg("--version")
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Make the fixture's directory a committed repository: `a.txt` tracked. The fixture is made
+/// with `git`; the supervisor's observation of it never runs `git`.
+fn commit_repo(repo: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    let git = |args: &[&str]| -> Result<(), Box<dyn std::error::Error>> {
+        let out = std::process::Command::new("git")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(format!("git {args:?}: {out:?}").into())
+        }
+    };
+    git(&["init", "-q"])?;
+    git(&["config", "user.email", "t@example.com"])?;
+    git(&["config", "user.name", "t"])?;
+    std::fs::write(repo.join("a.txt"), "one\n")?;
+    git(&["add", "."])?;
+    git(&["commit", "-q", "-m", "init"])?;
+    Ok(())
+}
+
+/// A worker that really writes: code work modifies `a.txt` and adds `notes.txt`, so the tree a
+/// verifier starts on is already dirty. A verifier reports PASS and, when `mutate` is set,
+/// edits `a.txt` again on its way — the change a capped diff could hide, since the file
+/// already shows as modified.
+struct TreeWorker {
+    mutate: bool,
+}
+
+#[async_trait]
+impl Worker for TreeWorker {
+    fn kind(&self) -> WorkerKind {
+        WorkerKind::Generic
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    async fn run(
+        &self,
+        ctx: aftman_core::worker::WorkerCtx,
+        sink: aftman_core::worker::WorkerEventSink,
+    ) -> Result<aftman_core::worker::WorkerOutcome, aftman_core::worker::WorkerError> {
+        let write = |name: &str, text: &str| {
+            std::fs::write(ctx.repo.join(name), text)
+                .map_err(|e| aftman_core::worker::WorkerError::Io(e.to_string()))
+        };
+        let text = match ctx.task {
+            aftman_core::job::TaskKind::Verify => {
+                if self.mutate {
+                    // Let the clock move on, so the write lands on a new timestamp even on a
+                    // filesystem with coarse ones.
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    write("a.txt", "one\ntwo, as the verifier would have it\n")?;
+                }
+                "ran the suite: 3 passed\nVERDICT: PASS\n"
+            }
+            _ => {
+                write("a.txt", "one\ntwo\n")?;
+                write("notes.txt", "what I did\n")?;
+                "implemented it; 3 passed\n"
+            }
+        };
+        ctx.output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(aftman_core::log::Stream::Stdout, text);
+        sink.activity();
+        Ok(aftman_core::worker::WorkerOutcome::Completed)
+    }
+
+    async fn steer(
+        &self,
+        _message: &str,
+    ) -> Result<aftman_core::worker::SteerOutcome, aftman_core::worker::WorkerError> {
+        Ok(aftman_core::worker::SteerOutcome::Unsupported)
+    }
+
+    async fn terminate(
+        &self,
+        _reason: aftman_core::worker::TerminateReason,
+    ) -> Result<(), aftman_core::worker::WorkerError> {
+        Ok(())
+    }
+}
+
+/// The `verifier_mutated_repo` notifications a run recorded.
+fn mutations(fx: &Fixture) -> Vec<EventEnvelope> {
+    fx.of_kind(EventKind::Notification)
+        .into_iter()
+        .filter(|e| e.payload["code"] == "verifier_mutated_repo")
+        .collect()
+}
+
+#[tokio::test]
+async fn a_verifier_that_leaves_the_tree_alone_completes_over_a_real_repository() -> TestResult {
+    // The control for the test below: the same real repository, the same dirty tree, a
+    // verifier that reads and reports. The fingerprint must not mistake the code worker's own
+    // changes for the verifier's. Ensemble off and on.
+    if !have_git() {
+        return Ok(());
+    }
+    for enabled in [false, true] {
+        let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+        commit_repo(&fx.repo)?;
+        let rt = fx.runtime(
+            config(|c| {
+                c.worker = WorkerKind::Generic;
+                c.verify = VerifyPolicy::Always;
+            }),
+            settings(|s| s.enabled = enabled),
+            Arc::new(R2Model::finish_ready()) as Arc<dyn DecisionModel>,
+            Arc::new(TreeWorker { mutate: false }),
+        );
+        let outcome = fx.run(rt).await?;
+        assert_eq!(outcome.status, FactoryStatus::Finished, "enabled={enabled}");
+        assert_eq!(tasks(&fx), vec!["Code", "Verify"], "enabled={enabled}");
+        assert!(outcome.counters.verifier_completed, "enabled={enabled}");
+        assert!(mutations(&fx).is_empty(), "enabled={enabled}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_verifier_that_modifies_the_repository_is_inconclusive_not_a_pass() -> TestResult {
+    // docs/04-workers.md §6 promised this and nothing did it: a verifier that edits the tree
+    // it was asked to judge reported PASS over its own edit, and that PASS completed the
+    // verification. Now the runtime fingerprints the tree before and after, records
+    // `verifier_mutated_repo`, and the verifier has not completed — so `verify = "always"`
+    // retries it once and then asks a person, saying why, and never finishes.
+    if !have_git() {
+        return Ok(());
+    }
+    for enabled in [false, true] {
+        let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+        commit_repo(&fx.repo)?;
+        let rt = fx.runtime(
+            config(|c| {
+                c.worker = WorkerKind::Generic;
+                c.verify = VerifyPolicy::Always;
+            }),
+            settings(|s| s.enabled = enabled),
+            Arc::new(R2Model::finish_ready()) as Arc<dyn DecisionModel>,
+            Arc::new(TreeWorker { mutate: true }),
+        );
+        let outcome = fx.run(rt).await?;
+        let what = format!("enabled={enabled}");
+        assert_eq!(outcome.status, FactoryStatus::NeedsHuman, "{what}");
+        assert!(!finished(&fx), "{what}");
+        assert_eq!(tasks(&fx), vec!["Code", "Verify", "Verify"], "{what}");
+        assert!(!outcome.counters.verifier_completed, "{what}");
+
+        // Each verifier's edit is recorded, naming the file. The retry rewrites the same
+        // bytes, which is still a write.
+        let recorded = mutations(&fx);
+        assert_eq!(recorded.len(), 2, "{what}: {recorded:?}");
+        for event in &recorded {
+            assert_eq!(
+                event.payload["paths"],
+                serde_json::json!(["a.txt"]),
+                "{what}"
+            );
+            assert_eq!(event.payload["head_moved"], false, "{what}");
+        }
+        // The notification follows the verifier's completion.
+        let log: Vec<(EventKind, Value)> = fx
+            .events()
+            .into_iter()
+            .map(|e| (e.kind, e.payload))
+            .collect();
+        let at = log
+            .iter()
+            .position(|(k, p)| {
+                *k == EventKind::Notification && p["code"] == "verifier_mutated_repo"
+            })
+            .ok_or("a mutation notification")?;
+        assert_eq!(log[at - 1].0, EventKind::WorkerCompleted, "{what}");
+
+        let ask = fx
+            .of_kind(EventKind::EscalationRaised)
+            .last()
+            .and_then(|e| e.payload["ask"].as_str().map(ToOwned::to_owned))
+            .unwrap_or_default();
+        assert!(ask.contains("modified the repository"), "{what}: {ask}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn under_when_asked_a_modifying_verifier_does_not_satisfy_the_verification_disjunct()
+-> TestResult {
+    // Under `when_asked` a `Finish` may still rest on `needs_verification` being low, which a
+    // verifier does not change; what must not happen is the verifier's own PASS carrying it
+    // through `verification_completed`. With `needs_verification` high, that disjunct is the
+    // only way to finish, so the run must not.
+    if !have_git() {
+        return Ok(());
+    }
+    let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+    commit_repo(&fx.repo)?;
+    let rt = fx.runtime(
+        config(|c| {
+            c.worker = WorkerKind::Generic;
+            c.verify = VerifyPolicy::WhenAsked;
+            c.max_workers = 4;
+        }),
+        no_refreshes(),
+        Arc::new(R2Model::finish_ready().with(NEEDS_VERIFICATION, 0.90)) as Arc<dyn DecisionModel>,
+        Arc::new(TreeWorker { mutate: true }),
+    );
+    let outcome = fx.run(rt).await?;
+    assert!(!finished(&fx), "{:?}: {:?}", outcome.status, tasks(&fx));
+    assert!(!outcome.counters.verifier_completed);
+    assert!(!mutations(&fx).is_empty());
+    Ok(())
+}

@@ -53,6 +53,7 @@ dependencies = [
  "aftman-store",
  "aftman-workers",
  "async-trait",
+ "blake3",
  "gix",
  "nix",
  "serde",

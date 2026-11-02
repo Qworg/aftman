@@ -272,9 +272,33 @@ Rules:
   or `ClaimComplete` to that question authorises one more verifier and whose `Accept` does not
   (an answer to any other question authorises nothing)
   (`recheck_authorises_one_more_verifier_after_its_retry`);
-- a verifier that modifies the repository is a policy violation: the runtime diffs the tree before
-  and after and records `verifier_mutated_repo` as an event, and the verification is treated as
-  inconclusive rather than as a pass;
+- a verifier that modifies the repository is a policy violation: the runtime fingerprints the
+  working tree before the verifier starts and again when it ends
+  (`repo_observe::tree_fingerprint`), and a difference is recorded as a `Notification` with
+  `code: "verifier_mutated_repo"` naming what changed. The verification is then inconclusive
+  rather than a pass: the verifier has **not completed**, whatever it reported, so under
+  `verify = "always"` it is retried once like any verifier that did not complete, and the
+  question that follows says a verifier may have modified the repository
+  (`a_verifier_that_modifies_the_repository_is_inconclusive_not_a_pass`). A tree that could not
+  be fingerprinted, before or after, is treated the same way and recorded as
+  `verifier_tree_unverified` with the reason — "nothing changed" is not concluded from "nothing
+  could be seen", as for `Invariant::UnobservedRepository`. Under simulation the repository is
+  never read and no fingerprint is taken.
+
+  The fingerprint covers what the observation does — `HEAD` and its branch, the index's entries
+  (path, object id, mode, stage; not their stat data, which a verifier's `git status` refreshes),
+  every tracked path that differs from the index and every untracked path that is not ignored —
+  and adds each of those paths' metadata, including its change time, which a process cannot set
+  back. So a further edit to a file that was already modified, or to an untracked file, is a
+  change even when the capped diff would not show it, and so is rewriting such a file with the
+  same bytes. A tracked file that matches the index is compared by content, as the status walk
+  compares it. Not covered: ignored paths (a verifier's build output belongs there; ignores are
+  read from the committed `.gitignore`), refs other than `HEAD`, and submodules. Anything that
+  writes the tree while the verifier runs counts, including a command provider run in the
+  repository meanwhile. The fingerprint is the same in-process read as an observation, under the
+  same bounds: one of the run's observation slots and `OBSERVATION_TIMEOUT`; an interrupted walk or
+  one with more than 200 000 untracked paths is refused rather than compared partially
+  ([08-security.md §3.2](08-security.md));
 - when the backend supports `--json-schema`, the verifier is asked for
   `{"verdict": "pass"|"fail", "evidence": [...], "unevaluated": [...], "confidence": 0..1}` and
   that answer becomes an `EvidenceResult`, not a probability fed to Jev. Jev still decides whether

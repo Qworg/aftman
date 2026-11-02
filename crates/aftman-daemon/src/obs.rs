@@ -100,6 +100,53 @@ impl ObservationBuilder {
         Self::new(matches!(kind, WorkerKind::Simulated))
     }
 
+    /// Fingerprint the job's working tree, to tell afterwards whether a verifier wrote to it
+    /// (`docs/04-workers.md` §6). `None` under simulation, which never reads the repository.
+    ///
+    /// The same bounds as an observation, because it is the same kind of read of a
+    /// worker-controlled repository: one of this run's observation slots, held by the blocking
+    /// task, and [`Self::timeout`], after which the walk is interrupted.
+    pub(crate) async fn tree_fingerprint(
+        &self,
+        repo: &Path,
+    ) -> Option<Result<crate::repo_observe::TreeFingerprint, String>> {
+        if self.simulation {
+            return None;
+        }
+        let interrupt = Arc::new(AtomicBool::new(false));
+        let repo_path = repo.to_path_buf();
+        let permit = match Arc::clone(&self.slots).try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                return Some(Err(format!(
+                    "{MAX_CONCURRENT_OBSERVATIONS} repository observations are already in \
+                     flight, so the working tree could not be fingerprinted"
+                )));
+            }
+        };
+        let task = {
+            let interrupt = interrupt.clone();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                crate::repo_observe::tree_fingerprint(&repo_path, &interrupt)
+            })
+        };
+        let deadline = tokio::time::Instant::now() + self.timeout;
+        Some(match tokio::time::timeout_at(deadline, task).await {
+            Ok(Ok(fingerprint)) => fingerprint,
+            Ok(Err(join_error)) => Err(format!(
+                "the working-tree fingerprint task failed: {join_error}"
+            )),
+            Err(_) => {
+                interrupt.store(true, Ordering::Relaxed);
+                Err(format!(
+                    "fingerprinting the working tree exceeded {}s",
+                    self.timeout.as_secs()
+                ))
+            }
+        })
+    }
+
     /// Assemble one observation.
     ///
     /// `events` are the recent persisted event summaries, already capped by the

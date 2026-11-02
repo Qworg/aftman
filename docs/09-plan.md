@@ -591,7 +591,7 @@ work that turns "the command line launches" into "the output is understood":
 | `agy` hardening: `--print-timeout`, stream-json event coverage | `aftman-workers` |
 | `claude` hardening: stream-json schema, `--json-schema` verifier output, `--resume` continuity | `aftman-workers` |
 | Verifier mission for all three, using `--json-schema` → `EvidenceResult` | `aftman-workers` |
-| Verifier-mutation detection (diff the tree before/after) | `aftman-core` |
+| ~~Verifier-mutation detection (diff the tree before/after)~~ — **built**: a working-tree fingerprint before and after each verifier; a difference is `verifier_mutated_repo` and the verifier has not completed (doc 04 §6) | `aftman-daemon` |
 | Per-backend permission mapping (§8.1) implemented and tested, including the `pi` refusal path | `aftman-workers` |
 | Update the §1 matrix with verified versions; `doctor --probe` gating for unverified backends | docs, `aftman-cli` |
 | ~~Preflight for a live run: versions, `--help` flag drift, repository check, and a one-turn worker probe~~ — **built**; the records it produces are still owed, see [10-live-validation.md](10-live-validation.md) | `aftman-cli` |

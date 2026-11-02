@@ -533,12 +533,13 @@ fn verification_hold(input: &PolicyInput<'_>, suppressed: &[Suppression]) -> Opt
     }
     let why = if input.counters.verifiers_on_this_code() > VERIFIER_RETRIES {
         "the verifier that ran since the last code worker did not complete (it failed, timed \
-         out, was stopped, or printed nothing), and neither did its retry. Recheck or \
+         out, was stopped, printed nothing, or modified the repository), and neither did its \
+         retry. Recheck or \
          ClaimComplete authorises one more verifier, which must still complete; Accept \
          authorises none; Stop ends the run"
     } else if input.counters.verified_since_code {
         "the verifier that ran since the last code worker did not complete (it failed, timed \
-         out, was stopped, or printed nothing)"
+         out, was stopped, printed nothing, or modified the repository)"
     } else {
         "no verifier has completed since the last code worker"
     };
@@ -783,8 +784,9 @@ fn resolution_changes(
 /// A verifier has started since the last code worker, so another would check the same code.
 ///
 /// Except under `verify = "always"` when that verifier did not complete (it failed, timed
-/// out, was stopped, or said nothing): `always` refuses every `Finish` until one completes,
-/// so refusing the retry as well would leave nothing that can make progress. One retry per
+/// out, was stopped, said nothing, or modified the repository): `always` refuses every
+/// `Finish` until one completes, so refusing the retry as well would leave nothing that can
+/// make progress. One retry per
 /// state of the code, [`VERIFIER_RETRIES`]: a verifier that fails to complete twice on the
 /// same code is not a fluke, and retrying it until `max_workers` spent every worker on it.
 fn verification_already_run(input: &PolicyInput<'_>) -> bool {

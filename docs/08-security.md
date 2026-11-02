@@ -306,6 +306,17 @@ stop the daemon from binding — the name is not guessable from the pid alone.
   C-quoted in both the status and the diff headers, so it cannot forge a second line; a path is
   never interpolated into a command, because no command runs.
 
+**The verifier's tree fingerprint is the same read.** Before a verifier starts and when it ends,
+the runtime fingerprints the working tree (`repo_observe::tree_fingerprint`, doc 04 §6). It opens
+the repository through the same `open_job_repository` refusals and runs the same status walk with
+the same empty-driver platform, so it can name no program either; the only addition is a
+`symlink_metadata` of each changed or untracked path, which never opens the path, so a FIFO there
+cannot block it. It takes one of the run's observation slots and runs under `OBSERVATION_TIMEOUT`,
+and an interrupted walk is refused rather than compared partially, since a walk cut short reports
+less than there is. Its untracked-path bound is higher than the observation's (200 000 rather than
+4 000) because a path it does not record is a change it cannot see; past it the fingerprint is
+refused, and the verifier does not count as completed.
+
 The supervisor's own `git` is gone, and with it the forced-configuration table this section used to
 carry (`GIT_FORCED_CONFIG`, `config_scan`, and the supervisor environment helper). Hard rule 3
 still holds: the only subprocesses the supervisor spawns are workers and the daemon self-spawn

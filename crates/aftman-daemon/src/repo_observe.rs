@@ -1274,6 +1274,17 @@ fn read_instructions(repo: &Path, cap_chars: usize) -> Option<RepoInstructions> 
 /// refused rather than incomplete. A path costs a few dozen bytes, so this is a few MiB at most.
 const MAX_FINGERPRINT_PATHS: usize = 200_000;
 
+/// The most index entries a fingerprint records, one metadata read each. Several times the
+/// largest real repositories; past it the fingerprint is refused.
+const MAX_FINGERPRINT_INDEX_ENTRIES: usize = 2_000_000;
+
+fn too_many_paths() -> String {
+    format!(
+        "the working tree has more than {MAX_FINGERPRINT_PATHS} untracked paths, too many to \
+         compare"
+    )
+}
+
 /// The most changed paths a [`TreeChange`] names, and the most characters of each.
 const MAX_REPORTED_CHANGES: usize = 20;
 const MAX_REPORTED_PATH_CHARS: usize = 200;
@@ -1299,18 +1310,46 @@ struct PathStat {
 impl PathStat {
     /// `None` for a path that does not exist (a deleted tracked file). Never follows a symlink
     /// and never opens the path, so a FIFO planted there cannot block.
-    fn of(path: &Path) -> Option<Self> {
+    ///
+    /// # Errors
+    /// Any other failure — a path too long to stat, a directory that cannot be searched. Such a
+    /// path reads the same before and after whatever is written to it, so it must not be
+    /// compared as though it had been seen.
+    fn of(path: &Path) -> Result<Option<Self>, String> {
         use std::os::unix::fs::MetadataExt as _;
-        let meta = std::fs::symlink_metadata(path).ok()?;
-        Some(Self {
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            // The kind only: the path is worker-controlled.
+            Err(err) => {
+                return Err(format!(
+                    "a path in the working tree could not be examined ({})",
+                    err.kind()
+                ));
+            }
+        };
+        let dir = meta.file_type().is_dir();
+        // A directory's size and times move whenever any entry in it is created or removed,
+        // an ignored one included. What is in a directory is compared entry by entry, so for
+        // the directory itself only what it is counts: its type, mode and identity.
+        let (len, mtime, ctime) = if dir {
+            (0, (0, 0), (0, 0))
+        } else {
+            (
+                meta.len(),
+                (meta.mtime(), meta.mtime_nsec()),
+                (meta.ctime(), meta.ctime_nsec()),
+            )
+        };
+        Ok(Some(Self {
             mode: meta.mode(),
-            dir: meta.file_type().is_dir(),
-            len: meta.len(),
+            dir,
+            len,
             dev: meta.dev(),
             ino: meta.ino(),
-            mtime: (meta.mtime(), meta.mtime_nsec()),
-            ctime: (meta.ctime(), meta.ctime_nsec()),
-        })
+            mtime,
+            ctime,
+        }))
     }
 }
 
@@ -1453,6 +1492,15 @@ pub(crate) fn tree_fingerprint(
         ));
     }
 
+    // Every tracked path is recorded, so the bound is the index's size plus the untracked
+    // bound. The index is worker-writable too, so it has a bound of its own.
+    if index.entries().len() > MAX_FINGERPRINT_INDEX_ENTRIES {
+        return Err(format!(
+            "the index has more than {MAX_FINGERPRINT_INDEX_ENTRIES} entries, too many to compare"
+        ));
+    }
+    let path_limit = index.entries().len() + MAX_FINGERPRINT_PATHS;
+
     let mut paths = BTreeMap::new();
     let mut hasher = blake3::Hasher::new();
     // The flags the walk acts on: an `assume-unchanged` or `skip-worktree` entry is never
@@ -1472,40 +1520,57 @@ pub(crate) fn tree_fingerprint(
         hasher.update(&entry.mode.bits().to_le_bytes());
         hasher.update(&entry.stage_raw().to_le_bytes());
         hasher.update(&(entry.flags & walk_flags).bits().to_le_bytes());
-        // The walk skips these, so nothing else would see a write to them.
-        if entry.flags.intersects(
+        // Every tracked path's own metadata, from the worktree. The walk decides whether a
+        // clean file needs hashing by comparing it with the index's stat data, and the index is
+        // worker-writable: a verifier that edits a file and then writes the new stat into its
+        // entry is never hashed. Nor does the walk compare an `assume-unchanged` or
+        // `skip-worktree` entry at all (`S`).
+        let skipped = entry.flags.intersects(
             gix::index::entry::Flags::ASSUME_VALID | gix::index::entry::Flags::SKIP_WORKTREE,
-        ) {
-            let stat = PathStat::of(&workdir.join(OsStr::from_bytes(path)));
-            paths.insert(path.to_vec(), (b'S', stat));
-        }
+        );
+        let stat = PathStat::of(&workdir.join(OsStr::from_bytes(path)))?;
+        paths.insert(path.to_vec(), (if skipped { b'S' } else { b' ' }, stat));
     }
 
     for tracked in &collector.tracked {
         if interrupt.load(Ordering::Relaxed) {
             return Err(interrupted());
         }
-        let stat = PathStat::of(&workdir.join(OsStr::from_bytes(&tracked.path)));
+        let stat = PathStat::of(&workdir.join(OsStr::from_bytes(&tracked.path)))?;
         paths.insert(tracked.path.clone(), (tracked.y, stat));
     }
+    // The repository's own ignore rules, from the index like the walk's, for the paths under
+    // an untracked directory the walk reported whole: build output in a nested repository is
+    // ignored there as it is anywhere else.
+    let mut excludes = repo
+        .excludes(
+            index,
+            None,
+            gix::worktree::stack::state::ignore::Source::IdMapping,
+        )
+        .map_err(|err| format!("could not build the exclude stack: {err}"))?;
     for untracked in &collector.untracked {
         if interrupt.load(Ordering::Relaxed) {
             return Err(interrupted());
         }
-        let stat = PathStat::of(&workdir.join(OsStr::from_bytes(untracked)));
+        let stat = PathStat::of(&workdir.join(OsStr::from_bytes(untracked)))?;
         let is_dir = stat.as_ref().is_some_and(|stat| stat.dir);
         paths.insert(untracked.clone(), (b'?', stat));
         // The walk reports some untracked directories whole — a nested repository — and a
         // directory's own metadata does not move when a file already inside it is rewritten.
         if is_dir {
-            stat_untracked_dir(&workdir, untracked, &mut paths, interrupt)?;
+            stat_untracked_dir(
+                &workdir,
+                untracked,
+                &mut paths,
+                &mut excludes,
+                path_limit,
+                interrupt,
+            )?;
         }
     }
-    if paths.len() > MAX_FINGERPRINT_PATHS {
-        return Err(format!(
-            "the working tree has more than {MAX_FINGERPRINT_PATHS} changed or untracked paths, \
-             too many to compare"
-        ));
+    if paths.len() > path_limit {
+        return Err(too_many_paths());
     }
 
     Ok(TreeFingerprint {
@@ -1534,8 +1599,17 @@ fn control_digest(repo: &gix::Repository) -> Result<[u8; 32], String> {
     let config = repo.config_snapshot().plumbing().to_bstring();
     hasher.update(&(config.len() as u64).to_le_bytes());
     hasher.update(&config);
-    for name in ["info/exclude", "info/attributes"] {
-        let path = repo.common_dir().join(name);
+    // A linked worktree has a `.git` directory of its own beside the common one; gix may read
+    // either, so both count.
+    let mut sources = vec![repo.common_dir().to_path_buf()];
+    if repo.git_dir() != repo.common_dir() {
+        sources.push(repo.git_dir().to_path_buf());
+    }
+    for (dir, name) in sources
+        .iter()
+        .flat_map(|dir| ["info/exclude", "info/attributes"].map(|name| (dir, name)))
+    {
+        let path = dir.join(name);
         // `open_repository` has already refused a non-regular file here; a missing one is an
         // empty list.
         let bytes = match read_capped(&path, MAX_CONTROL_FILE_BYTES + 1) {
@@ -1570,18 +1644,22 @@ fn control_digest(repo: &gix::Repository) -> Result<[u8; 32], String> {
 ///
 /// Iterative, never following a symlink, and only ever opening directories (`read_dir`), so
 /// a FIFO inside cannot block it. Bounded by [`MAX_FINGERPRINT_PATHS`] overall and by the
-/// interrupt. A nested repository's own `.git` is recorded but not descended into: its object
-/// store is not the code.
+/// interrupt. A nested repository's own `.git` is left out, and so is anything the
+/// repository's ignore rules exclude, as the walk would have excluded it.
 fn stat_untracked_dir(
     workdir: &Path,
     relative: &[u8],
     paths: &mut BTreeMap<Vec<u8>, (u8, Option<PathStat>)>,
+    excludes: &mut gix::AttributeStack<'_>,
+    path_limit: usize,
     interrupt: &Arc<AtomicBool>,
 ) -> Result<(), String> {
-    let too_many = || {
+    // A directory that cannot be listed hides what is in it, before and after alike: refused,
+    // not skipped. Only one that has gone since the walk saw it has nothing to compare.
+    let unreadable = |err: &std::io::Error| {
         format!(
-            "the working tree has more than {MAX_FINGERPRINT_PATHS} untracked paths, too many \
-             to compare"
+            "an untracked directory in the working tree could not be read ({})",
+            err.kind()
         )
     };
     let mut stack: Vec<Vec<u8>> = vec![relative.to_vec()];
@@ -1589,25 +1667,42 @@ fn stat_untracked_dir(
         if interrupt.load(Ordering::Relaxed) {
             return Err("the working-tree fingerprint was interrupted by its deadline".to_owned());
         }
-        let Ok(entries) = std::fs::read_dir(workdir.join(OsStr::from_bytes(&dir))) else {
-            // Unreadable: its own metadata, already recorded, is all there is to compare.
-            continue;
+        let entries = match std::fs::read_dir(workdir.join(OsStr::from_bytes(&dir))) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(unreadable(&err)),
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = entry.map_err(|err| unreadable(&err))?;
             let name = entry.file_name();
             let mut child = dir.clone();
             if !child.ends_with(b"/") {
                 child.push(b'/');
             }
             child.extend_from_slice(name.as_bytes());
-            let stat = PathStat::of(&entry.path());
-            let descend = name != ".git"
-                && entry
-                    .file_type()
-                    .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink());
+            // The nested repository's own `.git` is not the code, and a `git status` run in
+            // it rewrites its index: left out altogether. A `.git` deeper down is a directory.
+            if dir.as_slice() == relative && name == ".git" {
+                continue;
+            }
+            let stat = PathStat::of(&entry.path())?;
+            let is_dir = stat.as_ref().is_some_and(|stat| stat.dir);
+            let mode = if is_dir {
+                gix::index::entry::Mode::DIR
+            } else {
+                gix::index::entry::Mode::FILE
+            };
+            if excludes
+                .at_entry(child.as_bstr(), Some(mode))
+                .map_err(|err| format!("could not match the ignore rules: {err}"))?
+                .is_excluded()
+            {
+                continue;
+            }
+            let descend = is_dir;
             paths.insert(child.clone(), (b'?', stat));
-            if paths.len() > MAX_FINGERPRINT_PATHS {
-                return Err(too_many());
+            if paths.len() > path_limit {
+                return Err(too_many_paths());
             }
             if descend {
                 stack.push(child);
@@ -1833,12 +1928,29 @@ mod fingerprint_tests {
         let _ = std::fs::read_to_string(repo.join("a.txt")).expect("read");
         std::fs::create_dir_all(repo.join("target")).expect("mkdir");
         std::fs::write(repo.join("target/out.o"), "built").expect("write");
-        // Same bytes into a clean tracked file: its stat moves, its content does not.
-        std::fs::write(repo.join("clean.txt"), "same\n").expect("write");
         git(&repo, &["status", "--short"]);
+        git(&repo, &["status", "--porcelain", "-uall"]);
         git(&repo, &["diff"]);
+        git(&repo, &["diff", "--cached"]);
         let change = fingerprint(&repo).changes_since(&before);
         assert!(change.is_empty(), "{change:?}");
+    }
+
+    #[test]
+    fn rewriting_a_clean_file_with_the_same_bytes_is_a_write() {
+        // Every tracked path is compared by its own metadata, so a write counts whether or not
+        // it changed the bytes — the same rule as for a modified or untracked file. Before,
+        // a clean file was compared only against the index's stat data, which is
+        // worker-writable (see the forged-index test below).
+        if !have_git() {
+            return;
+        }
+        let (_dir, repo) = repo_with_work();
+        let before = fingerprint(&repo);
+        tick();
+        std::fs::write(repo.join("clean.txt"), "same\n").expect("write");
+        let change = fingerprint(&repo).changes_since(&before);
+        assert_eq!(change.paths, vec!["clean.txt".to_owned()], "{change:?}");
     }
 
     #[test]
@@ -2146,5 +2258,102 @@ mod fingerprint_tests {
         std::fs::write(repo.join("a.txt"), "one\nfour\n").expect("write");
         let _ = fingerprint(&repo).changes_since(&before);
         assert!(!marker.exists(), "a program the repository names ran");
+    }
+
+    // Verification of the fixes above (adversarial, with probes).
+
+    #[test]
+    fn a_forged_index_stat_cannot_hide_an_edit_to_a_clean_file() {
+        // The verifier edits a clean file to any content and length, then writes the new
+        // file's stat into its index entry, keeping the old object id. The entry is not racy,
+        // so the walk does not hash it; the index digest leaves stat data out on purpose.
+        // Only the worktree's own metadata, recorded for every tracked path, can see it.
+        if !have_git() {
+            return;
+        }
+        let (_dir, repo) = repo_with_work();
+        let before = fingerprint(&repo);
+        tick();
+        let path = repo.join("clean.txt");
+        std::fs::write(&path, "PWNED, any length at all\n").expect("write");
+        tick();
+        let mut index = gix::open(&repo).expect("open").open_index().expect("index");
+        let stat = gix::index::entry::Stat::from_fs(
+            &gix::index::fs::Metadata::from_path_no_follow(&path).expect("metadata"),
+        )
+        .expect("stat");
+        for entry in index.entries_mut() {
+            entry.stat = stat;
+        }
+        index.write(Default::default()).expect("write index");
+        // Every entry got `clean.txt`'s stat, so the others now differ from the index too;
+        // what matters is that the edit is seen.
+        let change = fingerprint(&repo).changes_since(&before);
+        assert!(change.paths.contains(&"clean.txt".to_owned()), "{change:?}");
+    }
+
+    #[test]
+    fn a_path_too_deep_to_examine_is_refused_not_skipped() {
+        // Inside a nested repository a chain of long directory names takes a file past
+        // PATH_MAX. Listing or stat-ing it fails the same way before and after a write, so a
+        // skipped directory hid the write. It is now refused, like the main walk's own error.
+        if !have_git() {
+            return;
+        }
+        let (_dir, repo) = repo_with_work();
+        let vendor = repo.join("vendor");
+        std::fs::create_dir_all(&vendor).expect("mkdir");
+        git(&vendor, &["init", "-q"]);
+        // Built inside-out: wrap one directory in another 25 times with `rename`, so no path
+        // this test touches is long, while the file ends up 25 × 201 bytes deep.
+        let segment = "d".repeat(200);
+        let wrapped = vendor.join("w");
+        std::fs::create_dir(&wrapped).expect("mkdir");
+        std::fs::write(wrapped.join("deep.rs"), "ok\n").expect("write");
+        for _ in 0..25 {
+            let outer = vendor.join("t");
+            std::fs::create_dir(&outer).expect("mkdir");
+            std::fs::rename(&wrapped, outer.join(&segment)).expect("wrap");
+            std::fs::rename(&outer, &wrapped).expect("rename");
+        }
+        assert!(
+            tree_fingerprint(&repo, &Arc::new(AtomicBool::new(false))).is_err(),
+            "a directory that cannot be listed must not be compared as though it were empty"
+        );
+    }
+
+    #[test]
+    fn an_obedient_verifier_over_a_nested_repository_changes_nothing() {
+        // The walk inside an untracked nested repository recorded build output the
+        // repository ignores, and the nested `.git`, whose metadata moves when `git status`
+        // runs there: an obedient verifier came out inconclusive. Both are left out now.
+        if !have_git() {
+            return;
+        }
+        let (_dir, repo) = repo_with_work();
+        std::fs::write(repo.join(".gitignore"), "target/\n__pycache__/\n").expect("write");
+        git(&repo, &["add", ".gitignore"]);
+        git(&repo, &["commit", "-q", "-m", "ignore pycache"]);
+        let vendor = repo.join("vendor");
+        std::fs::create_dir_all(vendor.join("src")).expect("mkdir");
+        git(&vendor, &["init", "-q"]);
+        std::fs::write(vendor.join("src/lib.py"), "x = 1\n").expect("write");
+        let before = fingerprint(&repo);
+        tick();
+        std::fs::create_dir_all(vendor.join("src/__pycache__")).expect("mkdir");
+        std::fs::write(vendor.join("src/__pycache__/lib.cpython-312.pyc"), "bytes").expect("write");
+        git(&vendor, &["status", "--short"]);
+        git(&repo, &["status", "--short"]);
+        git(&repo, &["diff"]);
+        let change = fingerprint(&repo).changes_since(&before);
+        assert!(change.is_empty(), "{change:?}");
+
+        // And a real write in there is still seen.
+        std::fs::write(vendor.join("src/lib.py"), "x = 2\n").expect("write");
+        let change = fingerprint(&repo).changes_since(&before);
+        assert!(
+            change.paths.contains(&"vendor/src/lib.py".to_owned()),
+            "{change:?}"
+        );
     }
 }

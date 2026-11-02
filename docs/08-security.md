@@ -310,9 +310,10 @@ stop the daemon from binding — the name is not guessable from the pid alone.
 the runtime fingerprints the working tree (`repo_observe::tree_fingerprint`, doc 04 §6). It opens
 the repository through the same `open_job_repository` refusals and runs the same status walk with
 the same empty-driver platform, so it can name no program either; the only addition is a
-`symlink_metadata` of each changed or untracked path, which never opens the path, so a FIFO there
+`symlink_metadata` of every tracked and untracked path, which never opens the path, so a FIFO there
 cannot block it, and a bounded `read_dir` of untracked directories the walk reports whole, which
-opens directories only and never follows a symlink. Its status walk uses fixed stat options, every
+opens directories only, never follows a symlink, and matches paths against the same index-sourced
+ignore rules. A path it cannot examine fails the fingerprint instead of being skipped. Its status walk uses fixed stat options, every
 field on, rather than the repository's `core.trustctime` / `core.checkStat`, which a worker can
 write; and it hashes the resolved configuration and `info/exclude` / `info/attributes` (each read
 `O_NONBLOCK | O_NOFOLLOW`, at most 1 MiB) so that a change to them is a change to the tree. It

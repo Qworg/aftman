@@ -287,16 +287,21 @@ Rules:
 
   The fingerprint covers what the observation does — `HEAD` and its branch, the index's entries
   (path, object id, mode, stage and the `assume-unchanged` / `skip-worktree` / `intent-to-add`
-  flags; not their stat data, which a verifier's `git status` refreshes), every tracked path that
-  differs from the index and every untracked path that is not ignored, each path inside an
-  untracked directory the walk reports whole (a nested repository, not its `.git`) — and adds
-  each of those paths' metadata, including its change time, which a process cannot set back. So
-  a further edit to a file that was already modified, or to an untracked file, is a change even
-  when the capped diff would not show it, and so is rewriting such a file with the same bytes.
-  An entry flagged `assume-unchanged` or `skip-worktree`, which the walk never compares, is
-  compared by its metadata too. A tracked file that matches the index is compared by the status
-  walk with **every** stat field, whatever the repository's `core.trustctime` or
-  `core.checkStat` say, and hashed when any differs. What decides how the tree is read is part of
+  flags; not their stat data, which a verifier's `git status` refreshes, and which a verifier
+  could forge), every tracked path, every untracked path that is not ignored, and each path
+  inside an untracked directory the walk reports whole (a nested repository) that the
+  repository's ignore rules do not exclude, leaving out that repository's own `.git` — and
+  records each of those paths' **own metadata from the worktree**, including its change time,
+  which a process cannot set back. So any write to a tracked or untracked file is a change,
+  whether or not it changed the bytes and whatever the index says: a further edit to a file that
+  was already modified, an edit to a clean file whose index entry was rewritten to match, or to
+  one flagged `assume-unchanged` / `skip-worktree`, which the walk never compares. A directory is
+  compared by its type, mode and identity only, since its times move whenever anything inside it
+  is created, ignored output included; its contents are compared entry by entry. The status walk
+  itself also runs with **every** stat field on, whatever the repository's `core.trustctime` or
+  `core.checkStat` say. A path that cannot be examined — too long, or in a directory that cannot
+  be listed — makes the fingerprint fail rather than be skipped, since it would read the same
+  before and after any write. What decides how the tree is read is part of
   the fingerprint as well: the resolved configuration (every file it came from, includes and
   `config.worktree` among them) and `.git/info/exclude` / `info/attributes`, so a verifier that
   adds an exclude pattern or turns a setting off has changed the tree as judged. Not covered:
@@ -313,9 +318,10 @@ Rules:
   over, by a clean retry; and a helper process a verifier leaves running after it exits (one with
   its output redirected) can write after the comparison — the worker's process group is only
   killed when its output does not drain. The fingerprint is the same in-process read as an observation, under the
-  same bounds: one of the run's observation slots and `OBSERVATION_TIMEOUT`; an interrupted walk or
-  one with more than 200 000 untracked paths is refused rather than compared partially
-  ([08-security.md §3.2](08-security.md));
+  same bounds: one of the run's observation slots and `OBSERVATION_TIMEOUT`; an interrupted walk,
+  or one recording more than 200 000 paths beyond the index's own, is refused rather than
+  compared partially
+  ([08-security.md §3.2](08-security.md)), as is an index of more than 2 000 000 entries;
 - when the backend supports `--json-schema`, the verifier is asked for
   `{"verdict": "pass"|"fail", "evidence": [...], "unevaluated": [...], "confidence": 0..1}` and
   that answer becomes an `EvidenceResult`, not a probability fed to Jev. Jev still decides whether

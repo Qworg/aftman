@@ -2486,11 +2486,14 @@ impl FactoryRuntime {
             }
             Some(VerifierTree::Unknown(reason)) => {
                 // gix's error text and the paths in it are worker-influenced: bounded, and no
-                // control characters (AGENTS.md hard rule 5).
-                let (reason, _) = aftman_core::observation::cap_text(
-                    &aftman_core::ansi::strip_control(&reason),
-                    VERIFIER_TREE_REASON_CHARS,
-                );
+                // control characters at all (AGENTS.md hard rule 5). `strip_control` keeps
+                // newlines and tabs, which would let a path forge a line of its own.
+                let flat: String = aftman_core::ansi::strip_control(&reason)
+                    .chars()
+                    .map(|c| if c.is_control() { ' ' } else { c })
+                    .collect();
+                let (reason, _) =
+                    aftman_core::observation::cap_text(&flat, VERIFIER_TREE_REASON_CHARS);
                 self.emit(
                     state,
                     EventKind::Notification,

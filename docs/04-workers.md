@@ -286,16 +286,33 @@ Rules:
   never read and no fingerprint is taken.
 
   The fingerprint covers what the observation does — `HEAD` and its branch, the index's entries
-  (path, object id, mode, stage; not their stat data, which a verifier's `git status` refreshes),
-  every tracked path that differs from the index and every untracked path that is not ignored —
-  and adds each of those paths' metadata, including its change time, which a process cannot set
-  back. So a further edit to a file that was already modified, or to an untracked file, is a
-  change even when the capped diff would not show it, and so is rewriting such a file with the
-  same bytes. A tracked file that matches the index is compared by content, as the status walk
-  compares it. Not covered: ignored paths (a verifier's build output belongs there; ignores are
-  read from the committed `.gitignore`), refs other than `HEAD`, and submodules. Anything that
-  writes the tree while the verifier runs counts, including a command provider run in the
-  repository meanwhile. The fingerprint is the same in-process read as an observation, under the
+  (path, object id, mode, stage and the `assume-unchanged` / `skip-worktree` / `intent-to-add`
+  flags; not their stat data, which a verifier's `git status` refreshes), every tracked path that
+  differs from the index and every untracked path that is not ignored, each path inside an
+  untracked directory the walk reports whole (a nested repository, not its `.git`) — and adds
+  each of those paths' metadata, including its change time, which a process cannot set back. So
+  a further edit to a file that was already modified, or to an untracked file, is a change even
+  when the capped diff would not show it, and so is rewriting such a file with the same bytes.
+  An entry flagged `assume-unchanged` or `skip-worktree`, which the walk never compares, is
+  compared by its metadata too. A tracked file that matches the index is compared by the status
+  walk with **every** stat field, whatever the repository's `core.trustctime` or
+  `core.checkStat` say, and hashed when any differs. What decides how the tree is read is part of
+  the fingerprint as well: the resolved configuration (every file it came from, includes and
+  `config.worktree` among them) and `.git/info/exclude` / `info/attributes`, so a verifier that
+  adds an exclude pattern or turns a setting off has changed the tree as judged. Not covered:
+  paths already ignored when the verifier starts (a verifier's build output belongs there;
+  ignores come from the committed `.gitignore` and `info/exclude`), refs other than `HEAD`, and
+  submodules. Anything that writes the tree while the verifier runs counts, including a command
+  provider run in the repository meanwhile.
+
+  The comparison is made when a verifier **ends on its own** (it exited, failed or timed out). A
+  verifier that is stopped, cancelled or superseded has not completed anyway, and is not
+  fingerprinted again, so a write it made before it was stopped is seen by the next observation
+  but not recorded as `verifier_mutated_repo`. Two known gaps: a retried verifier is started on
+  the tree as the first one left it, so a first verifier's edit can be verified, and finished
+  over, by a clean retry; and a helper process a verifier leaves running after it exits (one with
+  its output redirected) can write after the comparison — the worker's process group is only
+  killed when its output does not drain. The fingerprint is the same in-process read as an observation, under the
   same bounds: one of the run's observation slots and `OBSERVATION_TIMEOUT`; an interrupted walk or
   one with more than 200 000 untracked paths is refused rather than compared partially
   ([08-security.md §3.2](08-security.md));

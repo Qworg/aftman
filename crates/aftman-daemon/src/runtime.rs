@@ -479,6 +479,9 @@ struct WorkerHandle {
     tree_before: Option<TreeWatch>,
 }
 
+/// The most characters of the reason in a `verifier_tree_unverified` notification.
+const VERIFIER_TREE_REASON_CHARS: usize = 500;
+
 /// What a verifier did to the working tree it was asked to judge.
 enum VerifierTree {
     Unchanged,
@@ -2482,6 +2485,12 @@ impl FactoryRuntime {
                 .await?;
             }
             Some(VerifierTree::Unknown(reason)) => {
+                // gix's error text and the paths in it are worker-influenced: bounded, and no
+                // control characters (AGENTS.md hard rule 5).
+                let (reason, _) = aftman_core::observation::cap_text(
+                    &aftman_core::ansi::strip_control(&reason),
+                    VERIFIER_TREE_REASON_CHARS,
+                );
                 self.emit(
                     state,
                     EventKind::Notification,

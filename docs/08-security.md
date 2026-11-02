@@ -311,7 +311,12 @@ the runtime fingerprints the working tree (`repo_observe::tree_fingerprint`, doc
 the repository through the same `open_job_repository` refusals and runs the same status walk with
 the same empty-driver platform, so it can name no program either; the only addition is a
 `symlink_metadata` of each changed or untracked path, which never opens the path, so a FIFO there
-cannot block it. It takes one of the run's observation slots and runs under `OBSERVATION_TIMEOUT`,
+cannot block it, and a bounded `read_dir` of untracked directories the walk reports whole, which
+opens directories only and never follows a symlink. Its status walk uses fixed stat options, every
+field on, rather than the repository's `core.trustctime` / `core.checkStat`, which a worker can
+write; and it hashes the resolved configuration and `info/exclude` / `info/attributes` (each read
+`O_NONBLOCK | O_NOFOLLOW`, at most 1 MiB) so that a change to them is a change to the tree. It
+takes one of the run's observation slots and runs under `OBSERVATION_TIMEOUT`,
 and an interrupted walk is refused rather than compared partially, since a walk cut short reports
 less than there is. Its untracked-path bound is higher than the observation's (200 000 rather than
 4 000) because a path it does not record is a change it cannot see; past it the fingerprint is

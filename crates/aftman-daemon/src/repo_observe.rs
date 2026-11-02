@@ -575,6 +575,7 @@ fn git_evidence(
         &workdir,
         &objects,
         MAX_UNTRACKED_PATHS,
+        None,
         interrupt,
     )?;
 
@@ -647,8 +648,17 @@ fn walk_worktree(
     workdir: &Path,
     objects: &gix::OdbHandleArc,
     untracked_limit: usize,
+    stat: Option<gix::index::entry::stat::Options>,
     interrupt: &Arc<AtomicBool>,
 ) -> Result<WalkCollector, String> {
+    // The repository's own `core.trustctime` / `core.checkStat` unless the caller fixes them:
+    // they decide which clean tracked files the walk bothers to hash.
+    let stat = match stat {
+        Some(stat) => stat,
+        None => repo
+            .stat_options()
+            .map_err(|err| format!("could not read stat options: {err}"))?,
+    };
     let roots = WorktreeRoots {
         old_root: None,
         new_root: Some(workdir.to_path_buf()),
@@ -710,9 +720,7 @@ fn walk_worktree(
             tracked_file_modifications: gix::status::plumbing::index_as_worktree::Options {
                 fs: fs_caps,
                 thread_limit: None,
-                stat: repo
-                    .stat_options()
-                    .map_err(|err| format!("could not read stat options: {err}"))?,
+                stat,
                 fscache: false,
             },
             fscache: false,
@@ -1279,6 +1287,8 @@ struct PathStat {
     /// The `S_IFMT` bits and permissions, so a file replaced by a symlink or made
     /// executable differs.
     mode: u32,
+    /// A real directory, not a symlink to one.
+    dir: bool,
     len: u64,
     dev: u64,
     ino: u64,
@@ -1294,6 +1304,7 @@ impl PathStat {
         let meta = std::fs::symlink_metadata(path).ok()?;
         Some(Self {
             mode: meta.mode(),
+            dir: meta.file_type().is_dir(),
             len: meta.len(),
             dev: meta.dev(),
             ino: meta.ino(),
@@ -1322,8 +1333,16 @@ pub(crate) struct TreeFingerprint {
     /// BLAKE3 over every index entry's path, object id, mode and stage. Not its stat data,
     /// which a `git status` run by the verifier legitimately refreshes.
     index: [u8; 32],
-    /// Every path that differs from the index or is untracked: its status column (`M`, `D`,
-    /// `T`, `U`, `A`, or `?` for untracked) and its metadata.
+    /// BLAKE3 over the resolved configuration (every file it was read from, includes and
+    /// worktree-scoped files among them) and `.git/info/exclude` / `info/attributes`. They are
+    /// worker-writable and decide what the walk reports: a new exclude pattern hides a new
+    /// file, `status.showUntrackedFiles` hides them all, `core.trustctime` changes which clean
+    /// files are hashed. So a change to any of them is a change to the tree as judged.
+    control: [u8; 32],
+    /// Every path that differs from the index, is untracked, or is flagged in the index so that
+    /// the walk does not compare it: its status column (`M`, `D`, `T`, `U`, `A`; `?` for an
+    /// untracked path, including each path inside an untracked directory the walk reports
+    /// whole; `S` for an `assume-unchanged` or `skip-worktree` entry) and its metadata.
     paths: BTreeMap<Vec<u8>, (u8, Option<PathStat>)>,
 }
 
@@ -1331,6 +1350,8 @@ pub(crate) struct TreeFingerprint {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct TreeChange {
     pub head_moved: bool,
+    /// The index changed, or what governs how the tree is read did: the configuration,
+    /// `info/exclude`, `info/attributes`.
     pub index_changed: bool,
     /// Up to [`MAX_REPORTED_CHANGES`] paths that appeared, disappeared or were written,
     /// quoted as `git status` would quote them and capped in length.
@@ -1351,7 +1372,7 @@ impl TreeFingerprint {
     pub fn changes_since(&self, before: &Self) -> TreeChange {
         let mut change = TreeChange {
             head_moved: self.head != before.head || self.branch != before.branch,
-            index_changed: self.index != before.index,
+            index_changed: self.index != before.index || self.control != before.control,
             ..TreeChange::default()
         };
         let mut changed: Vec<&[u8]> = Vec::new();
@@ -1401,18 +1422,29 @@ pub(crate) fn tree_fingerprint(
         repo.objects.clone().into_arc().map_err(|err| {
             format!("the object database could not be shared across threads: {err}")
         })?;
+    // Every stat field, whatever the repository's `core.trustctime` / `core.checkStat` say:
+    // with them off, a same-length edit to a clean file with its mtime put back would match
+    // the index without being hashed. The configuration is worker-writable.
+    let stat = gix::index::entry::stat::Options {
+        trust_ctime: true,
+        check_stat: true,
+        use_nsec: true,
+        use_stdev: true,
+    };
     let collector = walk_worktree(
         &repo,
         index,
         &workdir,
         &objects,
         MAX_FINGERPRINT_PATHS,
+        Some(stat),
         interrupt,
     )?;
     // An interrupted walk stops early and reports less than there is, which would read as
     // "nothing was written" — the one wrong answer here.
+    let interrupted = || "the working-tree fingerprint was interrupted by its deadline".to_owned();
     if interrupt.load(Ordering::Relaxed) {
-        return Err("the working-tree fingerprint was interrupted by its deadline".to_owned());
+        return Err(interrupted());
     }
     if collector.capped {
         return Err(format!(
@@ -1421,8 +1453,17 @@ pub(crate) fn tree_fingerprint(
         ));
     }
 
+    let mut paths = BTreeMap::new();
     let mut hasher = blake3::Hasher::new();
+    // The flags the walk acts on: an `assume-unchanged` or `skip-worktree` entry is never
+    // compared with the worktree, and `intent-to-add` changes how it is reported.
+    let walk_flags = gix::index::entry::Flags::ASSUME_VALID
+        | gix::index::entry::Flags::SKIP_WORKTREE
+        | gix::index::entry::Flags::INTENT_TO_ADD;
     for entry in index.entries() {
+        if interrupt.load(Ordering::Relaxed) {
+            return Err(interrupted());
+        }
         let path = entry.path(index);
         // Length-prefixed, so no two different entry lists hash the same bytes.
         hasher.update(&(path.len() as u64).to_le_bytes());
@@ -1430,16 +1471,41 @@ pub(crate) fn tree_fingerprint(
         hasher.update(entry.id.as_bytes());
         hasher.update(&entry.mode.bits().to_le_bytes());
         hasher.update(&entry.stage_raw().to_le_bytes());
+        hasher.update(&(entry.flags & walk_flags).bits().to_le_bytes());
+        // The walk skips these, so nothing else would see a write to them.
+        if entry.flags.intersects(
+            gix::index::entry::Flags::ASSUME_VALID | gix::index::entry::Flags::SKIP_WORKTREE,
+        ) {
+            let stat = PathStat::of(&workdir.join(OsStr::from_bytes(path)));
+            paths.insert(path.to_vec(), (b'S', stat));
+        }
     }
 
-    let mut paths = BTreeMap::new();
     for tracked in &collector.tracked {
+        if interrupt.load(Ordering::Relaxed) {
+            return Err(interrupted());
+        }
         let stat = PathStat::of(&workdir.join(OsStr::from_bytes(&tracked.path)));
         paths.insert(tracked.path.clone(), (tracked.y, stat));
     }
     for untracked in &collector.untracked {
+        if interrupt.load(Ordering::Relaxed) {
+            return Err(interrupted());
+        }
         let stat = PathStat::of(&workdir.join(OsStr::from_bytes(untracked)));
+        let is_dir = stat.as_ref().is_some_and(|stat| stat.dir);
         paths.insert(untracked.clone(), (b'?', stat));
+        // The walk reports some untracked directories whole — a nested repository — and a
+        // directory's own metadata does not move when a file already inside it is rewritten.
+        if is_dir {
+            stat_untracked_dir(&workdir, untracked, &mut paths, interrupt)?;
+        }
+    }
+    if paths.len() > MAX_FINGERPRINT_PATHS {
+        return Err(format!(
+            "the working tree has more than {MAX_FINGERPRINT_PATHS} changed or untracked paths, \
+             too many to compare"
+        ));
     }
 
     Ok(TreeFingerprint {
@@ -1450,8 +1516,105 @@ pub(crate) fn tree_fingerprint(
             .flatten()
             .map(|name| name.as_bstr().to_string()),
         index: *hasher.finalize().as_bytes(),
+        control: control_digest(&repo)?,
         paths,
     })
+}
+
+/// The most bytes of `info/exclude` or `info/attributes` a fingerprint reads. Each is a list of
+/// patterns; one larger than this is refused rather than partly compared.
+const MAX_CONTROL_FILE_BYTES: usize = 1024 * 1024;
+
+/// BLAKE3 over what decides how the tree is read: the resolved configuration and the two
+/// per-repository pattern files gix reads from disk.
+fn control_digest(repo: &gix::Repository) -> Result<[u8; 32], String> {
+    let mut hasher = blake3::Hasher::new();
+    // Every section of every file the configuration was assembled from, includes and
+    // `config.worktree` among them, in the order gix read them.
+    let config = repo.config_snapshot().plumbing().to_bstring();
+    hasher.update(&(config.len() as u64).to_le_bytes());
+    hasher.update(&config);
+    for name in ["info/exclude", "info/attributes"] {
+        let path = repo.common_dir().join(name);
+        // `open_repository` has already refused a non-regular file here; a missing one is an
+        // empty list.
+        let bytes = match read_capped(&path, MAX_CONTROL_FILE_BYTES + 1) {
+            Some((bytes, _)) if bytes.len() > MAX_CONTROL_FILE_BYTES => {
+                return Err(format!(
+                    ".git/{name} is larger than {MAX_CONTROL_FILE_BYTES} bytes, too large to \
+                     compare"
+                ));
+            }
+            Some((bytes, _)) => Some(bytes),
+            None if path.exists() => {
+                return Err(format!(".git/{name} could not be read"));
+            }
+            None => None,
+        };
+        hasher.update(name.as_bytes());
+        match bytes {
+            Some(bytes) => {
+                hasher.update(&[1]);
+                hasher.update(&(bytes.len() as u64).to_le_bytes());
+                hasher.update(&bytes);
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// Record every path under an untracked directory the walk reported whole, with its metadata.
+///
+/// Iterative, never following a symlink, and only ever opening directories (`read_dir`), so
+/// a FIFO inside cannot block it. Bounded by [`MAX_FINGERPRINT_PATHS`] overall and by the
+/// interrupt. A nested repository's own `.git` is recorded but not descended into: its object
+/// store is not the code.
+fn stat_untracked_dir(
+    workdir: &Path,
+    relative: &[u8],
+    paths: &mut BTreeMap<Vec<u8>, (u8, Option<PathStat>)>,
+    interrupt: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let too_many = || {
+        format!(
+            "the working tree has more than {MAX_FINGERPRINT_PATHS} untracked paths, too many \
+             to compare"
+        )
+    };
+    let mut stack: Vec<Vec<u8>> = vec![relative.to_vec()];
+    while let Some(dir) = stack.pop() {
+        if interrupt.load(Ordering::Relaxed) {
+            return Err("the working-tree fingerprint was interrupted by its deadline".to_owned());
+        }
+        let Ok(entries) = std::fs::read_dir(workdir.join(OsStr::from_bytes(&dir))) else {
+            // Unreadable: its own metadata, already recorded, is all there is to compare.
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let mut child = dir.clone();
+            if !child.ends_with(b"/") {
+                child.push(b'/');
+            }
+            child.extend_from_slice(name.as_bytes());
+            let stat = PathStat::of(&entry.path());
+            let descend = name != ".git"
+                && entry
+                    .file_type()
+                    .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink());
+            paths.insert(child.clone(), (b'?', stat));
+            if paths.len() > MAX_FINGERPRINT_PATHS {
+                return Err(too_many());
+            }
+            if descend {
+                stack.push(child);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1796,5 +1959,192 @@ mod fingerprint_tests {
         let (_dir, repo) = repo_with_work();
         let interrupted = Arc::new(AtomicBool::new(true));
         assert!(tree_fingerprint(&repo, &interrupted).is_err());
+    }
+
+    // Review of the fingerprint (adversarial, with probes). Each of these was a verifier
+    // that wrote to the repository and still completed.
+
+    /// Write `text` to `path` keeping its modification time, so only its change time and
+    /// content can tell.
+    fn write_keeping_mtime(path: &Path, text: &str) {
+        let mtime = std::fs::metadata(path)
+            .and_then(|m| m.modified())
+            .expect("mtime");
+        std::fs::write(path, text).expect("write");
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(mtime))
+            .expect("set mtime");
+    }
+
+    #[test]
+    fn an_index_flag_that_stops_the_walk_comparing_a_file_cannot_hide_an_edit() {
+        // gix's walk skips an `assume-unchanged` or `skip-worktree` entry. A verifier that set
+        // the flag and then edited the file changed nothing the fingerprint covered. The flag
+        // is now part of the index digest, and a flagged entry's own metadata is compared.
+        if !have_git() {
+            return;
+        }
+        for flag in ["--assume-unchanged", "--skip-worktree"] {
+            // The verifier sets the flag itself.
+            let (_dir, repo) = repo_with_work();
+            let before = fingerprint(&repo);
+            tick();
+            git(&repo, &["update-index", flag, "clean.txt"]);
+            std::fs::write(repo.join("clean.txt"), "tests now pass\n").expect("write");
+            let change = fingerprint(&repo).changes_since(&before);
+            assert!(change.index_changed, "{flag}: {change:?}");
+            assert_eq!(change.paths, vec!["clean.txt".to_owned()], "{flag}");
+
+            // The flag was already set when the verifier started: only the file moves.
+            let (_dir, repo) = repo_with_work();
+            git(&repo, &["update-index", flag, "clean.txt"]);
+            let before = fingerprint(&repo);
+            tick();
+            std::fs::write(repo.join("clean.txt"), "tests now pass\n").expect("write");
+            let change = fingerprint(&repo).changes_since(&before);
+            assert_eq!(
+                change.paths,
+                vec!["clean.txt".to_owned()],
+                "{flag}: {change:?}"
+            );
+            assert!(!change.index_changed, "{flag}");
+        }
+    }
+
+    #[test]
+    fn the_repositorys_stat_settings_cannot_hide_a_same_length_edit() {
+        // With `core.trustctime = false`, gix compares a clean file's mtime and size only, so a
+        // same-length edit with its mtime put back matched the index unhashed. The fingerprint
+        // now compares every stat field whatever the repository says. The setting is in place
+        // before the verifier starts (a change to it is caught by the control digest, below),
+        // and the index entry is not racy, so only the stat comparison can catch the edit.
+        if !have_git() {
+            return;
+        }
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("mkdir");
+        git(&repo, &["init", "-q"]);
+        git(&repo, &["config", "user.email", "t@example.com"]);
+        git(&repo, &["config", "user.name", "t"]);
+        std::fs::write(repo.join("clean.txt"), "same\n").expect("write");
+        // Long enough for the index to be written in a later second than the file.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "init"]);
+        git(&repo, &["config", "core.trustctime", "false"]);
+        git(&repo, &["config", "core.checkStat", "minimal"]);
+        let before = fingerprint(&repo);
+        tick();
+        write_keeping_mtime(&repo.join("clean.txt"), "SAME\n");
+        let change = fingerprint(&repo).changes_since(&before);
+        assert_eq!(change.paths, vec!["clean.txt".to_owned()], "{change:?}");
+    }
+
+    #[test]
+    fn a_change_to_what_decides_how_the_tree_is_read_is_a_change() {
+        // A new `info/exclude` pattern hid a new source file; `status.showUntrackedFiles`
+        // or an included configuration file can hide others. Each is worker-writable.
+        if !have_git() {
+            return;
+        }
+        let (_dir, repo) = repo_with_work();
+        let before = fingerprint(&repo);
+        std::fs::write(repo.join(".git/info/exclude"), "evil.rs\n").expect("write");
+        std::fs::write(repo.join("evil.rs"), "fn main() {}\n").expect("write");
+        let change = fingerprint(&repo).changes_since(&before);
+        assert!(change.index_changed, "info/exclude: {change:?}");
+
+        let (_dir, repo) = repo_with_work();
+        let before = fingerprint(&repo);
+        git(&repo, &["config", "status.showUntrackedFiles", "no"]);
+        assert!(fingerprint(&repo).changes_since(&before).index_changed);
+
+        // An include outside the repository, already in place when the verifier starts.
+        let (dir, repo) = repo_with_work();
+        let included = dir.path().join("included.gitconfig");
+        std::fs::write(&included, "[core]\n\tfilemode = true\n").expect("write");
+        git(
+            &repo,
+            &["config", "include.path", &included.display().to_string()],
+        );
+        let before = fingerprint(&repo);
+        std::fs::write(&included, "[core]\n\tfilemode = false\n").expect("write");
+        assert!(fingerprint(&repo).changes_since(&before).index_changed);
+    }
+
+    #[test]
+    fn a_write_inside_an_untracked_nested_repository_is_a_change() {
+        // The walk reports an untracked nested repository as one directory, whose own
+        // metadata does not move when a file already inside it is rewritten.
+        if !have_git() {
+            return;
+        }
+        let (_dir, repo) = repo_with_work();
+        let vendor = repo.join("vendor");
+        std::fs::create_dir_all(vendor.join("src")).expect("mkdir");
+        git(&vendor, &["init", "-q"]);
+        std::fs::write(vendor.join("src/lib.rs"), "ok\n").expect("write");
+        let before = fingerprint(&repo);
+        tick();
+        std::fs::write(vendor.join("src/lib.rs"), "PWNED\n").expect("write");
+        let change = fingerprint(&repo).changes_since(&before);
+        assert_eq!(
+            change.paths,
+            vec!["vendor/src/lib.rs".to_owned()],
+            "{change:?}"
+        );
+    }
+
+    #[test]
+    fn the_fingerprint_runs_no_program_the_repository_names() {
+        // The marker technique of `tests/observation.rs`, applied to the fingerprint: filters,
+        // diff drivers, fsmonitor (directly and through an include) and hooks, with tracked
+        // files dirtied so the walk has something to compare.
+        use std::os::unix::fs::PermissionsExt as _;
+        if !have_git() {
+            return;
+        }
+        let (dir, repo) = repo_with_work();
+        let marker = dir.path().join("marker");
+        let evil = dir.path().join("evil.sh");
+        std::fs::write(
+            &evil,
+            format!("#!/bin/sh\ntouch {}\ncat\n", marker.display()),
+        )
+        .expect("write");
+        std::fs::set_permissions(&evil, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let e = evil.display();
+        std::fs::write(repo.join(".gitattributes"), "*.txt filter=evil diff=evil\n")
+            .expect("write");
+        git(&repo, &["add", ".gitattributes"]);
+        git(&repo, &["commit", "-q", "-m", "attrs"]);
+        let include = dir.path().join("inc");
+        std::fs::write(&include, format!("[core]\n\tfsmonitor = {e}\n")).expect("write");
+        let mut config = std::fs::read_to_string(repo.join(".git/config")).expect("read");
+        config.push_str(&format!(
+            "[core]\n\tfsmonitor = {e}\n\thooksPath = {}\n[filter \"evil\"]\n\tclean = {e}\n\
+             \tsmudge = {e}\n\tprocess = {e}\n\trequired = true\n[diff \"evil\"]\n\ttextconv = \
+             {e}\n[diff]\n\texternal = {e}\n[include]\n\tpath = {}\n",
+            dir.path().display(),
+            include.display()
+        ));
+        std::fs::write(repo.join(".git/config"), config).expect("write");
+        for hook in [
+            "post-index-change",
+            "fsmonitor-watchman",
+            "reference-transaction",
+        ] {
+            std::fs::copy(&evil, dir.path().join(hook)).expect("copy");
+        }
+        tick();
+        std::fs::write(repo.join("clean.txt"), "xxxx\n").expect("write");
+        std::fs::write(repo.join("a.txt"), "one\nthree\n").expect("write");
+        let before = fingerprint(&repo);
+        std::fs::write(repo.join("a.txt"), "one\nfour\n").expect("write");
+        let _ = fingerprint(&repo).changes_since(&before);
+        assert!(!marker.exists(), "a program the repository names ran");
     }
 }

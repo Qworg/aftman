@@ -732,7 +732,12 @@ Rules:
   observation cycle (plus one on worker exit), and only when new bytes arrived. This keeps the log proportional to decisions
   rather than to agent verbosity;
 - aftman-generated events never enter the assessment queue;
-- every event carries a `schema_version` inside `payload`.
+- every event carries a `schema_version` inside `payload`;
+- the summary the model is shown of an event (`EventEnvelope::summary`, in
+  `Observation::events`) carries no payload text, only a detail this build writes from a fixed
+  set: the directive selected, the state moved to, and the `code` of a `ModelError`, `Error` or
+  `Notification` — so a verifier's report followed by `NOTIFICATION: verifier_mutated_repo` is
+  shown to be one not to score a `Finish` over (doc 04 §6).
 
 ### 7.1 What wakes the watcher
 

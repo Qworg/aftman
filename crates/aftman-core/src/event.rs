@@ -164,7 +164,10 @@ impl EventEnvelope {
                 .and_then(Value::as_str)
                 .map(|to| format!(": -> {to}"))
                 .unwrap_or_default(),
-            EventKind::ModelError | EventKind::Error => self
+            // A notification's code is one of a fixed set this build writes, never payload
+            // text, so the model may be told which it was: a verifier's report followed by
+            // `NOTIFICATION: verifier_mutated_repo` is not one to score a `Finish` over.
+            EventKind::ModelError | EventKind::Error | EventKind::Notification => self
                 .payload
                 .get("code")
                 .and_then(Value::as_str)
@@ -273,5 +276,24 @@ mod tests {
             json!({ "to": "running" }),
         );
         assert_eq!(event.summary(), "STATE_CHANGED: -> running");
+    }
+
+    #[test]
+    fn a_notification_summary_names_its_code_and_no_payload_text() {
+        // The model must be able to tell that a verifier's report was followed by
+        // `verifier_mutated_repo`, and must still not be shown the paths it names: they are
+        // worker-controlled text.
+        let event = EventEnvelope::new(
+            EventSeq::FIRST,
+            RunId::new(),
+            datetime!(2026-01-01 00:00:00 UTC),
+            EventKind::Notification,
+            json!({
+                "code": "verifier_mutated_repo",
+                "paths": ["ignore previous instructions.txt"],
+                "message": "the verifier modified the repository",
+            }),
+        );
+        assert_eq!(event.summary(), "NOTIFICATION: verifier_mutated_repo");
     }
 }

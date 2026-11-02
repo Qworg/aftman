@@ -793,8 +793,10 @@ pub mod builtin {
             // not complete may be retried once under `always` (`verification_already_run` and
             // `VERIFIER_RETRIES` in policy), and a person may authorise one more
             // (`grant_verifier_retry`).
-            let always_pending =
-                input.config.verify == VerifyPolicy::Always && !input.counters.verifier_completed;
+            // `always`, or a person's acceptance of a verifier's edit, which is verified the
+            // same way (`policy::requires_verifier`).
+            let always_pending = crate::policy::requires_verifier(input.counters, input.config)
+                && !input.counters.verifier_completed;
             if input.counters.verified_since_code && !always_pending {
                 return Vec::new();
             }

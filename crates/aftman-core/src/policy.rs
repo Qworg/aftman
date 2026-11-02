@@ -292,8 +292,7 @@ pub fn arbitrate(input: &PolicyInput<'_>, proposals: &[Proposal]) -> PolicyDecis
     if input.active_worker.is_some() {
         invariants.push(Invariant::WorkerStillActive);
     }
-    if input.config.verify == crate::job::VerifyPolicy::Always && !input.counters.verifier_completed
-    {
+    if requires_verifier(input.counters, input.config) && !input.counters.verifier_completed {
         invariants.push(Invariant::VerificationIncomplete);
     }
     if input.config.verify == crate::job::VerifyPolicy::Never {
@@ -567,10 +566,23 @@ fn verification_hold(input: &PolicyInput<'_>, suppressed: &[Suppression]) -> Opt
     } else {
         "no verifier has completed since the last code worker"
     };
-    Some(format!(
-        "Finish is held because verify = \"always\" requires a verifier to complete first, \
-         and {why}."
-    ))
+    let rule = if input.config.verify == crate::job::VerifyPolicy::Always {
+        "verify = \"always\" requires a verifier to complete first"
+    } else {
+        "a person took a verifier's changes to the repository as the work, which a verifier \
+         must check first"
+    };
+    Some(format!("Finish is held because {rule}, and {why}."))
+}
+
+/// Whether a `Finish` needs a completed verifier on this state of the code: `verify =
+/// "always"`, or a person took a verifier's changes to the repository as the work
+/// ([`accept_verifier_edit`], `Counters::verification_owed`). Every rule `always` brings —
+/// the `Finish` hold, the proposed verifier, its one retry and a person's extra one — follows
+/// this, so the second case is verified exactly as the first.
+#[must_use]
+pub fn requires_verifier(counters: &Counters, config: &RunConfig) -> bool {
+    config.verify == crate::job::VerifyPolicy::Always || counters.verification_owed
 }
 
 /// The most unresolved checks the "nothing can make progress" question names one by one.
@@ -814,7 +826,7 @@ fn resolution_changes(
 /// state of the code, [`VERIFIER_RETRIES`]: a verifier that fails to complete twice on the
 /// same code is not a fluke, and retrying it until `max_workers` spent every worker on it.
 fn verification_already_run(input: &PolicyInput<'_>) -> bool {
-    let retry = input.config.verify == crate::job::VerifyPolicy::Always
+    let retry = requires_verifier(input.counters, input.config)
         && !input.counters.verifier_completed
         && input.counters.verifiers_on_this_code() <= VERIFIER_RETRIES;
     input.counters.verified_since_code && !retry
@@ -843,7 +855,7 @@ pub fn grant_verifier_retry(counters: &mut Counters, config: &RunConfig) -> bool
 /// `verify = "always"`, a verifier has started on this code without completing, and its
 /// retry is spent.
 fn verifier_retry_spent(counters: &Counters, config: &RunConfig) -> bool {
-    config.verify == crate::job::VerifyPolicy::Always
+    requires_verifier(counters, config)
         && counters.verified_since_code
         && !counters.verifier_completed
         && counters.verifiers_on_this_code() > VERIFIER_RETRIES
@@ -888,9 +900,10 @@ pub fn asks_about_verifier_edit(decision: &PolicyDecision) -> bool {
 /// A person answered the question about a verifier that modified the repository with
 /// anything but `Stop`: the tree as it now is, the verifier's changes included, is the work.
 /// It is a new state of the code, so what any verifier concluded about the old one no longer
-/// counts and a new verifier may be proposed under the normal rules — exactly as when a code
-/// worker starts, except that none did. Authorises a verification, never an outcome. `true`
-/// when there was such an edit to accept.
+/// counts — exactly as when a code worker starts, except that none did — and it is verified
+/// as under `verify = "always"` whatever the policy (`Counters::verification_owed`,
+/// [`requires_verifier`]): the question said it would be. Authorises a verification, never an
+/// outcome. `true` when there was such an edit to accept.
 pub fn accept_verifier_edit(counters: &mut Counters) -> bool {
     let edited = counters.verifier_modified_repo;
     if edited {
@@ -898,6 +911,7 @@ pub fn accept_verifier_edit(counters: &mut Counters) -> bool {
         counters.verifier_completed = false;
         counters.verified_since_code = false;
         counters.verifiers_since_code = 0;
+        counters.verification_owed = true;
     }
     edited
 }
@@ -938,8 +952,7 @@ fn refusal(
             if input.active_worker.is_some() {
                 return Some(SuppressionReason::Invariant(Invariant::WorkerStillActive));
             }
-            if input.config.verify == crate::job::VerifyPolicy::Always
-                && !input.counters.verifier_completed
+            if requires_verifier(input.counters, input.config) && !input.counters.verifier_completed
             {
                 return Some(SuppressionReason::Invariant(
                     Invariant::VerificationIncomplete,

@@ -2003,7 +2003,15 @@ impl FactoryRuntime {
             }),
         )
         .await?;
-        Ok(())
+        // A stopped verifier has not completed, but what it wrote before it was stopped is
+        // still in the tree, and a retry would start on it: compared here too, after the reap,
+        // so policy puts its edit to a person rather than letting a clean retry carry a
+        // `Finish` over it (`docs/04-workers.md` §6).
+        let tree = match &handle.tree_before {
+            Some(watch) => Some(self.verifier_tree(watch).await),
+            None => None,
+        };
+        self.record_verifier_tree(state, handle.id, tree).await
     }
 
     /// Terminate a worker, re-issuing until its task reports.
@@ -2487,6 +2495,19 @@ impl FactoryRuntime {
             }),
         )
         .await?;
+        self.record_verifier_tree(state, id, tree).await
+    }
+
+    /// Record what a verifier did to the working tree it was asked to judge: a
+    /// `verifier_mutated_repo` notification and the flag that puts the run to a person, or a
+    /// `verifier_tree_unverified` notification. Called when a verifier ends on its own and when
+    /// it is stopped, so that neither way of ending lets its edit through.
+    async fn record_verifier_tree(
+        &self,
+        state: &mut RunState,
+        id: WorkerId,
+        tree: Option<VerifierTree>,
+    ) -> Result<(), RuntimeError> {
         match tree {
             Some(VerifierTree::Mutated(change)) => {
                 // Policy puts the run to a person next, rather than retrying the verifier over

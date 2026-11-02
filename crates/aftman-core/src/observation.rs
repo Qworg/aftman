@@ -76,6 +76,13 @@ pub struct Counters {
     /// Defaulted, so a snapshot without it decodes.
     #[serde(default)]
     pub verifier_modified_repo: bool,
+    /// A person took a verifier's changes to the repository as the work
+    /// (`policy::accept_verifier_edit`), so this state of the code is verified as under
+    /// `verify = "always"` whatever the policy: no `Finish` until a verifier completes. The
+    /// question promised it. Cleared when a code worker starts. Defaulted, so a snapshot
+    /// without it decodes.
+    #[serde(default)]
+    pub verification_owed: bool,
     pub steers_sent: u32,
     pub assessments: u32,
     /// Cycles skipped because the observation content was unchanged.
@@ -127,6 +134,7 @@ impl Counters {
             self.verified_since_code = false;
             self.verifiers_since_code = 0;
             self.verifier_modified_repo = false;
+            self.verification_owed = false;
         } else {
             self.verifiers_run += 1;
             self.verifiers_since_code = self.verifiers_on_this_code() + 1;

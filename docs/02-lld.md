@@ -265,7 +265,8 @@ pub enum   Invariant { OverallTimeout, AttemptsExhausted, WorkerLimit, Verificat
     NoWorkAttempted, WorkerStillActive,
     // `verify = always` and no verifier has completed; `verify = never` refuses any `Verify`.
     VerificationIncomplete, VerificationDisabled,
-    ObservationTooLarge, UnobservedRepository, UnresolvedDependency }
+    ObservationTooLarge, UnobservedRepository, UnresolvedDependency,
+    VerifierModifiedRepository /* doc 04 §6, doc 05 §6.1 */ }
 pub struct Routing { pub always: bool, pub instructions: Option<String>, pub threshold: f32 }
 
 // ---- store ------------------------------------------------------------

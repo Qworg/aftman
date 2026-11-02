@@ -325,10 +325,12 @@ Rules:
   inconclusive; commit the ignore line (`.pytest_cache/`, `.mypy_cache/`, `.ruff_cache/`), as
   GitHub's Python template does.
 
-  The comparison is made when a verifier **ends on its own** (it exited, failed or timed out). A
-  verifier that is stopped, cancelled or superseded has not completed anyway, and is not
-  fingerprinted again, so a write it made before it was stopped is seen by the next observation
-  but not recorded as `verifier_mutated_repo`. One known gap: a helper process a verifier leaves
+  The comparison is made when a verifier ends on its own (it exited, failed or timed out) **and
+  when it is stopped**, cancelled or superseded, after the reap: a stopped verifier has not
+  completed, but what it wrote is still in the tree a retry would start on
+  (`a_stopped_verifiers_edit_is_put_to_a_person_too`). An accepted edit is verified as under
+  `verify = "always"` whatever the policy (`Counters::verification_owed`,
+  `policy::requires_verifier`), so the question's promise holds under `when_asked` too. One known gap: a helper process a verifier leaves
   running after it exits (one with its output redirected) can write after the comparison — the
   worker's process group is only killed when its output does not drain. The fingerprint is the same in-process read as an observation, under the
   same bounds: one of the run's observation slots and `OBSERVATION_TIMEOUT`; an interrupted walk,

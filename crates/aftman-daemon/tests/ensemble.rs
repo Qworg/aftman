@@ -5262,3 +5262,183 @@ async fn under_when_asked_a_modifying_verifier_does_not_satisfy_the_verification
     assert!(!mutations(&fx).is_empty());
     Ok(())
 }
+
+#[tokio::test]
+async fn under_when_asked_an_accepted_verifier_edit_is_still_verified_before_finishing()
+-> TestResult {
+    // Review of the verifier-edit question, finding 2. The question promises the accepted
+    // tree "is verified again from the start before the run can finish", but under
+    // `when_asked` a `Finish` could rest on `needs_verification` being low, and a model that
+    // judged none needed after the answer finished with no verifier over the accepted edit.
+    // An accepted edit is now verified as under `always`, whatever the policy.
+    if !have_git() {
+        return Ok(());
+    }
+    let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+    commit_repo(&fx.repo)?;
+    let rt = fx.runtime(
+        config(|c| {
+            c.worker = WorkerKind::Generic;
+            c.verify = VerifyPolicy::WhenAsked;
+            c.max_workers = 4;
+        }),
+        // Off: the test model's flip of `needs_verification` would otherwise be contested.
+        settings(|s| s.enabled = false),
+        Arc::new(
+            R2Model::finish_ready()
+                .with(NEEDS_VERIFICATION, 0.90)
+                .assess_rule(|key, state, _| {
+                    (*key == CheckKey::from(NEEDS_VERIFICATION)
+                        && state.contains("verifier_edit_accepted"))
+                    .then_some(0.10)
+                }),
+        ) as Arc<dyn DecisionModel>,
+        Arc::new(TreeWorker::new(1)),
+    );
+    let mut run = RunGuard::launch(&fx, rt).await?;
+    let id = escalation(&fx, 1).await?;
+    run.answer(id, HumanDecision::Accept).await?;
+    let outcome = run.join().await?;
+    assert_eq!(outcome.status, FactoryStatus::Finished);
+    assert_eq!(
+        tasks(&fx),
+        vec!["Code", "Verify", "Verify"],
+        "a verifier must run over the accepted tree before the run finishes"
+    );
+    assert!(outcome.counters.verifier_completed);
+    Ok(())
+}
+
+/// Code work writes `a.txt`. The first verifier edits `a.txt` and then works until it is
+/// stopped; any later verifier reads and reports PASS.
+struct StoppedEditor {
+    verifying: Arc<std::sync::atomic::AtomicBool>,
+    stop: Arc<tokio::sync::Notify>,
+    verifies: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl Worker for StoppedEditor {
+    fn kind(&self) -> WorkerKind {
+        WorkerKind::Generic
+    }
+
+    fn supports_steering(&self) -> bool {
+        false
+    }
+
+    async fn run(
+        &self,
+        ctx: aftman_core::worker::WorkerCtx,
+        sink: aftman_core::worker::WorkerEventSink,
+    ) -> Result<aftman_core::worker::WorkerOutcome, aftman_core::worker::WorkerError> {
+        let write = |name: &str, text: &str| {
+            std::fs::write(ctx.repo.join(name), text)
+                .map_err(|e| aftman_core::worker::WorkerError::Io(e.to_string()))
+        };
+        let push = |text: &str| {
+            ctx.output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(aftman_core::log::Stream::Stdout, text);
+        };
+        match ctx.task {
+            aftman_core::job::TaskKind::Verify => {
+                let nth = self
+                    .verifies
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if nth == 0 {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    write("a.txt", "one\ntwo, as the verifier would have it\n")?;
+                    push("checking... 3 passed so far\n");
+                    self.verifying
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    sink.activity();
+                    tokio::select! {
+                        () = self.stop.notified() => {}
+                        () = tokio::time::sleep(Duration::from_secs(30)) => {}
+                    }
+                } else {
+                    push("ran the suite: 3 passed\nVERDICT: PASS\n");
+                    sink.activity();
+                }
+            }
+            _ => {
+                write("a.txt", "one\ntwo\n")?;
+                push("implemented it; 3 passed\n");
+                sink.activity();
+            }
+        }
+        Ok(aftman_core::worker::WorkerOutcome::Completed)
+    }
+
+    async fn steer(
+        &self,
+        _message: &str,
+    ) -> Result<aftman_core::worker::SteerOutcome, aftman_core::worker::WorkerError> {
+        Ok(aftman_core::worker::SteerOutcome::Unsupported)
+    }
+
+    async fn terminate(
+        &self,
+        _reason: aftman_core::worker::TerminateReason,
+    ) -> Result<(), aftman_core::worker::WorkerError> {
+        self.verifying
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        self.stop.notify_one();
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_stopped_verifiers_edit_is_put_to_a_person_too() -> TestResult {
+    // Review of the verifier-edit question, finding 1. The tree was compared only when a
+    // verifier ended on its own. A verifier that edited the tree and was then stopped — here
+    // as stuck — raised nothing, the retry started on its edit, reported PASS, and the run
+    // finished over an edit no code worker made and no person saw. Now a stopped verifier's
+    // tree is compared after the reap, and its edit is put to a person like any other.
+    if !have_git() {
+        return Ok(());
+    }
+    let fx = Fixture::new(DefinitionSet::bundled()?, EvidencePlan::default())?;
+    commit_repo(&fx.repo)?;
+    let verifying = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&verifying);
+    let rt = fx.runtime(
+        config(|c| {
+            c.worker = WorkerKind::Generic;
+            c.verify = VerifyPolicy::Always;
+        }),
+        settings(|s| s.enabled = false),
+        Arc::new(R2Model::finish_ready().assess_rule(move |key, _, _| {
+            (*key == CheckKey::from(STUCK) && seen.load(std::sync::atomic::Ordering::SeqCst))
+                .then_some(0.95)
+        })) as Arc<dyn DecisionModel>,
+        Arc::new(StoppedEditor {
+            verifying,
+            stop: Arc::new(tokio::sync::Notify::new()),
+            verifies: std::sync::atomic::AtomicUsize::new(0),
+        }),
+    );
+    let outcome = fx.run(rt).await?;
+    assert!(!finished(&fx), "{:?}: {:?}", outcome.status, tasks(&fx));
+    assert_eq!(outcome.status, FactoryStatus::NeedsHuman);
+    assert_eq!(
+        tasks(&fx),
+        vec!["Code", "Verify"],
+        "no retry over the stopped verifier's edit"
+    );
+    assert_eq!(mutations(&fx).len(), 1);
+    let terminated = fx.of_kind(EventKind::WorkerTerminated);
+    assert_eq!(
+        terminated.len(),
+        1,
+        "the verifier was stopped, not completed"
+    );
+    let raised = fx.of_kind(EventKind::EscalationRaised);
+    assert_eq!(
+        raised.last().map(|e| e.payload["verifier_edit"].clone()),
+        Some(serde_json::json!(true))
+    );
+    Ok(())
+}

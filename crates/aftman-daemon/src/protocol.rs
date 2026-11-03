@@ -13,6 +13,7 @@
 //! first. A client that wants two streams opens two connections.
 
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 
 use aftman_core::assessment::HumanDecision;
@@ -21,7 +22,10 @@ use aftman_core::ids::{EscalationId, EventSeq, RunId};
 use aftman_core::job::FactoryStatus;
 use aftman_core::run::{RunState, RunSummary};
 use aftman_core::worker::SteerOutcome;
+use serde::de::{Deserializer, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
+use serde_json::error::Category;
+use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 
 // ---------------------------------------------------------------------------
@@ -427,7 +431,7 @@ enum WireDecision {
     Guidance { text: String },
 }
 
-fn strict_decision<'de, D: serde::Deserializer<'de>>(d: D) -> Result<HumanDecision, D::Error> {
+fn strict_decision<'de, D: Deserializer<'de>>(d: D) -> Result<HumanDecision, D::Error> {
     // Buffer first: internally tagged enums cannot see unit-variant extras
     // reliably, so check the key set explicitly as well.
     let value = Value::deserialize(d)?;
@@ -587,11 +591,30 @@ pub struct RequestWire {
     pub params: Value,
 }
 
-fn decode_params<T: serde::de::DeserializeOwned>(params: Value) -> Result<T, ProtocolError> {
-    serde_json::from_value(params).map_err(|e| ProtocolError::invalid(format!("bad params: {e}")))
+/// A serde_json error without its " at line L column C" suffix. Params are decoded
+/// from a slice of the request line, so a position would be relative to `params`, not
+/// to anything the client sent as a whole; and the message stays the one a decode from
+/// a `Value` gave before params stopped being parsed into one.
+fn error_text(e: &serde_json::Error) -> String {
+    let text = e.to_string();
+    if e.line() == 0 {
+        return text;
+    }
+    let position = format!(" at line {} column {}", e.line(), e.column());
+    text.strip_suffix(position.as_str())
+        .map_or_else(|| text.clone(), str::to_owned)
 }
 
-fn expect_empty(params: Value) -> Result<(), ProtocolError> {
+/// Decode a method's params from their unparsed text (`None`: absent or `null`).
+/// Straight into the typed struct: no `Value` tree is built, and every params struct
+/// denies unknown fields, so an unexpected member is rejected at its key, before
+/// anything under it is read.
+fn decode_params<T: serde::de::DeserializeOwned>(params: Option<&str>) -> Result<T, ProtocolError> {
+    serde_json::from_str(params.unwrap_or("{}"))
+        .map_err(|e| ProtocolError::invalid(format!("bad params: {}", error_text(&e))))
+}
+
+fn expect_empty(params: Option<&str>) -> Result<(), ProtocolError> {
     decode_params::<EmptyParams>(params).map(|_| ())
 }
 
@@ -821,6 +844,77 @@ pub struct Envelope {
     pub request: Request,
 }
 
+/// The envelope of a request line before its method is known. Each member is kept as
+/// its unparsed text, so nothing is built for `params` until the method says what they
+/// should be (LLD §11). Parsing the envelope still checks the whole line is JSON, but
+/// that is a scan, not a tree.
+#[derive(Default)]
+struct RawEnvelope<'a> {
+    id: Option<&'a RawValue>,
+    method: Option<&'a RawValue>,
+    params: Option<&'a RawValue>,
+    /// The first member that is none of the three, in document order.
+    unknown: Option<String>,
+}
+
+enum EnvelopeKey {
+    Id,
+    Method,
+    Params,
+    Other(String),
+}
+
+impl<'de> Deserialize<'de> for EnvelopeKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct KeyVisitor;
+        impl Visitor<'_> for KeyVisitor {
+            type Value = EnvelopeKey;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a member name")
+            }
+            fn visit_str<E: serde::de::Error>(self, key: &str) -> Result<EnvelopeKey, E> {
+                Ok(match key {
+                    "id" => EnvelopeKey::Id,
+                    "method" => EnvelopeKey::Method,
+                    "params" => EnvelopeKey::Params,
+                    other => EnvelopeKey::Other(other.to_owned()),
+                })
+            }
+        }
+        deserializer.deserialize_identifier(KeyVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for RawEnvelope<'de> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EnvelopeVisitor;
+        impl<'de> Visitor<'de> for EnvelopeVisitor {
+            type Value = RawEnvelope<'de>;
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON object")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let mut envelope = RawEnvelope::default();
+                // A repeated member replaces the earlier one, as it did when the line
+                // was decoded into a `Value` map.
+                while let Some(key) = map.next_key::<EnvelopeKey>()? {
+                    match key {
+                        EnvelopeKey::Id => envelope.id = Some(map.next_value()?),
+                        EnvelopeKey::Method => envelope.method = Some(map.next_value()?),
+                        EnvelopeKey::Params => envelope.params = Some(map.next_value()?),
+                        EnvelopeKey::Other(name) => {
+                            map.next_value::<IgnoredAny>()?;
+                            envelope.unknown.get_or_insert(name);
+                        }
+                    }
+                }
+                Ok(envelope)
+            }
+        }
+        deserializer.deserialize_map(EnvelopeVisitor)
+    }
+}
+
 /// Decode and validate one request line (without its trailing newline).
 pub fn decode_request(line: &str) -> Result<Envelope, RequestError> {
     let fail = |id: Option<u64>, error: ProtocolError| RequestError { id, error };
@@ -830,15 +924,19 @@ pub fn decode_request(line: &str) -> Result<Envelope, RequestError> {
             too_long("request line", line.len(), MAX_REQUEST_LINE_BYTES),
         ));
     }
-    let value: Value = serde_json::from_str(line)
-        .map_err(|e| fail(None, ProtocolError::invalid(format!("malformed JSON: {e}"))))?;
-    let Value::Object(mut obj) = value else {
-        return Err(fail(
-            None,
-            ProtocolError::invalid("a request must be a JSON object"),
-        ));
-    };
-    let id = obj.get("id").and_then(Value::as_u64);
+    let envelope: RawEnvelope<'_> = serde_json::from_str(line).map_err(|e| {
+        // The envelope visitor accepts any well-formed object, so a data error can
+        // only be a line that is JSON but not an object.
+        let error = if e.classify() == Category::Data {
+            ProtocolError::invalid("a request must be a JSON object")
+        } else {
+            ProtocolError::invalid(format!("malformed JSON: {e}"))
+        };
+        fail(None, error)
+    })?;
+    let id = envelope
+        .id
+        .and_then(|raw| serde_json::from_str::<u64>(raw.get()).ok());
     let Some(idv) = id else {
         return Err(fail(
             None,
@@ -846,22 +944,21 @@ pub fn decode_request(line: &str) -> Result<Envelope, RequestError> {
         ));
     };
     let id = Some(idv);
-    if let Some(extra) = obj
-        .keys()
-        .find(|k| !matches!(k.as_str(), "id" | "method" | "params"))
-    {
+    if let Some(extra) = envelope.unknown {
         return Err(fail(
             id,
             ProtocolError::invalid(format!("unknown request field {extra:?}")),
         ));
     }
-    let Some(method) = obj.get("method").and_then(Value::as_str).map(str::to_owned) else {
+    let Some(method) = envelope
+        .method
+        .and_then(|raw| serde_json::from_str::<String>(raw.get()).ok())
+    else {
         return Err(fail(
             id,
             ProtocolError::invalid("request needs a string \"method\""),
         ));
     };
-    let raw_params = obj.remove("params");
     let Some(m) = Method::parse(&method) else {
         return Err(fail(
             id,
@@ -872,10 +969,11 @@ pub fn decode_request(line: &str) -> Result<Envelope, RequestError> {
         ));
     };
     // Only an object (or null/absent, meaning "no params") is accepted; a
-    // positional array would otherwise decode as a struct.
-    let params = match raw_params {
-        None | Some(Value::Null) => Value::Object(Map::new()),
-        Some(p @ Value::Object(_)) => p,
+    // positional array would otherwise decode as a struct. A raw value starts at its
+    // first byte, so the first byte says which it is.
+    let params = match envelope.params.map(RawValue::get) {
+        None | Some("null") => None,
+        Some(p) if p.starts_with('{') => Some(p),
         Some(_) => {
             return Err(fail(
                 id,
@@ -1395,6 +1493,131 @@ mod tests {
             }
         }
         assert!(decode(&json!({"id":1,"method":"run.list","params":null})).is_ok());
+    }
+
+    /// Issue #30: a method that takes no params rejects a large `params` at its first
+    /// key, without building a tree for what is under it.
+    #[test]
+    fn a_method_without_params_rejects_large_params_at_the_first_key() {
+        let envelope = r#"{"id":7,"method":"daemon.status","params":{"pad":[]}}"#;
+        let zeros = "0,".repeat((MAX_REQUEST_LINE_BYTES - envelope.len()) / 2 - 1);
+        let line = envelope.replace("[]", &format!("[{zeros}0]"));
+        assert!(line.len() <= MAX_REQUEST_LINE_BYTES);
+        assert!(line.len() > MAX_REQUEST_LINE_BYTES - 16, "{}", line.len());
+
+        let err = decode_request(&line).unwrap_err();
+        assert_eq!(err.id, Some(7));
+        assert_eq!(err.error.code, ErrorCode::InvalidRequest);
+        assert!(
+            err.error.message.contains("unknown field `pad`"),
+            "{}",
+            err.error.message
+        );
+    }
+
+    /// The per-method decode stops at the first unexpected key: what follows it is never
+    /// read, so text that is not even JSON past that key gives the unknown-field error,
+    /// not a syntax one. Had the decoder descended into the value (or built a tree of
+    /// the params first), it would have reported the syntax error.
+    #[test]
+    fn params_decoding_rejects_before_descending_into_a_value() {
+        let not_json_after_the_key = r#"{"pad": [0, 0, this is not JSON"#;
+        for err in [
+            expect_empty(Some(not_json_after_the_key)).unwrap_err(),
+            decode_params::<RunIdParams>(Some(not_json_after_the_key)).unwrap_err(),
+            decode_params::<RunStartParams>(Some(not_json_after_the_key)).unwrap_err(),
+        ] {
+            assert_eq!(err.code, ErrorCode::InvalidRequest);
+            assert!(
+                err.message.starts_with("bad params: unknown field `pad`"),
+                "{}",
+                err.message
+            );
+        }
+        // The envelope does not decode params at all; it only checks they are JSON.
+        let env: RawEnvelope<'_> = serde_json::from_str(
+            r#"{"id":1,"method":"run.get","params":{"run_id": [1, {"x": 2}]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            env.params.map(RawValue::get),
+            Some(r#"{"run_id": [1, {"x": 2}]}"#)
+        );
+    }
+
+    /// Malformed params for a method that takes some are rejected with the same error
+    /// (code and message) they got when params were decoded from a `Value`.
+    #[test]
+    fn malformed_params_keep_their_error() {
+        fn via_value<T: serde::de::DeserializeOwned>(params: Value) -> String {
+            match serde_json::from_value::<T>(params) {
+                Ok(_) => panic!("expected these params to be rejected"),
+                Err(e) => format!("bad params: {e}"),
+            }
+        }
+        let run_id = rid();
+        let cases: Vec<(Value, Value, String)> = vec![
+            (
+                json!("run.get"),
+                json!({"run_id": 5}),
+                via_value::<RunIdParams>(json!({"run_id": 5})),
+            ),
+            (
+                json!("run.get"),
+                json!({}),
+                via_value::<RunIdParams>(json!({})),
+            ),
+            (
+                json!("run.list"),
+                json!({"limit": "ten"}),
+                via_value::<RunListParams>(json!({"limit": "ten"})),
+            ),
+            (
+                json!("run.steer"),
+                json!({"run_id": run_id, "message": "m", "extra": 1}),
+                via_value::<RunSteerParams>(json!({"run_id": run_id, "message": "m", "extra": 1})),
+            ),
+            (
+                json!("subscription.close"),
+                json!({"x": null}),
+                via_value::<EmptyParams>(json!({"x": null})),
+            ),
+        ];
+        for (method, params, expected) in cases {
+            let err = decode(&json!({"id":3,"method":method,"params":params})).unwrap_err();
+            assert_eq!(err.id, Some(3));
+            assert_eq!(err.error.code, ErrorCode::InvalidRequest);
+            assert_eq!(err.error.message, expected, "{method} {params}");
+        }
+    }
+
+    #[test]
+    fn envelope_members_are_read_as_before() {
+        // A repeated member: the last one wins, as with a `Value` map.
+        let env =
+            decode_request(r#"{"id":1,"id":2,"method":"x","method":"daemon.status"}"#).unwrap();
+        assert_eq!((env.id, env.request), (2, Request::DaemonStatus));
+        // An unknown member is reported with the id, wherever the id appears.
+        let err = decode_request(r#"{"zz":{"deep":[1]},"method":"run.list","id":4}"#).unwrap_err();
+        assert_eq!(err.id, Some(4));
+        assert!(
+            err.error.message.contains("\"zz\""),
+            "{}",
+            err.error.message
+        );
+        // Whitespace around params, and an escaped method name.
+        let env =
+            decode_request("{\"id\":5,\"method\":\"run.\\u006cist\",\"params\" :  {  } }").unwrap();
+        assert_eq!(env.request.method(), Method::RunList);
+        // Malformed JSON anywhere, including inside params, is still id-less.
+        let err =
+            decode_request(r#"{"id":6,"method":"run.list","params":{"limit":}}"#).unwrap_err();
+        assert_eq!(err.id, None);
+        assert!(
+            err.error.message.starts_with("malformed JSON"),
+            "{}",
+            err.error.message
+        );
     }
 
     #[test]

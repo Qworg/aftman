@@ -16,7 +16,8 @@ blake3.workspace = true
 gix.workspace = true
 nix.workspace = true
 serde.workspace = true
-serde_json.workspace = true
+# `raw_value`: request params are kept as an unparsed slice until the method is known (§11).
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror.workspace = true
 time.workspace = true
 tokio.workspace = true

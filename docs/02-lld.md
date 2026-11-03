@@ -1021,7 +1021,11 @@ be parsed). A slow subscriber is dropped with this, after receiving a correct ga
 ```
 
 `params` must be a JSON object (or `null`/absent for "none"); an array or scalar is
-`invalid_request`. A client must tolerate an error `code` it does not know (it decodes as
+`invalid_request`. The envelope is read without parsing `params`: they are kept as unparsed text
+(`serde_json::value::RawValue`) until the method is known, then decoded straight into that
+method's params struct. No `Value` tree is built for a request, so an unexpected member — a
+`params` of any size sent to a method that takes none — is rejected at its key, before anything
+under it is read. A client must tolerate an error `code` it does not know (it decodes as
 `unknown`). The `decision` of `run.answer` is decoded strictly (unknown fields are rejected;
 guidance text must be non-empty). The optional `surface` of `run.answer` names the surface the
 answer comes from and is recorded in `ESCALATION_ANSWERED`; it must be one of `cli`, `tui`, `web`,

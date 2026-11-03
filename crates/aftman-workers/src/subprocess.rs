@@ -478,6 +478,68 @@ fn utf8_chunk(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..complete]).into_owned()
 }
 
+/// Wait for the worker's leader to exit, end the rest of its process group, and reap it.
+///
+/// A helper the worker started and left running — `(sleep 1; echo x > F) >/dev/null &`, a dev
+/// server — is in the worker's process group, and once the worker is over it must not go on
+/// writing to the repository: the supervisor compares the tree when a verifier ends, and a
+/// helper writing after that comparison is a write no one sees (`docs/04-workers.md` §6). An
+/// earlier revision killed the group only when such a helper also held the output pipes open.
+///
+/// The group is killed **before** the leader is reaped. Once the leader is reaped and no
+/// member is left, its pid — the group id — can be reused, and a `kill(-pgid)` could reach an
+/// unrelated process group; while the leader is an unreaped zombie its pid cannot be reused.
+/// On Linux `waitid(WNOWAIT)` waits for the exit without reaping. Elsewhere `waitid` is not
+/// available through `nix`, so the group is killed right after the reap, as the terminate path
+/// always did; the window is the time between two system calls, and needs the pid space to
+/// wrap within it (`docs/08-security.md` §3).
+#[cfg(target_os = "linux")]
+async fn end_group_on_exit(
+    child: &mut Child,
+    pgid: i32,
+) -> std::io::Result<std::process::ExitStatus> {
+    use nix::sys::wait::{Id, WaitPidFlag, waitid};
+    if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
+        // Blocking, on a thread of its own; it returns when the leader exits, which a
+        // timeout's `stop_group` also brings about.
+        let exited = tokio::task::spawn_blocking(move || {
+            loop {
+                match waitid(
+                    Id::Pid(Pid::from_raw(pid)),
+                    WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
+                ) {
+                    Err(nix::errno::Errno::EINTR) => {}
+                    other => return other.is_ok(),
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if exited {
+            SubprocessWorker::signal_group(pgid, Signal::SIGKILL);
+        }
+        let status = child.wait().await;
+        if !exited {
+            // `waitid` failed (it should not): the portable order, rather than leave the group
+            // running.
+            SubprocessWorker::signal_group(pgid, Signal::SIGKILL);
+        }
+        return status;
+    }
+    // No pid: the child has already been reaped, and its group id is no longer ours to signal.
+    child.wait().await
+}
+
+#[cfg(not(target_os = "linux"))]
+async fn end_group_on_exit(
+    child: &mut Child,
+    pgid: i32,
+) -> std::io::Result<std::process::ExitStatus> {
+    let status = child.wait().await;
+    SubprocessWorker::signal_group(pgid, Signal::SIGKILL);
+    status
+}
+
 /// How long the output pipes are given to reach EOF after the child exits.
 ///
 /// Bounded because a backgrounded grandchild can hold them open indefinitely.
@@ -547,34 +609,32 @@ impl Worker for SubprocessWorker {
             ))
         });
 
-        let outcome = match tokio::time::timeout(ctx.timeout, child.wait()).await {
-            Ok(Ok(status)) => {
-                if self.terminating.load(std::sync::atomic::Ordering::SeqCst) {
-                    Self::signal_group(pgid, Signal::SIGKILL);
-                }
-                if status.success() {
-                    WorkerOutcome::Completed
-                } else {
-                    WorkerOutcome::Failed {
-                        code: status.code(),
+        let outcome =
+            match tokio::time::timeout(ctx.timeout, end_group_on_exit(&mut child, pgid)).await {
+                Ok(Ok(status)) => {
+                    if status.success() {
+                        WorkerOutcome::Completed
+                    } else {
+                        WorkerOutcome::Failed {
+                            code: status.code(),
+                        }
                     }
                 }
-            }
-            Ok(Err(error)) => {
-                guard.armed = false;
-                self.clear_live(pgid);
-                if let Some(ledger) = &ctx.ledger {
-                    ledger.clear().await;
+                Ok(Err(error)) => {
+                    guard.armed = false;
+                    self.clear_live(pgid);
+                    if let Some(ledger) = &ctx.ledger {
+                        ledger.clear().await;
+                    }
+                    return Err(WorkerError::Io(error.to_string()));
                 }
-                return Err(WorkerError::Io(error.to_string()));
-            }
-            Err(_elapsed) => {
-                // Timed out: interrupt, then kill the group.
-                self.stop_group(pgid).await;
-                let _ = child.wait().await;
-                WorkerOutcome::TimedOut
-            }
-        };
+                Err(_elapsed) => {
+                    // Timed out: interrupt, then kill the group.
+                    self.stop_group(pgid).await;
+                    let _ = child.wait().await;
+                    WorkerOutcome::TimedOut
+                }
+            };
 
         // The pipes reach EOF only when every process holding them exits. A worker that
         // backgrounds a helper (`npm run dev &`) keeps them open after the child exits, so an
@@ -887,6 +947,52 @@ mod tests {
             started.elapsed() < Duration::from_secs(8),
             "the drain must be bounded, took {:?}",
             started.elapsed()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_helper_a_completed_worker_left_running_is_ended_with_it() -> TestResult {
+        // Review of the verifier-mutation work, finding 4. A helper that does not hold the
+        // output pipes outlived the worker's normal completion and wrote to the repository
+        // after it — after the supervisor's comparison of a verifier's tree. The worker's
+        // process group is now ended whenever the worker exits, before its leader is reaped.
+        let dir = tempfile::tempdir()?;
+        let marker = dir.path().join("late-write");
+        let script = format!(
+            "(sleep 1; echo mutated > '{}') >/dev/null 2>&1 </dev/null & echo PASS",
+            marker.display()
+        );
+        let worker = SubprocessWorker::new(WorkerKind::Generic, spec(&script));
+        let (outcome, text) = drive(&worker, ctx(fresh_log(), Duration::from_secs(10))).await?;
+        assert_eq!(outcome, WorkerOutcome::Completed);
+        assert!(
+            text.contains("PASS"),
+            "the leader's own output is kept: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            !marker.exists(),
+            "a helper of a completed worker wrote after it ended"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failing_worker_ends_its_helpers_too() -> TestResult {
+        let dir = tempfile::tempdir()?;
+        let marker = dir.path().join("late-write");
+        let script = format!(
+            "(sleep 1; echo mutated > '{}') >/dev/null 2>&1 </dev/null & exit 3",
+            marker.display()
+        );
+        let worker = SubprocessWorker::new(WorkerKind::Generic, spec(&script));
+        let (outcome, _) = drive(&worker, ctx(fresh_log(), Duration::from_secs(10))).await?;
+        assert_eq!(outcome, WorkerOutcome::Failed { code: Some(3) });
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert!(
+            !marker.exists(),
+            "a helper of a failed worker wrote after it ended"
         );
         Ok(())
     }

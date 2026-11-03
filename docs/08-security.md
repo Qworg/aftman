@@ -149,7 +149,7 @@ which keys were granted in `meta.json` (names only) and prints a warning.
 
 | Control | Implementation |
 | --- | --- |
-| Process group | Every worker starts with `process_group(0)`, so termination reaches grandchildren (shells, test runners, language servers) |
+| Process group | Every worker starts with `process_group(0)`, so termination reaches grandchildren (shells, test runners, language servers), and the group is ended whenever the worker exits, before its leader is reaped, so a helper it left running cannot go on writing to the repository (doc 04 § termination). A process that calls `setsid` leaves the group and escapes both; containing that needs an external sandbox. |
 | No shell interpolation | `argv` is a literal vector everywhere; `generic` uses a parsed template, never `sh -c` around a mission |
 | Mission as a file | `{mission_file}` is preferred over `{mission}` so a long prompt never lands in `argv` or in a process listing |
 | Bounded output | Every stream is a bounded ring; a worker cannot exhaust daemon memory by printing |

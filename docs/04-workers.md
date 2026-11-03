@@ -334,9 +334,9 @@ Rules:
   temporary file in the tree); those count as its edit, and the run is put to a person rather
   than retried — fail-closed, by design. An accepted edit is verified as under
   `verify = "always"` whatever the policy (`Counters::verification_owed`,
-  `policy::requires_verifier`), so the question's promise holds under `when_asked` too. One known gap: a helper process a verifier leaves
-  running after it exits (one with its output redirected) can write after the comparison — the
-  worker's process group is only killed when its output does not drain. The fingerprint is the same in-process read as an observation, under the
+  `policy::requires_verifier`), so the question's promise holds under `when_asked` too. A helper process a verifier
+  leaves running cannot write after the comparison: the worker's process group is ended when the
+  worker exits (§ termination below). The fingerprint is the same in-process read as an observation, under the
   same bounds: one of the run's observation slots and `OBSERVATION_TIMEOUT`; an interrupted walk,
   or one recording more than 200 000 paths beyond the index's own, is refused rather than
   compared partially
@@ -489,6 +489,16 @@ interrupt → wait terminate_grace (5s) → kill process group
 
 - Unix: children are started with `process_group(0)`, so `kill(-pgid, SIGKILL)` reaches the whole
   tree. This matters: coding agents spawn shells, test runners, and language servers.
+- **The group is ended whenever the worker exits**, not only when it is terminated: a helper it
+  started and left running (a dev server, `(…) >/dev/null &`) is part of the worker, and the
+  worker is over. Without this, such a helper wrote to the repository after the worker ended —
+  after the supervisor compared a verifier's tree (§6). The group is killed **before** the
+  leader is reaped: once the leader is reaped and no member is left, its pid (the group id) can
+  be reused, and the kill could reach an unrelated process group. On Linux the exit is awaited
+  with `waitid(WNOWAIT)`, which leaves the leader an unreaped zombie whose pid cannot be reused;
+  elsewhere the kill follows the reap immediately, a window of two system calls that would need
+  the pid space to wrap within it (`subprocess::end_group_on_exit`). A process that leaves the
+  group with `setsid` escapes this, as it escapes termination ([08-security.md §3](08-security.md)).
 - `TerminateReason::Timeout | Cancelled | Stopped | Superseded` is recorded on the worker record
   and in a `WorkerTerminated` event with the number of signals sent and the elapsed grace.
 - Termination is idempotent; calling it twice is not an error.

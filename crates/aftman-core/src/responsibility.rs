@@ -809,11 +809,17 @@ pub mod builtin {
                 .iter()
                 .all(|check| input.check_ge(check, rule_threshold(input, &self.checks, check)));
                 if ready {
+                    let reason = if input.config.verify == VerifyPolicy::Always {
+                        "verify = always requires a verifier before finishing"
+                    } else {
+                        "a person took a verifier's changes as the work, which a verifier must \
+                         check before finishing"
+                    };
                     return vec![proposal(
                         &self.id,
                         "core.verification:required",
                         Directive::Verify {
-                            reason: "verify = always requires a verifier before finishing".into(),
+                            reason: reason.into(),
                         },
                         priority::VERIFY,
                     )];

@@ -5442,3 +5442,67 @@ async fn a_stopped_verifiers_edit_is_put_to_a_person_too() -> TestResult {
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn a_retry_that_supersedes_a_verifier_does_not_start_over_its_edit() -> TestResult {
+    // Verification of the stopped-verifier fix. A user rule proposing `retry` (not refused
+    // while a worker is active) superseded a verifier that had edited the tree. The stop now
+    // recorded the edit, but the code worker the same `apply` started cleared the flag before
+    // policy saw it: no person was asked, and the run finished. Now the superseding directive
+    // starts nothing that cycle, and the edit is put to a person.
+    if !have_git() {
+        return Ok(());
+    }
+    let mut defs = DefinitionSet::bundled()?;
+    defs.definitions.insert(
+        "user.restart".to_owned(),
+        ResponsibilityDefinition::parse(
+            "user.restart",
+            "enabled = true\nalways = true\ntitle = \"Restart\"\n\n[checks.hung]\n\
+             instructions = \"Is the active worker hung?\"\nmin_threshold = 0.9\n\n[[rules]]\n\
+             id = \"user.restart:hung\"\nwhen = \"user.restart__hung >= 0.9\"\n\
+             propose = \"retry\"\nreason = \"restart a hung worker\"\n",
+            "test",
+        )?,
+    );
+    let fx = Fixture::new(defs, EvidencePlan::default())?;
+    commit_repo(&fx.repo)?;
+    let verifying = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = Arc::clone(&verifying);
+    let rt = fx.runtime(
+        config(|c| {
+            c.worker = WorkerKind::Generic;
+            c.verify = VerifyPolicy::Always;
+        }),
+        settings(|s| s.enabled = false),
+        Arc::new(R2Model::finish_ready().assess_rule(move |key, _, _| {
+            (*key == CheckKey::from("user.restart__hung")).then(|| {
+                if seen.load(std::sync::atomic::Ordering::SeqCst) {
+                    0.95
+                } else {
+                    0.05
+                }
+            })
+        })) as Arc<dyn DecisionModel>,
+        Arc::new(StoppedEditor {
+            verifying,
+            stop: Arc::new(tokio::sync::Notify::new()),
+            verifies: std::sync::atomic::AtomicUsize::new(0),
+        }),
+    );
+    let outcome = fx.run(rt).await?;
+    assert!(!finished(&fx), "{:?}: {:?}", outcome.status, tasks(&fx));
+    assert_eq!(outcome.status, FactoryStatus::NeedsHuman);
+    assert_eq!(
+        tasks(&fx),
+        vec!["Code", "Verify"],
+        "nothing started over the edit"
+    );
+    assert_eq!(mutations(&fx).len(), 1);
+    let raised = fx.of_kind(EventKind::EscalationRaised);
+    assert_eq!(
+        raised.last().map(|e| e.payload["verifier_edit"].clone()),
+        Some(serde_json::json!(true))
+    );
+    Ok(())
+}

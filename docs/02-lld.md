@@ -263,7 +263,8 @@ pub enum   Invariant { OverallTimeout, AttemptsExhausted, WorkerLimit, Verificat
     AssessmentBudget, ModelUnavailable, UnresolvedUncertainty,
     // No worker has ever run, so there is nothing to declare complete.
     NoWorkAttempted, WorkerStillActive,
-    // `verify = always` and no verifier has completed; `verify = never` refuses any `Verify`.
+    // `verify = always`, or an accepted verifier edit (`verification_owed`), and no verifier
+    // has completed; `verify = never` refuses any `Verify`.
     VerificationIncomplete, VerificationDisabled,
     ObservationTooLarge, UnobservedRepository, UnresolvedDependency,
     VerifierModifiedRepository /* doc 04 §6, doc 05 §6.1 */ }

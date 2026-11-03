@@ -3004,6 +3004,11 @@ impl FactoryRuntime {
                 if let Some(old) = worker {
                     self.stop_worker(state, old, StopWhy::Superseded).await?;
                 }
+                // The superseded worker was a verifier that wrote to the tree: no new worker,
+                // or its start would clear the flag before policy put the edit to a person.
+                if state.counters.verifier_modified_repo {
+                    return Ok(None);
+                }
                 let mission = code_mission(job, observation);
                 Ok(Some(
                     self.start_worker(state, job, TaskKind::Code, mission, None)
@@ -3020,6 +3025,11 @@ impl FactoryRuntime {
                 // drop but never reaped or cleared from the ledger.
                 if let Some(old) = worker {
                     self.stop_worker(state, old, StopWhy::Superseded).await?;
+                }
+                // As for `Retry`: a superseded verifier's edit is put to a person first, not
+                // judged by the next verifier.
+                if state.counters.verifier_modified_repo {
+                    return Ok(None);
                 }
                 let mission = verify_mission(job);
                 // Taken once the superseded worker has been reaped and before the verifier

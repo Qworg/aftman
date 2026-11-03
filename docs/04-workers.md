@@ -328,7 +328,11 @@ Rules:
   The comparison is made when a verifier ends on its own (it exited, failed or timed out) **and
   when it is stopped**, cancelled or superseded, after the reap: a stopped verifier has not
   completed, but what it wrote is still in the tree a retry would start on
-  (`a_stopped_verifiers_edit_is_put_to_a_person_too`). An accepted edit is verified as under
+  (`a_stopped_verifiers_edit_is_put_to_a_person_too`); a `Retry` or `Verify` that supersedes such
+  a verifier starts nothing that cycle, so the edit is put to a person before any worker can
+  start over it. A verifier killed mid-run may leave files it would have cleaned up (a lock, a
+  temporary file in the tree); those count as its edit, and the run is put to a person rather
+  than retried — fail-closed, by design. An accepted edit is verified as under
   `verify = "always"` whatever the policy (`Counters::verification_owed`,
   `policy::requires_verifier`), so the question's promise holds under `when_asked` too. One known gap: a helper process a verifier leaves
   running after it exits (one with its output redirected) can write after the comparison — the

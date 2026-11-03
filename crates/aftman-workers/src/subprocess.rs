@@ -114,10 +114,11 @@ pub struct SubprocessWorker {
     terminate_grace: Duration,
     /// The process group to signal. Zero means no worker is running.
     pgid: std::sync::atomic::AtomicI32,
-    /// Set by `terminate` once it has a group to signal, so that `run` finishes the
-    /// job with a `SIGKILL` of the whole group after the child is gone: an agent
-    /// that exits on `SIGINT` can leave a grandchild that ignored it.
-    terminating: std::sync::atomic::AtomicBool,
+    /// Held while the group is signalled and while `run` retires it before reaping its
+    /// leader, so that no signal can follow the reap: once the leader is reaped and no member
+    /// is left, the group id can be reused by an unrelated process group (`signal_live`).
+    /// Only ever held for a check and a system call, never across an `await`.
+    signal_lock: Mutex<()>,
     stdin: tokio::sync::Mutex<Option<ChildStdin>>,
 }
 
@@ -136,20 +137,17 @@ impl Drop for MissionFile {
 /// worker is live. `kill_on_drop` alone reaches only the direct child.
 struct GroupGuard<'a> {
     pgid: i32,
-    slot: &'a std::sync::atomic::AtomicI32,
+    worker: &'a SubprocessWorker,
     armed: bool,
 }
 
 impl Drop for GroupGuard<'_> {
     fn drop(&mut self) {
         if self.armed {
-            SubprocessWorker::signal_group(self.pgid, Signal::SIGKILL);
-            let _ = self.slot.compare_exchange(
-                self.pgid,
-                0,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            );
+            // Only while the group is still live: a `run` dropped after it retired the group
+            // has reaped (or is reaping) the leader, and the id may no longer be ours.
+            self.worker.signal_live(self.pgid, Signal::SIGKILL);
+            self.worker.retire(self.pgid);
         }
     }
 }
@@ -172,7 +170,7 @@ impl SubprocessWorker {
             source: SpecSource::Fixed(spec),
             terminate_grace: DEFAULT_TERMINATE_GRACE,
             pgid: std::sync::atomic::AtomicI32::new(0),
-            terminating: std::sync::atomic::AtomicBool::new(false),
+            signal_lock: Mutex::new(()),
             stdin: tokio::sync::Mutex::new(None),
         }
     }
@@ -194,7 +192,7 @@ impl SubprocessWorker {
             },
             terminate_grace: DEFAULT_TERMINATE_GRACE,
             pgid: std::sync::atomic::AtomicI32::new(0),
-            terminating: std::sync::atomic::AtomicBool::new(false),
+            signal_lock: Mutex::new(()),
             stdin: tokio::sync::Mutex::new(None),
         }
     }
@@ -287,8 +285,6 @@ impl SubprocessWorker {
             message: "the child exited before it could be identified".to_owned(),
         })?;
         let pgid = pid as i32;
-        self.terminating
-            .store(false, std::sync::atomic::Ordering::SeqCst);
         self.pgid.store(pgid, std::sync::atomic::Ordering::SeqCst);
 
         // Move stdin into the shared slot so steering can reach it.
@@ -314,18 +310,109 @@ impl SubprocessWorker {
         let _ = kill(Pid::from_raw(-pgid), signal);
     }
 
+    /// Wait for the worker's leader to exit, end the rest of its process group, and reap it.
+    ///
+    /// A helper the worker started and left running — `(sleep 1; echo x > F) >/dev/null &`, a dev
+    /// server — is in the worker's process group, and once the worker is over it must not go on
+    /// writing to the repository: the supervisor compares the tree when a verifier ends, and a
+    /// helper writing after that comparison is a write no one sees (`docs/04-workers.md` §6). An
+    /// earlier revision killed the group only when such a helper also held the output pipes open.
+    ///
+    /// The group is killed **before** the leader is reaped. Once the leader is reaped and no
+    /// member is left, its pid — the group id — can be reused, and a `kill(-pgid)` could reach an
+    /// unrelated process group; while the leader is an unreaped zombie its pid cannot be reused.
+    /// On Linux `waitid(WNOWAIT)` waits for the exit without reaping. Elsewhere `waitid` is not
+    /// available through `nix`, so the group is killed right after the reap, as the terminate path
+    /// always did; the window is the time between two system calls, and needs the pid space to
+    /// wrap within it (`docs/08-security.md` §3).
+    #[cfg(target_os = "linux")]
+    async fn end_group_on_exit(
+        &self,
+        child: &mut Child,
+        pgid: i32,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        use nix::sys::wait::{Id, WaitPidFlag, waitid};
+        let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) else {
+            // No pid: the child has already been reaped, and its id is no longer ours.
+            self.retire(pgid);
+            return child.wait().await;
+        };
+        // Blocking, on a thread of its own; it returns when the leader exits, which a
+        // timeout's `stop_group` also brings about.
+        let exited = tokio::task::spawn_blocking(move || {
+            loop {
+                match waitid(
+                    Id::Pid(Pid::from_raw(pid)),
+                    WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
+                ) {
+                    Err(nix::errno::Errno::EINTR) => {}
+                    other => return other.is_ok(),
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if exited {
+            self.signal_live(pgid, Signal::SIGKILL);
+        }
+        // `waitid` failed (it should not): the leader may already be reaped, so the group is
+        // not signalled at all rather than signalled late.
+        self.retire(pgid);
+        child.wait().await
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    async fn end_group_on_exit(
+        &self,
+        child: &mut Child,
+        pgid: i32,
+    ) -> std::io::Result<std::process::ExitStatus> {
+        let status = child.wait().await;
+        // No `waitid` here: the kill follows the reap, the documented window.
+        self.signal_live(pgid, Signal::SIGKILL);
+        self.retire(pgid);
+        status
+    }
+
+    /// Signal the group, but only while it is still this worker's live group.
+    ///
+    /// `run` retires the group under the same lock before it reaps the leader, so a signal
+    /// sent here always lands while the leader is at worst an unreaped zombie, whose pid —
+    /// the group id — cannot be reused. Without this, `terminate`'s kill after its grace
+    /// period could follow a reap that happened during the grace, and reach an unrelated
+    /// process group that had been given the freed id.
+    fn signal_live(&self, pgid: i32, signal: Signal) {
+        let _held = self
+            .signal_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pgid != 0 && self.pgid.load(std::sync::atomic::Ordering::SeqCst) == pgid {
+            Self::signal_group(pgid, signal);
+        }
+    }
+
+    /// Retire the group before its leader is reaped: from here no signal reaches it.
+    fn retire(&self, pgid: i32) {
+        let _held = self
+            .signal_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.clear_live(pgid);
+    }
+
     /// Interrupt the group and, if it does not go quietly, kill it.
     async fn stop_group(&self, pgid: i32) {
         if pgid == 0 {
             return;
         }
         tracing::debug!(pgid, "interrupting the worker process group");
-        Self::signal_group(pgid, Signal::SIGINT);
+        self.signal_live(pgid, Signal::SIGINT);
         tokio::time::sleep(self.terminate_grace).await;
-        // Always follow with a kill: signalling a group that is already gone is
-        // harmless, and checking first would need the child handle that `run` owns.
+        // Followed by a kill unless `run` has retired the group meanwhile — then the worker
+        // exited on the interrupt, its group was killed before the reap, and the id may
+        // already belong to someone else.
         tracing::debug!(pgid, "killing the worker process group");
-        Self::signal_group(pgid, Signal::SIGKILL);
+        self.signal_live(pgid, Signal::SIGKILL);
     }
 
     /// Write one JSONL command to the child's stdin.
@@ -478,68 +565,6 @@ fn utf8_chunk(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
     String::from_utf8_lossy(&bytes[..complete]).into_owned()
 }
 
-/// Wait for the worker's leader to exit, end the rest of its process group, and reap it.
-///
-/// A helper the worker started and left running — `(sleep 1; echo x > F) >/dev/null &`, a dev
-/// server — is in the worker's process group, and once the worker is over it must not go on
-/// writing to the repository: the supervisor compares the tree when a verifier ends, and a
-/// helper writing after that comparison is a write no one sees (`docs/04-workers.md` §6). An
-/// earlier revision killed the group only when such a helper also held the output pipes open.
-///
-/// The group is killed **before** the leader is reaped. Once the leader is reaped and no
-/// member is left, its pid — the group id — can be reused, and a `kill(-pgid)` could reach an
-/// unrelated process group; while the leader is an unreaped zombie its pid cannot be reused.
-/// On Linux `waitid(WNOWAIT)` waits for the exit without reaping. Elsewhere `waitid` is not
-/// available through `nix`, so the group is killed right after the reap, as the terminate path
-/// always did; the window is the time between two system calls, and needs the pid space to
-/// wrap within it (`docs/08-security.md` §3).
-#[cfg(target_os = "linux")]
-async fn end_group_on_exit(
-    child: &mut Child,
-    pgid: i32,
-) -> std::io::Result<std::process::ExitStatus> {
-    use nix::sys::wait::{Id, WaitPidFlag, waitid};
-    if let Some(pid) = child.id().and_then(|pid| i32::try_from(pid).ok()) {
-        // Blocking, on a thread of its own; it returns when the leader exits, which a
-        // timeout's `stop_group` also brings about.
-        let exited = tokio::task::spawn_blocking(move || {
-            loop {
-                match waitid(
-                    Id::Pid(Pid::from_raw(pid)),
-                    WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT,
-                ) {
-                    Err(nix::errno::Errno::EINTR) => {}
-                    other => return other.is_ok(),
-                }
-            }
-        })
-        .await
-        .unwrap_or(false);
-        if exited {
-            SubprocessWorker::signal_group(pgid, Signal::SIGKILL);
-        }
-        let status = child.wait().await;
-        if !exited {
-            // `waitid` failed (it should not): the portable order, rather than leave the group
-            // running.
-            SubprocessWorker::signal_group(pgid, Signal::SIGKILL);
-        }
-        return status;
-    }
-    // No pid: the child has already been reaped, and its group id is no longer ours to signal.
-    child.wait().await
-}
-
-#[cfg(not(target_os = "linux"))]
-async fn end_group_on_exit(
-    child: &mut Child,
-    pgid: i32,
-) -> std::io::Result<std::process::ExitStatus> {
-    let status = child.wait().await;
-    SubprocessWorker::signal_group(pgid, Signal::SIGKILL);
-    status
-}
-
 /// How long the output pipes are given to reach EOF after the child exits.
 ///
 /// Bounded because a backgrounded grandchild can hold them open indefinitely.
@@ -564,7 +589,7 @@ impl Worker for SubprocessWorker {
         let (mut child, pgid) = self.spawn(&ctx, &spec)?;
         let mut guard = GroupGuard {
             pgid,
-            slot: &self.pgid,
+            worker: self,
             armed: true,
         };
         // Leave a trail in the run directory so that, if the supervisor dies before it
@@ -610,7 +635,8 @@ impl Worker for SubprocessWorker {
         });
 
         let outcome =
-            match tokio::time::timeout(ctx.timeout, end_group_on_exit(&mut child, pgid)).await {
+            match tokio::time::timeout(ctx.timeout, self.end_group_on_exit(&mut child, pgid)).await
+            {
                 Ok(Ok(status)) => {
                     if status.success() {
                         WorkerOutcome::Completed
@@ -631,27 +657,25 @@ impl Worker for SubprocessWorker {
                 Err(_elapsed) => {
                     // Timed out: interrupt, then kill the group.
                     self.stop_group(pgid).await;
+                    self.retire(pgid);
                     let _ = child.wait().await;
                     WorkerOutcome::TimedOut
                 }
             };
 
-        // The pipes reach EOF only when every process holding them exits. A worker that
-        // backgrounds a helper (`npm run dev &`) keeps them open after the child exits, so an
-        // unbounded drain hangs `run` right here: the worker stays `Running`, `Finish` is
-        // suppressed by `WorkerLimit`, and the helper keeps writing to the repository — which
-        // is exactly what the process group exists to prevent. Give the pipes a moment, then
-        // end the group: it is the worker's, and the worker is over.
+        // The pipes reach EOF only when every process holding them exits. The worker's group
+        // was killed when its leader exited (`end_group_on_exit`), so a helper it left running
+        // is gone, and with it whatever it had not yet written: what an agent reports, its
+        // leader writes. Only a process that left the group with `setsid` can still hold a
+        // pipe open, and no signal to the group reaches it, so the drain is bounded and then
+        // abandoned rather than waited on — and nothing is signalled here, because the group
+        // has been retired and its id may no longer be ours.
         let mut drain = Box::pin(async move {
             for task in [stdout_task, stderr_task].into_iter().flatten() {
                 let _ = task.await;
             }
         });
-        if tokio::time::timeout(DRAIN_GRACE, &mut drain).await.is_err() {
-            Self::signal_group(pgid, Signal::SIGKILL);
-            // Take whatever the pumps had already buffered before they hit EOF.
-            let _ = tokio::time::timeout(DRAIN_GRACE, &mut drain).await;
-        }
+        let _ = tokio::time::timeout(DRAIN_GRACE, &mut drain).await;
         guard.armed = false;
         self.clear_live(pgid);
         if let Some(ledger) = &ctx.ledger {
@@ -704,8 +728,6 @@ impl Worker for SubprocessWorker {
             return Ok(());
         }
         tracing::debug!(pgid, ?reason, "terminating the worker process group");
-        self.terminating
-            .store(true, std::sync::atomic::Ordering::SeqCst);
         // `run` observes the process exit and returns; this call does not need to wait
         // for it, which is what lets a termination interrupt a running worker.
         self.stop_group(pgid).await;

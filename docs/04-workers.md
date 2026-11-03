@@ -497,8 +497,15 @@ interrupt → wait terminate_grace (5s) → kill process group
   be reused, and the kill could reach an unrelated process group. On Linux the exit is awaited
   with `waitid(WNOWAIT)`, which leaves the leader an unreaped zombie whose pid cannot be reused;
   elsewhere the kill follows the reap immediately, a window of two system calls that would need
-  the pid space to wrap within it (`subprocess::end_group_on_exit`). A process that leaves the
-  group with `setsid` escapes this, as it escapes termination ([08-security.md §3](08-security.md)).
+  the pid space to wrap within it (`subprocess::end_group_on_exit`). Every other signal to the
+  group — `terminate`'s interrupt and its kill after `terminate_grace`, the drop guard's — is sent
+  only while the group is still live (`signal_live`), and `run` retires the group under the same
+  lock before it reaps: a worker that exits on the interrupt during the grace period is not
+  followed by a kill to an id that may since have been reused. Output a helper had not yet
+  written when the group is ended is lost; what an agent reports, its leader writes. A process
+  that leaves the group with `setsid` escapes all of this, as it escapes termination, and the
+  output drain gives up on it after `DRAIN_GRACE` rather than signal anything
+  ([08-security.md §3](08-security.md)).
 - `TerminateReason::Timeout | Cancelled | Stopped | Superseded` is recorded on the worker record
   and in a `WorkerTerminated` event with the number of signals sent and the elapsed grace.
 - Termination is idempotent; calling it twice is not an error.

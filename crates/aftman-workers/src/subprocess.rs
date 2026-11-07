@@ -415,6 +415,13 @@ impl SubprocessWorker {
         self.signal_live(pgid, Signal::SIGKILL);
     }
 
+    /// Close the worker's input: for a `pi --mode rpc` session, the request to shut down.
+    ///
+    /// Waits for a steer that is mid-write, which is bounded by that write's own timeout.
+    async fn close_stdin(&self) {
+        self.stdin.lock().await.take();
+    }
+
     /// Write one JSONL command to the child's stdin.
     async fn write_stdin(&self, line: &str) -> Result<(), WorkerError> {
         let mut slot = self.stdin.lock().await;
@@ -463,6 +470,7 @@ async fn pump(
     activity: std::sync::Arc<Mutex<Option<StreamActivity>>>,
     sink: WorkerEventSink,
     kind: WorkerKind,
+    mut settled: Option<std::sync::Arc<tokio::sync::Notify>>,
 ) {
     // Only a *structured* backend's stdout goes through the decoder. A `Generic` worker's
     // output is already the readable form: decoding it buffers it waiting for a newline it
@@ -514,6 +522,14 @@ async fn pump(
                 // Signal after the bytes are visible, so a woken watcher always sees
                 // the output that woke it.
                 sink.activity();
+                // Once only: the session closes its input once, and a permit is stored if
+                // the run loop is not yet waiting.
+                if let Some(notify) = &settled
+                    && decoder.as_ref().is_some_and(StreamDecoder::settled)
+                {
+                    notify.notify_one();
+                    settled = None;
+                }
             }
             Err(error) => {
                 tracing::debug!(%error, "worker pipe read ended");
@@ -613,6 +629,13 @@ impl Worker for SubprocessWorker {
             )));
         }
 
+        // A long-lived session (`pi --mode rpc`) does not exit when its work is done: it
+        // waits for its input to close. The stdout decoder says when the agent has settled,
+        // and the run then closes stdin, which is pi's documented orderly shutdown.
+        let settled = spec
+            .steer
+            .supports_steering()
+            .then(|| std::sync::Arc::new(tokio::sync::Notify::new()));
         let stdout_task = child.stdout.take().map(|pipe| {
             tokio::spawn(pump(
                 pipe,
@@ -621,6 +644,7 @@ impl Worker for SubprocessWorker {
                 std::sync::Arc::clone(&ctx.activity),
                 sink.clone(),
                 self.kind,
+                settled.clone(),
             ))
         });
         let stderr_task = child.stderr.take().map(|pipe| {
@@ -631,37 +655,47 @@ impl Worker for SubprocessWorker {
                 std::sync::Arc::clone(&ctx.activity),
                 sink.clone(),
                 self.kind,
+                None,
             ))
         });
 
-        let outcome =
-            match tokio::time::timeout(ctx.timeout, self.end_group_on_exit(&mut child, pgid)).await
-            {
-                Ok(Ok(status)) => {
-                    if status.success() {
-                        WorkerOutcome::Completed
-                    } else {
-                        WorkerOutcome::Failed {
-                            code: status.code(),
-                        }
+        let exit = async {
+            let exit = self.end_group_on_exit(&mut child, pgid);
+            tokio::pin!(exit);
+            if let Some(settled) = &settled {
+                tokio::select! {
+                    status = &mut exit => return status,
+                    () = settled.notified() => self.close_stdin().await,
+                }
+            }
+            exit.await
+        };
+        let outcome = match tokio::time::timeout(ctx.timeout, exit).await {
+            Ok(Ok(status)) => {
+                if status.success() {
+                    WorkerOutcome::Completed
+                } else {
+                    WorkerOutcome::Failed {
+                        code: status.code(),
                     }
                 }
-                Ok(Err(error)) => {
-                    guard.armed = false;
-                    self.clear_live(pgid);
-                    if let Some(ledger) = &ctx.ledger {
-                        ledger.clear().await;
-                    }
-                    return Err(WorkerError::Io(error.to_string()));
+            }
+            Ok(Err(error)) => {
+                guard.armed = false;
+                self.clear_live(pgid);
+                if let Some(ledger) = &ctx.ledger {
+                    ledger.clear().await;
                 }
-                Err(_elapsed) => {
-                    // Timed out: interrupt, then kill the group.
-                    self.stop_group(pgid).await;
-                    self.retire(pgid);
-                    let _ = child.wait().await;
-                    WorkerOutcome::TimedOut
-                }
-            };
+                return Err(WorkerError::Io(error.to_string()));
+            }
+            Err(_elapsed) => {
+                // Timed out: interrupt, then kill the group.
+                self.stop_group(pgid).await;
+                self.retire(pgid);
+                let _ = child.wait().await;
+                WorkerOutcome::TimedOut
+            }
+        };
 
         // The pipes reach EOF only when every process holding them exits. The worker's group
         // was killed when its leader exited (`end_group_on_exit`), so a helper it left running
@@ -713,6 +747,13 @@ impl Worker for SubprocessWorker {
                 // stays queued. Claiming delivery would make the steer budget
                 // meaningless.
                 Ok(SteerOutcome::Queued)
+            }
+            // A steering backend whose input is gone has settled and is shutting down;
+            // the backend is no less steerable for it, so this is not `Unsupported`.
+            Err(WorkerError::SteeringUnsupported) if protocol.supports_steering() => {
+                Ok(SteerOutcome::Rejected {
+                    reason: "the agent has settled and its session is closing".to_owned(),
+                })
             }
             Err(WorkerError::SteeringUnsupported) => Ok(SteerOutcome::Unsupported),
             Err(error) => Ok(SteerOutcome::Rejected {
@@ -839,6 +880,75 @@ mod tests {
             "a one-shot backend must not wait on stdin: {text}"
         );
         assert!(text.contains("done"), "{text}");
+        Ok(())
+    }
+
+    /// A stand-in for `pi --mode rpc`: it reads its prompt, prints `events`, then stays
+    /// alive until its input closes — which is how pi documents an RPC session ending.
+    fn rpc_session(events: &[&str]) -> CommandSpec {
+        let printed: String = events
+            .iter()
+            .map(|event| format!("printf '%s\\n' '{event}'; "))
+            .collect();
+        let mut spec = spec(&format!(
+            "read -r prompt; {printed}cat >/dev/null; echo 'input closed' >&2"
+        ));
+        spec.steer = SteerProtocol::PiRpc;
+        spec
+    }
+
+    #[tokio::test]
+    async fn an_rpc_session_ends_when_the_agent_settles() -> TestResult {
+        // Without the close, this session waits for an EOF that never comes and the run
+        // ends only at the worker timeout: a steerable run could never complete.
+        let worker = SubprocessWorker::new(
+            WorkerKind::Pi,
+            rpc_session(&[
+                r#"{"type":"agent_start"}"#,
+                r#"{"type":"message_update","assistantMessageEvent":{"type":"text_delta","delta":"done"}}"#,
+                r#"{"type":"agent_end"}"#,
+                r#"{"type":"agent_settled","aborted":false}"#,
+            ]),
+        );
+        let started = tokio::time::Instant::now();
+        let (outcome, text) = drive(&worker, ctx(fresh_log(), Duration::from_secs(10))).await?;
+        assert_eq!(outcome, WorkerOutcome::Completed, "{text}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{text}");
+        assert!(
+            text.contains("input closed"),
+            "the session ends because its input closed: {text}"
+        );
+        assert!(text.contains("done"), "{text}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_rpc_session_is_not_closed_at_agent_end() -> TestResult {
+        // pi documents that a retry, compaction, a steer or follow-up work can follow
+        // `agent_end`. Closing the input there would cut that work off.
+        let worker = SubprocessWorker::new(
+            WorkerKind::Pi,
+            rpc_session(&[r#"{"type":"agent_start"}"#, r#"{"type":"agent_end"}"#]),
+        );
+        let (outcome, text) = drive(&worker, ctx(fresh_log(), Duration::from_secs(1))).await?;
+        assert_eq!(outcome, WorkerOutcome::TimedOut, "{text}");
+        assert!(!text.contains("input closed"), "{text}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_one_shot_stream_that_settles_is_not_treated_as_a_session() -> TestResult {
+        // The recorded one-shot stream ends in `agent_settled` too; a backend without an
+        // input channel has nothing to close and simply exits.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/pi/one-shot.jsonl");
+        let worker = SubprocessWorker::new(
+            WorkerKind::Pi,
+            spec(&format!("cat '{}'; echo exited >&2", fixture.display())),
+        );
+        let (outcome, text) = drive(&worker, ctx(fresh_log(), Duration::from_secs(10))).await?;
+        assert_eq!(outcome, WorkerOutcome::Completed, "{text}");
+        assert!(text.contains("exited"), "{text}");
         Ok(())
     }
 

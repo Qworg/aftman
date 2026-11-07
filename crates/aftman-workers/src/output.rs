@@ -74,6 +74,8 @@ pub struct StreamDecoder {
     /// assembled here and emitted a line at a time.
     prose: String,
     activity: StreamActivity,
+    /// The agent said it will not continue on its own (`pi`'s `agent_settled`).
+    settled: bool,
 }
 
 impl std::fmt::Debug for StreamDecoder {
@@ -94,6 +96,7 @@ impl StreamDecoder {
             buffer: String::new(),
             prose: String::new(),
             activity: StreamActivity::default(),
+            settled: false,
         }
     }
 
@@ -149,6 +152,17 @@ impl StreamDecoder {
     #[must_use]
     pub fn activity(&self) -> &StreamActivity {
         &self.activity
+    }
+
+    /// Whether the agent has said it will not continue on its own.
+    ///
+    /// Only `pi` says so, with `agent_settled`. `agent_end` is not enough: pi documents that
+    /// retries, compaction, steering and follow-up work can still follow it. A one-shot
+    /// process exits by itself, but a `pi --mode rpc` session is long-lived and waits for
+    /// its input to close, so this is how a supervised RPC session learns its work is over.
+    #[must_use]
+    pub fn settled(&self) -> bool {
+        self.settled
     }
 
     /// Decode one line.
@@ -245,6 +259,7 @@ impl StreamDecoder {
             }
             "agent_settled" => {
                 self.activity.aborted = event.get("aborted").and_then(Value::as_bool);
+                self.settled = true;
             }
             _ => {}
         }
@@ -516,6 +531,37 @@ mod tests {
         let (_, activity) = decode_all(WorkerKind::Pi, PI);
         assert!(activity.looks_structured(), "{activity:?}");
         assert_eq!(activity.unparsed_lines, 0, "{activity:?}");
+    }
+
+    #[test]
+    fn pi_is_settled_only_once_it_says_agent_settled() -> TestResult {
+        // The recorded stream ends `agent_end`, then `agent_settled`. Only the second means
+        // pi will not continue on its own; an `agent_end` can be followed by a retry.
+        let settled_at = PI
+            .lines()
+            .position(|l| l.contains("\"type\":\"agent_settled\""))
+            .ok_or("the recording ends with agent_settled")?;
+        let before: String = PI
+            .lines()
+            .take(settled_at)
+            .map(|l| format!("{l}\n"))
+            .collect();
+        assert!(before.contains("\"type\":\"agent_end\""));
+        let mut decoder = StreamDecoder::new(WorkerKind::Pi);
+        decoder.push(&before, &mut |_| {});
+        assert!(!decoder.settled(), "agent_end is not the end of the work");
+        decoder.push(PI, &mut |_| {});
+        assert!(decoder.settled());
+        Ok(())
+    }
+
+    #[test]
+    fn only_pi_ever_settles() {
+        for (kind, text) in [(WorkerKind::Agy, AGY), (WorkerKind::Claude, CLAUDE)] {
+            let mut decoder = StreamDecoder::new(kind);
+            decoder.push(text, &mut |_| {});
+            assert!(!decoder.settled(), "{kind:?}");
+        }
     }
 
     // ---- agy ---------------------------------------------------------------

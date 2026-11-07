@@ -128,6 +128,14 @@ SteerOutcome::Unsupported
 steer the same worker at most `max_steers_per_worker` times (default 1), because a queue that
 never drains is indistinguishable from a stuck worker.
 
+**Ending a session.** An RPC session does not exit when its work is done; it waits for stdin to
+close, which is pi's documented orderly shutdown. The stdout decoder watches for `agent_settled`
+("Pi will not continue automatically") and the run then closes stdin, so the worker exits and is
+reaped like a one-shot one. `agent_end` is deliberately not the signal: pi documents that a retry,
+compaction, a steer or follow-up work can follow it. A steer sent after the session settled is
+`Rejected` ("the agent has settled"), not `Unsupported` — the backend is still steerable. Before
+this, nothing closed stdin and an RPC run could end only at `worker_timeout` or by a policy stop.
+
 `abort` is used for `TerminateReason::Timeout | Cancelled`; `terminate()` sends `abort`, waits
 `terminate_grace`, then kills the process group.
 

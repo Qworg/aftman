@@ -727,6 +727,23 @@ impl Worker for SubprocessWorker {
             }
         });
         let _ = tokio::time::timeout(DRAIN_GRACE, &mut drain).await;
+        // A session that printed its refusal and then exited by itself can win the race above
+        // before the refusal was read. The stream has been drained now, so look again: a
+        // mission pi refused is never `Completed`, however the process ended.
+        let outcome = match (
+            outcome,
+            end_receiver
+                .as_mut()
+                .map(tokio::sync::oneshot::Receiver::try_recv),
+        ) {
+            (
+                WorkerOutcome::Completed | WorkerOutcome::Failed { .. },
+                Some(Ok(crate::output::SessionEnd::Refused(why))),
+            ) => WorkerOutcome::StreamError {
+                message: format!("pi did not start the mission: {why}"),
+            },
+            (outcome, _) => outcome,
+        };
         guard.armed = false;
         self.clear_live(pgid);
         if let Some(ledger) = &ctx.ledger {
@@ -978,6 +995,24 @@ mod tests {
                 }
                 other => return Err(format!("expected a failure, got {other:?}").into()),
             }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_refusal_is_not_completion_even_when_pi_exits_first() -> TestResult {
+        // The process can exit before the pump has read the refusal it printed, so the exit
+        // wins the race; the outcome must still be decided by what the stream said.
+        let refused = r#"{"id":"mission","type":"response","command":"prompt","success":false,"error":"Model not found: x"}"#;
+        for _ in 0..20 {
+            let mut spec = spec(&format!("read -r prompt; printf '%s\\n' '{refused}'"));
+            spec.steer = SteerProtocol::PiRpc;
+            let worker = SubprocessWorker::new(WorkerKind::Pi, spec);
+            let (outcome, text) = drive(&worker, ctx(fresh_log(), Duration::from_secs(10))).await?;
+            assert!(
+                matches!(&outcome, WorkerOutcome::StreamError { message } if message.contains("Model not found")),
+                "{outcome:?}: {text}"
+            );
         }
         Ok(())
     }

@@ -575,8 +575,10 @@ interrupt → wait terminate_grace (5s) → kill process group
    (`invalid_config`, naming the probe) unless `<state dir>/verified-streams.json` records a probe
    turn by this aftman of **the executable this run would start** — `pi` resolved against the
    run's own worker environment, which is the client's forwarded `PATH`, not the daemon's — and
-   that executable still reports the recorded `--version`. The run then starts it by that
-   absolute path, so the file checked is the file run. The probe records a turn only if it
+   that executable still reports the recorded `--version`. The path is canonical (symlinks
+   resolved), so the same `pi` reached through a version manager's per-shell symlink directory
+   (fnm's `fnm_multishells/…/bin`) is one file from every shell. The run then starts it by that
+   canonical path, so the file checked is the file run. The probe records a turn only if it
    decoded, said `agent_settled` without `aborted`, and exited 0 once its input closed
    (`crates/aftman-cli/src/verified.rs`). With no record, nothing is looked up or run. Run the
    probe from the shell you start runs from: another shell whose `PATH` finds another `pi` is

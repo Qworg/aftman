@@ -17,6 +17,7 @@ aftman.pid
 
 # Agent harness / editor local state
 .pi/
+.claude/worktrees/
 .DS_Store
 .idea/
 .vscode/

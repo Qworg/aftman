@@ -216,8 +216,13 @@ pub fn require(
 }
 
 /// The executable `program` names in `environment`, the way a spawn with that environment
-/// would find it: as given if it contains a `/`, otherwise the first executable regular file
-/// on the environment's `PATH`. Nothing is run.
+/// would find it — as given if it contains a `/`, otherwise the first executable regular file
+/// on the environment's `PATH` — with every symlink resolved. Nothing is run.
+///
+/// Canonical because version managers put a per-shell directory of symlinks first on `PATH`
+/// (fnm's `fnm_multishells/<pid>_<ts>/bin`): the same `pi` reached from two shells must be one
+/// file, or the record would die with the shell that made it. The run then starts this
+/// canonical path, so the file compared is the file run.
 #[must_use]
 pub fn resolve(program: &str, environment: &[(String, String)]) -> Option<PathBuf> {
     fn executable(path: &Path) -> bool {
@@ -226,7 +231,9 @@ pub fn resolve(program: &str, environment: &[(String, String)]) -> Option<PathBu
     }
     if program.contains('/') {
         let path = std::path::absolute(program).ok()?;
-        return executable(&path).then_some(path);
+        return executable(&path)
+            .then(|| std::fs::canonicalize(&path).ok())
+            .flatten();
     }
     let search = environment
         .iter()
@@ -239,6 +246,7 @@ pub fn resolve(program: &str, environment: &[(String, String)]) -> Option<PathBu
         .filter(|dir| dir.is_absolute())
         .map(|dir| dir.join(program))
         .find(|candidate| executable(candidate))
+        .and_then(|found| std::fs::canonicalize(found).ok())
 }
 
 /// The first non-empty line of `<program> --version`, or `None` if it cannot be read within
@@ -460,6 +468,7 @@ mod tests {
             .into_string()
             .map_err(|_| "a temporary path is text")?;
         let environment = vec![("PATH".to_owned(), path)];
+        let wanted = std::fs::canonicalize(wanted)?;
         assert_eq!(resolve("pi-fake", &environment), Some(wanted.clone()));
         assert_eq!(resolve("pi-fake", &[]), None, "no PATH, nothing found");
         assert_eq!(
@@ -467,6 +476,25 @@ mod tests {
             Some(wanted),
             "a path is taken as given"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn the_same_file_behind_two_symlink_directories_is_one_executable() -> TestResult {
+        // fnm's per-shell `fnm_multishells/<pid>_<ts>/bin`: each shell reaches the same pi
+        // through a different symlink, and a probe in one must hold for a run from another.
+        let real = tempfile::tempdir()?;
+        let program = script(real.path(), "pi", "echo 'pi 1.5.0'")?;
+        let shell = |name: &str| -> Result<Vec<(String, String)>, Box<dyn std::error::Error>> {
+            let dir = real.path().join(name);
+            std::fs::create_dir(&dir)?;
+            std::os::unix::fs::symlink(&program, dir.join("pi"))?;
+            Ok(vec![("PATH".to_owned(), dir.display().to_string())])
+        };
+        let (one, two) = (shell("shell1")?, shell("shell2")?);
+        let found = resolve("pi", &one).ok_or("found from shell one")?;
+        assert_eq!(Some(found.clone()), resolve("pi", &two));
+        assert_eq!(found, std::fs::canonicalize(&program)?);
         Ok(())
     }
 

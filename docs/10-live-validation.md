@@ -73,6 +73,14 @@ same `StreamDecoder` a supervised run uses, and reports whether the stream parse
   drift. The first line of its stderr is printed.
 - `DRIFT: N line(s), M unparsed` — it produced output aftman cannot read. Same treatment as step 0.
 
+If `pi` is installed, the probe then runs one **`pi rpc`** turn: `pi --mode rpc`, the session
+`--steer` drives. It is the one launch shape with no recorded fixture, so this turn is what stands
+in for one. It passes only if the stream decodes, says `agent_settled`, and the process exits
+within 15 s of its input closing — the three things a supervised session depends on. A pass is
+written to `<state dir>/verified-streams.json` with the `pi` version and the aftman version, and
+`run --steer` is refused until a record matches both (`docs/04-workers.md` §12). Anything else
+prints why and `--steer stays locked for this pi`.
+
 ## Step 3 — a real supervised run
 
 ```bash

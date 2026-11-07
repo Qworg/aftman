@@ -602,6 +602,25 @@ pub fn probe_spec(kind: WorkerKind, mission: &str) -> Option<Result<CommandSpec,
     }
 }
 
+/// The `pi --mode rpc` session a live probe runs: the CLI's own defaults, as [`probe_spec`].
+///
+/// The one launch shape with no recorded fixture, so a run may use it only after this probe
+/// has verified it on the machine (`docs/04-workers.md` §12).
+#[must_use]
+pub fn rpc_probe_spec() -> CommandSpec {
+    pi_rpc(&BackendOptions {
+        model: None,
+        effort: None,
+        executable: None,
+        permissions: PermissionMode::Sandboxed,
+        external_sandbox: true,
+        human_available: false,
+        command_template: None,
+        prefer_steering: true,
+        extra_args: Vec::new(),
+    })
+}
+
 /// The distinct flags an argv passes, in order.
 ///
 /// `--print=<mission>` yields `--print`, a bare `--` is a separator rather than a flag, and

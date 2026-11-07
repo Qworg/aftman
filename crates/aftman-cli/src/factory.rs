@@ -289,6 +289,17 @@ impl CliFactory {
         let (model, jev_budget) = self.build_model(params.simulate_model, &mut launch)?;
         crate::statedir::ensure(&self.data_dir)
             .map_err(|e| internal(format!("preparing the state directory: {e}")))?;
+        // `pi --mode rpc` has no recorded fixture: a live probe on this machine stands in for
+        // one, and without it the run is refused before anything starts.
+        if config.worker == WorkerKind::Pi && options.prefer_steering {
+            let program = aftman_workers::backends::rpc_probe_spec().program;
+            let verified =
+                crate::verified::require(&self.data_dir, crate::verified::Shape::PiRpc, || {
+                    crate::verified::installed_version(&program)
+                })
+                .map_err(|refusal| config_error(refusal.to_string()))?;
+            launch.insert("rpc_verified_for".to_owned(), verified);
+        }
         let worker = build_worker(&config, &options, &self.data_dir)?;
         launch.insert(
             "permissions".to_owned(),
@@ -819,6 +830,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(prepared.built.job.repo, dir.path());
+    }
+
+    #[tokio::test]
+    async fn steering_pi_is_refused_until_a_probe_has_verified_its_rpc_mode() {
+        // `pi --mode rpc` has no recorded fixture. With no probe record the run is refused
+        // before the installed pi is even asked its version, so this never runs a real `pi`.
+        let (dir, factory) = factory();
+        let mut p = params(dir.path());
+        p.worker = Some("pi".into());
+        // pi has no sandbox flag; asserting external isolation keeps the posture valid, so
+        // the only thing that can refuse this run is the gate.
+        p.external_sandbox = true;
+        p.steer = true;
+        let error = factory.prepare(&p, context()).await.err().unwrap();
+        assert_eq!(error.code, ErrorCode::InvalidConfig);
+        assert!(
+            error.message.contains("aftman doctor --probe-workers"),
+            "the refusal names the way out: {}",
+            error.message
+        );
+        assert!(
+            !dir.path().join(crate::statedir::MISSIONS_DIR).exists()
+                || std::fs::read_dir(dir.path().join(crate::statedir::MISSIONS_DIR))
+                    .unwrap()
+                    .next()
+                    .is_none(),
+            "nothing was launched"
+        );
+        // One-shot pi is fixture-verified and is not gated.
+        p.steer = false;
+        assert_ne!(code(&factory, &p).await, Some(ErrorCode::InvalidConfig));
     }
 
     #[tokio::test]

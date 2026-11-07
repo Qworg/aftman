@@ -75,10 +75,12 @@ same `StreamDecoder` a supervised run uses, and reports whether the stream parse
 
 If `pi` is installed, the probe then runs one **`pi rpc`** turn: `pi --mode rpc`, the session
 `--steer` drives. It is the one launch shape with no recorded fixture, so this turn is what stands
-in for one. It passes only if the stream decodes, says `agent_settled`, and the process exits
-within 15 s of its input closing — the three things a supervised session depends on. A pass is
-written to `<state dir>/verified-streams.json` with the `pi` version and the aftman version, and
-`run --steer` is refused until a record matches both (`docs/04-workers.md` §12). Anything else
+in for one. It passes only if the stream decodes, says `agent_settled` (not aborted), and the
+process exits 0 within 15 s of its input closing — what a supervised session depends on. A pass is
+written to `<state dir>/verified-streams.json` with the `pi` executable's absolute path, its
+version and the aftman version, and `run --steer` is refused unless the run's own `PATH` finds
+that same file at that same version (`docs/04-workers.md` §12). Run the probe from the shell you
+start runs from. Anything else
 prints why and `--steer stays locked for this pi`.
 
 ## Step 3 — a real supervised run

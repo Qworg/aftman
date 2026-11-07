@@ -537,7 +537,8 @@ fn worker_line(kind: WorkerKind, problems: &mut bool) -> Result<(), CliError> {
         return Ok(());
     }
     // The same reading the `--steer` gate compares against (`crate::verified`).
-    let version = crate::verified::installed_version(&spec.program)
+    let version = crate::verified::resolve(&spec.program, &aftman_workers::worker_environment(&[]))
+        .and_then(|program| crate::verified::installed_version(&program, &[]))
         .unwrap_or_else(|| "version unknown".to_owned());
     let help = capture(&spec.program, &["--help"]).unwrap_or_default();
     let flags = aftman_workers::backends::spec_flags(&spec.args);
@@ -708,18 +709,14 @@ async fn probe_workers_live(problems: &mut bool) -> Result<(), CliError> {
 
 /// How long an RPC session may take to exit once its input has closed.
 const RPC_CLOSE_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
-/// The longest stdout line the RPC probe inspects for a prompt response.
-const RPC_MAX_LINE_BYTES: usize = 1024 * 1024;
 
 /// What one `pi --mode rpc` turn did.
 #[derive(Debug, Default)]
 struct RpcTurn {
     activity: aftman_core::activity::StreamActivity,
-    /// The stream said `agent_settled`.
-    settled: bool,
-    /// pi refused or short-circuited the prompt, in its own words.
-    refused: Option<String>,
-    /// The process exited within [`RPC_CLOSE_GRACE`] of its input closing.
+    /// Why the stream said the session's work was over, if it did.
+    end: Option<aftman_workers::SessionEnd>,
+    /// The process exited within the close grace of its input closing.
     exited_on_close: bool,
     code: Option<i32>,
     stderr: String,
@@ -728,51 +725,41 @@ struct RpcTurn {
 /// What the RPC probe concluded, separate from the printing so it can be tested.
 #[derive(Debug, PartialEq, Eq)]
 enum RpcConclusion {
-    /// Decoded, settled, and exited when its input closed: `--steer` may use it.
+    /// Decoded, settled, and exited 0 when its input closed: `--steer` may use it.
     Verified,
     Refused(String),
     NotWorking(ProbeVerdict),
     /// Worked, but never said `agent_settled`: a run could not tell when it was done.
     NeverSettled,
+    /// Settled with `aborted: true`: the turn did not complete.
+    Aborted,
     /// Settled, but kept running after its input closed: a run would not end.
     DidNotExit,
+    /// Settled and exited, but not with 0: every run would be recorded `Failed`.
+    ExitedWith(Option<i32>),
 }
 
 fn rpc_conclusion(turn: &RpcTurn) -> RpcConclusion {
-    if let Some(why) = &turn.refused {
+    if let Some(aftman_workers::SessionEnd::Refused(why)) = &turn.end {
         return RpcConclusion::Refused(why.clone());
     }
     match probe_verdict(&turn.activity) {
         ProbeVerdict::Working => {}
         other => return RpcConclusion::NotWorking(other),
     }
-    if !turn.settled {
+    if turn.end != Some(aftman_workers::SessionEnd::Settled) {
         return RpcConclusion::NeverSettled;
+    }
+    if turn.activity.aborted == Some(true) {
+        return RpcConclusion::Aborted;
     }
     if !turn.exited_on_close {
         return RpcConclusion::DidNotExit;
     }
+    if turn.code != Some(0) {
+        return RpcConclusion::ExitedWith(turn.code);
+    }
     RpcConclusion::Verified
-}
-
-/// pi's answer to the probe's `prompt` command, when it means no run will follow.
-fn prompt_refusal(line: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
-    if value.get("type")?.as_str()? != "response" || value.get("command")?.as_str()? != "prompt" {
-        return None;
-    }
-    if value.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
-        let error = value
-            .get("error")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("no reason given");
-        return Some(error.chars().take(200).collect());
-    }
-    let disposition = value
-        .get("data")
-        .and_then(|data| data.get("disposition"))
-        .and_then(serde_json::Value::as_str);
-    (disposition == Some("handled")).then(|| "pi handled the prompt without starting a run".into())
 }
 
 /// Read a pipe to its end, keeping at most `cap` bytes. The rest is read and dropped, so a
@@ -791,10 +778,14 @@ async fn read_capped(mut pipe: impl tokio::io::AsyncRead + Unpin, cap: usize) ->
     String::from_utf8_lossy(&kept).into_owned()
 }
 
-/// Drive one RPC turn: send the prompt, read until the agent settles (or pi refuses, or the
-/// stream ends), close the input, and see whether the session exits.
+/// Drive one RPC turn: send the prompt, read until the session's work is over (the agent
+/// settles, or pi refuses the prompt) or the stream ends, close the input, and see whether
+/// and how the session exits.
+///
+/// The end of the work is read by the same [`aftman_workers::StreamDecoder`] a supervised run
+/// uses, so the probe verifies the rule a run relies on, not a copy of it.
 async fn rpc_turn(
-    program: &str,
+    program: &Path,
     args: &[String],
     dir: &Path,
     mission: &str,
@@ -825,30 +816,18 @@ async fn rpc_turn(
 
     let mut turn = RpcTurn::default();
     let mut decoder = aftman_workers::StreamDecoder::new(WorkerKind::Pi);
-    let mut pending = String::new();
     let mut chunk = vec![0u8; 8192];
     loop {
         let read = stdout.read(&mut chunk).await?;
         if read == 0 {
             break;
         }
-        let text = String::from_utf8_lossy(&chunk[..read]);
-        decoder.push(&text, &mut |_| {});
-        pending.push_str(&text);
-        while let Some(end) = pending.find('\n') {
-            let line: String = pending.drain(..=end).collect();
-            if turn.refused.is_none() {
-                turn.refused = prompt_refusal(&line);
-            }
-        }
-        if pending.len() > RPC_MAX_LINE_BYTES {
-            pending.clear();
-        }
-        if turn.refused.is_some() || decoder.settled() {
+        decoder.push(&String::from_utf8_lossy(&chunk[..read]), &mut |_| {});
+        if decoder.session_end().is_some() {
             break;
         }
     }
-    turn.settled = decoder.settled();
+    turn.end = decoder.session_end().cloned();
     turn.activity = decoder.finish(&mut |_| {});
     // Keep reading what the session says while it shuts down, so it cannot block on a
     // full pipe while we wait for it.
@@ -871,19 +850,23 @@ async fn rpc_turn(
     Ok(turn)
 }
 
-/// Run one `pi --mode rpc` turn; if it decodes, settles and exits when its input closes,
-/// record that `--steer` may use this pi (`crate::verified`).
+/// Run one `pi --mode rpc` turn; if it decodes, settles and exits cleanly when its input
+/// closes, record that `--steer` may use this pi (`crate::verified`).
 ///
+/// The `pi` probed is the one this shell's worker environment finds, which is the one a run
+/// started from this shell would execute; its absolute path is what is recorded.
 /// `pi --mode rpc` is the one launch shape with no recorded fixture, so this probe is what
 /// stands in for one, and it says so whichever way it goes.
 async fn probe_pi_rpc(data_dir: &Path, problems: &mut bool) -> Result<(), CliError> {
     let spec = aftman_workers::backends::rpc_probe_spec();
     let name = "pi rpc";
-    if !which(&spec.program) {
+    let Some(program) =
+        crate::verified::resolve(&spec.program, &aftman_workers::worker_environment(&[]))
+    else {
         outln!("  {name:<10} skipped (not installed)")?;
         return Ok(());
-    }
-    let Some(version) = crate::verified::installed_version(&spec.program) else {
+    };
+    let Some(version) = crate::verified::installed_version(&program, &[]) else {
         outln!(
             "  {name:<10} skipped: `pi --version` could not be read, so nothing can be recorded"
         )?;
@@ -897,11 +880,12 @@ async fn probe_pi_rpc(data_dir: &Path, problems: &mut bool) -> Result<(), CliErr
         return Ok(());
     }
     outln!("  {name:<10} running one turn (this is what unlocks --steer)...")?;
+    outln!("             {} ({version})", program.display())?;
     let started = std::time::Instant::now();
     let session = tokio::time::timeout(
         PROBE_TIMEOUT,
         rpc_turn(
-            &spec.program,
+            &program,
             &spec.args,
             &dir,
             "Reply with exactly: ok",
@@ -939,10 +923,15 @@ async fn probe_pi_rpc(data_dir: &Path, problems: &mut bool) -> Result<(), CliErr
     match conclusion {
         RpcConclusion::Verified => {
             outln!("             {}", turn.activity.summary())?;
-            match crate::verified::record(data_dir, crate::verified::Shape::PiRpc, &version) {
+            match crate::verified::record(
+                data_dir,
+                crate::verified::Shape::PiRpc,
+                &program,
+                &version,
+            ) {
                 Ok(()) => outln!(
-                    "             verified: the session decoded, settled, and exited when its \
-                     input closed. --steer is unlocked for {version}"
+                    "             verified: the session decoded, settled, and exited 0 when its \
+                     input closed. --steer is unlocked for this pi"
                 )?,
                 Err(error) => {
                     outln!("             verified, but the record could not be written: {error}")?;
@@ -973,11 +962,21 @@ async fn probe_pi_rpc(data_dir: &Path, problems: &mut bool) -> Result<(), CliErr
                  when the session's work was done; {locked}"
             )?;
         }
+        RpcConclusion::Aborted => {
+            outln!("             the turn settled as aborted; {locked}")?;
+        }
         RpcConclusion::DidNotExit => {
             outln!(
                 "             settled, but still running {}s after its input closed, so a run \
                  would not end; {locked}",
                 RPC_CLOSE_GRACE.as_secs()
+            )?;
+        }
+        RpcConclusion::ExitedWith(code) => {
+            outln!(
+                "             settled, but exited {} when its input closed, so every run would \
+                 be recorded as failed; {locked}",
+                code.map_or_else(|| "on a signal".to_owned(), |code| code.to_string())
             )?;
         }
     }
@@ -1160,8 +1159,8 @@ fn which(binary: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        ProbeVerdict, RpcConclusion, help_mentions, probe_verdict, prompt_refusal, rpc_conclusion,
-        rpc_turn, stderr_excerpt,
+        ProbeVerdict, RpcConclusion, help_mentions, probe_verdict, rpc_conclusion, rpc_turn,
+        stderr_excerpt,
     };
     use std::time::Duration;
 
@@ -1175,7 +1174,7 @@ mod tests {
         let turn = tokio::time::timeout(
             Duration::from_secs(20),
             rpc_turn(
-                "/bin/sh",
+                std::path::Path::new("/bin/sh"),
                 &["-c".to_owned(), script],
                 dir.path(),
                 "Reply with exactly: ok",
@@ -1234,15 +1233,27 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn only_a_prompt_response_that_starts_nothing_is_a_refusal() {
-        let started = r#"{"type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}"#;
-        assert_eq!(prompt_refusal(started), None);
-        let handled = r#"{"type":"response","command":"prompt","success":true,"data":{"disposition":"handled"}}"#;
-        assert!(prompt_refusal(handled).is_some());
-        let other = r#"{"type":"response","command":"get_state","success":false,"error":"x"}"#;
-        assert_eq!(prompt_refusal(other), None);
-        assert_eq!(prompt_refusal("not json"), None);
+    #[tokio::test]
+    async fn an_rpc_session_that_exits_non_zero_on_close_is_not_verified() -> TestResult {
+        // A run would record every worker on this pi as failed.
+        let turn = fake_session(&format!("{SETTLED_TURN} cat >/dev/null; exit 3")).await?;
+        assert_eq!(
+            rpc_conclusion(&turn),
+            RpcConclusion::ExitedWith(Some(3)),
+            "{turn:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_rpc_turn_that_settles_aborted_is_not_verified() -> TestResult {
+        let turn = fake_session(&format!(
+            "{} cat >/dev/null",
+            SETTLED_TURN.replace(r#""aborted":false"#, r#""aborted":true"#)
+        ))
+        .await?;
+        assert_eq!(rpc_conclusion(&turn), RpcConclusion::Aborted, "{turn:?}");
+        Ok(())
     }
 
     #[test]

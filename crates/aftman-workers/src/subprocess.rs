@@ -470,7 +470,7 @@ async fn pump(
     activity: std::sync::Arc<Mutex<Option<StreamActivity>>>,
     sink: WorkerEventSink,
     kind: WorkerKind,
-    mut settled: Option<std::sync::Arc<tokio::sync::Notify>>,
+    mut session_end: Option<tokio::sync::oneshot::Sender<crate::output::SessionEnd>>,
 ) {
     // Only a *structured* backend's stdout goes through the decoder. A `Generic` worker's
     // output is already the readable form: decoding it buffers it waiting for a newline it
@@ -522,13 +522,11 @@ async fn pump(
                 // Signal after the bytes are visible, so a woken watcher always sees
                 // the output that woke it.
                 sink.activity();
-                // Once only: the session closes its input once, and a permit is stored if
-                // the run loop is not yet waiting.
-                if let Some(notify) = &settled
-                    && decoder.as_ref().is_some_and(StreamDecoder::settled)
+                // Once only: the session closes its input once.
+                if let Some(end) = decoder.as_ref().and_then(StreamDecoder::session_end)
+                    && let Some(sender) = session_end.take()
                 {
-                    notify.notify_one();
-                    settled = None;
+                    let _ = sender.send(end.clone());
                 }
             }
             Err(error) => {
@@ -630,12 +628,15 @@ impl Worker for SubprocessWorker {
         }
 
         // A long-lived session (`pi --mode rpc`) does not exit when its work is done: it
-        // waits for its input to close. The stdout decoder says when the agent has settled,
-        // and the run then closes stdin, which is pi's documented orderly shutdown.
-        let settled = spec
-            .steer
-            .supports_steering()
-            .then(|| std::sync::Arc::new(tokio::sync::Notify::new()));
+        // waits for its input to close. The stdout decoder says when the agent has settled
+        // (or refused the mission, after which nothing will settle), and the run then closes
+        // stdin, which is pi's documented orderly shutdown.
+        let (end_sender, mut end_receiver) = if spec.steer.supports_steering() {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
         let stdout_task = child.stdout.take().map(|pipe| {
             tokio::spawn(pump(
                 pipe,
@@ -644,7 +645,7 @@ impl Worker for SubprocessWorker {
                 std::sync::Arc::clone(&ctx.activity),
                 sink.clone(),
                 self.kind,
-                settled.clone(),
+                end_sender,
             ))
         });
         let stderr_task = child.stderr.take().map(|pipe| {
@@ -659,18 +660,34 @@ impl Worker for SubprocessWorker {
             ))
         });
 
+        let mut refused: Option<String> = None;
         let exit = async {
             let exit = self.end_group_on_exit(&mut child, pgid);
             tokio::pin!(exit);
-            if let Some(settled) = &settled {
+            if let Some(receiver) = end_receiver.as_mut() {
                 tokio::select! {
                     status = &mut exit => return status,
-                    () = settled.notified() => self.close_stdin().await,
+                    end = receiver => {
+                        // `Err`: the stream ended without saying; the exit decides.
+                        if let Ok(end) = end {
+                            if let crate::output::SessionEnd::Refused(why) = end {
+                                refused = Some(why);
+                            }
+                            self.close_stdin().await;
+                        }
+                    }
                 }
             }
             exit.await
         };
         let outcome = match tokio::time::timeout(ctx.timeout, exit).await {
+            // A mission pi refused was never worked on, whatever the exit code says.
+            Ok(Ok(_)) if refused.is_some() => WorkerOutcome::StreamError {
+                message: format!(
+                    "pi did not start the mission: {}",
+                    refused.take().unwrap_or_default()
+                ),
+            },
             Ok(Ok(status)) => {
                 if status.success() {
                     WorkerOutcome::Completed
@@ -933,6 +950,35 @@ mod tests {
         let (outcome, text) = drive(&worker, ctx(fresh_log(), Duration::from_secs(1))).await?;
         assert_eq!(outcome, WorkerOutcome::TimedOut, "{text}");
         assert!(!text.contains("input closed"), "{text}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_rpc_session_that_will_not_start_the_mission_ends_at_once_and_fails() -> TestResult {
+        // A refused prompt (a bad --model is enough) or one pi handles without a run is never
+        // followed by agent_settled. Waiting for it would hold the run until worker_timeout.
+        for (answer, reason) in [
+            (
+                r#"{"id":"mission","type":"response","command":"prompt","success":false,"error":"Model not found: x"}"#,
+                "Model not found: x",
+            ),
+            (
+                r#"{"id":"mission","type":"response","command":"prompt","success":true,"data":{"disposition":"handled"}}"#,
+                "without starting a run",
+            ),
+        ] {
+            let worker = SubprocessWorker::new(WorkerKind::Pi, rpc_session(&[answer]));
+            let started = tokio::time::Instant::now();
+            let (outcome, text) = drive(&worker, ctx(fresh_log(), Duration::from_secs(10))).await?;
+            assert!(started.elapsed() < Duration::from_secs(5), "{text}");
+            assert!(text.contains("input closed"), "{text}");
+            match outcome {
+                WorkerOutcome::StreamError { message } => {
+                    assert!(message.contains(reason), "{message}");
+                }
+                other => return Err(format!("expected a failure, got {other:?}").into()),
+            }
+        }
         Ok(())
     }
 

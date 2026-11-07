@@ -98,6 +98,9 @@ pi --print --mode json --no-session -- <mission>
 pi --mode rpc --no-session
 ```
 
+**Gated** until `aftman doctor --probe-workers` has verified it on the machine: this shape has
+no recorded fixture yet (§12).
+
 Long-lived; stdin is a JSONL command channel, stdout is JSONL responses and events. Verified
 commands relevant to supervision:
 
@@ -562,7 +565,14 @@ interrupt → wait terminate_grace (5s) → kill process group
 6. Record real CLI output into `crates/aftman-workers/tests/fixtures/<name>/` and parse *that*.
    Hand-written fixtures for a third-party CLI format are how parsers rot. (Doc 09 M8 sequences
    this work; the red line here is that a backend without a recorded fixture stays gated behind
-   `aftman doctor --probe`.)
+   `aftman doctor --probe-workers`.)
+   *Gated today:* `pi --mode rpc`, the shape `--worker pi --steer` selects. `run` refuses it
+   (`invalid_config`, naming the probe) unless `<state dir>/verified-streams.json` records a probe
+   turn by this aftman against the `pi --version` installed now. The probe records one only for a
+   turn that decoded, said `agent_settled`, and exited once its input closed
+   (`crates/aftman-cli/src/verified.rs`). With no record, the installed `pi` is not run at all.
+   The record is per machine and per state directory; a daemon with a different state directory
+   than the shell that ran `doctor` will not see it, which `doctor` already reports.
    *Recorded so far:* `pi/one-shot.jsonl` (with a tool call, and the `message_update` text-delta
    shape that a hand-written input had got wrong), `agy/print.jsonl`, `claude/print.jsonl`. A
    **failed** run per backend, and a `pi --mode rpc` session, are still unrecorded.

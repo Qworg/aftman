@@ -15,6 +15,7 @@
 //! | [`follow`] | the self-recovering event stream |
 //! | [`out`], [`sanitize`] | the only way to the terminal, and what it strips |
 //! | [`statedir`] | private creation of the state directory, log rotation |
+//! | [`verified`] | launch shapes a live probe has unlocked (`pi --mode rpc`) |
 //! | [`tui`] | `aftman watch`: the terminal UI (pure state, view and input; async driver) |
 //! | [`runid`], [`error`] | run-id prefixes, exit codes |
 
@@ -33,6 +34,7 @@ pub mod runid;
 pub mod sanitize;
 pub mod statedir;
 pub mod tui;
+pub mod verified;
 
 use std::process::ExitCode;
 

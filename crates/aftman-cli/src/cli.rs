@@ -252,7 +252,9 @@ pub struct RunArgs {
     #[arg(long)]
     pub effort: Option<String>,
 
-    /// Prefer a live-input mode where the backend has one (currently only pi).
+    /// Prefer a live-input mode where the backend has one (currently only pi, as
+    /// `pi --mode rpc`). That mode has no recorded fixture, so it is refused until
+    /// `aftman doctor --probe-workers` has verified it against the installed pi.
     #[arg(long)]
     pub steer: bool,
 

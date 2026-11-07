@@ -853,7 +853,8 @@ $XDG_STATE_HOME/aftman/            (default ~/.local/state/aftman)
 │     ├─ processes.json            # worker processes launched and not yet reaped (docs/04 §11)
 │     └─ artifacts/                # diffs captured at decision points, evidence blobs
 ├─ index.sqlite                    # optional: run list queries when the dir grows
-└─ jev-usage.jsonl                 # one line per model request
+├─ jev-usage.jsonl                 # one line per model request
+└─ verified-streams.json           # launch shapes a live probe unlocked (docs/04 §12), 0600
 ```
 
 `RunStore` API:

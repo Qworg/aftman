@@ -7,9 +7,10 @@
 //!
 //! | Backend | Steering | Verified against |
 //! | --- | --- | --- |
-//! | [`backends::pi_oneshot`] / [`backends::pi_rpc`] | RPC mode only | pi 1.1.0 |
-//! | [`backends::agy`] | no | agy 1.3.3 |
-//! | [`backends::claude`] | no | claude 2.1.293 |
+//! | [`backends::pi_oneshot`] | no | pi 1.3.0 |
+//! | [`backends::pi_rpc`] | yes | unrecorded: gated behind `aftman doctor --probe-workers` |
+//! | [`backends::agy`] | no | agy 1.4.2 |
+//! | [`backends::claude`] | no | claude 2.1.299 |
 //! | [`backends::generic`] | no | operator-supplied |
 //! | [`simulated::SimulatedWorker`] | yes (synthetic) | — |
 //!

@@ -593,7 +593,7 @@ work that turns "the command line launches" into "the output is understood":
 | Verifier mission for all three, using `--json-schema` → `EvidenceResult` | `aftman-workers` |
 | ~~Verifier-mutation detection (diff the tree before/after)~~ — **built**: a working-tree fingerprint before and after each verifier; a difference is `verifier_mutated_repo` and the verifier has not completed (doc 04 §6) | `aftman-daemon` |
 | Per-backend permission mapping (§8.1) implemented and tested, including the `pi` refusal path | `aftman-workers` |
-| Update the §1 matrix with verified versions; `doctor --probe` gating for unverified backends | docs, `aftman-cli` |
+| ~~Update the §1 matrix with verified versions; `doctor --probe` gating for unverified backends~~ — **built**: the matrix carries the 2026-10-20 versions, and `pi --mode rpc` (`--steer`), the one shape with no recording, is refused until `doctor --probe-workers` verifies it against the installed pi (doc 04 §12). The probe found that nothing ended an RPC session: it waits for stdin to close, and aftman never closed it, so a `--steer` run could end only at `worker_timeout`. It now closes stdin at `agent_settled` | docs, `aftman-cli` |
 | ~~Preflight for a live run: versions, `--help` flag drift, repository check, and a one-turn worker probe~~ — **built**; the records it produces are still owed, see [10-live-validation.md](10-live-validation.md) | `aftman-cli` |
 
 **Exit criteria:** each backend parses its recorded fixture; a backend whose stream schema is not

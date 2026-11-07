@@ -284,21 +284,41 @@ impl CliFactory {
         }
 
         let config = run_config(params)?;
-        let options = backend_options(params, self.human_available)?;
+        let mut options = backend_options(params, self.human_available)?;
         let mut launch = BTreeMap::new();
         let (model, jev_budget) = self.build_model(params.simulate_model, &mut launch)?;
         crate::statedir::ensure(&self.data_dir)
             .map_err(|e| internal(format!("preparing the state directory: {e}")))?;
         // `pi --mode rpc` has no recorded fixture: a live probe on this machine stands in for
         // one, and without it the run is refused before anything starts.
+        //
+        // The executable checked is the one the worker's own environment finds — the
+        // client's forwarded PATH, not this process's — and the run then starts it by that
+        // absolute path, so what was checked is what runs.
         if config.worker == WorkerKind::Pi && options.prefer_steering {
             let program = aftman_workers::backends::rpc_probe_spec().program;
-            let verified =
-                crate::verified::require(&self.data_dir, crate::verified::Shape::PiRpc, || {
-                    crate::verified::installed_version(&program)
-                })
-                .map_err(|refusal| config_error(refusal.to_string()))?;
-            launch.insert("rpc_verified_for".to_owned(), verified);
+            let forwarded: Vec<(String, String)> = params
+                .env
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone()))
+                .collect();
+            let entry = crate::verified::require(
+                &self.data_dir,
+                crate::verified::Shape::PiRpc,
+                || {
+                    crate::verified::resolve(
+                        &program,
+                        &aftman_workers::worker_environment(&forwarded),
+                    )
+                },
+                |found| crate::verified::installed_version(found, &forwarded),
+            )
+            .map_err(|refusal| config_error(refusal.to_string()))?;
+            options.executable = Some(entry.cli_path.display().to_string());
+            launch.insert(
+                "rpc_verified_for".to_owned(),
+                format!("{} ({})", entry.cli_version, entry.cli_path.display()),
+            );
         }
         let worker = build_worker(&config, &options, &self.data_dir)?;
         launch.insert(
@@ -861,6 +881,55 @@ mod tests {
         // One-shot pi is fixture-verified and is not gated.
         p.steer = false;
         assert_ne!(code(&factory, &p).await, Some(ErrorCode::InvalidConfig));
+    }
+
+    #[tokio::test]
+    async fn the_pi_checked_is_the_one_on_the_runs_forwarded_path() {
+        // The probe verified one pi; a run whose forwarded PATH finds another must not pass
+        // the gate on the strength of the first. Both are fake scripts: no real pi runs.
+        use std::os::unix::fs::PermissionsExt as _;
+        let fake = |dir: &Path, version: &str| {
+            let path = dir.join("pi");
+            std::fs::write(&path, format!("#!/bin/sh\necho '{version}'\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path
+        };
+        let verified_dir = tempfile::tempdir().unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        let verified_pi = fake(verified_dir.path(), "pi 1.5.0");
+        fake(other_dir.path(), "pi 1.5.0");
+
+        let (dir, factory) = factory();
+        crate::verified::record(
+            factory.data_dir(),
+            crate::verified::Shape::PiRpc,
+            &verified_pi,
+            "pi 1.5.0",
+        )
+        .unwrap();
+        let mut p = params(dir.path());
+        p.worker = Some("pi".into());
+        p.external_sandbox = true;
+        p.steer = true;
+
+        p.env
+            .insert("PATH".into(), other_dir.path().display().to_string());
+        let error = factory.prepare(&p, context()).await.err().unwrap();
+        assert_eq!(error.code, ErrorCode::InvalidConfig);
+        assert!(
+            error
+                .message
+                .contains(&other_dir.path().display().to_string()),
+            "the refusal names the pi this run would execute: {}",
+            error.message
+        );
+
+        p.env
+            .insert("PATH".into(), verified_dir.path().display().to_string());
+        assert!(
+            factory.prepare(&p, context()).await.is_ok(),
+            "the verified pi, at the verified version, passes"
+        );
     }
 
     #[tokio::test]

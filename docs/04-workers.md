@@ -23,7 +23,7 @@ pub trait Worker: Send + Sync {
 
 | Backend | Selection | Transport | Live steering | Non-interactive permissions | Verified against |
 | --- | --- | --- | --- | --- | --- |
-| `pi` | `--worker pi` | `pi --print --mode json` (one-shot) or `pi --mode rpc` (steerable) | **Yes** (RPC) | no sandbox flag — see §8.1 | pi 1.3.0 |
+| `pi` | `--worker pi` | `pi --print --mode json` (one-shot) or `pi --mode rpc` (steerable) | **Yes** (RPC), gated behind `doctor --probe-workers` — see §12 | no sandbox flag — see §8.1 | pi 1.3.0 (one-shot); RPC unrecorded |
 | `agy` | `--worker agy` | `agy --print="…" --output-format stream-json` | No | `--sandbox` | agy 1.4.2 |
 | `claude` | `--worker claude` | `claude -p --output-format stream-json` | No (resume only) | `--permission-mode` / `--permission-prompts` | claude 2.1.299 |
 | `generic` | `--worker generic --cmd …` | operator-supplied argv template | No | operator's responsibility | — |
@@ -34,7 +34,8 @@ pub trait Worker: Send + Sync {
 is a startup error with the exact binary name and an install hint, not a mid-run surprise.
 
 Versions verified on 2026-10-20 by `aftman doctor --probe-workers` and a supervised live run
-(`docs/live/2026-10-20/`).
+(`docs/live/2026-10-20/`), one-shot modes only. `pi --mode rpc` has no recording and is verified
+per machine by the probe instead (§12).
 `aftman doctor` re-checks every flag these backends pass against the installed CLI's `--help`,
 deriving the list from the argv the backend builds, so drift shows up before a run does.
 
@@ -135,8 +136,12 @@ never drains is indistinguishable from a stuck worker.
 close, which is pi's documented orderly shutdown. The stdout decoder watches for `agent_settled`
 ("Pi will not continue automatically") and the run then closes stdin, so the worker exits and is
 reaped like a one-shot one. `agent_end` is deliberately not the signal: pi documents that a retry,
-compaction, a steer or follow-up work can follow it. A steer sent after the session settled is
-`Rejected` ("the agent has settled"), not `Unsupported` — the backend is still steerable. Before
+compaction, a steer or follow-up work can follow it. The session also ends when pi's `response`
+to the mission's `prompt` is `success: false` or `disposition: "handled"`: pi documents that no
+run follows either, so no `agent_settled` will come. That worker ends as a `StreamError` carrying
+pi's reason (a bad `--model` is enough to cause it), never as `Completed`. A steer sent after the
+session settled is `Rejected` ("the agent has settled"), not `Unsupported` — the backend is still
+steerable. Before
 this, nothing closed stdin and an RPC run could end only at `worker_timeout` or by a policy stop.
 
 `abort` is used for `TerminateReason::Timeout | Cancelled`; `terminate()` sends `abort`, waits
@@ -568,11 +573,15 @@ interrupt → wait terminate_grace (5s) → kill process group
    `aftman doctor --probe-workers`.)
    *Gated today:* `pi --mode rpc`, the shape `--worker pi --steer` selects. `run` refuses it
    (`invalid_config`, naming the probe) unless `<state dir>/verified-streams.json` records a probe
-   turn by this aftman against the `pi --version` installed now. The probe records one only for a
-   turn that decoded, said `agent_settled`, and exited once its input closed
-   (`crates/aftman-cli/src/verified.rs`). With no record, the installed `pi` is not run at all.
-   The record is per machine and per state directory; a daemon with a different state directory
-   than the shell that ran `doctor` will not see it, which `doctor` already reports.
+   turn by this aftman of **the executable this run would start** — `pi` resolved against the
+   run's own worker environment, which is the client's forwarded `PATH`, not the daemon's — and
+   that executable still reports the recorded `--version`. The run then starts it by that
+   absolute path, so the file checked is the file run. The probe records a turn only if it
+   decoded, said `agent_settled` without `aborted`, and exited 0 once its input closed
+   (`crates/aftman-cli/src/verified.rs`). With no record, nothing is looked up or run. Run the
+   probe from the shell you start runs from: another shell whose `PATH` finds another `pi` is
+   refused. The record is per state directory; a daemon with a different state directory than the
+   shell that ran `doctor` will not see it, which `doctor` already reports.
    *Recorded so far:* `pi/one-shot.jsonl` (with a tool call, and the `message_update` text-delta
    shape that a hand-written input had got wrong), `agy/print.jsonl`, `claude/print.jsonl`. A
    **failed** run per backend, and a `pi --mode rpc` session, are still unrecorded.

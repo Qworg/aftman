@@ -57,6 +57,19 @@ pub fn has_structured_stream(kind: WorkerKind) -> bool {
     !matches!(envelope_for(kind), Envelope::Plain)
 }
 
+/// Why a long-lived session (`pi --mode rpc`) has no more work to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionEnd {
+    /// `agent_settled`: pi will not continue on its own.
+    Settled,
+    /// pi refused the mission, or handled it without starting a run, so no `agent_settled`
+    /// will ever come. Pi's own reason, bounded.
+    Refused(String),
+}
+
+/// The most of pi's reason for refusing a prompt that is kept.
+const REFUSAL_CHARS: usize = 200;
+
 /// Renders a structured stream into readable lines.
 ///
 /// Feed it bytes as they arrive; it emits complete lines. Partial lines are buffered,
@@ -74,8 +87,8 @@ pub struct StreamDecoder {
     /// assembled here and emitted a line at a time.
     prose: String,
     activity: StreamActivity,
-    /// The agent said it will not continue on its own (`pi`'s `agent_settled`).
-    settled: bool,
+    /// The agent said it has no more work: see [`StreamDecoder::session_end`].
+    end: Option<SessionEnd>,
 }
 
 impl std::fmt::Debug for StreamDecoder {
@@ -96,7 +109,7 @@ impl StreamDecoder {
             buffer: String::new(),
             prose: String::new(),
             activity: StreamActivity::default(),
-            settled: false,
+            end: None,
         }
     }
 
@@ -154,15 +167,17 @@ impl StreamDecoder {
         &self.activity
     }
 
-    /// Whether the agent has said it will not continue on its own.
+    /// Whether, and why, the agent has said it has no more work.
     ///
-    /// Only `pi` says so, with `agent_settled`. `agent_end` is not enough: pi documents that
-    /// retries, compaction, steering and follow-up work can still follow it. A one-shot
-    /// process exits by itself, but a `pi --mode rpc` session is long-lived and waits for
-    /// its input to close, so this is how a supervised RPC session learns its work is over.
+    /// Only `pi` says so: with `agent_settled`, or with a `response` refusing the `prompt`
+    /// (`success: false`, or `disposition: "handled"`, after which pi documents that no run
+    /// starts). `agent_end` is not enough: pi documents that retries, compaction, steering
+    /// and follow-up work can still follow it. A one-shot process exits by itself, but a
+    /// `pi --mode rpc` session is long-lived and waits for its input to close, so this is how
+    /// a supervised RPC session learns its work is over.
     #[must_use]
-    pub fn settled(&self) -> bool {
-        self.settled
+    pub fn session_end(&self) -> Option<&SessionEnd> {
+        self.end.as_ref()
     }
 
     /// Decode one line.
@@ -259,7 +274,40 @@ impl StreamDecoder {
             }
             "agent_settled" => {
                 self.activity.aborted = event.get("aborted").and_then(Value::as_bool);
-                self.settled = true;
+                if self.end.is_none() {
+                    self.end = Some(SessionEnd::Settled);
+                }
+            }
+            // RPC mode only: pi's answer to a command. The one that matters is the answer to
+            // the mission's `prompt`, when it means no run will follow.
+            "response" if event.get("command").and_then(Value::as_str) == Some("prompt") => {
+                if self.end.is_some() {
+                    return;
+                }
+                let why = if event.get("success").and_then(Value::as_bool) == Some(false) {
+                    Some(
+                        event
+                            .get("error")
+                            .and_then(Value::as_str)
+                            .unwrap_or("no reason given")
+                            .chars()
+                            .take(REFUSAL_CHARS)
+                            .collect::<String>(),
+                    )
+                } else if event
+                    .get("data")
+                    .and_then(|data| data.get("disposition"))
+                    .and_then(Value::as_str)
+                    == Some("handled")
+                {
+                    Some("pi handled the prompt without starting a run".to_owned())
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    emit(&format!("✗ pi did not start the mission: {why}"));
+                    self.end = Some(SessionEnd::Refused(why));
+                }
             }
             _ => {}
         }
@@ -489,7 +537,7 @@ pub fn decode_all(kind: WorkerKind, stream: &str) -> (Vec<String>, StreamActivit
 
 #[cfg(test)]
 mod tests {
-    use super::{ASSISTANT_TEXT_CAP, StreamDecoder, decode_all};
+    use super::{ASSISTANT_TEXT_CAP, SessionEnd, StreamDecoder, decode_all};
     use aftman_core::activity::MAX_TOOL_CALLS;
     use aftman_core::job::WorkerKind;
 
@@ -549,10 +597,49 @@ mod tests {
         assert!(before.contains("\"type\":\"agent_end\""));
         let mut decoder = StreamDecoder::new(WorkerKind::Pi);
         decoder.push(&before, &mut |_| {});
-        assert!(!decoder.settled(), "agent_end is not the end of the work");
+        assert_eq!(
+            decoder.session_end(),
+            None,
+            "agent_end is not the end of the work"
+        );
         decoder.push(PI, &mut |_| {});
-        assert!(decoder.settled());
+        assert_eq!(decoder.session_end(), Some(&SessionEnd::Settled));
         Ok(())
+    }
+
+    #[test]
+    fn a_refused_or_handled_prompt_ends_a_pi_session() {
+        // pi documents that no run follows either answer, so no agent_settled will come.
+        let refused = r#"{"id":"mission","type":"response","command":"prompt","success":false,"error":"Model not found: x"}"#;
+        let (lines, _) = decode_all(WorkerKind::Pi, refused);
+        let mut decoder = StreamDecoder::new(WorkerKind::Pi);
+        decoder.push(&format!("{refused}\n"), &mut |_| {});
+        assert_eq!(
+            decoder.session_end(),
+            Some(&SessionEnd::Refused("Model not found: x".to_owned()))
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("Model not found: x")),
+            "the reason reaches the log: {lines:?}"
+        );
+
+        let handled = r#"{"id":"mission","type":"response","command":"prompt","success":true,"data":{"disposition":"handled"}}"#;
+        let mut decoder = StreamDecoder::new(WorkerKind::Pi);
+        decoder.push(&format!("{handled}\n"), &mut |_| {});
+        assert!(matches!(
+            decoder.session_end(),
+            Some(SessionEnd::Refused(_))
+        ));
+
+        // A prompt that started, and an answer to another command, end nothing.
+        for line in [
+            r#"{"id":"mission","type":"response","command":"prompt","success":true,"data":{"disposition":"started"}}"#,
+            r#"{"type":"response","command":"steer","success":false,"error":"x"}"#,
+        ] {
+            let mut decoder = StreamDecoder::new(WorkerKind::Pi);
+            decoder.push(&format!("{line}\n"), &mut |_| {});
+            assert_eq!(decoder.session_end(), None, "{line}");
+        }
     }
 
     #[test]
@@ -560,7 +647,7 @@ mod tests {
         for (kind, text) in [(WorkerKind::Agy, AGY), (WorkerKind::Claude, CLAUDE)] {
             let mut decoder = StreamDecoder::new(kind);
             decoder.push(text, &mut |_| {});
-            assert!(!decoder.settled(), "{kind:?}");
+            assert_eq!(decoder.session_end(), None, "{kind:?}");
         }
     }
 

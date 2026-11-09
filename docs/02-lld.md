@@ -16,21 +16,25 @@ aftman/
 │  ├─ aftman-workers/            # Worker trait + backends (incl. aftman-workers::herdr)
 │  ├─ aftman-store/              # events.jsonl, state.json, run index
 │  ├─ aftman-daemon/             # FactoryRuntime, protocol server, transports
-│  ├─ aftman-web/                # axum router + embedded assets (used by the daemon)
-│  └─ aftman-cli/                # `aftman` binary: clap, client, TUI
+│  ├─ aftman-web/                # axum router + pages; a second transport over RunManager
+│  └─ aftman-cli/                # `aftman` binary: clap, client, TUI, composition root
 └─ xtask/                        # optional build automation
 ```
 
 Dependency direction is strictly downward. `aftman-core` depends on nothing in the workspace.
 
 ```text
-aftman-cli ──► aftman-daemon ──► aftman-web
-                   │  │
-                   │  ├──► aftman-store
-                   │  ├──► aftman-workers ──► aftman-core
-                   │  └──► aftman-jev ──────► aftman-core
-                   └──► aftman-core
+aftman-cli ──► aftman-web ──► aftman-daemon ──► aftman-store ───► aftman-core
+    │                              │
+    │                              └──► aftman-workers ─► aftman-core
+    ├──► aftman-jev ─────────────────────────────────────► aftman-core
+    └──► (also daemon, store, workers, core directly)
 ```
+
+The daemon knows neither Jev nor the web. It is handed a `RuntimeFactory`; the real one,
+`aftman-cli/src/factory.rs`, is the composition root that puts `aftman-jev`'s client behind
+`dyn DecisionModel`. `aftman-web` calls the daemon's `RunManager`, and `aftman serve` mounts it.
+The walkthrough in [architecture.md §3](architecture.md) draws the full graph.
 
 One binary: `aftman`. `aftman serve` runs the daemon; every other subcommand is a client of it
 (or of the embedded runtime under `--no-daemon`).

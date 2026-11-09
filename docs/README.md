@@ -14,6 +14,7 @@ Read in order the first time. Each doc stands alone after that.
 | 08 | [Security](08-security.md) | You are touching credentials, subprocess environments, or network exposure |
 | 09 | [Plan](09-plan.md) | You want to know what gets built in what order |
 | 10 | [Live validation runbook](10-live-validation.md) | You are about to exercise the real decision model or a real agent CLI for the first time |
+| — | [Architecture deep dive](architecture.md) | You want a guided, diagrammed tour of the whole system before (or instead of) the numbered docs |
 
 ## The one-paragraph version
 
